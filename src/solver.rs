@@ -794,6 +794,12 @@ impl Solver {
                 }
             }
         }
+        if !best_cost.is_finite() {
+            bail!(
+                "no valid exact guess found for subset of size {}",
+                subset.len()
+            );
+        }
         memo.insert(key, best_cost);
         Ok(best_cost)
     }
@@ -900,16 +906,21 @@ fn compare_exact_costs(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, path::PathBuf};
+
     use chrono::NaiveDate;
 
     use crate::{
         config::PriorConfig,
-        model::AnswerRecord,
+        model::{AnswerRecord, ModelVariant, WeightMode},
+        pattern_table::PatternTable,
         scoring::{format_feedback_letters, score_guess},
+        small_state::SmallStateTable,
     };
 
     use super::{
-        ExactSubsetKey, ExactSubsetStorage, ExactSuggestionMode, Solver, exact_suggestion_mode,
+        ExactSearchScratch, ExactSubsetKey, ExactSubsetStorage, ExactSuggestionMode, Solver,
+        exact_suggestion_mode,
     };
 
     #[test]
@@ -979,5 +990,81 @@ mod tests {
         let subset = (0..17).collect::<Vec<_>>();
         let key = ExactSubsetKey::from_sorted_subset(&subset);
         assert!(matches!(key, ExactSubsetKey(ExactSubsetStorage::Heap(_))));
+    }
+
+    #[test]
+    fn exact_search_errors_when_no_guess_shrinks_subset() {
+        let corpus = ["cigar", "rebut", "sissy", "humph", "awake", "blush"];
+        let mut witness = None;
+        'outer: for guess in corpus {
+            for left_index in 0..corpus.len() {
+                for right_index in (left_index + 1)..corpus.len() {
+                    if score_guess(guess, corpus[left_index])
+                        == score_guess(guess, corpus[right_index])
+                    {
+                        witness = Some((
+                            guess.to_string(),
+                            corpus[left_index].to_string(),
+                            corpus[right_index].to_string(),
+                        ));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let witness = witness.expect("need a non-splitting witness");
+        let guesses = vec![witness.0.clone()];
+        let answers = vec![
+            AnswerRecord {
+                word: witness.1.clone(),
+                in_seed: true,
+                manual_entry: false,
+                manual_weight: 1.0,
+                history_dates: Vec::new(),
+            },
+            AnswerRecord {
+                word: witness.2.clone(),
+                in_seed: true,
+                manual_entry: false,
+                manual_weight: 1.0,
+                history_dates: Vec::new(),
+            },
+        ];
+        let pattern_root: PathBuf = std::env::temp_dir().join("maybe-wordle-exact-no-shrink");
+        let _ = std::fs::remove_dir_all(&pattern_root);
+        std::fs::create_dir_all(&pattern_root).expect("pattern root");
+        let pattern_table =
+            PatternTable::load_or_build_at(&pattern_root.join("pattern.bin"), &guesses, &answers)
+                .expect("pattern table");
+        let solver = Solver {
+            config: PriorConfig::default(),
+            mode: WeightMode::Uniform,
+            variant: ModelVariant::SeedPlusHistory,
+            guesses: guesses.clone(),
+            answers,
+            history_dates: Vec::new(),
+            exact_small_state_table: SmallStateTable::build(2),
+            pattern_table,
+            guess_index: guesses
+                .iter()
+                .enumerate()
+                .map(|(index, guess)| (guess.clone(), index))
+                .collect::<HashMap<_, _>>(),
+        };
+        let mut memo = HashMap::new();
+        let mut scratch = ExactSearchScratch::new();
+        let error = solver
+            .exact_best_cost(
+                &[0, 1],
+                &[1.0, 1.0],
+                &solver.exact_small_state_table,
+                &mut memo,
+                &mut scratch,
+                0,
+            )
+            .expect_err("no shrinking guess should error");
+        assert!(error.to_string().contains("no valid exact guess found"));
+        assert!(memo.is_empty());
+        let _ = std::fs::remove_dir_all(&pattern_root);
     }
 }
