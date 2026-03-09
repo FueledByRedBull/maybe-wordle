@@ -11,7 +11,7 @@
 
 > Classic Wordle solvers usually assume a fixed answer universe and a uniform prior.
 > This project does not.
-> It models modern NYT Wordle as a moving target: historical answers are fetched from the live daily endpoint, candidate answers are seeded from pinned community lists, and the solver can switch from weighted prediction to exact policy search when the state is small enough.
+> It models modern NYT Wordle as a moving target: historical answers are fetched from the live daily endpoint, candidate answers are seeded from pinned community lists, and the app can switch between a fast predictive solver and a separate formal exact-policy builder over a pinned model.
 
 ## Why this repo exists
 
@@ -118,8 +118,6 @@ The historical archive is fetched from the NYT daily puzzle endpoint:
 - `state_values.bin`
 - `policy_table.bin`
 - `proof_metadata.json`
-- `proof_certificate.json`
-- `small_state_table.json`
 - `pattern_table.bin`
 - `prior.toml`
 
@@ -128,15 +126,11 @@ Build them with:
 ```bash
 cargo run --release -- build-optimal-policy --model formal-v1
 cargo run --release -- verify-optimal-policy --model formal-v1
-cargo run --release -- verify-optimal-policy --model formal-v1 --mode oracle
 ```
 
-`verify-optimal-policy` supports two verification passes:
+The formal build is intentionally offline-heavy. On the full pinned model it can take a long time to finish, and the manifest/policy files are written at the end of the run.
 
-- `certificate` checks the persisted proof certificate against the serialized policy rows
-- `oracle` recomputes exact values on the loaded model and cross-checks cached policy decisions
-
-Formal artifacts are versioned. If the state or certificate format changes, stale files are rejected and should be rebuilt.
+Formal artifacts are versioned. If the model inputs or serialized state format change, stale files are rejected and should be rebuilt.
 
 If you only want fast suggestions, predictive mode works with the derived artifacts under [`data/derived`](./data/derived).
 

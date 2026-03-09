@@ -303,9 +303,11 @@ impl Hash for StateKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct PartitionSignature {
-    children: Vec<(u8, StateKey)>,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PartitionFingerprint {
+    bucket_count: u16,
+    mix_a: u64,
+    mix_b: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -474,15 +476,11 @@ impl HotTranspositionTable {
 }
 
 fn compare_hot_tt_entry(left: &HotTtEntry, right: &HotTtEntry) -> std::cmp::Ordering {
-    left.state
-        .count()
-        .cmp(&right.state.count())
-        .then_with(|| {
-            left.stored
-                .objective
-                .worst_case_depth
-                .cmp(&right.stored.objective.worst_case_depth)
-        })
+    left.stored
+        .objective
+        .worst_case_depth
+        .cmp(&right.stored.objective.worst_case_depth)
+        .then_with(|| left.state.count().cmp(&right.state.count()))
         .then_with(|| left.generation.cmp(&right.generation))
 }
 
@@ -970,8 +968,9 @@ impl FormalPolicyRuntime {
     fn evaluate_state_ranked(&self, state: &StateKey) -> Result<Vec<GuessEvaluation>> {
         let total_mass = self.state_mass(state);
         let mut scratch = PartitionScratch::default();
-        let mut signature_map = HashSet::new();
+        let mut signature_map: HashMap<PartitionFingerprint, Vec<usize>> = HashMap::new();
         let mut evaluations = Vec::new();
+        let mut evaluation_buckets: Vec<Vec<PartitionBucket>> = Vec::new();
         for guess_index in 0..self.model.guesses.len() {
             let buckets = partition_guess_with_scratch(
                 self.model.answers.len(),
@@ -982,15 +981,25 @@ impl FormalPolicyRuntime {
                 &self.model.zobrist,
                 &mut scratch,
             )?;
-            let signature = partition_signature_from_buckets(&buckets);
-            if !signature_map.insert(signature) {
+            let signature = partition_fingerprint_from_buckets(&buckets);
+            if signature_map.get(&signature).is_some_and(|indexes| {
+                indexes
+                    .iter()
+                    .copied()
+                    .any(|index| same_bucket_partition(&evaluation_buckets[index], &buckets))
+            }) {
                 continue;
             }
             let Some(built) =
-                self.build_guess_evaluation(state, guess_index, total_mass, buckets, false)?
+                self.build_guess_evaluation(state, guess_index, total_mass, &buckets, false)?
             else {
                 continue;
             };
+            signature_map
+                .entry(signature)
+                .or_default()
+                .push(evaluations.len());
+            evaluation_buckets.push(buckets);
             evaluations.push(built);
         }
         evaluations.sort_by(|left, right| {
@@ -1024,7 +1033,7 @@ impl FormalPolicyRuntime {
         state: &StateKey,
         guess_index: usize,
         total_mass: f64,
-        buckets: Vec<PartitionBucket>,
+        buckets: &[PartitionBucket],
         use_cache_only: bool,
     ) -> Result<Option<GuessEvaluation>> {
         if buckets
@@ -1334,7 +1343,7 @@ impl FormalPolicyBuilder {
             .into_par_iter()
             .map_init(
                 PartitionScratch::default,
-                |scratch, guess_index| -> Result<Option<(GuessQuickPlan, PartitionSignature)>> {
+                |scratch, guess_index| -> Result<Option<(GuessQuickPlan, PartitionFingerprint)>> {
                     let buckets = partition_guess_with_scratch(
                         self.model.answers.len(),
                         state,
@@ -1372,7 +1381,7 @@ impl FormalPolicyBuilder {
                             solve_mass = bucket.mass;
                         }
                     }
-                    let signature = partition_signature_from_buckets(&buckets);
+                    let signature = partition_fingerprint_from_buckets(&buckets);
                     Ok(Some((
                         GuessQuickPlan {
                             guess_index,
@@ -1387,14 +1396,15 @@ impl FormalPolicyBuilder {
                 },
             )
             .collect::<Result<Vec<_>>>()?;
-        let mut signatures = HashSet::new();
+        let mut signatures: HashMap<PartitionFingerprint, Vec<usize>> = HashMap::new();
         let mut plans = Vec::new();
         self.partition_calls += self.model.guesses.len() as u64;
         for (plan, signature) in raw_plans.into_iter().flatten() {
-            if !signatures.insert(signature) {
+            if partition_dedup_hit(&signatures, &plans, signature, &plan.buckets) {
                 self.deduped_signatures += 1;
                 continue;
             }
+            signatures.entry(signature).or_default().push(plans.len());
             plans.push(plan);
         }
         plans.sort_by(|left, right| {
@@ -1627,16 +1637,6 @@ impl StateKey {
                 words
             }
             StateStorage::Bitset(words) => words.to_vec(),
-        }
-    }
-
-    fn word_len(&self) -> usize {
-        match &self.storage {
-            StateStorage::Inline { len, indices } => indices[..*len as usize]
-                .last()
-                .map(|index| (*index as usize / 64) + 1)
-                .unwrap_or(0),
-            StateStorage::Bitset(words) => words.len(),
         }
     }
 
@@ -2054,6 +2054,13 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
                 state.state_id
             );
         }
+        let total_mass = state_total_mass(key, &runtime.model.prior);
+        if total_mass <= 0.0 {
+            bail!(
+                "certificate state {} has non-positive total mass",
+                state.state_id
+            );
+        }
         let mut saw_best = false;
         for candidate in &state.candidates {
             if candidate.guess_index == state.best_guess
@@ -2061,7 +2068,28 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
             {
                 saw_best = true;
             }
+            let mut seen_patterns = [false; PATTERN_SPACE];
+            let mut recomputed = PolicyObjective {
+                worst_case_depth: 1,
+                expected_guesses: 1.0,
+            };
+            let should_rederive = !candidate.children.is_empty() || key.count() == 1;
             for child in &candidate.children {
+                if child.pattern == ALL_GREEN_PATTERN {
+                    bail!(
+                        "certificate child unexpectedly uses all-green pattern for state {}",
+                        state.state_id
+                    );
+                }
+                let pattern_index = child.pattern as usize;
+                if seen_patterns[pattern_index] {
+                    bail!(
+                        "certificate has duplicate child pattern {} for state {}",
+                        child.pattern,
+                        state.state_id
+                    );
+                }
+                seen_patterns[pattern_index] = true;
                 let child_key = runtime
                     .ordered_states
                     .get(child.child_state_id as usize)
@@ -2083,6 +2111,17 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
                 if !same_objective(&child_stored.objective, &child.objective) {
                     bail!("certificate child objective mismatch");
                 }
+                recomputed.worst_case_depth = recomputed
+                    .worst_case_depth
+                    .max(1 + child.objective.worst_case_depth);
+                recomputed.expected_guesses +=
+                    (child.mass / total_mass) * child.objective.expected_guesses;
+            }
+            if should_rederive && !same_objective(&recomputed, &candidate.objective) {
+                bail!(
+                    "certificate candidate objective mismatch for state {}",
+                    state.state_id
+                );
             }
             if compare_objective_with_kind(
                 &candidate.objective,
@@ -2289,17 +2328,53 @@ fn state_key_from_words(words: Vec<u64>, zobrist: &[u64]) -> StateKey {
     StateKey::from_words_with_tokens(words, zobrist)
 }
 
-fn partition_signature_from_buckets(buckets: &[PartitionBucket]) -> PartitionSignature {
-    let mut states = buckets
-        .iter()
-        .map(|bucket| (bucket.pattern, bucket.state.clone()))
-        .collect::<Vec<_>>();
-    states.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.indices().cmp(&right.1.indices()))
-    });
-    PartitionSignature { children: states }
+fn partition_fingerprint_from_buckets(buckets: &[PartitionBucket]) -> PartitionFingerprint {
+    let mut mix_a = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix_b = 0x9e37_79b9_7f4a_7c15u64;
+    for bucket in buckets {
+        let encoded =
+            ((bucket.pattern as u64) << 56) ^ bucket.state.state_hash() ^ (bucket.count as u64);
+        mix_a = mix_a.rotate_left(7) ^ splitmix64(encoded ^ mix_b);
+        mix_b = mix_b
+            .wrapping_mul(0x1000_0000_01b3)
+            .wrapping_add(splitmix64(encoded ^ mix_a));
+    }
+    PartitionFingerprint {
+        bucket_count: buckets.len() as u16,
+        mix_a,
+        mix_b,
+    }
+}
+
+fn partition_dedup_hit(
+    fingerprints: &HashMap<PartitionFingerprint, Vec<usize>>,
+    plans: &[GuessQuickPlan],
+    fingerprint: PartitionFingerprint,
+    buckets: &[PartitionBucket],
+) -> bool {
+    fingerprints.get(&fingerprint).is_some_and(|indexes| {
+        indexes
+            .iter()
+            .copied()
+            .any(|index| same_bucket_partition(&plans[index].buckets, buckets))
+    })
+}
+
+fn same_bucket_partition(left: &[PartitionBucket], right: &[PartitionBucket]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left_bucket, right_bucket)| {
+                left_bucket.pattern == right_bucket.pattern
+                    && left_bucket.state == right_bucket.state
+            })
+}
+
+fn state_total_mass(state: &StateKey, prior: &[f64]) -> f64 {
+    let mut total = 0.0;
+    state.for_each_index(|index| total += prior[index]);
+    total
 }
 
 fn compare_stored_with_kind(
@@ -2437,13 +2512,54 @@ fn plan_refined_by(candidate: &GuessQuickPlan, retained: &GuessQuickPlan) -> boo
 }
 
 fn state_is_subset_of(left: &StateKey, right: &StateKey) -> bool {
-    let answer_count = left.word_len().max(right.word_len()) * 64;
-    let left_words = left.as_words(answer_count);
-    let right_words = right.as_words(answer_count);
-    left_words
-        .iter()
-        .zip(right_words.iter())
-        .all(|(left_word, right_word)| left_word & !right_word == 0)
+    if left.count() > right.count() {
+        return false;
+    }
+    match (&left.storage, &right.storage) {
+        (
+            StateStorage::Inline {
+                len: left_len,
+                indices: left_indices,
+            },
+            StateStorage::Inline {
+                len: right_len,
+                indices: right_indices,
+            },
+        ) => {
+            let left_slice = &left_indices[..*left_len as usize];
+            let right_slice = &right_indices[..*right_len as usize];
+            let mut left_pos = 0usize;
+            let mut right_pos = 0usize;
+            while left_pos < left_slice.len() && right_pos < right_slice.len() {
+                match left_slice[left_pos].cmp(&right_slice[right_pos]) {
+                    std::cmp::Ordering::Less => return false,
+                    std::cmp::Ordering::Equal => {
+                        left_pos += 1;
+                        right_pos += 1;
+                    }
+                    std::cmp::Ordering::Greater => right_pos += 1,
+                }
+            }
+            left_pos == left_slice.len()
+        }
+        (
+            StateStorage::Inline {
+                len: left_len,
+                indices: left_indices,
+            },
+            StateStorage::Bitset(right_words),
+        ) => left_indices[..*left_len as usize].iter().all(|index| {
+            let index = *index as usize;
+            let word_index = index / 64;
+            word_index < right_words.len()
+                && (right_words[word_index] & (1u64 << (index % 64))) != 0
+        }),
+        (StateStorage::Bitset(left_words), StateStorage::Bitset(right_words)) => left_words
+            .iter()
+            .zip(right_words.iter())
+            .all(|(left_word, right_word)| left_word & !right_word == 0),
+        (StateStorage::Bitset(_), StateStorage::Inline { .. }) => false,
+    }
 }
 
 fn same_decision(left: &StoredState, right: &StoredState) -> bool {
@@ -2514,6 +2630,22 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         state.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn bucket_from_indices(
+        answer_count: usize,
+        pattern: u8,
+        indices: impl IntoIterator<Item = usize>,
+        zobrist: &[u64],
+    ) -> PartitionBucket {
+        let state = StateKey::from_indices_with_tokens(answer_count, indices, zobrist);
+        PartitionBucket {
+            pattern,
+            count: state.count(),
+            state,
+            mass: 1.0,
+            entropy_bits: 0.0,
+        }
     }
 
     fn partition_guess_scalar(
@@ -2657,6 +2789,125 @@ mod tests {
             assert!((left.entropy_bits - right.entropy_bits).abs() < 1e-12);
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subset_checks_cover_inline_and_bitset_storage_without_allocating_words() {
+        let answer_count = 96;
+        let zobrist = build_zobrist_tokens(answer_count);
+        let inline_left = StateKey::from_indices_with_tokens(answer_count, [1, 3, 9], &zobrist);
+        let inline_right =
+            StateKey::from_indices_with_tokens(answer_count, [1, 3, 7, 9, 15], &zobrist);
+        let inline_miss = StateKey::from_indices_with_tokens(answer_count, [1, 7, 55], &zobrist);
+        let bitset_right = StateKey::from_indices_with_tokens(answer_count, 0..40, &zobrist);
+        let bitset_left = StateKey::from_indices_with_tokens(answer_count, 10..45, &zobrist);
+
+        assert!(state_is_subset_of(&inline_left, &inline_right));
+        assert!(!state_is_subset_of(&inline_left, &inline_miss));
+        assert!(state_is_subset_of(&inline_left, &bitset_right));
+        assert!(!state_is_subset_of(&inline_miss, &bitset_right));
+        assert!(state_is_subset_of(
+            &StateKey::from_indices_with_tokens(answer_count, 10..20, &zobrist),
+            &bitset_right,
+        ));
+        assert!(!state_is_subset_of(&bitset_left, &bitset_right));
+        assert!(!state_is_subset_of(&bitset_right, &inline_right));
+    }
+
+    #[test]
+    fn partition_dedup_requires_exact_bucket_match_within_fingerprint_bucket() {
+        let answer_count = 96;
+        let zobrist = build_zobrist_tokens(answer_count);
+        let kept_buckets = vec![
+            bucket_from_indices(answer_count, 1, [1, 3, 5], &zobrist),
+            bucket_from_indices(answer_count, 2, [7, 9], &zobrist),
+        ];
+        let kept_plan = GuessQuickPlan {
+            guess_index: 0,
+            lower_bound: 1,
+            max_bucket: 3,
+            entropy: 0.0,
+            solve_mass: 0.0,
+            buckets: kept_buckets.clone(),
+        };
+        let fingerprint = PartitionFingerprint {
+            bucket_count: kept_buckets.len() as u16,
+            mix_a: 123,
+            mix_b: 456,
+        };
+        let mut index = std::collections::HashMap::new();
+        index.insert(fingerprint, vec![0]);
+
+        assert!(partition_dedup_hit(
+            &index,
+            std::slice::from_ref(&kept_plan),
+            fingerprint,
+            &kept_buckets,
+        ));
+        assert!(!partition_dedup_hit(
+            &index,
+            &[kept_plan],
+            fingerprint,
+            &[
+                bucket_from_indices(answer_count, 1, [1, 3, 5], &zobrist),
+                bucket_from_indices(answer_count, 2, [7, 11], &zobrist),
+            ],
+        ));
+    }
+
+    #[test]
+    fn certificate_verification_rejects_tampered_candidate_objective() {
+        let root = std::env::temp_dir().join("maybe-wordle-formal-tampered-certificate");
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = ProjectPaths::new(&root);
+        paths.ensure_layout().expect("layout");
+        let artifacts = PolicyArtifactSet::for_model(&paths, DEFAULT_FORMAL_MODEL_ID);
+        std::fs::create_dir_all(&artifacts.model_dir).expect("formal dir");
+        write_fixture(&paths.seed_guesses, "cigar\nrebut\nsissy\nhumph\n");
+        write_fixture(&paths.seed_answers, "cigar\nrebut\nsissy\n");
+        write_fixture(&artifacts.prior_spec, "kind = \"uniform\"\n");
+
+        let _ = build_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).expect("policy");
+        let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("load");
+        let mut certificate =
+            read_proof_certificate(&paths, DEFAULT_FORMAL_MODEL_ID).expect("certificate");
+        certificate.states[0].candidates[0]
+            .objective
+            .expected_guesses += 0.25;
+
+        assert!(verify_certificate(&runtime, &certificate).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hot_tt_comparator_evicts_shallow_states_before_deeper_ones() {
+        let answer_count = 96;
+        let zobrist = build_zobrist_tokens(answer_count);
+        let shallow = HotTtEntry {
+            state: StateKey::from_indices_with_tokens(answer_count, 0..40, &zobrist),
+            stored: StoredState {
+                objective: PolicyObjective {
+                    worst_case_depth: 2,
+                    expected_guesses: 2.0,
+                },
+                best_guess: 0,
+            },
+            generation: 10,
+        };
+        let deep = HotTtEntry {
+            state: StateKey::from_indices_with_tokens(answer_count, [1, 3, 5, 7, 9], &zobrist),
+            stored: StoredState {
+                objective: PolicyObjective {
+                    worst_case_depth: 5,
+                    expected_guesses: 5.0,
+                },
+                best_guess: 1,
+            },
+            generation: 1,
+        };
+
+        assert!(compare_hot_tt_entry(&shallow, &deep).is_lt());
+        assert!(compare_hot_tt_entry(&deep, &shallow).is_gt());
     }
 
     #[test]
