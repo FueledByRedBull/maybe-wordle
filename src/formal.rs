@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, File},
+    hash::{Hash, Hasher},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -33,12 +34,21 @@ const POLICY_MAGIC: &[u8; 8] = b"MWORDPV1";
 const VALUES_MAGIC: &[u8; 8] = b"MWORDVV1";
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const OBJECTIVE_VERSION: u32 = 2;
-const STATE_FORMAT_VERSION: u32 = 1;
+const STATE_FORMAT_VERSION: u32 = 2;
 const AUX_TABLE_VERSION: u32 = 2;
-const CERTIFICATE_FORMAT_VERSION: u32 = 2;
+const CERTIFICATE_FORMAT_VERSION: u32 = 3;
 const SMALL_STATE_LIMIT: usize = 12;
 const ROOT_REFINEMENT_LIMIT: usize = 256;
 const LOCAL_REFINEMENT_LIMIT: usize = 40;
+
+type AnswerId = u16;
+const INLINE_STATE_THRESHOLD: usize = 30;
+const LOCAL_REINDEX_THRESHOLD: usize = 256;
+const STATE_INLINE_CAPACITY: usize = INLINE_STATE_THRESHOLD;
+const HOT_TT_BYTES: usize = 128 * 1024 * 1024;
+const HOT_TT_ASSOCIATIVITY: usize = 4;
+const STATE_TAG_INLINE: u8 = 0;
+const STATE_TAG_BITSET: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormalObjectiveKind {
@@ -59,27 +69,48 @@ pub enum FormalVerificationMode {
     Oracle,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct CertificateState {
-    state_hash: u64,
-    state_words: Vec<u64>,
+    state: StateKey,
     best_guess: usize,
     best_objective: PolicyObjective,
     candidates: Vec<CertificateCandidate>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct CertificateCandidate {
     guess_index: usize,
     objective: PolicyObjective,
     children: Vec<CertificateChild>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct CertificateChild {
     pattern: u8,
-    state_hash: u64,
-    state_words: Vec<u64>,
+    state: StateKey,
+    objective: PolicyObjective,
+    mass: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedCertificateState {
+    state_id: u32,
+    best_guess: usize,
+    best_objective: PolicyObjective,
+    candidates: Vec<PersistedCertificateCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedCertificateCandidate {
+    guess_index: usize,
+    objective: PolicyObjective,
+    children: Vec<PersistedCertificateChild>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedCertificateChild {
+    pattern: u8,
+    child_state_id: u32,
     objective: PolicyObjective,
     mass: f64,
 }
@@ -165,7 +196,7 @@ pub struct ProofCertificate {
     pub certificate_format_version: u32,
     pub small_state_table_hash: u64,
     pub state_count: usize,
-    states: Vec<CertificateState>,
+    states: Vec<PersistedCertificateState>,
 }
 
 #[derive(Clone, Debug)]
@@ -233,6 +264,7 @@ pub struct FormalModel {
     pub guesses: Vec<String>,
     pub answers: Vec<String>,
     pub prior: Vec<f64>,
+    zobrist: Vec<u64>,
     small_state_table: SmallStateTable,
     objective_spec: FormalObjectiveSpec,
     pattern_table: PatternTable,
@@ -243,19 +275,37 @@ pub struct FormalModel {
 pub struct FormalPolicyRuntime {
     model: FormalModel,
     policy: HashMap<StateKey, StoredState>,
+    ordered_states: Vec<StateKey>,
+    state_ids: HashMap<StateKey, u32>,
     metadata: ProofMetadata,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateKey {
-    words: Vec<u64>,
+    storage: StateStorage,
     count: usize,
     hash: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StateStorage {
+    Inline {
+        len: u8,
+        indices: [AnswerId; STATE_INLINE_CAPACITY],
+    },
+    Bitset(Box<[u64]>),
+}
+
+impl Hash for StateKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+        state.write_usize(self.count);
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PartitionSignature {
-    children: Vec<StateKey>,
+    children: Vec<(u8, StateKey)>,
 }
 
 #[derive(Clone, Debug)]
@@ -286,6 +336,7 @@ struct FormalPolicyBuilder {
     model: FormalModel,
     memo: HashMap<StateKey, StoredState>,
     certificate_states: HashMap<StateKey, CertificateState>,
+    hot_tt: HotTranspositionTable,
     deduped_signatures: u64,
     bound_hits: u64,
     root_refinement_pruned: u64,
@@ -305,14 +356,226 @@ struct PartitionBucket {
     entropy_bits: f64,
 }
 
+#[derive(Clone, Debug)]
+struct PartitionScratch {
+    words: Vec<u64>,
+    masses: [f64; PATTERN_SPACE],
+    counts: [usize; PATTERN_SPACE],
+    weighted_log_sums: [f64; PATTERN_SPACE],
+    offsets: [usize; PATTERN_SPACE + 1],
+    positions: Vec<u16>,
+}
+
+impl Default for PartitionScratch {
+    fn default() -> Self {
+        Self {
+            words: Vec::new(),
+            masses: [0.0; PATTERN_SPACE],
+            counts: [0; PATTERN_SPACE],
+            weighted_log_sums: [0.0; PATTERN_SPACE],
+            offsets: [0; PATTERN_SPACE + 1],
+            positions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StateFrame {
+    global_ids: Box<[AnswerId]>,
+}
+
+#[derive(Clone, Debug)]
+struct HotTranspositionTable {
+    sets: Vec<[Option<HotTtEntry>; HOT_TT_ASSOCIATIVITY]>,
+    victims: Vec<Option<HotTtEntry>>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct HotTtEntry {
+    state: StateKey,
+    stored: StoredState,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct IndependentExactSolver<'a> {
+    model: &'a FormalModel,
+    seed_cache: Option<&'a HashMap<StateKey, StoredState>>,
+    local_memo: HashMap<StateKey, StoredState>,
+    scratch: PartitionScratch,
+}
+
+impl HotTranspositionTable {
+    fn new(bytes: usize) -> Self {
+        let entry_bytes = std::mem::size_of::<HotTtEntry>().max(1);
+        let target_entries = (bytes / entry_bytes).max(HOT_TT_ASSOCIATIVITY);
+        let set_count = (target_entries / HOT_TT_ASSOCIATIVITY).max(1);
+        Self {
+            sets: (0..set_count)
+                .map(|_| std::array::from_fn(|_| None))
+                .collect(),
+            victims: vec![None; set_count],
+            generation: 0,
+        }
+    }
+
+    fn get(&mut self, state: &StateKey) -> Option<StoredState> {
+        let set_index = self.set_index(state.state_hash());
+        if let Some(entry) = self.sets[set_index]
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.state == *state)
+        {
+            self.generation += 1;
+            entry.generation = self.generation;
+            return Some(entry.stored.clone());
+        }
+        if let Some(entry) = self.victims[set_index]
+            .as_mut()
+            .filter(|entry| entry.state == *state)
+        {
+            self.generation += 1;
+            entry.generation = self.generation;
+            return Some(entry.stored.clone());
+        }
+        None
+    }
+
+    fn insert(&mut self, state: StateKey, stored: StoredState) {
+        let set_index = self.set_index(state.state_hash());
+        self.generation += 1;
+        let new_entry = HotTtEntry {
+            state,
+            stored,
+            generation: self.generation,
+        };
+        if let Some(slot) = self.sets[set_index].iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(new_entry);
+            return;
+        }
+        let replace_index = self.sets[set_index]
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                compare_hot_tt_entry(left.as_ref().unwrap(), right.as_ref().unwrap())
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let evicted = self.sets[set_index][replace_index].replace(new_entry);
+        if let Some(entry) = evicted {
+            self.victims[set_index] = Some(entry);
+        }
+    }
+
+    fn set_index(&self, hash: u64) -> usize {
+        (hash as usize) % self.sets.len()
+    }
+}
+
+fn compare_hot_tt_entry(left: &HotTtEntry, right: &HotTtEntry) -> std::cmp::Ordering {
+    left.state
+        .count()
+        .cmp(&right.state.count())
+        .then_with(|| {
+            left.stored
+                .objective
+                .worst_case_depth
+                .cmp(&right.stored.objective.worst_case_depth)
+        })
+        .then_with(|| left.generation.cmp(&right.generation))
+}
+
+impl<'a> IndependentExactSolver<'a> {
+    fn new(model: &'a FormalModel, seed_cache: Option<&'a HashMap<StateKey, StoredState>>) -> Self {
+        Self {
+            model,
+            seed_cache,
+            local_memo: HashMap::new(),
+            scratch: PartitionScratch::default(),
+        }
+    }
+
+    fn solve(&mut self, state: &StateKey) -> Result<StoredState> {
+        if let Some(existing) = self.local_memo.get(state) {
+            return Ok(existing.clone());
+        }
+        if let Some(existing) = self.seed_cache.and_then(|cache| cache.get(state)).cloned() {
+            return Ok(existing);
+        }
+        if state.count() == 1 {
+            let stored = singleton_state_for_model(self.model, state)?;
+            self.local_memo.insert(state.clone(), stored.clone());
+            return Ok(stored);
+        }
+
+        let state_indices = state.indices();
+        let total_mass = state_indices
+            .iter()
+            .map(|index| self.model.prior[*index])
+            .sum::<f64>();
+        let mut best: Option<StoredState> = None;
+        for guess_index in 0..self.model.guesses.len() {
+            let buckets = partition_guess_with_scratch(
+                self.model.answers.len(),
+                state,
+                guess_index,
+                &self.model.pattern_table,
+                &self.model.prior,
+                &self.model.zobrist,
+                &mut self.scratch,
+            )?;
+            if buckets
+                .iter()
+                .any(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.state == *state)
+            {
+                continue;
+            }
+            let mut worst_case = 1u8;
+            let mut expected = 1.0;
+            for bucket in buckets {
+                if bucket.pattern == ALL_GREEN_PATTERN {
+                    continue;
+                }
+                let child = self.solve(&bucket.state)?;
+                worst_case = worst_case.max(1 + child.objective.worst_case_depth);
+                expected += (bucket.mass / total_mass) * child.objective.expected_guesses;
+            }
+            let candidate = StoredState {
+                objective: PolicyObjective {
+                    worst_case_depth: worst_case,
+                    expected_guesses: expected,
+                },
+                best_guess: guess_index,
+            };
+            if best.as_ref().is_none_or(|current| {
+                compare_stored_with_kind(
+                    &candidate,
+                    current,
+                    &self.model.guesses,
+                    self.model.objective_spec.kind,
+                )
+                .is_lt()
+            }) {
+                best = Some(candidate);
+            }
+        }
+        let best = best
+            .ok_or_else(|| anyhow!("state {} had no independent candidates", state.state_hash()))?;
+        self.local_memo.insert(state.clone(), best.clone());
+        Ok(best)
+    }
+}
+
 pub fn build_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<BuildOptimalSummary> {
     let model = FormalModel::load(paths, model_id)?;
-    let root = StateKey::full(model.answers.len());
+    let root = StateKey::full(model.answers.len(), &model.zobrist);
     let started = Instant::now();
     let mut builder = FormalPolicyBuilder {
         model,
         memo: HashMap::new(),
         certificate_states: HashMap::new(),
+        hot_tt: HotTranspositionTable::new(HOT_TT_BYTES),
         deduped_signatures: 0,
         bound_hits: 0,
         root_refinement_pruned: 0,
@@ -408,7 +671,10 @@ pub fn verify_optimal_policy_with_mode(
         for (state, stored) in &runtime.policy {
             let cached = runtime.evaluate_state_exact(state)?;
             if !same_decision(&cached, stored) {
-                bail!("cached verification failed for state {}", state.hash());
+                bail!(
+                    "cached verification failed for state {}",
+                    state.state_hash()
+                );
             }
             cached_states += 1;
             let size = state.count();
@@ -418,7 +684,7 @@ pub fn verify_optimal_policy_with_mode(
                     bail!(
                         "independent verification failed for size {} state {}",
                         size,
-                        state.hash()
+                        state.state_hash()
                     );
                 }
                 small_states += 1;
@@ -428,7 +694,7 @@ pub fn verify_optimal_policy_with_mode(
                     bail!(
                         "medium-state verification failed for size {} state {}",
                         size,
-                        state.hash()
+                        state.state_hash()
                     );
                 }
                 medium_states += 1;
@@ -544,12 +810,14 @@ impl FormalModel {
             .enumerate()
             .map(|(index, guess)| (guess.clone(), index))
             .collect::<HashMap<_, _>>();
+        let zobrist = build_zobrist_tokens(answers.len());
 
         Ok(Self {
             manifest,
             guesses,
             answers,
             prior,
+            zobrist,
             small_state_table,
             objective_spec,
             pattern_table,
@@ -582,12 +850,23 @@ impl FormalPolicyRuntime {
         .with_context(|| format!("failed to parse {}", artifacts.metadata.display()))?;
         let values = read_values(&artifacts.values, &model)?;
         let policies = read_policy(&artifacts.policy, &model)?;
+        let mut ordered_states = values.keys().cloned().collect::<Vec<_>>();
+        ordered_states.sort_by(|left, right| {
+            left.state_hash()
+                .cmp(&right.state_hash())
+                .then_with(|| left.cmp_storage(right, model.answers.len()))
+        });
+        let state_ids = ordered_states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| (state.clone(), index as u32))
+            .collect::<HashMap<_, _>>();
         let mut policy = HashMap::with_capacity(values.len());
         for (state, objective) in values {
             let best_guess = policies
                 .get(&state)
                 .copied()
-                .ok_or_else(|| anyhow!("missing policy entry for state {}", state.hash()))?;
+                .ok_or_else(|| anyhow!("missing policy entry for state {}", state.state_hash()))?;
             policy.insert(
                 state,
                 StoredState {
@@ -600,12 +879,14 @@ impl FormalPolicyRuntime {
         Ok(Self {
             model,
             policy,
+            ordered_states,
+            state_ids,
             metadata,
         })
     }
 
     pub fn initial_state(&self) -> StateKey {
-        StateKey::full(self.model.answers.len())
+        StateKey::full(self.model.answers.len(), &self.model.zobrist)
     }
 
     pub fn apply_history(&self, observations: &[(String, u8)]) -> Result<StateKey> {
@@ -623,13 +904,13 @@ impl FormalPolicyRuntime {
             .get(&guess.to_ascii_lowercase())
             .copied()
             .ok_or_else(|| anyhow!("unknown guess: {}", guess))?;
-        let mut next = StateKey::empty(self.model.answers.len());
-        for answer_index in state.indices() {
-            if self.model.pattern_table.get(guess_index, answer_index) == pattern {
-                next.set(answer_index);
-            }
-        }
-        next.finalize();
+        let next = StateKey::from_indices_with_tokens(
+            self.model.answers.len(),
+            state.indices().into_iter().filter(|answer_index| {
+                self.model.pattern_table.get(guess_index, *answer_index) == pattern
+            }),
+            &self.model.zobrist,
+        );
         if next.count() == 0 {
             bail!(
                 "no answers remain after applying {} {}",
@@ -658,7 +939,7 @@ impl FormalPolicyRuntime {
         let best = ranked
             .first()
             .cloned()
-            .ok_or_else(|| anyhow!("state {} is missing evaluations", state.hash()))?;
+            .ok_or_else(|| anyhow!("state {} is missing evaluations", state.state_hash()))?;
         let tied_moves = ranked.into_iter().take(top).collect::<Vec<_>>();
         Ok(FormalStateExplanation {
             model_id: self.model.manifest.model_id.clone(),
@@ -687,17 +968,26 @@ impl FormalPolicyRuntime {
     }
 
     fn evaluate_state_ranked(&self, state: &StateKey) -> Result<Vec<GuessEvaluation>> {
-        let state_indices = state.indices();
+        let total_mass = self.state_mass(state);
+        let mut scratch = PartitionScratch::default();
         let mut signature_map = HashSet::new();
         let mut evaluations = Vec::new();
         for guess_index in 0..self.model.guesses.len() {
-            let buckets = self.partition_guess(&state_indices, guess_index)?;
+            let buckets = partition_guess_with_scratch(
+                self.model.answers.len(),
+                state,
+                guess_index,
+                &self.model.pattern_table,
+                &self.model.prior,
+                &self.model.zobrist,
+                &mut scratch,
+            )?;
             let signature = partition_signature_from_buckets(&buckets);
             if !signature_map.insert(signature) {
                 continue;
             }
             let Some(built) =
-                self.build_guess_evaluation(state, guess_index, &state_indices, buckets, true)?
+                self.build_guess_evaluation(state, guess_index, total_mass, buckets, false)?
             else {
                 continue;
             };
@@ -718,7 +1008,7 @@ impl FormalPolicyRuntime {
         let ranked = self.evaluate_state_ranked(state)?;
         let best = ranked
             .first()
-            .ok_or_else(|| anyhow!("state {} missing exact ranking", state.hash()))?;
+            .ok_or_else(|| anyhow!("state {} missing exact ranking", state.state_hash()))?;
         Ok(StoredState {
             objective: best.objective.clone(),
             best_guess: best.guess_index,
@@ -726,97 +1016,14 @@ impl FormalPolicyRuntime {
     }
 
     fn solve_state_independent(&self, state: &StateKey) -> Result<StoredState> {
-        let mut memo = HashMap::new();
-        self.solve_state_independent_with_memo(state, &mut memo)
-    }
-
-    fn solve_state_independent_with_memo(
-        &self,
-        state: &StateKey,
-        memo: &mut HashMap<StateKey, StoredState>,
-    ) -> Result<StoredState> {
-        if let Some(existing) = memo.get(state) {
-            return Ok(existing.clone());
-        }
-        if state.count() == 1 {
-            let answer_index = state
-                .indices()
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("singleton state was empty"))?;
-            let best_guess = self
-                .model
-                .guess_index
-                .get(&self.model.answers[answer_index])
-                .copied()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "answer {} is not a valid guess",
-                        self.model.answers[answer_index]
-                    )
-                })?;
-            let stored = StoredState {
-                objective: PolicyObjective {
-                    worst_case_depth: 1,
-                    expected_guesses: 1.0,
-                },
-                best_guess,
-            };
-            memo.insert(state.clone(), stored.clone());
-            return Ok(stored);
-        }
-
-        let state_indices = state.indices();
-        let total_mass = self.state_mass_from_indices(&state_indices);
-        let mut best: Option<StoredState> = None;
-        for guess_index in 0..self.model.guesses.len() {
-            let buckets = self.partition_guess(&state_indices, guess_index)?;
-            if buckets
-                .iter()
-                .any(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.state == *state)
-            {
-                continue;
-            }
-            let mut worst_case = 1u8;
-            let mut expected = 1.0;
-            for bucket in buckets {
-                if bucket.pattern == ALL_GREEN_PATTERN {
-                    continue;
-                }
-                let child = self.solve_state_independent_with_memo(&bucket.state, memo)?;
-                worst_case = worst_case.max(1 + child.objective.worst_case_depth);
-                expected += (bucket.mass / total_mass) * child.objective.expected_guesses;
-            }
-            let candidate = StoredState {
-                objective: PolicyObjective {
-                    worst_case_depth: worst_case,
-                    expected_guesses: expected,
-                },
-                best_guess: guess_index,
-            };
-            if best.as_ref().is_none_or(|current| {
-                compare_stored_with_kind(
-                    &candidate,
-                    current,
-                    &self.model.guesses,
-                    self.model.objective_spec.kind,
-                )
-                .is_lt()
-            }) {
-                best = Some(candidate);
-            }
-        }
-        let best =
-            best.ok_or_else(|| anyhow!("state {} had no independent candidates", state.hash()))?;
-        memo.insert(state.clone(), best.clone());
-        Ok(best)
+        IndependentExactSolver::new(&self.model, Some(&self.policy)).solve(state)
     }
 
     fn build_guess_evaluation(
         &self,
         state: &StateKey,
         guess_index: usize,
-        state_indices: &[usize],
+        total_mass: f64,
         buckets: Vec<PartitionBucket>,
         use_cache_only: bool,
     ) -> Result<Option<GuessEvaluation>> {
@@ -826,7 +1033,6 @@ impl FormalPolicyRuntime {
         {
             return Ok(None);
         }
-        let total_mass = self.state_mass_from_indices(state_indices);
         let mut worst_case = 1u8;
         let mut expected = 1.0;
         let mut bucket_sizes = buckets
@@ -860,25 +1066,10 @@ impl FormalPolicyRuntime {
         }))
     }
 
-    fn partition_guess(
-        &self,
-        state_indices: &[usize],
-        guess_index: usize,
-    ) -> Result<Vec<PartitionBucket>> {
-        partition_guess_impl(
-            self.model.answers.len(),
-            state_indices,
-            guess_index,
-            &self.model.pattern_table,
-            &self.model.prior,
-        )
-    }
-
-    fn state_mass_from_indices(&self, state_indices: &[usize]) -> f64 {
-        state_indices
-            .iter()
-            .map(|index| self.model.prior[*index])
-            .sum()
+    fn state_mass(&self, state: &StateKey) -> f64 {
+        let mut total = 0.0;
+        state.for_each_index(|index| total += self.model.prior[index]);
+        total
     }
 }
 
@@ -887,8 +1078,7 @@ impl FormalPolicyBuilder {
         if let Some(existing) = self.memo.get(state) {
             return Ok(existing.clone());
         }
-        let state_indices = state.indices();
-        let quick_plans = self.collect_quick_plans_for_state(state, &state_indices)?;
+        let quick_plans = self.collect_quick_plans_for_state(state)?;
         let lower_bound = quick_plans
             .first()
             .map(|plan| plan.lower_bound)
@@ -898,13 +1088,11 @@ impl FormalPolicyBuilder {
                 worst_case_depth: target_depth,
                 expected_guesses: f64::INFINITY,
             };
-            if let Some(best) =
-                self.solve_state_with_bound(state, &state_indices, &quick_plans, &upper)?
-            {
+            if let Some(best) = self.solve_state_with_bound(state, &quick_plans, &upper)? {
                 return Ok(best);
             }
         }
-        bail!("state {} exceeded bounded depth search", state.hash())
+        bail!("state {} exceeded bounded depth search", state.state_hash())
     }
 
     fn solve_state_with_upper(
@@ -918,15 +1106,19 @@ impl FormalPolicyBuilder {
                     .then_some(existing.clone()),
             );
         }
-        let state_indices = state.indices();
-        let quick_plans = self.collect_quick_plans_for_state(state, &state_indices)?;
-        self.solve_state_with_bound(state, &state_indices, &quick_plans, upper)
+        if let Some(existing) = self.hot_tt.get(state) {
+            return Ok(
+                objective_le(&existing.objective, upper, self.model.objective_spec.kind)
+                    .then_some(existing),
+            );
+        }
+        let quick_plans = self.collect_quick_plans_for_state(state)?;
+        self.solve_state_with_bound(state, &quick_plans, upper)
     }
 
     fn solve_state_with_bound(
         &mut self,
         state: &StateKey,
-        state_indices: &[usize],
         quick_plans: &[GuessQuickPlan],
         upper: &PolicyObjective,
     ) -> Result<Option<StoredState>> {
@@ -936,11 +1128,15 @@ impl FormalPolicyBuilder {
                     .then_some(existing.clone()),
             );
         }
+        if let Some(existing) = self.hot_tt.get(state) {
+            return Ok(
+                objective_le(&existing.objective, upper, self.model.objective_spec.kind)
+                    .then_some(existing),
+            );
+        }
         if state.count() == 1 {
             let stored = singleton_state_for_model(&self.model, state)?;
-            self.memo.insert(state.clone(), stored.clone());
-            self.certificate_states
-                .insert(state.clone(), trivial_certificate_state(state, &stored));
+            self.hot_tt.insert(state.clone(), stored.clone());
             return Ok(
                 objective_le(&stored.objective, upper, self.model.objective_spec.kind)
                     .then_some(stored),
@@ -948,9 +1144,7 @@ impl FormalPolicyBuilder {
         }
         if state.count() <= self.model.small_state_table.max_size {
             let exact = self.solve_small_state_exact(state)?;
-            self.memo.insert(state.clone(), exact.clone());
-            self.certificate_states
-                .insert(state.clone(), trivial_certificate_state(state, &exact));
+            self.hot_tt.insert(state.clone(), exact.clone());
             return Ok(
                 objective_le(&exact.objective, upper, self.model.objective_spec.kind)
                     .then_some(exact),
@@ -965,7 +1159,7 @@ impl FormalPolicyBuilder {
             self.bound_hits += 1;
             return Ok(None);
         }
-        let total_mass = self.state_mass_from_indices(state_indices);
+        let total_mass = self.state_mass(state);
         let mut best: Option<StoredState> = None;
         let mut best_certificate: Option<CertificateState> = None;
         for plan in quick_plans {
@@ -1054,8 +1248,7 @@ impl FormalPolicyBuilder {
                 }
                 children.push(CertificateChild {
                     pattern: bucket.pattern,
-                    state_hash: bucket.state.hash(),
-                    state_words: bucket.state.words.to_vec(),
+                    state: bucket.state.clone(),
                     objective: child.objective.clone(),
                     mass: bucket.mass,
                 });
@@ -1085,8 +1278,7 @@ impl FormalPolicyBuilder {
                 .is_lt()
             }) {
                 best_certificate = Some(CertificateState {
-                    state_hash: state.hash(),
-                    state_words: state.words.to_vec(),
+                    state: state.clone(),
                     best_guess: plan.guess_index,
                     best_objective: candidate.objective.clone(),
                     candidates: vec![certificate],
@@ -1097,7 +1289,7 @@ impl FormalPolicyBuilder {
             }
         }
         if let (Some(stored), Some(certificate)) = (best, best_certificate) {
-            self.memo.insert(state.clone(), stored.clone());
+            self.hot_tt.insert(state.clone(), stored.clone());
             self.certificate_states.insert(state.clone(), certificate);
             return Ok(
                 objective_le(&stored.objective, upper, self.model.objective_spec.kind)
@@ -1108,37 +1300,23 @@ impl FormalPolicyBuilder {
     }
 
     fn solve_small_state_exact(&mut self, state: &StateKey) -> Result<StoredState> {
-        let runtime = FormalPolicyRuntime {
-            model: self.model.clone(),
-            policy: self.memo.clone(),
-            metadata: ProofMetadata {
-                model_id: self.model.manifest.model_id.clone(),
-                manifest_hash: self.model.manifest.manifest_hash,
-                solved_states: 0,
-                deduped_signatures: 0,
-                bound_hits: 0,
-                root_refinement_pruned: 0,
-                local_refinement_pruned: 0,
-                build_millis: 0,
-                root_objective: PolicyObjective {
-                    worst_case_depth: 0,
-                    expected_guesses: 0.0,
-                },
-            },
-        };
-        runtime.solve_state_independent(state)
+        IndependentExactSolver::new(&self.model, Some(&self.memo)).solve(state)
     }
 
     fn materialize_policy_reachable_states(&mut self, root: &StateKey) -> Result<()> {
         let mut frontier = vec![root.clone()];
         let mut seen = HashSet::new();
         while let Some(state) = frontier.pop() {
-            if !seen.insert(state.clone()) {
+            if !seen.insert(state.clone()) || self.memo.contains_key(&state) {
                 continue;
             }
             self.maybe_report_progress("materialization");
             let stored = self.solve_state(&state)?;
-            let buckets = self.partition_guess(&state.indices(), stored.best_guess)?;
+            self.memo.insert(state.clone(), stored.clone());
+            self.certificate_states
+                .entry(state.clone())
+                .or_insert_with(|| trivial_certificate_state(&state, &stored));
+            let buckets = self.partition_guess(&state, stored.best_guess)?;
             for bucket in buckets {
                 if bucket.pattern != ALL_GREEN_PATTERN {
                     frontier.push(bucket.state);
@@ -1148,24 +1326,23 @@ impl FormalPolicyBuilder {
         Ok(())
     }
 
-    fn collect_quick_plans_for_state(
-        &mut self,
-        state: &StateKey,
-        state_indices: &[usize],
-    ) -> Result<Vec<GuessQuickPlan>> {
+    fn collect_quick_plans_for_state(&mut self, state: &StateKey) -> Result<Vec<GuessQuickPlan>> {
         self.quick_plan_calls += 1;
         self.maybe_report_progress("search");
-        let total_mass = self.state_mass_from_indices(state_indices);
+        let total_mass = self.state_mass(state);
         let raw_plans = (0..self.model.guesses.len())
             .into_par_iter()
-            .map(
-                |guess_index| -> Result<Option<(GuessQuickPlan, PartitionSignature)>> {
-                    let buckets = partition_guess_impl(
+            .map_init(
+                PartitionScratch::default,
+                |scratch, guess_index| -> Result<Option<(GuessQuickPlan, PartitionSignature)>> {
+                    let buckets = partition_guess_with_scratch(
                         self.model.answers.len(),
-                        state_indices,
+                        state,
                         guess_index,
                         &self.model.pattern_table,
                         &self.model.prior,
+                        &self.model.zobrist,
+                        scratch,
                     )?;
                     if buckets
                         .iter()
@@ -1248,24 +1425,26 @@ impl FormalPolicyBuilder {
 
     fn partition_guess(
         &mut self,
-        state_indices: &[usize],
+        state: &StateKey,
         guess_index: usize,
     ) -> Result<Vec<PartitionBucket>> {
         self.partition_calls += 1;
-        partition_guess_impl(
+        let mut scratch = PartitionScratch::default();
+        partition_guess_with_scratch(
             self.model.answers.len(),
-            state_indices,
+            state,
             guess_index,
             &self.model.pattern_table,
             &self.model.prior,
+            &self.model.zobrist,
+            &mut scratch,
         )
     }
 
-    fn state_mass_from_indices(&self, state_indices: &[usize]) -> f64 {
-        state_indices
-            .iter()
-            .map(|index| self.model.prior[*index])
-            .sum()
+    fn state_mass(&self, state: &StateKey) -> f64 {
+        let mut total = 0.0;
+        state.for_each_index(|index| total += self.model.prior[index]);
+        total
     }
 
     fn maybe_report_progress(&mut self, phase: &str) {
@@ -1305,72 +1484,253 @@ fn progress_enabled() -> bool {
 }
 
 impl StateKey {
-    fn empty(answer_count: usize) -> Self {
-        Self {
-            words: vec![0; answer_count.div_ceil(64)],
-            count: 0,
-            hash: 1469598103934665603u64,
-        }
-    }
-
-    fn full(answer_count: usize) -> Self {
-        let mut state = Self::empty(answer_count);
-        for answer_index in 0..answer_count {
-            state.set(answer_index);
-        }
-        state.finalize();
-        state
+    fn full(answer_count: usize, zobrist: &[u64]) -> Self {
+        Self::from_indices_with_tokens(answer_count, 0..answer_count, zobrist)
     }
 
     #[cfg(test)]
     fn from_indices(answer_count: usize, indices: impl IntoIterator<Item = usize>) -> Self {
-        let mut state = Self::empty(answer_count);
-        for index in indices {
-            state.set(index);
-        }
-        state.finalize();
-        state
+        let zobrist = build_zobrist_tokens(answer_count);
+        Self::from_indices_with_tokens(answer_count, indices, &zobrist)
     }
 
-    fn set(&mut self, index: usize) {
-        let word_index = index / 64;
-        let bit_index = index % 64;
-        self.words[word_index] |= 1u64 << bit_index;
+    fn from_indices_with_tokens(
+        answer_count: usize,
+        indices: impl IntoIterator<Item = usize>,
+        zobrist: &[u64],
+    ) -> Self {
+        let mut collected = indices.into_iter().collect::<Vec<_>>();
+        collected.sort_unstable();
+        if collected.len() <= INLINE_STATE_THRESHOLD {
+            let mut inline = [0u16; STATE_INLINE_CAPACITY];
+            let mut hash = 0u64;
+            for (slot, index) in collected.iter().copied().enumerate() {
+                inline[slot] = index as u16;
+                hash ^= zobrist[index];
+            }
+            Self {
+                storage: StateStorage::Inline {
+                    len: collected.len() as u8,
+                    indices: inline,
+                },
+                count: collected.len(),
+                hash,
+            }
+        } else {
+            let mut words = vec![0u64; answer_count.div_ceil(64)];
+            let mut hash = 0u64;
+            for index in collected {
+                words[index / 64] |= 1u64 << (index % 64);
+                hash ^= zobrist[index];
+            }
+            let count = words.iter().map(|word| word.count_ones() as usize).sum();
+            Self {
+                storage: StateStorage::Bitset(words.into_boxed_slice()),
+                count,
+                hash,
+            }
+        }
+    }
+
+    fn from_words_with_tokens(words: Vec<u64>, zobrist: &[u64]) -> Self {
+        let count = words
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum::<usize>();
+        if count <= INLINE_STATE_THRESHOLD {
+            let mut inline = [0u16; STATE_INLINE_CAPACITY];
+            let mut slot = 0usize;
+            let mut hash = 0u64;
+            for (word_index, word) in words.iter().copied().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    let index = (word_index * 64) + bit;
+                    inline[slot] = index as u16;
+                    slot += 1;
+                    hash ^= zobrist[index];
+                    bits &= bits - 1;
+                }
+            }
+            Self {
+                storage: StateStorage::Inline {
+                    len: count as u8,
+                    indices: inline,
+                },
+                count,
+                hash,
+            }
+        } else {
+            let mut hash = 0u64;
+            for (word_index, word) in words.iter().copied().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    hash ^= zobrist[(word_index * 64) + bit];
+                    bits &= bits - 1;
+                }
+            }
+            Self {
+                storage: StateStorage::Bitset(words.into_boxed_slice()),
+                count,
+                hash,
+            }
+        }
     }
 
     pub fn count(&self) -> usize {
         self.count
     }
 
-    fn indices(&self) -> Vec<usize> {
-        let mut indices = Vec::with_capacity(self.count());
-        for (word_index, word) in self.words.iter().copied().enumerate() {
-            let mut bits = word;
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                indices.push((word_index * 64) + bit);
-                bits &= bits - 1;
-            }
-        }
-        indices
-    }
-
-    fn hash(&self) -> u64 {
+    fn state_hash(&self) -> u64 {
         self.hash
     }
 
-    fn finalize(&mut self) {
-        self.count = self
-            .words
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum::<usize>();
-        let mut hash = 1469598103934665603u64;
-        for word in &self.words {
-            hash = hash_bytes(hash, &word.to_le_bytes());
+    fn indices(&self) -> Vec<usize> {
+        match &self.storage {
+            StateStorage::Inline { len, indices } => indices[..*len as usize]
+                .iter()
+                .map(|index| *index as usize)
+                .collect(),
+            StateStorage::Bitset(words) => indices_from_words(words),
         }
-        self.hash = hash;
     }
+
+    fn for_each_index(&self, mut f: impl FnMut(usize)) {
+        match &self.storage {
+            StateStorage::Inline { len, indices } => {
+                for index in &indices[..*len as usize] {
+                    f(*index as usize);
+                }
+            }
+            StateStorage::Bitset(words) => {
+                for (word_index, word) in words.iter().copied().enumerate() {
+                    let mut bits = word;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        f((word_index * 64) + bit);
+                        bits &= bits - 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn as_words(&self, answer_count: usize) -> Vec<u64> {
+        match &self.storage {
+            StateStorage::Inline { len, indices } => {
+                let mut words = vec![0u64; answer_count.div_ceil(64)];
+                for index in &indices[..*len as usize] {
+                    let index = *index as usize;
+                    words[index / 64] |= 1u64 << (index % 64);
+                }
+                words
+            }
+            StateStorage::Bitset(words) => words.to_vec(),
+        }
+    }
+
+    fn word_len(&self) -> usize {
+        match &self.storage {
+            StateStorage::Inline { len, indices } => indices[..*len as usize]
+                .last()
+                .map(|index| (*index as usize / 64) + 1)
+                .unwrap_or(0),
+            StateStorage::Bitset(words) => words.len(),
+        }
+    }
+
+    fn write_tagged(&self, writer: &mut impl Write, answer_count: usize) -> Result<()> {
+        match &self.storage {
+            StateStorage::Inline { len, indices } => {
+                writer.write_all(&[STATE_TAG_INLINE])?;
+                writer.write_all(&(*len as u16).to_le_bytes())?;
+                for index in &indices[..*len as usize] {
+                    writer.write_all(&index.to_le_bytes())?;
+                }
+            }
+            StateStorage::Bitset(words) => {
+                writer.write_all(&[STATE_TAG_BITSET])?;
+                writer.write_all(&(answer_count.div_ceil(64) as u16).to_le_bytes())?;
+                for word in words.iter() {
+                    writer.write_all(&word.to_le_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_tagged(reader: &mut impl Read, answer_count: usize, zobrist: &[u64]) -> Result<Self> {
+        let tag = read_u8(reader)?;
+        match tag {
+            STATE_TAG_INLINE => {
+                let len = read_u16(reader)? as usize;
+                let mut indices = Vec::with_capacity(len);
+                for _ in 0..len {
+                    indices.push(read_u16(reader)? as usize);
+                }
+                Ok(Self::from_indices_with_tokens(
+                    answer_count,
+                    indices,
+                    zobrist,
+                ))
+            }
+            STATE_TAG_BITSET => {
+                let word_count = read_u16(reader)? as usize;
+                if word_count != answer_count.div_ceil(64) {
+                    bail!("unexpected tagged state word count");
+                }
+                let words = read_state_words(reader, word_count)?;
+                Ok(Self::from_words_with_tokens(words, zobrist))
+            }
+            _ => bail!("invalid state tag {}", tag),
+        }
+    }
+
+    fn cmp_storage(&self, other: &Self, answer_count: usize) -> std::cmp::Ordering {
+        let left = self.as_words(answer_count);
+        let right = other.as_words(answer_count);
+        left.cmp(&right)
+    }
+}
+
+impl StateFrame {
+    fn from_state(state: &StateKey) -> Option<Self> {
+        (state.count() <= LOCAL_REINDEX_THRESHOLD).then(|| Self {
+            global_ids: state
+                .indices()
+                .into_iter()
+                .map(|index| index as u16)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
+    }
+}
+
+fn build_zobrist_tokens(answer_count: usize) -> Vec<u64> {
+    (0..answer_count)
+        .map(|index| splitmix64((index as u64) + 0x9e37_79b9_7f4a_7c15))
+        .collect()
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn indices_from_words(words: &[u64]) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for (word_index, word) in words.iter().copied().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            indices.push((word_index * 64) + bit);
+            bits &= bits - 1;
+        }
+    }
+    indices
 }
 
 fn build_prior(answers: &[String], prior_spec: FormalPriorSpec) -> Result<Vec<f64>> {
@@ -1427,10 +1787,22 @@ fn persist_policy(
     let mut certificate_entries = certificate_states.iter().collect::<Vec<_>>();
     certificate_entries.sort_by(|(left_key, _), (right_key, _)| {
         left_key
-            .hash()
-            .cmp(&right_key.hash())
-            .then_with(|| left_key.words.cmp(&right_key.words))
+            .state_hash()
+            .cmp(&right_key.state_hash())
+            .then_with(|| left_key.cmp_storage(right_key, model.answers.len()))
     });
+    let mut entries = memo.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left_key, _), (right_key, _)| {
+        left_key
+            .state_hash()
+            .cmp(&right_key.state_hash())
+            .then_with(|| left_key.cmp_storage(right_key, model.answers.len()))
+    });
+    let state_ids = entries
+        .iter()
+        .enumerate()
+        .map(|(index, (state, _))| ((*state).clone(), index as u32))
+        .collect::<HashMap<_, _>>();
     let certificate = ProofCertificate {
         model_id: model.manifest.model_id.clone(),
         manifest_hash: model.manifest.manifest_hash,
@@ -1443,7 +1815,29 @@ fn persist_policy(
         state_count: memo.len(),
         states: certificate_entries
             .into_iter()
-            .map(|(_, state)| state.clone())
+            .map(|(_, state)| PersistedCertificateState {
+                state_id: state_ids[&state.state],
+                best_guess: state.best_guess,
+                best_objective: state.best_objective.clone(),
+                candidates: state
+                    .candidates
+                    .iter()
+                    .map(|candidate| PersistedCertificateCandidate {
+                        guess_index: candidate.guess_index,
+                        objective: candidate.objective.clone(),
+                        children: candidate
+                            .children
+                            .iter()
+                            .map(|child| PersistedCertificateChild {
+                                pattern: child.pattern,
+                                child_state_id: state_ids[&child.state],
+                                objective: child.objective.clone(),
+                                mass: child.mass,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
             .collect(),
     };
     serde_json::to_writer_pretty(
@@ -1455,13 +1849,6 @@ fn persist_policy(
     )
     .with_context(|| format!("failed to write {}", artifacts.certificate.display()))?;
 
-    let mut entries = memo.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left_key, _), (right_key, _)| {
-        left_key
-            .hash()
-            .cmp(&right_key.hash())
-            .then_with(|| left_key.words.cmp(&right_key.words))
-    });
     write_values(&artifacts.values, model, &entries)?;
     write_policy(&artifacts.policy, model, &entries)?;
     Ok(())
@@ -1480,10 +1867,8 @@ fn write_values(
     writer.write_all(&(entries.len() as u64).to_le_bytes())?;
     writer.write_all(&(model.answers.len().div_ceil(64) as u32).to_le_bytes())?;
     for (state, stored) in entries {
-        writer.write_all(&state.hash().to_le_bytes())?;
-        for word in &state.words {
-            writer.write_all(&word.to_le_bytes())?;
-        }
+        writer.write_all(&state.state_hash().to_le_bytes())?;
+        state.write_tagged(&mut writer, model.answers.len())?;
         writer.write_all(&[stored.objective.worst_case_depth])?;
         writer.write_all(&stored.objective.expected_guesses.to_le_bytes())?;
     }
@@ -1506,10 +1891,8 @@ fn write_policy(
     writer.write_all(&(entries.len() as u64).to_le_bytes())?;
     writer.write_all(&(model.answers.len().div_ceil(64) as u32).to_le_bytes())?;
     for (state, stored) in entries {
-        writer.write_all(&state.hash().to_le_bytes())?;
-        for word in &state.words {
-            writer.write_all(&word.to_le_bytes())?;
-        }
+        writer.write_all(&state.state_hash().to_le_bytes())?;
+        state.write_tagged(&mut writer, model.answers.len())?;
         writer.write_all(&(stored.best_guess as u32).to_le_bytes())?;
     }
     writer
@@ -1539,11 +1922,10 @@ fn read_values(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, Pol
     let mut values = HashMap::with_capacity(count);
     for _ in 0..count {
         let state_hash = read_u64(&mut reader)?;
-        let words = read_state_words(&mut reader, word_count)?;
+        let state = StateKey::read_tagged(&mut reader, model.answers.len(), &model.zobrist)?;
         let worst_case_depth = read_u8(&mut reader)?;
         let expected_guesses = read_f64(&mut reader)?;
-        let state = state_key_from_words(words);
-        if state.hash() != state_hash {
+        if state.state_hash() != state_hash {
             bail!("state hash mismatch in {}", path.display());
         }
         values.insert(
@@ -1578,7 +1960,7 @@ fn read_policy(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, usi
     let mut policies = HashMap::with_capacity(count);
     for _ in 0..count {
         let state_hash = read_u64(&mut reader)?;
-        let words = read_state_words(&mut reader, word_count)?;
+        let state = StateKey::read_tagged(&mut reader, model.answers.len(), &model.zobrist)?;
         let best_guess = read_u32(&mut reader)? as usize;
         if best_guess >= model.guesses.len() {
             bail!(
@@ -1586,8 +1968,7 @@ fn read_policy(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, usi
                 path.display()
             );
         }
-        let state = state_key_from_words(words);
-        if state.hash() != state_hash {
+        if state.state_hash() != state_hash {
             bail!("state hash mismatch in {}", path.display());
         }
         policies.insert(state, best_guess);
@@ -1613,6 +1994,12 @@ fn read_u32(reader: &mut impl Read) -> Result<u32> {
     let mut bytes = [0u8; 4];
     reader.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u16(reader: &mut impl Read) -> Result<u16> {
+    let mut bytes = [0u8; 2];
+    reader.read_exact(&mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
 }
 
 fn read_u64(reader: &mut impl Read) -> Result<u64> {
@@ -1645,20 +2032,26 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
         );
     }
     for state in &certificate.states {
-        let key = state_key_from_words(state.state_words.clone());
-        if key.hash() != state.state_hash {
-            bail!("certificate state hash mismatch");
+        let key = runtime
+            .ordered_states
+            .get(state.state_id as usize)
+            .ok_or_else(|| anyhow!("certificate state id {} out of range", state.state_id))?;
+        if runtime.state_ids.get(key).copied() != Some(state.state_id) {
+            bail!(
+                "runtime state row mapping mismatch for state {}",
+                state.state_id
+            );
         }
         let stored = runtime
             .policy
-            .get(&key)
-            .ok_or_else(|| anyhow!("certificate references unknown state {}", state.state_hash))?;
+            .get(key)
+            .ok_or_else(|| anyhow!("certificate references unknown state {}", state.state_id))?;
         if stored.best_guess != state.best_guess
             || !same_objective(&stored.objective, &state.best_objective)
         {
             bail!(
                 "certificate best decision mismatch for state {}",
-                state.state_hash
+                state.state_id
             );
         }
         let mut saw_best = false;
@@ -1669,14 +2062,22 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
                 saw_best = true;
             }
             for child in &candidate.children {
-                let child_key = state_key_from_words(child.state_words.clone());
-                if child_key.hash() != child.state_hash {
-                    bail!("certificate child hash mismatch");
+                let child_key = runtime
+                    .ordered_states
+                    .get(child.child_state_id as usize)
+                    .ok_or_else(|| {
+                        anyhow!("certificate child id {} out of range", child.child_state_id)
+                    })?;
+                if runtime.state_ids.get(child_key).copied() != Some(child.child_state_id) {
+                    bail!(
+                        "runtime child row mapping mismatch for state {}",
+                        child.child_state_id
+                    );
                 }
-                let child_stored = runtime.policy.get(&child_key).ok_or_else(|| {
+                let child_stored = runtime.policy.get(child_key).ok_or_else(|| {
                     anyhow!(
                         "certificate references unknown child state {}",
-                        child.state_hash
+                        child.child_state_id
                     )
                 })?;
                 if !same_objective(&child_stored.objective, &child.objective) {
@@ -1692,14 +2093,14 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
             {
                 bail!(
                     "certificate contains candidate better than best for state {}",
-                    state.state_hash
+                    state.state_id
                 );
             }
         }
         if !saw_best {
             bail!(
                 "certificate is missing the winning candidate for state {}",
-                state.state_hash
+                state.state_id
             );
         }
     }
@@ -1770,44 +2171,110 @@ fn child_expected_lower_bound(
     table_floor.max(entropy_floor)
 }
 
-fn partition_guess_impl(
+fn partition_guess_with_scratch(
     answer_count: usize,
-    state_indices: &[usize],
+    state: &StateKey,
     guess_index: usize,
     pattern_table: &PatternTable,
     prior: &[f64],
+    zobrist: &[u64],
+    scratch: &mut PartitionScratch,
 ) -> Result<Vec<PartitionBucket>> {
-    let word_count = answer_count.div_ceil(64);
-    let mut words = vec![0u64; PATTERN_SPACE * word_count];
-    let mut masses = [0.0f64; PATTERN_SPACE];
-    let mut counts = [0usize; PATTERN_SPACE];
-    let mut weighted_log_sums = [0.0f64; PATTERN_SPACE];
-
-    for answer_index in state_indices.iter().copied() {
-        let pattern = pattern_table.get(guess_index, answer_index) as usize;
-        let offset = (pattern * word_count) + (answer_index / 64);
-        words[offset] |= 1u64 << (answer_index % 64);
-        let weight = prior[answer_index];
-        masses[pattern] += weight;
-        counts[pattern] += 1;
-        if weight > 0.0 {
-            weighted_log_sums[pattern] += weight * weight.log2();
+    scratch.masses.fill(0.0);
+    scratch.counts.fill(0);
+    scratch.weighted_log_sums.fill(0.0);
+    if let Some(frame) = StateFrame::from_state(state) {
+        scratch.positions.resize(frame.global_ids.len() * 2, 0);
+        let (patterns, staged) = scratch.positions.split_at_mut(frame.global_ids.len());
+        for (local_index, answer_id) in frame.global_ids.iter().copied().enumerate() {
+            let answer_index = answer_id as usize;
+            let pattern = pattern_table.get(guess_index, answer_index) as usize;
+            scratch.counts[pattern] += 1;
+            let weight = prior[answer_index];
+            scratch.masses[pattern] += weight;
+            if weight > 0.0 {
+                scratch.weighted_log_sums[pattern] += weight * weight.log2();
+            }
+            patterns[local_index] = pattern as AnswerId;
         }
+        let mut next = 0usize;
+        for pattern in 0..PATTERN_SPACE {
+            scratch.offsets[pattern] = next;
+            next += scratch.counts[pattern];
+        }
+        scratch.offsets[PATTERN_SPACE] = next;
+        let mut cursors = [0usize; PATTERN_SPACE];
+        cursors.copy_from_slice(&scratch.offsets[..PATTERN_SPACE]);
+        for (local_index, pattern) in patterns.iter().copied().enumerate() {
+            let slot = &mut cursors[pattern as usize];
+            staged[*slot] = local_index as AnswerId;
+            *slot += 1;
+        }
+        let built = (0..PATTERN_SPACE)
+            .filter(|pattern| scratch.counts[*pattern] > 0)
+            .map(|pattern| {
+                let start = scratch.offsets[pattern];
+                let end = scratch.offsets[pattern + 1];
+                let child = StateKey::from_indices_with_tokens(
+                    answer_count,
+                    staged[start..end]
+                        .iter()
+                        .map(|local_index| frame.global_ids[*local_index as usize] as usize),
+                    zobrist,
+                );
+                PartitionBucket {
+                    pattern: pattern as u8,
+                    state: child,
+                    mass: scratch.masses[pattern],
+                    count: scratch.counts[pattern],
+                    entropy_bits: if scratch.counts[pattern] <= 1 || scratch.masses[pattern] <= 0.0
+                    {
+                        0.0
+                    } else {
+                        scratch.masses[pattern].log2()
+                            - (scratch.weighted_log_sums[pattern] / scratch.masses[pattern])
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        if built.is_empty() {
+            bail!("guess partition unexpectedly empty");
+        }
+        return Ok(built);
     }
 
+    let word_count = answer_count.div_ceil(64);
+    scratch.words.resize(PATTERN_SPACE * word_count, 0);
+    scratch.words.fill(0);
+    state.for_each_index(|answer_index| {
+        let pattern = pattern_table.get(guess_index, answer_index) as usize;
+        let offset = (pattern * word_count) + (answer_index / 64);
+        scratch.words[offset] |= 1u64 << (answer_index % 64);
+        let weight = prior[answer_index];
+        scratch.masses[pattern] += weight;
+        scratch.counts[pattern] += 1;
+        if weight > 0.0 {
+            scratch.weighted_log_sums[pattern] += weight * weight.log2();
+        }
+    });
+
     let built = (0..PATTERN_SPACE)
-        .filter(|pattern| counts[*pattern] > 0)
+        .filter(|pattern| scratch.counts[*pattern] > 0)
         .map(|pattern| {
             let offset = pattern * word_count;
             PartitionBucket {
                 pattern: pattern as u8,
-                state: state_key_from_words(words[offset..offset + word_count].to_vec()),
-                mass: masses[pattern],
-                count: counts[pattern],
-                entropy_bits: if counts[pattern] <= 1 || masses[pattern] <= 0.0 {
+                state: state_key_from_words(
+                    scratch.words[offset..offset + word_count].to_vec(),
+                    zobrist,
+                ),
+                mass: scratch.masses[pattern],
+                count: scratch.counts[pattern],
+                entropy_bits: if scratch.counts[pattern] <= 1 || scratch.masses[pattern] <= 0.0 {
                     0.0
                 } else {
-                    masses[pattern].log2() - (weighted_log_sums[pattern] / masses[pattern])
+                    scratch.masses[pattern].log2()
+                        - (scratch.weighted_log_sums[pattern] / scratch.masses[pattern])
                 },
             }
         })
@@ -1818,22 +2285,20 @@ fn partition_guess_impl(
     Ok(built)
 }
 
-fn state_key_from_words(words: Vec<u64>) -> StateKey {
-    let mut state = StateKey {
-        words,
-        count: 0,
-        hash: 0,
-    };
-    state.finalize();
-    state
+fn state_key_from_words(words: Vec<u64>, zobrist: &[u64]) -> StateKey {
+    StateKey::from_words_with_tokens(words, zobrist)
 }
 
 fn partition_signature_from_buckets(buckets: &[PartitionBucket]) -> PartitionSignature {
     let mut states = buckets
         .iter()
-        .map(|bucket| bucket.state.clone())
+        .map(|bucket| (bucket.pattern, bucket.state.clone()))
         .collect::<Vec<_>>();
-    states.sort_by(|left, right| left.words.cmp(&right.words));
+    states.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.indices().cmp(&right.1.indices()))
+    });
     PartitionSignature { children: states }
 }
 
@@ -1929,8 +2394,7 @@ fn singleton_state_for_model(model: &FormalModel, state: &StateKey) -> Result<St
 
 fn trivial_certificate_state(state: &StateKey, stored: &StoredState) -> CertificateState {
     CertificateState {
-        state_hash: state.hash(),
-        state_words: state.words.to_vec(),
+        state: state.clone(),
         best_guess: stored.best_guess,
         best_objective: stored.objective.clone(),
         candidates: vec![CertificateCandidate {
@@ -1973,9 +2437,12 @@ fn plan_refined_by(candidate: &GuessQuickPlan, retained: &GuessQuickPlan) -> boo
 }
 
 fn state_is_subset_of(left: &StateKey, right: &StateKey) -> bool {
-    left.words
+    let answer_count = left.word_len().max(right.word_len()) * 64;
+    let left_words = left.as_words(answer_count);
+    let right_words = right.as_words(answer_count);
+    left_words
         .iter()
-        .zip(right.words.iter())
+        .zip(right_words.iter())
         .all(|(left_word, right_word)| left_word & !right_word == 0)
 }
 
@@ -2001,15 +2468,98 @@ pub fn parse_observations(guesses: &[String], feedbacks: &[String]) -> Result<Ve
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+        io::Cursor,
+        path::Path,
+    };
 
     use chrono::NaiveDate;
 
     use super::*;
-    use crate::data::ProjectPaths;
+    use crate::{data::ProjectPaths, model::AnswerRecord, pattern_table::PatternTable};
 
     fn write_fixture(path: &Path, contents: &str) {
         std::fs::write(path, contents).expect("write fixture");
+    }
+
+    fn synthetic_words(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|mut value| {
+                let mut chars = ['a'; 5];
+                for slot in (0..5).rev() {
+                    chars[slot] = char::from(b'a' + (value % 26) as u8);
+                    value /= 26;
+                }
+                chars.into_iter().collect::<String>()
+            })
+            .collect()
+    }
+
+    fn synthetic_answers(words: &[String]) -> Vec<AnswerRecord> {
+        words
+            .iter()
+            .map(|word| AnswerRecord {
+                word: word.clone(),
+                in_seed: true,
+                manual_entry: false,
+                manual_weight: 1.0,
+                history_dates: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn state_hash_for_tests(state: &StateKey) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        state.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn partition_guess_scalar(
+        answer_count: usize,
+        state: &StateKey,
+        guess_index: usize,
+        pattern_table: &PatternTable,
+        prior: &[f64],
+        zobrist: &[u64],
+    ) -> Vec<PartitionBucket> {
+        let word_count = answer_count.div_ceil(64);
+        let mut words = vec![0u64; PATTERN_SPACE * word_count];
+        let mut masses = [0.0f64; PATTERN_SPACE];
+        let mut counts = [0usize; PATTERN_SPACE];
+        let mut weighted_log_sums = [0.0f64; PATTERN_SPACE];
+        state.for_each_index(|answer_index| {
+            let pattern = pattern_table.get(guess_index, answer_index) as usize;
+            let offset = (pattern * word_count) + (answer_index / 64);
+            words[offset] |= 1u64 << (answer_index % 64);
+            let weight = prior[answer_index];
+            masses[pattern] += weight;
+            counts[pattern] += 1;
+            if weight > 0.0 {
+                weighted_log_sums[pattern] += weight * weight.log2();
+            }
+        });
+        (0..PATTERN_SPACE)
+            .filter(|pattern| counts[*pattern] > 0)
+            .map(|pattern| {
+                let offset = pattern * word_count;
+                PartitionBucket {
+                    pattern: pattern as u8,
+                    state: state_key_from_words(
+                        words[offset..offset + word_count].to_vec(),
+                        zobrist,
+                    ),
+                    mass: masses[pattern],
+                    count: counts[pattern],
+                    entropy_bits: if counts[pattern] <= 1 || masses[pattern] <= 0.0 {
+                        0.0
+                    } else {
+                        masses[pattern].log2() - (weighted_log_sums[pattern] / masses[pattern])
+                    },
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -2017,7 +2567,7 @@ mod tests {
         let state = StateKey::from_indices(10, [1, 3, 9]);
         assert_eq!(state.count(), 3);
         assert_eq!(state.indices(), vec![1, 3, 9]);
-        assert_eq!(state.hash(), state.hash());
+        assert_eq!(state.state_hash(), state.state_hash());
     }
 
     #[test]
@@ -2035,6 +2585,77 @@ mod tests {
         let left = FormalModel::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("model");
         let right = FormalModel::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("model");
         assert_eq!(left.manifest.manifest_hash, right.manifest.manifest_hash);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tagged_state_round_trips_for_inline_and_bitset_states() {
+        let answer_count = 96;
+        let zobrist = build_zobrist_tokens(answer_count);
+        for state in [
+            StateKey::from_indices_with_tokens(answer_count, [1, 7, 15, 31], &zobrist),
+            StateKey::from_indices_with_tokens(answer_count, 0..48, &zobrist),
+        ] {
+            let mut bytes = Vec::new();
+            state
+                .write_tagged(&mut bytes, answer_count)
+                .expect("write tagged state");
+            let restored = StateKey::read_tagged(&mut Cursor::new(bytes), answer_count, &zobrist)
+                .expect("read tagged state");
+            assert_eq!(restored, state);
+            assert_eq!(restored.state_hash(), state.state_hash());
+            assert_eq!(
+                state_hash_for_tests(&restored),
+                state_hash_for_tests(&state)
+            );
+        }
+    }
+
+    #[test]
+    fn state_key_hashing_is_deterministic() {
+        let answer_count = 64;
+        let left_tokens = build_zobrist_tokens(answer_count);
+        let right_tokens = build_zobrist_tokens(answer_count);
+        let left = StateKey::from_indices_with_tokens(answer_count, [2, 9, 17, 33], &left_tokens);
+        let right = StateKey::from_indices_with_tokens(answer_count, [2, 9, 17, 33], &right_tokens);
+        assert_eq!(left, right);
+        assert_eq!(left.state_hash(), right.state_hash());
+        assert_eq!(state_hash_for_tests(&left), state_hash_for_tests(&right));
+    }
+
+    #[test]
+    fn scratch_partition_matches_scalar_partition_for_local_frame_states() {
+        let answer_count = 48;
+        let words = synthetic_words(answer_count);
+        let answers = synthetic_answers(&words);
+        let root = std::env::temp_dir().join("maybe-wordle-formal-partition-scratch");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("partition root");
+        let table = PatternTable::load_or_build_at(&root.join("pattern.bin"), &words, &answers)
+            .expect("pattern table");
+        let prior = vec![1.0 / answer_count as f64; answer_count];
+        let zobrist = build_zobrist_tokens(answer_count);
+        let state = StateKey::from_indices_with_tokens(answer_count, 0..answer_count, &zobrist);
+        let expected = partition_guess_scalar(answer_count, &state, 0, &table, &prior, &zobrist);
+        let mut scratch = PartitionScratch::default();
+        let actual = partition_guess_with_scratch(
+            answer_count,
+            &state,
+            0,
+            &table,
+            &prior,
+            &zobrist,
+            &mut scratch,
+        )
+        .expect("scratch partition");
+        assert_eq!(actual.len(), expected.len());
+        for (left, right) in actual.iter().zip(expected.iter()) {
+            assert_eq!(left.pattern, right.pattern);
+            assert_eq!(left.state, right.state);
+            assert_eq!(left.count, right.count);
+            assert!((left.mass - right.mass).abs() < 1e-12);
+            assert!((left.entropy_bits - right.entropy_bits).abs() < 1e-12);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    array,
+    collections::{HashMap, HashSet},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Days, NaiveDate, Utc};
@@ -76,6 +79,7 @@ pub struct Solver {
     pub guesses: Vec<String>,
     pub answers: Vec<AnswerRecord>,
     pub history_dates: Vec<NytDailyEntry>,
+    exact_small_state_table: SmallStateTable,
     pattern_table: PatternTable,
     guess_index: HashMap<String, usize>,
 }
@@ -86,13 +90,128 @@ enum ExactSuggestionMode {
     Pooled,
 }
 
+const EXACT_SUBSET_INLINE_CAPACITY: usize = 16;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ExactSubsetKey(Box<[usize]>);
+struct ExactSubsetKey(ExactSubsetStorage);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ExactSubsetStorage {
+    Inline {
+        len: u8,
+        ids: [u16; EXACT_SUBSET_INLINE_CAPACITY],
+    },
+    Heap(Box<[u16]>),
+}
 
 impl ExactSubsetKey {
     fn from_sorted_subset(subset: &[usize]) -> Self {
         debug_assert!(subset.windows(2).all(|window| window[0] < window[1]));
-        Self(subset.to_vec().into_boxed_slice())
+        if subset.len() <= EXACT_SUBSET_INLINE_CAPACITY {
+            let mut ids = [0u16; EXACT_SUBSET_INLINE_CAPACITY];
+            for (slot, value) in ids.iter_mut().zip(subset.iter().copied()) {
+                *slot = u16::try_from(value).expect("predictive exact subset index exceeds u16");
+            }
+            return Self(ExactSubsetStorage::Inline {
+                len: subset.len() as u8,
+                ids,
+            });
+        }
+        Self(ExactSubsetStorage::Heap(
+            subset
+                .iter()
+                .copied()
+                .map(|value| {
+                    u16::try_from(value).expect("predictive exact subset index exceeds u16")
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ))
+    }
+}
+
+struct ExactPartitionFrame {
+    masses: [f64; PATTERN_SPACE],
+    touched_patterns: Vec<u8>,
+    child_subsets: [Vec<usize>; PATTERN_SPACE],
+}
+
+impl ExactPartitionFrame {
+    fn new() -> Self {
+        Self {
+            masses: [0.0; PATTERN_SPACE],
+            touched_patterns: Vec::with_capacity(PATTERN_SPACE),
+            child_subsets: array::from_fn(|_| Vec::new()),
+        }
+    }
+
+    fn reset(&mut self) {
+        for pattern in self.touched_patterns.drain(..) {
+            self.masses[pattern as usize] = 0.0;
+            self.child_subsets[pattern as usize].clear();
+        }
+    }
+}
+
+struct ExactSearchScratch {
+    frames: Vec<ExactPartitionFrame>,
+}
+
+impl ExactSearchScratch {
+    fn new() -> Self {
+        Self { frames: Vec::new() }
+    }
+
+    fn frame_mut(&mut self, depth: usize) -> &mut ExactPartitionFrame {
+        while self.frames.len() <= depth {
+            self.frames.push(ExactPartitionFrame::new());
+        }
+        let frame = &mut self.frames[depth];
+        frame.reset();
+        frame
+    }
+}
+
+struct ExactEntropyScratch {
+    masses: [f64; PATTERN_SPACE],
+    touched_patterns: Vec<u8>,
+}
+
+impl ExactEntropyScratch {
+    fn new() -> Self {
+        Self {
+            masses: [0.0; PATTERN_SPACE],
+            touched_patterns: Vec::with_capacity(PATTERN_SPACE),
+        }
+    }
+
+    fn score_guess(
+        &mut self,
+        solver: &Solver,
+        guess_index: usize,
+        subset: &[usize],
+        weights: &[f64],
+        total_weight: f64,
+    ) -> (usize, f64) {
+        for answer_index in subset {
+            let pattern = solver.pattern_table.get(guess_index, *answer_index) as usize;
+            if self.masses[pattern] == 0.0 {
+                self.touched_patterns.push(pattern as u8);
+            }
+            self.masses[pattern] += weights[*answer_index];
+        }
+        let entropy = self
+            .touched_patterns
+            .iter()
+            .map(|pattern| {
+                let probability = self.masses[*pattern as usize] / total_weight;
+                -probability * probability.log2()
+            })
+            .sum::<f64>();
+        for pattern in self.touched_patterns.drain(..) {
+            self.masses[pattern as usize] = 0.0;
+        }
+        (guess_index, entropy)
     }
 }
 
@@ -140,6 +259,9 @@ impl Solver {
             guesses: model.guesses,
             answers: model.answers,
             history_dates: model.history,
+            exact_small_state_table: SmallStateTable::build(
+                config.exact_exhaustive_threshold.max(2),
+            ),
             pattern_table,
             guess_index,
         })
@@ -257,8 +379,6 @@ impl Solver {
         suggestions.sort_by(|left, right| compare_suggestions(left, right, &surviving_words));
 
         if let Some(exact_mode) = exact_suggestion_mode(&self.config, state.surviving.len()) {
-            let small_state_table =
-                SmallStateTable::build(self.config.exact_exhaustive_threshold.max(2));
             let exact_candidates = match exact_mode {
                 ExactSuggestionMode::Exhaustive => (0..self.guesses.len()).collect::<Vec<_>>(),
                 ExactSuggestionMode::Pooled => {
@@ -266,6 +386,7 @@ impl Solver {
                 }
             };
             let mut memo = HashMap::new();
+            let mut exact_scratch = ExactSearchScratch::new();
             let mut exact_costs = vec![None; self.guesses.len()];
 
             for guess_index in exact_candidates {
@@ -273,9 +394,11 @@ impl Solver {
                     guess_index,
                     &state.surviving,
                     &state.weights,
-                    &small_state_table,
+                    &self.exact_small_state_table,
                     &mut memo,
                     f64::INFINITY,
+                    &mut exact_scratch,
+                    0,
                 )?;
                 exact_costs[guess_index] = Some(cost);
             }
@@ -557,6 +680,8 @@ impl Solver {
         small_state_table: &SmallStateTable,
         memo: &mut HashMap<ExactSubsetKey, f64>,
         best_bound: f64,
+        scratch: &mut ExactSearchScratch,
+        depth: usize,
     ) -> Result<f64> {
         if subset.is_empty() {
             return Ok(0.0);
@@ -566,27 +691,49 @@ impl Solver {
         }
 
         let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
-        let mut partitions: HashMap<u8, (f64, Vec<usize>)> = HashMap::new();
-
-        for answer_index in subset {
-            let pattern = self.pattern_table.get(guess_index, *answer_index);
-            let entry = partitions.entry(pattern).or_insert((0.0, Vec::new()));
-            entry.0 += weights[*answer_index];
-            entry.1.push(*answer_index);
-        }
-
-        let mut ordered = partitions.into_iter().collect::<Vec<_>>();
-        ordered.sort_by(|left, right| right.1.0.total_cmp(&left.1.0));
+        let mut ordered_patterns = [0u8; PATTERN_SPACE];
+        let ordered_len = {
+            let frame = scratch.frame_mut(depth);
+            for answer_index in subset {
+                let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
+                if frame.child_subsets[pattern].is_empty() {
+                    frame.touched_patterns.push(pattern as u8);
+                }
+                frame.masses[pattern] += weights[*answer_index];
+                frame.child_subsets[pattern].push(*answer_index);
+            }
+            let len = frame.touched_patterns.len();
+            ordered_patterns[..len].copy_from_slice(&frame.touched_patterns);
+            let masses = &frame.masses;
+            ordered_patterns[..len]
+                .sort_by(|left, right| masses[*right as usize].total_cmp(&masses[*left as usize]));
+            len
+        };
 
         let mut cost = 1.0;
-        for (pattern, (mass, child_subset)) in ordered {
+        for pattern in ordered_patterns[..ordered_len].iter().copied() {
+            let mass = scratch.frames[depth].masses[pattern as usize];
             let branch_probability = mass / total_weight;
             let child_cost = if pattern == ALL_GREEN_PATTERN {
                 0.0
-            } else if child_subset.len() == subset.len() && child_subset == subset {
-                return Ok(f64::INFINITY);
             } else {
-                self.exact_best_cost(&child_subset, weights, small_state_table, memo)?
+                let child_subset =
+                    std::mem::take(&mut scratch.frames[depth].child_subsets[pattern as usize]);
+                let result =
+                    if child_subset.len() == subset.len() && child_subset.as_slice() == subset {
+                        f64::INFINITY
+                    } else {
+                        self.exact_best_cost(
+                            &child_subset,
+                            weights,
+                            small_state_table,
+                            memo,
+                            scratch,
+                            depth + 1,
+                        )?
+                    };
+                scratch.frames[depth].child_subsets[pattern as usize] = child_subset;
+                result
             };
             cost += branch_probability * child_cost;
             if cost >= best_bound {
@@ -603,6 +750,8 @@ impl Solver {
         weights: &[f64],
         small_state_table: &SmallStateTable,
         memo: &mut HashMap<ExactSubsetKey, f64>,
+        scratch: &mut ExactSearchScratch,
+        depth: usize,
     ) -> Result<f64> {
         if subset.is_empty() {
             return Ok(0.0);
@@ -623,6 +772,9 @@ impl Solver {
             }
         };
         let lower_bound = small_state_table.lower_bound(subset.len());
+        for answer_index in subset {
+            debug_assert!(u16::try_from(*answer_index).is_ok());
+        }
         let mut best_cost = f64::INFINITY;
         for guess_index in scores {
             let cost = self.exact_cost_for_guess(
@@ -632,6 +784,8 @@ impl Solver {
                 small_state_table,
                 memo,
                 best_cost,
+                scratch,
+                depth,
             )?;
             if cost < best_cost {
                 best_cost = cost;
@@ -653,21 +807,8 @@ impl Solver {
         let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
         let mut scores = (0..self.guesses.len())
             .into_par_iter()
-            .map(|guess_index| {
-                let mut masses = [0.0f64; PATTERN_SPACE];
-                for answer_index in subset {
-                    let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
-                    masses[pattern] += weights[*answer_index];
-                }
-                let entropy = masses
-                    .iter()
-                    .filter(|mass| **mass > 0.0)
-                    .map(|mass| {
-                        let probability = mass / total_weight;
-                        -probability * probability.log2()
-                    })
-                    .sum::<f64>();
-                (guess_index, entropy)
+            .map_init(ExactEntropyScratch::new, |scratch, guess_index| {
+                scratch.score_guess(self, guess_index, subset, weights, total_weight)
             })
             .collect::<Vec<_>>();
         scores.sort_by(|left, right| {
@@ -767,7 +908,9 @@ mod tests {
         scoring::{format_feedback_letters, score_guess},
     };
 
-    use super::{ExactSuggestionMode, Solver, exact_suggestion_mode};
+    use super::{
+        ExactSubsetKey, ExactSubsetStorage, ExactSuggestionMode, Solver, exact_suggestion_mode,
+    };
 
     #[test]
     fn parse_observations_rejects_length_mismatch() {
@@ -820,5 +963,21 @@ mod tests {
             Some(ExactSuggestionMode::Pooled)
         );
         assert_eq!(exact_suggestion_mode(&config, 17), None);
+    }
+
+    #[test]
+    fn exact_subset_key_inlines_small_subsets() {
+        let key = ExactSubsetKey::from_sorted_subset(&[1, 4, 9, 15]);
+        assert!(matches!(
+            key,
+            ExactSubsetKey(ExactSubsetStorage::Inline { len: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn exact_subset_key_boxes_large_subsets() {
+        let subset = (0..17).collect::<Vec<_>>();
+        let key = ExactSubsetKey::from_sorted_subset(&subset);
+        assert!(matches!(key, ExactSubsetKey(ExactSubsetStorage::Heap(_))));
     }
 }

@@ -51,6 +51,13 @@ fn formal_policy_builds_and_verifies_certificate() {
     )
     .expect("verify");
     assert_eq!(verify.verified_cached_states, summary.solved_states);
+    let oracle = verify_optimal_policy_with_mode(
+        &paths,
+        DEFAULT_FORMAL_MODEL_ID,
+        FormalVerificationMode::Oracle,
+    )
+    .expect("oracle verify");
+    assert!(oracle.verified_small_states > 0 || oracle.verified_medium_states > 0);
     let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("load");
     assert!(runtime.initial_state().count() > 0);
     let _ = std::fs::remove_dir_all(&root);
@@ -70,5 +77,12 @@ fn expected_only_model_builds_separately() {
 
     let summary = build_optimal_policy(&paths, DEFAULT_EXPECTED_ONLY_MODEL_ID).expect("policy");
     assert!(summary.solved_states > 0);
+    let verify = verify_optimal_policy_with_mode(
+        &paths,
+        DEFAULT_EXPECTED_ONLY_MODEL_ID,
+        FormalVerificationMode::Certificate,
+    )
+    .expect("verify");
+    assert_eq!(verify.verified_cached_states, summary.solved_states);
     let _ = std::fs::remove_dir_all(&root);
 }

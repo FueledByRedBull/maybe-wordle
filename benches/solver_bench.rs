@@ -27,13 +27,13 @@ struct FormalBenchFixture {
     root: PathBuf,
 }
 
-fn bench_predictive_tiny_exact(c: &mut Criterion) {
+fn bench_predictive_recursive_exact(c: &mut Criterion) {
     let fixture = predictive_fixture();
     let paths = ProjectPaths::new(&fixture.root);
     let solver = Solver::from_paths(&paths, &fixture.config).expect("solver");
     let state = solver.initial_state(bench_date());
 
-    c.bench_function("predictive_tiny_exact_suggestions", |bench| {
+    c.bench_function("predictive_recursive_exact_suggestions", |bench| {
         bench.iter(|| solver.suggestions(&state, 5).expect("suggestions"));
     });
 }
@@ -88,6 +88,25 @@ fn bench_formal_verify_certificate(c: &mut Criterion) {
     });
 }
 
+fn bench_formal_verify_oracle(c: &mut Criterion) {
+    let fixture = formal_fixture();
+    let paths = ProjectPaths::new(&fixture.root);
+    unsafe {
+        std::env::set_var("MAYBE_WORDLE_FORMAL_PROGRESS", "0");
+    }
+    let _ = build_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).expect("build");
+    c.bench_function("formal_verify_toy_oracle", |bench| {
+        bench.iter(|| {
+            verify_optimal_policy_with_mode(
+                &paths,
+                DEFAULT_FORMAL_MODEL_ID,
+                FormalVerificationMode::Oracle,
+            )
+            .expect("verify")
+        });
+    });
+}
+
 fn bench_small_state_table(c: &mut Criterion) {
     c.bench_function("small_state_table_build_12", |bench| {
         bench.iter(|| SmallStateTable::build(12));
@@ -103,15 +122,21 @@ fn predictive_fixture() -> &'static PredictiveBenchFixture {
 
         write_fixture(
             &paths.seed_guesses,
-            "cigar\nrebut\nsissy\nhumph\nawake\nblush\nfocal\nevade\nnaval\nserve\n",
+            "cigar\nrebut\nsissy\nhumph\nawake\nblush\nfocal\nevade\nnaval\nserve\nheath\ndwarf\nmodel\nkarma\nstink\ngrade\n",
         );
-        write_fixture(&paths.seed_answers, "cigar\nrebut\nsissy\nhumph\n");
+        write_fixture(
+            &paths.seed_answers,
+            "cigar\nrebut\nsissy\nhumph\nawake\nblush\nfocal\nevade\nnaval\nserve\nheath\ndwarf\n",
+        );
         write_fixture(&paths.seed_reference_answers, "");
         write_fixture(&paths.seed_sources, "");
         write_fixture(&paths.manual_additions, "");
         write_fixture(&paths.raw_history, "");
 
-        let config = PriorConfig::default();
+        let mut config = PriorConfig::default();
+        config.exact_threshold = 16;
+        config.exact_exhaustive_threshold = 8;
+        config.exact_candidate_pool = 12;
         write_fixture(
             &paths.config_prior,
             &toml::to_string_pretty(&config).expect("config toml"),
@@ -164,10 +189,11 @@ fn unique_bench_root(label: &str) -> PathBuf {
 
 criterion_group!(
     benches,
-    bench_predictive_tiny_exact,
+    bench_predictive_recursive_exact,
     bench_formal_build,
     bench_formal_suggest,
     bench_formal_verify_certificate,
+    bench_formal_verify_oracle,
     bench_small_state_table
 );
 criterion_main!(benches);

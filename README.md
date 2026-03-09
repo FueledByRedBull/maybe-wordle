@@ -118,6 +118,8 @@ The historical archive is fetched from the NYT daily puzzle endpoint:
 - `state_values.bin`
 - `policy_table.bin`
 - `proof_metadata.json`
+- `proof_certificate.json`
+- `small_state_table.json`
 - `pattern_table.bin`
 - `prior.toml`
 
@@ -126,7 +128,15 @@ Build them with:
 ```bash
 cargo run --release -- build-optimal-policy --model formal-v1
 cargo run --release -- verify-optimal-policy --model formal-v1
+cargo run --release -- verify-optimal-policy --model formal-v1 --mode oracle
 ```
+
+`verify-optimal-policy` supports two verification passes:
+
+- `certificate` checks the persisted proof certificate against the serialized policy rows
+- `oracle` recomputes exact values on the loaded model and cross-checks cached policy decisions
+
+Formal artifacts are versioned. If the state or certificate format changes, stale files are rejected and should be rebuilt.
 
 If you only want fast suggestions, predictive mode works with the derived artifacts under [`data/derived`](./data/derived).
 

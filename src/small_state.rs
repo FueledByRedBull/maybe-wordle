@@ -8,25 +8,34 @@ pub const SMALL_STATE_TABLE_VERSION: u32 = 2;
 pub struct SmallStateTable {
     pub version: u32,
     pub max_size: usize,
-    pub min_expected: Vec<f64>,
+    pub expected_lower_bound_by_size: Vec<f64>,
 }
 
 impl SmallStateTable {
+    // This is an admissible lower bound table, not a retrograde exact-value table.
+    // It minimizes over abstract partition-size distributions and therefore may
+    // assume a split that no real guess can realize for a given state.
     pub fn build(max_size: usize) -> Self {
-        let mut min_expected = vec![0.0; max_size + 1];
+        let mut expected_lower_bound_by_size = vec![0.0; max_size + 1];
         if max_size >= 1 {
-            min_expected[1] = 1.0;
+            expected_lower_bound_by_size[1] = 1.0;
         }
         for size in 2..=max_size {
             let mut best = f64::INFINITY;
             let mut partition = Vec::with_capacity(size);
-            enumerate_partitions(size, size, &mut partition, &min_expected, &mut best);
-            min_expected[size] = best;
+            enumerate_partitions(
+                size,
+                size,
+                &mut partition,
+                &expected_lower_bound_by_size,
+                &mut best,
+            );
+            expected_lower_bound_by_size[size] = best;
         }
         Self {
             version: SMALL_STATE_TABLE_VERSION,
             max_size,
-            min_expected,
+            expected_lower_bound_by_size,
         }
     }
 
@@ -34,7 +43,7 @@ impl SmallStateTable {
         if size == 0 {
             return 0.0;
         }
-        self.min_expected
+        self.expected_lower_bound_by_size
             .get(size)
             .copied()
             .unwrap_or_else(|| 1.0 + depth_like_floor(size))
@@ -96,7 +105,7 @@ mod tests {
     fn lower_bound_is_positive_over_small_sizes() {
         let table = SmallStateTable::build(8);
         for size in 1..=8 {
-            assert!(table.min_expected[size] >= 1.0);
+            assert!(table.expected_lower_bound_by_size[size] >= 1.0);
         }
     }
 
