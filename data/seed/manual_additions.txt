@@ -1,0 +1,2 @@
+# One lowercase five-letter word per line.
+# Words listed here are added to the modeled answer universe even if they are not in the pinned seed lists.

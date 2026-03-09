@@ -1,0 +1,14 @@
+[valid_guesses]
+source = "https://github.com/tabatkins/wordle-list"
+commit = "255b9469c4dad99a3b95cc4ddbe139b3d3747868"
+path = "words"
+
+[candidate_answers]
+source = "https://github.com/joshstephenson/Wordle-Solver"
+commit = "48c32e1ac0cb1ec87740cab009214e89b2c636c8"
+path = "nyt-answers.txt"
+
+[reference_candidate_answers]
+source = "https://github.com/LaurentLessard/wordlesolver"
+commit = "739cf6f9a79fd6cedb5041d2110e6e3bb6143038"
+path = "solutions_nyt.txt"

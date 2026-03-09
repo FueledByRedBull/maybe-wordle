@@ -1,0 +1,555 @@
+use std::{
+    env,
+    io::{self, Write},
+};
+
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::NaiveDate;
+use clap::{Parser, Subcommand};
+use maybe_wordle::{
+    config::PriorConfig,
+    data::{ProjectPaths, sync_nyt_history},
+    formal::{
+        DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, build_optimal_policy,
+        parse_observations as parse_formal_observations, verify_optimal_policy,
+    },
+    gui::run_gui,
+    model::build_model_artifacts,
+    model::{ModelVariant, WeightMode},
+    seed::{MergeStrategy, add_manual_addition, merge_seed_lists, reconcile_seed_lists},
+    solver::Solver,
+};
+
+#[derive(Parser, Debug)]
+#[command(name = "maybe-wordle")]
+#[command(about = "Weighted Wordle solver for current NYT behavior")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    SyncData,
+    BuildModel,
+    BuildOptimalPolicy {
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        model: String,
+    },
+    VerifyOptimalPolicy {
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        model: String,
+    },
+    Gui,
+    AddManual {
+        word: String,
+    },
+    ReconcileSeeds,
+    MergeSeeds {
+        #[arg(long, default_value = "union")]
+        strategy: String,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
+    Suggest {
+        #[arg(long = "guess")]
+        guess: Vec<String>,
+        #[arg(long = "feedback")]
+        feedback: Vec<String>,
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+        #[arg(long)]
+        date: Option<String>,
+        #[arg(long, default_value = "predictive")]
+        mode: String,
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        model: String,
+    },
+    SolveInteractive {
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+        #[arg(long)]
+        date: Option<String>,
+        #[arg(long, default_value = "predictive")]
+        mode: String,
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        model: String,
+    },
+    ExplainState {
+        #[arg(long = "guess")]
+        guess: Vec<String>,
+        #[arg(long = "feedback")]
+        feedback: Vec<String>,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        model: String,
+    },
+    Backtest {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+    },
+    Experiments {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+    },
+    Benchmark {
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+        #[arg(long, default_value = "predictive")]
+        mode: String,
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        model: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SolverMode {
+    Predictive,
+    FormalOptimal,
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    let root = env::current_dir().context("failed to resolve current directory")?;
+    let paths = ProjectPaths::new(root);
+    paths.ensure_layout()?;
+    let config = PriorConfig::load_or_create(&paths.config_prior)?;
+
+    match cli.command {
+        Command::SyncData => {
+            let summary = sync_nyt_history(&paths, &config, Solver::today())?;
+            println!(
+                "synced {} entries from {} to {} (fetched {}, reverified {}, changed {})",
+                summary.total,
+                summary.first_date,
+                summary.last_date,
+                summary.fetched,
+                summary.reverified,
+                summary.changed
+            );
+            if !summary.changed_dates.is_empty() {
+                println!(
+                    "changed_dates={}",
+                    summary
+                        .changed_dates
+                        .iter()
+                        .map(|date| date.format("%Y-%m-%d").to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+        Command::BuildModel => {
+            let summary = build_model_artifacts(&paths, &config, Solver::today())?;
+            println!(
+                "built model with {} guesses, {} modeled answers, {} historical answers across {} daily rows",
+                summary.guess_count,
+                summary.answer_count,
+                summary.historical_answers,
+                summary.history_rows
+            );
+        }
+        Command::BuildOptimalPolicy { model } => {
+            let summary = build_optimal_policy(&paths, &model)?;
+            println!(
+                "model={} manifest={} states={} deduped_signatures={} bound_hits={} build_ms={} best_guess={} worst_case_depth={} expected_guesses={:.6}",
+                summary.model_id,
+                summary.manifest_hash,
+                summary.solved_states,
+                summary.deduped_signatures,
+                summary.bound_hits,
+                summary.build_millis,
+                summary.root_best_guess,
+                summary.root_objective.worst_case_depth,
+                summary.root_objective.expected_guesses
+            );
+        }
+        Command::VerifyOptimalPolicy { model } => {
+            let summary = verify_optimal_policy(&paths, &model)?;
+            println!(
+                "model={} manifest={} verified_small_states={} verified_medium_states={}",
+                summary.model_id,
+                summary.manifest_hash,
+                summary.verified_small_states,
+                summary.verified_medium_states
+            );
+        }
+        Command::Gui => {
+            run_gui(paths.root.clone())?;
+        }
+        Command::AddManual { word } => {
+            add_manual_addition(&paths, &word)?;
+            println!("added manual answer {}", word.to_ascii_lowercase());
+        }
+        Command::ReconcileSeeds => {
+            let summary = reconcile_seed_lists(&paths)?;
+            println!(
+                "primary={} reference={} shared={} primary_only={} reference_only={}",
+                summary.primary_count,
+                summary.reference_count,
+                summary.shared_count,
+                summary.primary_only_count,
+                summary.reference_only_count
+            );
+        }
+        Command::MergeSeeds { strategy, apply } => {
+            let strategy = parse_merge_strategy(&strategy)?;
+            let summary = merge_seed_lists(&paths, strategy, apply)?;
+            println!(
+                "strategy={} primary={} reference={} merged={} output={} applied={}",
+                summary.strategy.label(),
+                summary.primary_count,
+                summary.reference_count,
+                summary.merged_count,
+                summary.output_path,
+                summary.applied_to_primary
+            );
+        }
+        Command::Suggest {
+            guess,
+            feedback,
+            top,
+            date,
+            mode,
+            model,
+        } => match parse_solver_mode(&mode)? {
+            SolverMode::Predictive => {
+                let observations = Solver::parse_observations(&guess, &feedback)?;
+                let as_of = parse_or_today(date.as_deref())?;
+                let solver = Solver::from_paths(&paths, &config)?;
+                let state = solver.apply_history(as_of, &observations)?;
+                println!(
+                    "mode=predictive date={} surviving={} total_weight={:.4}",
+                    as_of,
+                    state.surviving.len(),
+                    state.total_weight
+                );
+                for suggestion in solver.suggestions(&state, top)? {
+                    match suggestion.exact_cost {
+                        Some(exact_cost) => println!(
+                            "{} entropy={:.5} solve_prob={:.5} expected_remaining={:.3} exact_cost={:.5}",
+                            suggestion.word,
+                            suggestion.entropy,
+                            suggestion.solve_probability,
+                            suggestion.expected_remaining,
+                            exact_cost
+                        ),
+                        None => println!(
+                            "{} entropy={:.5} solve_prob={:.5} expected_remaining={:.3}",
+                            suggestion.word,
+                            suggestion.entropy,
+                            suggestion.solve_probability,
+                            suggestion.expected_remaining
+                        ),
+                    }
+                }
+            }
+            SolverMode::FormalOptimal => {
+                let observations = parse_formal_observations(&guess, &feedback)?;
+                let runtime = FormalPolicyRuntime::load(&paths, &model)?;
+                let state = runtime.apply_history(&observations)?;
+                println!(
+                    "mode=formal-optimal model={} manifest={} surviving={}",
+                    runtime.manifest().model_id,
+                    runtime.manifest().manifest_hash,
+                    state.count()
+                );
+                for suggestion in runtime.suggest(&state, top)? {
+                    println!(
+                        "{} worst_case_depth={} expected_guesses={:.6} bucket_sizes={}",
+                        suggestion.word,
+                        suggestion.objective.worst_case_depth,
+                        suggestion.objective.expected_guesses,
+                        suggestion
+                            .bucket_sizes
+                            .iter()
+                            .map(|size| size.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
+            }
+        },
+        Command::SolveInteractive {
+            top,
+            date,
+            mode,
+            model,
+        } => match parse_solver_mode(&mode)? {
+            SolverMode::Predictive => {
+                let as_of = parse_or_today(date.as_deref())?;
+                let solver = Solver::from_paths(&paths, &config)?;
+                let mut observations = Vec::new();
+
+                loop {
+                    let state = solver.apply_history(as_of, &observations)?;
+                    println!(
+                        "mode=predictive surviving={} total_weight={:.4}",
+                        state.surviving.len(),
+                        state.total_weight
+                    );
+                    for suggestion in solver.suggestions(&state, top)? {
+                        println!(
+                            "{} entropy={:.5} solve_prob={:.5} expected_remaining={:.3}{}",
+                            suggestion.word,
+                            suggestion.entropy,
+                            suggestion.solve_probability,
+                            suggestion.expected_remaining,
+                            suggestion
+                                .exact_cost
+                                .map(|cost| format!(" exact_cost={:.5}", cost))
+                                .unwrap_or_default()
+                        );
+                    }
+
+                    print!("guess (blank to stop): ");
+                    io::stdout().flush().context("failed to flush stdout")?;
+                    let guess = read_line()?;
+                    if guess.trim().is_empty() {
+                        break;
+                    }
+
+                    print!("feedback (01020 or bgybb): ");
+                    io::stdout().flush().context("failed to flush stdout")?;
+                    let feedback = read_line()?;
+                    observations.push((
+                        guess.trim().to_ascii_lowercase(),
+                        maybe_wordle::scoring::parse_feedback(&feedback)?,
+                    ));
+                }
+            }
+            SolverMode::FormalOptimal => {
+                let runtime = FormalPolicyRuntime::load(&paths, &model)?;
+                let mut observations = Vec::new();
+
+                loop {
+                    let state = runtime.apply_history(&observations)?;
+                    println!(
+                        "mode=formal-optimal model={} manifest={} surviving={}",
+                        runtime.manifest().model_id,
+                        runtime.manifest().manifest_hash,
+                        state.count()
+                    );
+                    for suggestion in runtime.suggest(&state, top)? {
+                        println!(
+                            "{} worst_case_depth={} expected_guesses={:.6} bucket_sizes={}",
+                            suggestion.word,
+                            suggestion.objective.worst_case_depth,
+                            suggestion.objective.expected_guesses,
+                            suggestion
+                                .bucket_sizes
+                                .iter()
+                                .map(|size| size.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        );
+                    }
+
+                    print!("guess (blank to stop): ");
+                    io::stdout().flush().context("failed to flush stdout")?;
+                    let guess = read_line()?;
+                    if guess.trim().is_empty() {
+                        break;
+                    }
+
+                    print!("feedback (01020 or bgybb): ");
+                    io::stdout().flush().context("failed to flush stdout")?;
+                    let feedback = read_line()?;
+                    observations.push((
+                        guess.trim().to_ascii_lowercase(),
+                        maybe_wordle::scoring::parse_feedback(&feedback)?,
+                    ));
+                }
+            }
+        },
+        Command::ExplainState {
+            guess,
+            feedback,
+            top,
+            model,
+        } => {
+            let observations = parse_formal_observations(&guess, &feedback)?;
+            let runtime = FormalPolicyRuntime::load(&paths, &model)?;
+            let state = runtime.apply_history(&observations)?;
+            let explanation = runtime.explain_state(&state, top)?;
+            println!(
+                "model={} manifest={} surviving={} best_guess={} worst_case_depth={} expected_guesses={:.6} bucket_sizes={}",
+                explanation.model_id,
+                explanation.manifest_hash,
+                explanation.surviving_answers,
+                explanation.best_guess,
+                explanation.objective.worst_case_depth,
+                explanation.objective.expected_guesses,
+                explanation
+                    .bucket_sizes
+                    .iter()
+                    .map(|size| size.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            for tied in explanation.tied_moves {
+                println!(
+                    "candidate={} worst_case_depth={} expected_guesses={:.6} bucket_sizes={}",
+                    tied.word,
+                    tied.objective.worst_case_depth,
+                    tied.objective.expected_guesses,
+                    tied.bucket_sizes
+                        .iter()
+                        .map(|size| size.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+        Command::Backtest { from, to, top } => {
+            let solver = Solver::from_paths(&paths, &config)?;
+            let (default_from, default_to) = Solver::latest_history_range(&paths)?
+                .ok_or_else(|| anyhow!("run sync-data before backtesting"))?;
+            let from = parse_date(from.as_deref())?.unwrap_or(default_from);
+            let to = parse_date(to.as_deref())?.unwrap_or(default_to);
+            if from > to {
+                bail!("--from cannot be after --to");
+            }
+            let stats = solver.backtest(from, to, top)?;
+            println!(
+                "games={} average_guesses={:.4} p95={} max={} failures={} coverage_gaps={}",
+                stats.games,
+                stats.average_guesses,
+                stats.p95_guesses,
+                stats.max_guesses,
+                stats.failures,
+                stats.coverage_gaps
+            );
+        }
+        Command::Experiments { from, to, top } => {
+            let (default_from, default_to) = Solver::latest_history_range(&paths)?
+                .ok_or_else(|| anyhow!("run sync-data before experiments"))?;
+            let from = parse_date(from.as_deref())?.unwrap_or(default_from);
+            let to = parse_date(to.as_deref())?.unwrap_or(default_to);
+            if from > to {
+                bail!("--from cannot be after --to");
+            }
+            for mode in [
+                WeightMode::Uniform,
+                WeightMode::CooldownOnly,
+                WeightMode::Weighted,
+            ] {
+                for variant in [ModelVariant::SeedOnly, ModelVariant::SeedPlusHistory] {
+                    let solver = Solver::from_paths_with_settings(&paths, &config, mode, variant)?;
+                    let result = solver.experiment_report(from, to, top)?;
+                    println!(
+                        "mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_log_loss={:.6} avg_brier={:.6} avg_target_prob={:.6} avg_target_rank={:.2}",
+                        result.mode.label(),
+                        result.variant.label(),
+                        result.backtest.games,
+                        result.backtest.average_guesses,
+                        result.backtest.p95_guesses,
+                        result.backtest.max_guesses,
+                        result.backtest.failures,
+                        result.average_log_loss,
+                        result.average_brier,
+                        result.average_target_probability,
+                        result.average_target_rank
+                    );
+                }
+            }
+        }
+        Command::Benchmark { runs, mode, model } => {
+            if runs == 0 {
+                bail!("runs must be greater than 0");
+            }
+            match parse_solver_mode(&mode)? {
+                SolverMode::Predictive => {
+                    let solver = Solver::from_paths(&paths, &config)?;
+                    let state = solver.initial_state(Solver::today());
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for _ in 0..runs {
+                        let started = std::time::Instant::now();
+                        let _ = solver.suggestions(&state, 10)?;
+                        elapsed += started.elapsed();
+                    }
+                    let average_ms = elapsed.as_secs_f64() * 1000.0 / runs as f64;
+                    println!(
+                        "mode=predictive runs={} surviving={} pattern_table_bytes={} average_ms={:.3}",
+                        runs,
+                        state.surviving.len(),
+                        solver.pattern_table_bytes(),
+                        average_ms
+                    );
+                }
+                SolverMode::FormalOptimal => {
+                    let runtime = FormalPolicyRuntime::load(&paths, &model)?;
+                    let state = runtime.initial_state();
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for _ in 0..runs {
+                        let started = std::time::Instant::now();
+                        let _ = runtime.suggest(&state, 10)?;
+                        elapsed += started.elapsed();
+                    }
+                    let average_ms = elapsed.as_secs_f64() * 1000.0 / runs as f64;
+                    println!(
+                        "mode=formal-optimal runs={} surviving={} states={} average_ms={:.3}",
+                        runs,
+                        state.count(),
+                        runtime.metadata().solved_states,
+                        average_ms
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_or_today(raw: Option<&str>) -> Result<NaiveDate> {
+    Ok(parse_date(raw)?.unwrap_or_else(Solver::today))
+}
+
+fn parse_date(raw: Option<&str>) -> Result<Option<NaiveDate>> {
+    raw.map(|value| {
+        NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .with_context(|| format!("invalid date: {value}"))
+    })
+    .transpose()
+}
+
+fn read_line() -> Result<String> {
+    let mut buffer = String::new();
+    io::stdin()
+        .read_line(&mut buffer)
+        .context("failed to read stdin")?;
+    Ok(buffer)
+}
+
+fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "union" => Ok(MergeStrategy::Union),
+        "keep_primary" => Ok(MergeStrategy::KeepPrimary),
+        _ => bail!("merge strategy must be one of: union, keep_primary"),
+    }
+}
+
+fn parse_solver_mode(raw: &str) -> Result<SolverMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "predictive" => Ok(SolverMode::Predictive),
+        "formal-optimal" | "formal_optimal" | "formal" | "optimal" => Ok(SolverMode::FormalOptimal),
+        _ => bail!("mode must be one of: predictive, formal-optimal"),
+    }
+}

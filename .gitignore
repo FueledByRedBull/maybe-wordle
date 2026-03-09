@@ -1,0 +1,5 @@
+/target
+/data/raw/*.jsonl
+/data/derived/*.bin
+/data/derived/*.csv
+/data/derived/*.md
