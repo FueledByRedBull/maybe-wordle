@@ -15,6 +15,7 @@ use crate::{
     scoring::{
         ALL_GREEN_PATTERN, PATTERN_SPACE, format_feedback_letters, parse_feedback, score_guess,
     },
+    small_state::SmallStateTable,
 };
 
 #[derive(Clone, Debug)]
@@ -77,6 +78,22 @@ pub struct Solver {
     pub history_dates: Vec<NytDailyEntry>,
     pattern_table: PatternTable,
     guess_index: HashMap<String, usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactSuggestionMode {
+    Exhaustive,
+    Pooled,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ExactSubsetKey(Box<[usize]>);
+
+impl ExactSubsetKey {
+    fn from_sorted_subset(subset: &[usize]) -> Self {
+        debug_assert!(subset.windows(2).all(|window| window[0] < window[1]));
+        Self(subset.to_vec().into_boxed_slice())
+    }
 }
 
 impl Solver {
@@ -239,27 +256,54 @@ impl Solver {
 
         suggestions.sort_by(|left, right| compare_suggestions(left, right, &surviving_words));
 
-        if state.surviving.len() <= self.config.exact_threshold {
-            let exact_candidates = self.collect_exact_candidates(state, &suggestions)?;
+        if let Some(exact_mode) = exact_suggestion_mode(&self.config, state.surviving.len()) {
+            let small_state_table =
+                SmallStateTable::build(self.config.exact_exhaustive_threshold.max(2));
+            let exact_candidates = match exact_mode {
+                ExactSuggestionMode::Exhaustive => (0..self.guesses.len()).collect::<Vec<_>>(),
+                ExactSuggestionMode::Pooled => {
+                    self.collect_exact_candidates(state, &suggestions)?
+                }
+            };
             let mut memo = HashMap::new();
-            let mut exact_costs = HashMap::new();
+            let mut exact_costs = vec![None; self.guesses.len()];
 
             for guess_index in exact_candidates {
                 let cost = self.exact_cost_for_guess(
                     guess_index,
                     &state.surviving,
                     &state.weights,
+                    &small_state_table,
                     &mut memo,
                     f64::INFINITY,
                 )?;
-                exact_costs.insert(self.guesses[guess_index].clone(), cost);
+                exact_costs[guess_index] = Some(cost);
             }
 
-            for suggestion in &mut suggestions {
-                suggestion.exact_cost = exact_costs.get(&suggestion.word).copied();
+            match exact_mode {
+                ExactSuggestionMode::Exhaustive => {
+                    for suggestion in &mut suggestions {
+                        suggestion.exact_cost = self
+                            .guess_index
+                            .get(&suggestion.word)
+                            .and_then(|guess_index| exact_costs[*guess_index]);
+                    }
+                    suggestions.sort_by(|left, right| compare_exact(left, right, &surviving_words));
+                }
+                ExactSuggestionMode::Pooled => {
+                    suggestions.sort_by(|left, right| {
+                        let left_cost = self
+                            .guess_index
+                            .get(&left.word)
+                            .and_then(|guess_index| exact_costs[*guess_index]);
+                        let right_cost = self
+                            .guess_index
+                            .get(&right.word)
+                            .and_then(|guess_index| exact_costs[*guess_index]);
+                        compare_exact_costs(left, right, left_cost, right_cost, &surviving_words)
+                    });
+                }
             }
-
-            suggestions.sort_by(|left, right| compare_exact(left, right, &surviving_words));
         }
 
         suggestions.truncate(top);
@@ -510,7 +554,8 @@ impl Solver {
         guess_index: usize,
         subset: &[usize],
         weights: &[f64],
-        memo: &mut HashMap<Vec<usize>, f64>,
+        small_state_table: &SmallStateTable,
+        memo: &mut HashMap<ExactSubsetKey, f64>,
         best_bound: f64,
     ) -> Result<f64> {
         if subset.is_empty() {
@@ -538,8 +583,10 @@ impl Solver {
             let branch_probability = mass / total_weight;
             let child_cost = if pattern == ALL_GREEN_PATTERN {
                 0.0
+            } else if child_subset.len() == subset.len() && child_subset == subset {
+                return Ok(f64::INFINITY);
             } else {
-                self.exact_best_cost(&child_subset, weights, memo)?
+                self.exact_best_cost(&child_subset, weights, small_state_table, memo)?
             };
             cost += branch_probability * child_cost;
             if cost >= best_bound {
@@ -554,7 +601,8 @@ impl Solver {
         &self,
         subset: &[usize],
         weights: &[f64],
-        memo: &mut HashMap<Vec<usize>, f64>,
+        small_state_table: &SmallStateTable,
+        memo: &mut HashMap<ExactSubsetKey, f64>,
     ) -> Result<f64> {
         if subset.is_empty() {
             return Ok(0.0);
@@ -563,19 +611,33 @@ impl Solver {
             return Ok(1.0);
         }
 
-        let mut key = subset.to_vec();
-        key.sort_unstable();
+        let key = ExactSubsetKey::from_sorted_subset(subset);
         if let Some(cached) = memo.get(&key) {
             return Ok(*cached);
         }
 
-        let scores =
-            self.top_guess_indexes_for_subset(subset, weights, self.config.exact_candidate_pool);
+        let scores = match exact_suggestion_mode(&self.config, subset.len()) {
+            Some(ExactSuggestionMode::Exhaustive) => (0..self.guesses.len()).collect::<Vec<_>>(),
+            Some(ExactSuggestionMode::Pooled) | None => {
+                self.top_guess_indexes_for_subset(subset, weights, self.config.exact_candidate_pool)
+            }
+        };
+        let lower_bound = small_state_table.lower_bound(subset.len());
         let mut best_cost = f64::INFINITY;
         for guess_index in scores {
-            let cost = self.exact_cost_for_guess(guess_index, subset, weights, memo, best_cost)?;
+            let cost = self.exact_cost_for_guess(
+                guess_index,
+                subset,
+                weights,
+                small_state_table,
+                memo,
+                best_cost,
+            )?;
             if cost < best_cost {
                 best_cost = cost;
+                if best_cost <= lower_bound {
+                    break;
+                }
             }
         }
         memo.insert(key, best_cost);
@@ -627,6 +689,24 @@ struct PriorMetrics {
     brier: f64,
 }
 
+fn exact_suggestion_mode(
+    config: &PriorConfig,
+    surviving_answers: usize,
+) -> Option<ExactSuggestionMode> {
+    if surviving_answers > config.exact_threshold {
+        return None;
+    }
+    if surviving_answers
+        <= config
+            .exact_exhaustive_threshold
+            .min(config.exact_threshold)
+    {
+        Some(ExactSuggestionMode::Exhaustive)
+    } else {
+        Some(ExactSuggestionMode::Pooled)
+    }
+}
+
 fn compare_suggestions(
     left: &Suggestion,
     right: &Suggestion,
@@ -660,6 +740,23 @@ fn compare_exact(
     }
 }
 
+fn compare_exact_costs(
+    left: &Suggestion,
+    right: &Suggestion,
+    left_cost: Option<f64>,
+    right_cost: Option<f64>,
+    surviving_words: &HashSet<&str>,
+) -> std::cmp::Ordering {
+    match (left_cost, right_cost) {
+        (Some(left_cost), Some(right_cost)) => left_cost
+            .total_cmp(&right_cost)
+            .then_with(|| compare_suggestions(left, right, surviving_words)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => compare_suggestions(left, right, surviving_words),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
@@ -670,7 +767,7 @@ mod tests {
         scoring::{format_feedback_letters, score_guess},
     };
 
-    use super::Solver;
+    use super::{ExactSuggestionMode, Solver, exact_suggestion_mode};
 
     #[test]
     fn parse_observations_rejects_length_mismatch() {
@@ -702,5 +799,26 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 3, 1).expect("valid"),
         );
         assert!(state_weight.final_weight > 0.0);
+    }
+
+    #[test]
+    fn exact_mode_uses_exhaustive_search_for_tiny_states() {
+        let config = PriorConfig::default();
+        assert_eq!(
+            exact_suggestion_mode(&config, config.exact_exhaustive_threshold),
+            Some(ExactSuggestionMode::Exhaustive)
+        );
+    }
+
+    #[test]
+    fn exact_mode_keeps_pooled_search_between_thresholds() {
+        let mut config = PriorConfig::default();
+        config.exact_threshold = 16;
+        config.exact_exhaustive_threshold = 8;
+        assert_eq!(
+            exact_suggestion_mode(&config, 12),
+            Some(ExactSuggestionMode::Pooled)
+        );
+        assert_eq!(exact_suggestion_mode(&config, 17), None);
     }
 }

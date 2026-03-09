@@ -10,8 +10,8 @@ use maybe_wordle::{
     config::PriorConfig,
     data::{ProjectPaths, sync_nyt_history},
     formal::{
-        DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, build_optimal_policy,
-        parse_observations as parse_formal_observations, verify_optimal_policy,
+        DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, FormalVerificationMode, build_optimal_policy,
+        parse_observations as parse_formal_observations, verify_optimal_policy_with_mode,
     },
     gui::run_gui,
     model::build_model_artifacts,
@@ -39,6 +39,8 @@ enum Command {
     VerifyOptimalPolicy {
         #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
         model: String,
+        #[arg(long, default_value_t = false)]
+        oracle: bool,
     },
     Gui,
     AddManual {
@@ -180,12 +182,26 @@ fn run() -> Result<()> {
                 summary.root_objective.expected_guesses
             );
         }
-        Command::VerifyOptimalPolicy { model } => {
-            let summary = verify_optimal_policy(&paths, &model)?;
+        Command::VerifyOptimalPolicy { model, oracle } => {
+            let summary = verify_optimal_policy_with_mode(
+                &paths,
+                &model,
+                if oracle {
+                    FormalVerificationMode::Oracle
+                } else {
+                    FormalVerificationMode::Certificate
+                },
+            )?;
             println!(
-                "model={} manifest={} verified_small_states={} verified_medium_states={}",
+                "model={} manifest={} mode={} verified_cached_states={} verified_small_states={} verified_medium_states={}",
                 summary.model_id,
                 summary.manifest_hash,
+                if summary.mode == FormalVerificationMode::Oracle {
+                    "oracle"
+                } else {
+                    "certificate"
+                },
+                summary.verified_cached_states,
                 summary.verified_small_states,
                 summary.verified_medium_states
             );

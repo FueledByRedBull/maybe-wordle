@@ -6,4 +6,5 @@ pub mod model;
 pub mod pattern_table;
 pub mod scoring;
 pub mod seed;
+pub mod small_state;
 pub mod solver;
