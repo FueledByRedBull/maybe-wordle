@@ -193,5 +193,8 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
     );
     let tuned: PriorConfig = toml::from_str(&summary.replacement_toml).expect("parse tuned config");
     assert!(tuned.lookahead_threshold >= tuned.exact_threshold);
+    let hard_cases = solver.hard_case_report(5).expect("hard cases");
+    assert!(!hard_cases.cases.is_empty());
+    assert!(summary.current.hard_case_failures <= hard_cases.cases.len());
     let _ = std::fs::remove_dir_all(&root);
 }

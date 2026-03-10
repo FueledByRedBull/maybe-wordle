@@ -72,6 +72,35 @@ fn bench_predictive_lookahead(c: &mut Criterion) {
     });
 }
 
+fn bench_predictive_danger_escalated_exact(c: &mut Criterion) {
+    let fixture = predictive_fixture();
+    let paths = ProjectPaths::new(&fixture.root);
+    let mut config = PriorConfig::default();
+    config.exact_threshold = 4;
+    config.exact_exhaustive_threshold = 2;
+    config.lookahead_threshold = 4;
+    config.danger_lookahead_threshold = 0.0;
+    config.danger_exact_threshold = 0.0;
+    config.danger_exact_root_pool = 10;
+    config.danger_exact_survivor_cap = 16;
+    let solver = Solver::from_paths(&paths, &config).expect("solver");
+    let state = solver.initial_state(bench_date());
+
+    c.bench_function("predictive_danger_escalated_exact_suggestions", |bench| {
+        bench.iter(|| solver.suggestions(&state, 5).expect("suggestions"));
+    });
+}
+
+fn bench_predictive_hard_cases(c: &mut Criterion) {
+    let fixture = predictive_fixture();
+    let paths = ProjectPaths::new(&fixture.root);
+    let solver = Solver::from_paths(&paths, &PriorConfig::default()).expect("solver");
+
+    c.bench_function("predictive_hard_case_report", |bench| {
+        bench.iter(|| solver.hard_case_report(5).expect("hard cases"));
+    });
+}
+
 fn bench_formal_build(c: &mut Criterion) {
     let fixture = formal_fixture();
     let paths = ProjectPaths::new(&fixture.root);
@@ -222,6 +251,8 @@ criterion_group!(
     bench_predictive_recursive_exact,
     bench_predictive_proxy_only,
     bench_predictive_lookahead,
+    bench_predictive_danger_escalated_exact,
+    bench_predictive_hard_cases,
     bench_formal_build,
     bench_formal_suggest,
     bench_formal_verify_certificate,

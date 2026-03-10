@@ -919,6 +919,12 @@ impl FormalPolicyRuntime {
         Ok(next)
     }
 
+    pub fn has_guess(&self, guess: &str) -> bool {
+        self.model
+            .guess_index
+            .contains_key(&guess.to_ascii_lowercase())
+    }
+
     pub fn suggest(&self, state: &StateKey, top: usize) -> Result<Vec<FormalSuggestion>> {
         let mut evaluations = self.evaluate_state_ranked(state)?;
         evaluations.truncate(top);

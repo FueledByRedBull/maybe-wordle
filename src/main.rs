@@ -94,6 +94,10 @@ enum Command {
         to: Option<String>,
         #[arg(long, default_value_t = 5)]
         top: usize,
+        #[arg(long, default_value_t = false)]
+        detailed: bool,
+        #[arg(long, default_value_t = false)]
+        failures_only: bool,
     },
     Experiments {
         #[arg(long)]
@@ -258,23 +262,7 @@ fn run() -> Result<()> {
                     state.total_weight
                 );
                 for suggestion in solver.suggestions(&state, top)? {
-                    match suggestion.exact_cost {
-                        Some(exact_cost) => println!(
-                            "{} entropy={:.5} solve_prob={:.5} expected_remaining={:.3} exact_cost={:.5}",
-                            suggestion.word,
-                            suggestion.entropy,
-                            suggestion.solve_probability,
-                            suggestion.expected_remaining,
-                            exact_cost
-                        ),
-                        None => println!(
-                            "{} entropy={:.5} solve_prob={:.5} expected_remaining={:.3}",
-                            suggestion.word,
-                            suggestion.entropy,
-                            suggestion.solve_probability,
-                            suggestion.expected_remaining
-                        ),
-                    }
+                    println!("{}", format_predictive_suggestion(&suggestion));
                 }
             }
             SolverMode::FormalOptimal => {
@@ -322,17 +310,7 @@ fn run() -> Result<()> {
                         state.total_weight
                     );
                     for suggestion in solver.suggestions(&state, top)? {
-                        println!(
-                            "{} entropy={:.5} solve_prob={:.5} expected_remaining={:.3}{}",
-                            suggestion.word,
-                            suggestion.entropy,
-                            suggestion.solve_probability,
-                            suggestion.expected_remaining,
-                            suggestion
-                                .exact_cost
-                                .map(|cost| format!(" exact_cost={:.5}", cost))
-                                .unwrap_or_default()
-                        );
+                        println!("{}", format_predictive_suggestion(&suggestion));
                     }
 
                     print!("guess (blank to stop): ");
@@ -341,14 +319,25 @@ fn run() -> Result<()> {
                     if guess.trim().is_empty() {
                         break;
                     }
+                    let guess = match normalize_interactive_guess(&guess, |candidate| {
+                        solver.has_guess(candidate)
+                    }) {
+                        Ok(guess) => guess,
+                        Err(error) => {
+                            println!("error: {error}");
+                            continue;
+                        }
+                    };
 
                     print!("feedback (01020 or bgybb): ");
                     io::stdout().flush().context("failed to flush stdout")?;
                     let feedback = read_line()?;
-                    observations.push((
-                        guess.trim().to_ascii_lowercase(),
-                        maybe_wordle::scoring::parse_feedback(&feedback)?,
-                    ));
+                    match try_append_observation(&observations, &guess, &feedback, |next| {
+                        solver.apply_history(as_of, next).map(|_| ())
+                    }) {
+                        Ok(next) => observations = next,
+                        Err(error) => println!("error: {error}"),
+                    }
                 }
             }
             SolverMode::FormalOptimal => {
@@ -384,14 +373,25 @@ fn run() -> Result<()> {
                     if guess.trim().is_empty() {
                         break;
                     }
+                    let guess = match normalize_interactive_guess(&guess, |candidate| {
+                        runtime.has_guess(candidate)
+                    }) {
+                        Ok(guess) => guess,
+                        Err(error) => {
+                            println!("error: {error}");
+                            continue;
+                        }
+                    };
 
                     print!("feedback (01020 or bgybb): ");
                     io::stdout().flush().context("failed to flush stdout")?;
                     let feedback = read_line()?;
-                    observations.push((
-                        guess.trim().to_ascii_lowercase(),
-                        maybe_wordle::scoring::parse_feedback(&feedback)?,
-                    ));
+                    match try_append_observation(&observations, &guess, &feedback, |next| {
+                        runtime.apply_history(next).map(|_| ())
+                    }) {
+                        Ok(next) => observations = next,
+                        Err(error) => println!("error: {error}"),
+                    }
                 }
             }
         },
@@ -434,7 +434,13 @@ fn run() -> Result<()> {
                 );
             }
         }
-        Command::Backtest { from, to, top } => {
+        Command::Backtest {
+            from,
+            to,
+            top,
+            detailed,
+            failures_only,
+        } => {
             let solver = Solver::from_paths(&paths, &config)?;
             let (default_from, default_to) = Solver::latest_history_range(&paths)?
                 .ok_or_else(|| anyhow!("run sync-data before backtesting"))?;
@@ -443,7 +449,8 @@ fn run() -> Result<()> {
             if from > to {
                 bail!("--from cannot be after --to");
             }
-            let stats = solver.backtest(from, to, top)?;
+            let report = solver.backtest_detailed(from, to, top)?;
+            let stats = &report.summary;
             println!(
                 "games={} average_guesses={:.4} p95={} max={} failures={} coverage_gaps={}",
                 stats.games,
@@ -453,6 +460,58 @@ fn run() -> Result<()> {
                 stats.failures,
                 stats.coverage_gaps
             );
+            if detailed {
+                for run in report.runs.iter().filter(|run| {
+                    if failures_only {
+                        !run.solved
+                    } else {
+                        !run.solved || run.steps.len() >= 5
+                    }
+                }) {
+                    println!(
+                        "target={} date={} solved={} guesses={}",
+                        run.target,
+                        run.date,
+                        run.solved,
+                        run.steps.len()
+                    );
+                    for (index, step) in run.steps.iter().enumerate() {
+                        println!(
+                            "step={} guess={} feedback={} survivors={}=>{} regime={} danger_score={:.3} danger_escalated={} chosen_force_in_two={} alternative_force_in_two={}",
+                            index + 1,
+                            step.guess,
+                            maybe_wordle::scoring::format_feedback_letters(step.feedback),
+                            step.surviving_before,
+                            step.surviving_after,
+                            step.regime_used.label(),
+                            step.danger_score,
+                            step.danger_escalated,
+                            step.chosen_force_in_two,
+                            step.alternative_force_in_two
+                        );
+                        for suggestion in &step.top_suggestions {
+                            println!(
+                                "  top={} force_in_two={} worst_non_green_bucket_size={} largest_non_green_bucket_mass={:.5}{}{}",
+                                suggestion.word,
+                                suggestion.force_in_two,
+                                suggestion.worst_non_green_bucket_size,
+                                suggestion.largest_non_green_bucket_mass,
+                                suggestion
+                                    .proxy_cost
+                                    .map(|value| format!(" proxy_cost={:.5}", value))
+                                    .unwrap_or_default(),
+                                suggestion
+                                    .exact_cost
+                                    .map(|value| format!(" exact_cost={:.5}", value))
+                                    .or_else(|| suggestion
+                                        .lookahead_cost
+                                        .map(|value| format!(" lookahead_cost={:.5}", value)))
+                                    .unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
         }
         Command::Experiments { from, to, top } => {
             let (default_from, default_to) = Solver::latest_history_range(&paths)?
@@ -492,7 +551,7 @@ fn run() -> Result<()> {
         Command::TunePrior => {
             let summary = Solver::tune_prior(&paths, &config)?;
             println!(
-                "search_window={}..{} validation_window={}..{} current_avg_guesses={:.4} current_failures={} current_coverage_gaps={} current_log_loss={:.6} current_target_rank={:.2} current_latency_p95_ms={:.3}",
+                "search_window={}..{} validation_window={}..{} current_avg_guesses={:.4} current_failures={} current_coverage_gaps={} current_log_loss={:.6} current_target_rank={:.2} current_latency_p95_ms={:.3} current_hard_case_avg_guesses={:.4} current_hard_case_failures={} current_regime_mix=proxy:{:.1}%/lookahead:{:.1}%/escalated_exact:{:.1}%/exact:{:.1}%",
                 summary.search_window_start,
                 summary.search_window_end,
                 summary.validation_window_start,
@@ -502,16 +561,28 @@ fn run() -> Result<()> {
                 summary.current.coverage_gaps,
                 summary.current.average_log_loss,
                 summary.current.average_target_rank,
-                summary.current.latency_p95_ms
+                summary.current.latency_p95_ms,
+                summary.current.hard_case_average_guesses,
+                summary.current.hard_case_failures,
+                summary.current.proxy_step_pct * 100.0,
+                summary.current.lookahead_step_pct * 100.0,
+                summary.current.escalated_exact_step_pct * 100.0,
+                summary.current.exact_step_pct * 100.0
             );
             println!(
-                "best_avg_guesses={:.4} best_failures={} best_coverage_gaps={} best_log_loss={:.6} best_target_rank={:.2} best_latency_p95_ms={:.3}",
+                "best_avg_guesses={:.4} best_failures={} best_coverage_gaps={} best_log_loss={:.6} best_target_rank={:.2} best_latency_p95_ms={:.3} best_hard_case_avg_guesses={:.4} best_hard_case_failures={} best_regime_mix=proxy:{:.1}%/lookahead:{:.1}%/escalated_exact:{:.1}%/exact:{:.1}%",
                 summary.best.average_guesses,
                 summary.best.failures,
                 summary.best.coverage_gaps,
                 summary.best.average_log_loss,
                 summary.best.average_target_rank,
-                summary.best.latency_p95_ms
+                summary.best.latency_p95_ms,
+                summary.best.hard_case_average_guesses,
+                summary.best.hard_case_failures,
+                summary.best.proxy_step_pct * 100.0,
+                summary.best.lookahead_step_pct * 100.0,
+                summary.best.escalated_exact_step_pct * 100.0,
+                summary.best.exact_step_pct * 100.0
             );
             println!("{}", summary.replacement_toml.trim_end());
         }
@@ -583,6 +654,51 @@ fn read_line() -> Result<String> {
     Ok(buffer)
 }
 
+fn normalize_interactive_guess<F>(guess: &str, has_guess: F) -> std::result::Result<String, String>
+where
+    F: FnOnce(&str) -> bool,
+{
+    let normalized = guess.trim().to_ascii_lowercase();
+    if !has_guess(&normalized) {
+        return Err(format!("unknown guess: {}", normalized));
+    }
+    Ok(normalized)
+}
+
+fn try_append_observation<F>(
+    observations: &[(String, u8)],
+    guess: &str,
+    feedback: &str,
+    validate: F,
+) -> std::result::Result<Vec<(String, u8)>, String>
+where
+    F: FnOnce(&[(String, u8)]) -> Result<()>,
+{
+    let pattern =
+        maybe_wordle::scoring::parse_feedback(feedback).map_err(|error| error.to_string())?;
+    let mut next = observations.to_vec();
+    next.push((guess.to_ascii_lowercase(), pattern));
+    validate(&next).map_err(|error| error.to_string())?;
+    Ok(next)
+}
+
+fn format_predictive_suggestion(suggestion: &maybe_wordle::solver::Suggestion) -> String {
+    let mut line = format!(
+        "{} entropy={:.5} solve_prob={:.5} expected_remaining={:.3}",
+        suggestion.word,
+        suggestion.entropy,
+        suggestion.solve_probability,
+        suggestion.expected_remaining
+    );
+    if suggestion.force_in_two {
+        line.push_str(" force_in_two=true");
+    }
+    if let Some(exact_cost) = suggestion.exact_cost {
+        line.push_str(&format!(" exact_cost={:.5}", exact_cost));
+    }
+    line
+}
+
 fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "union" => Ok(MergeStrategy::Union),
@@ -596,5 +712,67 @@ fn parse_solver_mode(raw: &str) -> Result<SolverMode> {
         "predictive" => Ok(SolverMode::Predictive),
         "formal-optimal" | "formal_optimal" | "formal" | "optimal" => Ok(SolverMode::FormalOptimal),
         _ => bail!("mode must be one of: predictive, formal-optimal"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::{
+        format_predictive_suggestion, normalize_interactive_guess, try_append_observation,
+    };
+
+    #[test]
+    fn try_append_observation_rejects_invalid_feedback_without_mutation() {
+        let observations = vec![("crane".to_string(), 0)];
+        let result = try_append_observation(&observations, "slate", "oops", |_| Ok(()));
+        assert!(result.is_err());
+        assert_eq!(observations.len(), 1);
+    }
+
+    #[test]
+    fn try_append_observation_rejects_contradictions_without_mutation() {
+        let observations = vec![("crane".to_string(), 0)];
+        let result = try_append_observation(&observations, "slate", "00000", |_| {
+            Err(anyhow!("no answers remain"))
+        });
+        assert!(result.is_err());
+        assert_eq!(observations.len(), 1);
+    }
+
+    #[test]
+    fn try_append_observation_commits_valid_observation() {
+        let observations = vec![("crane".to_string(), 0)];
+        let result = try_append_observation(&observations, "slate", "00000", |_| Ok(()))
+            .expect("valid observation");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], observations[0]);
+        assert_eq!(result[1].0, "slate");
+    }
+
+    #[test]
+    fn normalize_interactive_guess_rejects_unknown_guess() {
+        let result = normalize_interactive_guess("slate", |guess| guess == "crane");
+        assert_eq!(result.expect_err("must fail"), "unknown guess: slate");
+    }
+
+    #[test]
+    fn predictive_suggestion_format_includes_force_in_two_marker() {
+        let formatted = format_predictive_suggestion(&maybe_wordle::solver::Suggestion {
+            word: "crane".into(),
+            entropy: 4.0,
+            solve_probability: 0.2,
+            expected_remaining: 3.0,
+            force_in_two: true,
+            worst_non_green_bucket_size: 1,
+            largest_non_green_bucket_mass: 0.05,
+            proxy_cost: Some(2.0),
+            posterior_answer_probability: 0.1,
+            lookahead_cost: None,
+            exact_cost: Some(2.5),
+        });
+        assert!(formatted.contains("force_in_two=true"));
+        assert!(formatted.contains("exact_cost=2.50000"));
     }
 }

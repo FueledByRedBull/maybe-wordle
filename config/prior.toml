@@ -10,6 +10,13 @@ exact_candidate_pool = 96
 lookahead_threshold = 160
 lookahead_candidate_pool = 24
 lookahead_reply_pool = 12
+lookahead_root_force_in_two_scan = 64
+danger_lookahead_threshold = 0.58
+danger_exact_threshold = 0.72
+danger_reply_pool_bonus = 8
+danger_exact_root_pool = 24
+danger_exact_survivor_cap = 192
+lookahead_trap_penalty = 0.35
 sync_reverify_days = 3
 
 [manual_weights]
