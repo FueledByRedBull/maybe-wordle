@@ -15,6 +15,9 @@ pub struct PriorConfig {
     pub exact_threshold: usize,
     pub exact_exhaustive_threshold: usize,
     pub exact_candidate_pool: usize,
+    pub lookahead_threshold: usize,
+    pub lookahead_candidate_pool: usize,
+    pub lookahead_reply_pool: usize,
     pub sync_reverify_days: i64,
     pub manual_weights: BTreeMap<String, f64>,
 }
@@ -22,15 +25,18 @@ pub struct PriorConfig {
 impl Default for PriorConfig {
     fn default() -> Self {
         Self {
-            base_seed_weight: 1.0,
-            base_history_only_weight: 0.25,
-            cooldown_days: 180,
-            cooldown_floor: 0.01,
-            midpoint_days: 720.0,
-            logistic_k: 0.01,
+            base_seed_weight: 0.75,
+            base_history_only_weight: 0.50,
+            cooldown_days: 365,
+            cooldown_floor: 0.0,
+            midpoint_days: 1080.0,
+            logistic_k: 0.02,
             exact_threshold: 64,
             exact_exhaustive_threshold: 12,
             exact_candidate_pool: 96,
+            lookahead_threshold: 160,
+            lookahead_candidate_pool: 24,
+            lookahead_reply_pool: 12,
             sync_reverify_days: 3,
             manual_weights: BTreeMap::new(),
         }
@@ -65,5 +71,30 @@ impl PriorConfig {
             .iter()
             .map(|(key, value)| (key.trim().to_ascii_lowercase(), *value))
             .collect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PriorConfig;
+
+    #[test]
+    fn prior_config_round_trips_lookahead_fields() {
+        let mut config = PriorConfig::default();
+        config.exact_exhaustive_threshold = 14;
+        config.lookahead_threshold = 144;
+        config.lookahead_candidate_pool = 18;
+        config.lookahead_reply_pool = 9;
+        let encoded = toml::to_string_pretty(&config).expect("encode");
+        assert!(encoded.contains("exact_exhaustive_threshold = 14"));
+        assert!(encoded.contains("lookahead_threshold = 144"));
+        assert!(encoded.contains("lookahead_candidate_pool = 18"));
+        assert!(encoded.contains("lookahead_reply_pool = 9"));
+
+        let decoded: PriorConfig = toml::from_str(&encoded).expect("decode");
+        assert_eq!(decoded.exact_exhaustive_threshold, 14);
+        assert_eq!(decoded.lookahead_threshold, 144);
+        assert_eq!(decoded.lookahead_candidate_pool, 18);
+        assert_eq!(decoded.lookahead_reply_pool, 9);
     }
 }

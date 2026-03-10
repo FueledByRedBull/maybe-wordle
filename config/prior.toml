@@ -1,11 +1,15 @@
-base_seed_weight = 1.0
-base_history_only_weight = 0.25
-cooldown_days = 180
-cooldown_floor = 0.01
-midpoint_days = 720.0
-logistic_k = 0.01
+base_seed_weight = 0.75
+base_history_only_weight = 0.50
+cooldown_days = 365
+cooldown_floor = 0.00
+midpoint_days = 1080.0
+logistic_k = 0.020
 exact_threshold = 64
+exact_exhaustive_threshold = 12
 exact_candidate_pool = 96
+lookahead_threshold = 160
+lookahead_candidate_pool = 24
+lookahead_reply_pool = 12
 sync_reverify_days = 3
 
 [manual_weights]

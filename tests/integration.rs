@@ -1,12 +1,16 @@
 use std::path::Path;
 
+use chrono::NaiveDate;
 use maybe_wordle::{
-    data::ProjectPaths,
+    config::PriorConfig,
+    data::{NytDailyEntry, ProjectPaths, write_history_jsonl},
     formal::{
         DEFAULT_EXPECTED_ONLY_MODEL_ID, DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime,
         FormalVerificationMode, build_optimal_policy, verify_optimal_policy_with_mode,
     },
+    model::{ModelVariant, WeightMode, build_model_artifacts},
     scoring::{format_feedback_letters, parse_feedback, score_guess},
+    solver::Solver,
 };
 
 #[test]
@@ -28,6 +32,54 @@ fn write_fixture(path: &Path, contents: &str) {
         std::fs::create_dir_all(parent).expect("parent");
     }
     std::fs::write(path, contents).expect("fixture");
+}
+
+fn write_predictive_fixture(paths: &ProjectPaths) {
+    write_fixture(
+        &paths.seed_guesses,
+        "cigar\nrebut\nsissy\nhumph\nawake\nblush\nfocal\nevade\nnaval\nserve\nheath\ndwarf\nmodel\nkarma\nstink\ngrade\n",
+    );
+    write_fixture(
+        &paths.seed_answers,
+        "cigar\nrebut\nsissy\nhumph\nawake\nblush\nfocal\nevade\nnaval\nserve\nheath\ndwarf\n",
+    );
+    write_fixture(&paths.seed_reference_answers, "");
+    write_fixture(&paths.seed_sources, "");
+    write_fixture(&paths.manual_additions, "");
+    write_history_jsonl(
+        &paths.raw_history,
+        &[
+            NytDailyEntry {
+                id: Some(1),
+                solution: "cigar".into(),
+                print_date: NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"),
+                days_since_launch: None,
+                editor: None,
+            },
+            NytDailyEntry {
+                id: Some(2),
+                solution: "rebut".into(),
+                print_date: NaiveDate::from_ymd_opt(2024, 1, 2).expect("date"),
+                days_since_launch: None,
+                editor: None,
+            },
+            NytDailyEntry {
+                id: Some(3),
+                solution: "sissy".into(),
+                print_date: NaiveDate::from_ymd_opt(2024, 1, 3).expect("date"),
+                days_since_launch: None,
+                editor: None,
+            },
+            NytDailyEntry {
+                id: Some(4),
+                solution: "humph".into(),
+                print_date: NaiveDate::from_ymd_opt(2024, 1, 4).expect("date"),
+                days_since_launch: None,
+                editor: None,
+            },
+        ],
+    )
+    .expect("history");
 }
 
 #[test]
@@ -84,5 +136,62 @@ fn expected_only_model_builds_separately() {
     )
     .expect("verify");
     assert_eq!(verify.verified_cached_states, summary.solved_states);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn predictive_experiments_and_tuning_work_on_toy_fixture() {
+    let root = std::env::temp_dir().join("maybe-wordle-integration-predictive");
+    let _ = std::fs::remove_dir_all(&root);
+    let paths = ProjectPaths::new(&root);
+    paths.ensure_layout().expect("layout");
+    write_predictive_fixture(&paths);
+
+    let config = PriorConfig::default();
+    write_fixture(
+        &paths.config_prior,
+        &toml::to_string_pretty(&config).expect("config"),
+    );
+    build_model_artifacts(
+        &paths,
+        &config,
+        NaiveDate::from_ymd_opt(2024, 1, 5).expect("date"),
+    )
+    .expect("model");
+
+    let solver = Solver::from_paths(&paths, &config).expect("solver");
+    let state = solver
+        .apply_history(NaiveDate::from_ymd_opt(2024, 1, 5).expect("date"), &[])
+        .expect("state");
+    let suggestions = solver.suggestions(&state, 5).expect("suggestions");
+    assert!(!suggestions.is_empty());
+
+    for mode in [
+        WeightMode::Uniform,
+        WeightMode::CooldownOnly,
+        WeightMode::Weighted,
+    ] {
+        for variant in [ModelVariant::SeedOnly, ModelVariant::SeedPlusHistory] {
+            let solver =
+                Solver::from_paths_with_settings(&paths, &config, mode, variant).expect("solver");
+            let report = solver
+                .experiment_report(
+                    NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"),
+                    NaiveDate::from_ymd_opt(2024, 1, 4).expect("date"),
+                    5,
+                )
+                .expect("report");
+            assert!(report.latency_p95_ms >= 0.0);
+        }
+    }
+
+    let summary = Solver::tune_prior(&paths, &config).expect("tune");
+    assert!(
+        summary
+            .replacement_toml
+            .contains("exact_exhaustive_threshold")
+    );
+    let tuned: PriorConfig = toml::from_str(&summary.replacement_toml).expect("parse tuned config");
+    assert!(tuned.lookahead_threshold >= tuned.exact_threshold);
     let _ = std::fs::remove_dir_all(&root);
 }

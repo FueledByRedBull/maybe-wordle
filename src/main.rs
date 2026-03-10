@@ -103,6 +103,7 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         top: usize,
     },
+    TunePrior,
     Benchmark {
         #[arg(long, default_value_t = 3)]
         runs: usize,
@@ -470,7 +471,8 @@ fn run() -> Result<()> {
                     let solver = Solver::from_paths_with_settings(&paths, &config, mode, variant)?;
                     let result = solver.experiment_report(from, to, top)?;
                     println!(
-                        "mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_log_loss={:.6} avg_brier={:.6} avg_target_prob={:.6} avg_target_rank={:.2}",
+                        "config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_log_loss={:.6} avg_brier={:.6} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3}",
+                        result.config_id,
                         result.mode.label(),
                         result.variant.label(),
                         result.backtest.games,
@@ -481,10 +483,37 @@ fn run() -> Result<()> {
                         result.average_log_loss,
                         result.average_brier,
                         result.average_target_probability,
-                        result.average_target_rank
+                        result.average_target_rank,
+                        result.latency_p95_ms
                     );
                 }
             }
+        }
+        Command::TunePrior => {
+            let summary = Solver::tune_prior(&paths, &config)?;
+            println!(
+                "search_window={}..{} validation_window={}..{} current_avg_guesses={:.4} current_failures={} current_coverage_gaps={} current_log_loss={:.6} current_target_rank={:.2} current_latency_p95_ms={:.3}",
+                summary.search_window_start,
+                summary.search_window_end,
+                summary.validation_window_start,
+                summary.validation_window_end,
+                summary.current.average_guesses,
+                summary.current.failures,
+                summary.current.coverage_gaps,
+                summary.current.average_log_loss,
+                summary.current.average_target_rank,
+                summary.current.latency_p95_ms
+            );
+            println!(
+                "best_avg_guesses={:.4} best_failures={} best_coverage_gaps={} best_log_loss={:.6} best_target_rank={:.2} best_latency_p95_ms={:.3}",
+                summary.best.average_guesses,
+                summary.best.failures,
+                summary.best.coverage_gaps,
+                summary.best.average_log_loss,
+                summary.best.average_target_rank,
+                summary.best.latency_p95_ms
+            );
+            println!("{}", summary.replacement_toml.trim_end());
         }
         Command::Benchmark { runs, mode, model } => {
             if runs == 0 {

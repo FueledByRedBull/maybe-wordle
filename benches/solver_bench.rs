@@ -20,7 +20,6 @@ use maybe_wordle::{
 
 struct PredictiveBenchFixture {
     root: PathBuf,
-    config: PriorConfig,
 }
 
 struct FormalBenchFixture {
@@ -30,10 +29,45 @@ struct FormalBenchFixture {
 fn bench_predictive_recursive_exact(c: &mut Criterion) {
     let fixture = predictive_fixture();
     let paths = ProjectPaths::new(&fixture.root);
-    let solver = Solver::from_paths(&paths, &fixture.config).expect("solver");
+    let mut config = PriorConfig::default();
+    config.exact_threshold = 16;
+    config.exact_exhaustive_threshold = 8;
+    config.exact_candidate_pool = 12;
+    let solver = Solver::from_paths(&paths, &config).expect("solver");
     let state = solver.initial_state(bench_date());
 
     c.bench_function("predictive_recursive_exact_suggestions", |bench| {
+        bench.iter(|| solver.suggestions(&state, 5).expect("suggestions"));
+    });
+}
+
+fn bench_predictive_proxy_only(c: &mut Criterion) {
+    let fixture = predictive_fixture();
+    let paths = ProjectPaths::new(&fixture.root);
+    let mut config = PriorConfig::default();
+    config.exact_threshold = 0;
+    config.lookahead_threshold = 0;
+    let solver = Solver::from_paths(&paths, &config).expect("solver");
+    let state = solver.initial_state(bench_date());
+
+    c.bench_function("predictive_proxy_only_suggestions", |bench| {
+        bench.iter(|| solver.suggestions(&state, 5).expect("suggestions"));
+    });
+}
+
+fn bench_predictive_lookahead(c: &mut Criterion) {
+    let fixture = predictive_fixture();
+    let paths = ProjectPaths::new(&fixture.root);
+    let mut config = PriorConfig::default();
+    config.exact_threshold = 8;
+    config.exact_exhaustive_threshold = 6;
+    config.lookahead_threshold = 16;
+    config.lookahead_candidate_pool = 8;
+    config.lookahead_reply_pool = 4;
+    let solver = Solver::from_paths(&paths, &config).expect("solver");
+    let state = solver.initial_state(bench_date());
+
+    c.bench_function("predictive_lookahead_suggestions", |bench| {
         bench.iter(|| solver.suggestions(&state, 5).expect("suggestions"));
     });
 }
@@ -133,17 +167,13 @@ fn predictive_fixture() -> &'static PredictiveBenchFixture {
         write_fixture(&paths.manual_additions, "");
         write_fixture(&paths.raw_history, "");
 
-        let mut config = PriorConfig::default();
-        config.exact_threshold = 16;
-        config.exact_exhaustive_threshold = 8;
-        config.exact_candidate_pool = 12;
         write_fixture(
             &paths.config_prior,
-            &toml::to_string_pretty(&config).expect("config toml"),
+            &toml::to_string_pretty(&PriorConfig::default()).expect("config toml"),
         );
-        build_model_artifacts(&paths, &config, bench_date()).expect("model");
+        build_model_artifacts(&paths, &PriorConfig::default(), bench_date()).expect("model");
 
-        PredictiveBenchFixture { root, config }
+        PredictiveBenchFixture { root }
     })
 }
 
@@ -190,6 +220,8 @@ fn unique_bench_root(label: &str) -> PathBuf {
 criterion_group!(
     benches,
     bench_predictive_recursive_exact,
+    bench_predictive_proxy_only,
+    bench_predictive_lookahead,
     bench_formal_build,
     bench_formal_suggest,
     bench_formal_verify_certificate,

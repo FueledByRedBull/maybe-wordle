@@ -407,7 +407,7 @@ mod tests {
             in_seed: true,
             manual_entry: false,
             manual_weight: 1.0,
-            history_dates: vec![NaiveDate::from_ymd_opt(2026, 3, 1).expect("valid")],
+            history_dates: vec![NaiveDate::from_ymd_opt(2024, 3, 1).expect("valid")],
         };
 
         let snapshot = weight_snapshot(
@@ -415,8 +415,8 @@ mod tests {
             &config,
             NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid"),
         );
-        assert_eq!(snapshot.base_weight, 1.0);
-        assert!((snapshot.recency_weight - config.cooldown_floor).abs() < f64::EPSILON);
+        assert_eq!(snapshot.base_weight, config.base_seed_weight);
+        assert!(snapshot.recency_weight > config.cooldown_floor);
         assert!(snapshot.final_weight > 0.0);
     }
 

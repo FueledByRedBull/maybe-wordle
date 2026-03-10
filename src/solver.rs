@@ -1,6 +1,7 @@
 use std::{
     array,
     collections::{HashMap, HashSet},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,6 +28,9 @@ pub struct Suggestion {
     pub entropy: f64,
     pub solve_probability: f64,
     pub expected_remaining: f64,
+    pub proxy_cost: Option<f64>,
+    pub posterior_answer_probability: f64,
+    pub lookahead_cost: Option<f64>,
     pub exact_cost: Option<f64>,
 }
 
@@ -63,6 +67,7 @@ pub struct BacktestStats {
 
 #[derive(Clone, Debug)]
 pub struct ExperimentResult {
+    pub config_id: String,
     pub mode: WeightMode,
     pub variant: ModelVariant,
     pub backtest: BacktestStats,
@@ -70,6 +75,36 @@ pub struct ExperimentResult {
     pub average_brier: f64,
     pub average_target_probability: f64,
     pub average_target_rank: f64,
+    pub latency_p95_ms: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct TuningEvaluation {
+    pub config: PriorConfig,
+    pub average_guesses: f64,
+    pub failures: usize,
+    pub coverage_gaps: usize,
+    pub average_log_loss: f64,
+    pub average_target_rank: f64,
+    pub latency_p95_ms: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct TunePriorSummary {
+    pub search_window_start: NaiveDate,
+    pub search_window_end: NaiveDate,
+    pub validation_window_start: NaiveDate,
+    pub validation_window_end: NaiveDate,
+    pub current: TuningEvaluation,
+    pub best: TuningEvaluation,
+    pub replacement_toml: String,
+}
+
+#[derive(Clone, Debug)]
+struct PriorSearchEvaluation {
+    average_log_loss: f64,
+    average_target_rank: f64,
+    average_target_probability: f64,
 }
 
 pub struct Solver {
@@ -88,6 +123,23 @@ pub struct Solver {
 enum ExactSuggestionMode {
     Exhaustive,
     Pooled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PredictiveSearchMode {
+    ProxyOnly,
+    Lookahead,
+    Exact(ExactSuggestionMode),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GuessMetrics {
+    guess_index: usize,
+    entropy: f64,
+    solve_probability: f64,
+    expected_remaining: f64,
+    proxy_cost: f64,
+    posterior_answer_probability: f64,
 }
 
 const EXACT_SUBSET_INLINE_CAPACITY: usize = 16;
@@ -172,46 +224,29 @@ impl ExactSearchScratch {
     }
 }
 
-struct ExactEntropyScratch {
+struct GuessMetricScratch {
     masses: [f64; PATTERN_SPACE],
+    counts: [usize; PATTERN_SPACE],
+    weighted_log_sums: [f64; PATTERN_SPACE],
     touched_patterns: Vec<u8>,
 }
 
-impl ExactEntropyScratch {
+impl GuessMetricScratch {
     fn new() -> Self {
         Self {
             masses: [0.0; PATTERN_SPACE],
+            counts: [0; PATTERN_SPACE],
+            weighted_log_sums: [0.0; PATTERN_SPACE],
             touched_patterns: Vec::with_capacity(PATTERN_SPACE),
         }
     }
 
-    fn score_guess(
-        &mut self,
-        solver: &Solver,
-        guess_index: usize,
-        subset: &[usize],
-        weights: &[f64],
-        total_weight: f64,
-    ) -> (usize, f64) {
-        for answer_index in subset {
-            let pattern = solver.pattern_table.get(guess_index, *answer_index) as usize;
-            if self.masses[pattern] == 0.0 {
-                self.touched_patterns.push(pattern as u8);
-            }
-            self.masses[pattern] += weights[*answer_index];
-        }
-        let entropy = self
-            .touched_patterns
-            .iter()
-            .map(|pattern| {
-                let probability = self.masses[*pattern as usize] / total_weight;
-                -probability * probability.log2()
-            })
-            .sum::<f64>();
+    fn reset(&mut self) {
         for pattern in self.touched_patterns.drain(..) {
             self.masses[pattern as usize] = 0.0;
+            self.counts[pattern as usize] = 0;
+            self.weighted_log_sums[pattern as usize] = 0.0;
         }
-        (guess_index, entropy)
     }
 }
 
@@ -333,52 +368,62 @@ impl Solver {
         if state.surviving.is_empty() {
             bail!("cannot score guesses with an empty state");
         }
+        let search_mode = predictive_search_mode(&self.config, state.surviving.len());
         let surviving_words = state
             .surviving
             .iter()
             .map(|index| self.answers[*index].word.as_str())
             .collect::<HashSet<_>>();
-
-        let mut suggestions = (0..self.guesses.len())
-            .into_par_iter()
-            .map(|guess_index| {
-                let mut masses = [0.0f64; PATTERN_SPACE];
-                let mut counts = [0usize; PATTERN_SPACE];
-                for answer_index in &state.surviving {
-                    let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
-                    masses[pattern] += state.weights[*answer_index];
-                    counts[pattern] += 1;
-                }
-
-                let entropy = masses
-                    .iter()
-                    .filter(|mass| **mass > 0.0)
-                    .map(|mass| {
-                        let probability = mass / state.total_weight;
-                        -probability * probability.log2()
-                    })
-                    .sum::<f64>();
-
-                let expected_remaining = masses
-                    .iter()
-                    .zip(counts.iter())
-                    .filter(|(mass, _)| **mass > 0.0)
-                    .map(|(mass, count)| (mass / state.total_weight) * (*count as f64))
-                    .sum::<f64>();
-
-                Suggestion {
-                    word: self.guesses[guess_index].clone(),
-                    entropy,
-                    solve_probability: masses[ALL_GREEN_PATTERN as usize] / state.total_weight,
-                    expected_remaining,
-                    exact_cost: None,
-                }
+        let metrics = self.score_guess_metrics_for_subset(
+            &state.surviving,
+            &state.weights,
+            &self.exact_small_state_table,
+        );
+        let mut suggestions = metrics
+            .into_iter()
+            .map(|metric| Suggestion {
+                word: self.guesses[metric.guess_index].clone(),
+                entropy: metric.entropy,
+                solve_probability: metric.solve_probability,
+                expected_remaining: metric.expected_remaining,
+                proxy_cost: Some(metric.proxy_cost),
+                posterior_answer_probability: metric.posterior_answer_probability,
+                lookahead_cost: None,
+                exact_cost: None,
             })
             .collect::<Vec<_>>();
 
         suggestions.sort_by(|left, right| compare_suggestions(left, right, &surviving_words));
 
-        if let Some(exact_mode) = exact_suggestion_mode(&self.config, state.surviving.len()) {
+        if let PredictiveSearchMode::Lookahead = search_mode {
+            let root_candidates = self.collect_lookahead_candidates(&suggestions)?;
+            let mut exact_memo = HashMap::new();
+            let mut exact_scratch = ExactSearchScratch::new();
+            let mut lookahead_memo = HashMap::new();
+            let mut lookahead_costs = vec![None; self.guesses.len()];
+
+            for guess_index in root_candidates {
+                let cost = self.lookahead_cost_for_guess(
+                    guess_index,
+                    &state.surviving,
+                    &state.weights,
+                    &mut exact_memo,
+                    &mut exact_scratch,
+                    &mut lookahead_memo,
+                )?;
+                lookahead_costs[guess_index] = Some(cost);
+            }
+
+            for suggestion in &mut suggestions {
+                suggestion.lookahead_cost = self
+                    .guess_index
+                    .get(&suggestion.word)
+                    .and_then(|guess_index| lookahead_costs[*guess_index]);
+            }
+            suggestions.sort_by(|left, right| compare_lookahead(left, right, &surviving_words));
+        }
+
+        if let PredictiveSearchMode::Exact(exact_mode) = search_mode {
             let exact_candidates = match exact_mode {
                 ExactSuggestionMode::Exhaustive => (0..self.guesses.len()).collect::<Vec<_>>(),
                 ExactSuggestionMode::Pooled => {
@@ -572,6 +617,15 @@ impl Solver {
 
         let divisor = measured.max(1) as f64;
         Ok(ExperimentResult {
+            config_id: format!(
+                "et{}-ee{}-cp{}-lt{}-lc{}-lr{}",
+                self.config.exact_threshold,
+                self.config.exact_exhaustive_threshold,
+                self.config.exact_candidate_pool,
+                self.config.lookahead_threshold,
+                self.config.lookahead_candidate_pool,
+                self.config.lookahead_reply_pool
+            ),
             mode: self.mode,
             variant: self.variant,
             backtest,
@@ -579,6 +633,7 @@ impl Solver {
             average_brier: total_brier / divisor,
             average_target_probability: total_target_probability / divisor,
             average_target_rank: total_rank / divisor,
+            latency_p95_ms: self.benchmark_predictive_latency(5)?,
         })
     }
 
@@ -609,6 +664,108 @@ impl Solver {
 
     pub fn pattern_table_bytes(&self) -> usize {
         self.pattern_table.bytes_len()
+    }
+
+    pub fn tune_prior(paths: &ProjectPaths, config: &PriorConfig) -> Result<TunePriorSummary> {
+        let (history_start, history_end) = Self::latest_history_range(paths)?
+            .ok_or_else(|| anyhow!("run sync-data before tune-prior"))?;
+        let window_end = history_end;
+        let window_start = history_end
+            .checked_sub_days(Days::new(364))
+            .map_or(history_start, |date| date.max(history_start));
+        let mut best_prior_config = config.clone();
+        let mut best_prior = Self::evaluate_prior_search_candidate(
+            paths,
+            &best_prior_config,
+            window_start,
+            window_end,
+        )?;
+
+        macro_rules! search_dimension {
+            ($field:ident, $values:expr) => {{
+                loop {
+                    let mut improved = false;
+                    for value in $values {
+                        if best_prior_config.$field == value {
+                            continue;
+                        }
+                        let mut candidate_config = best_prior_config.clone();
+                        candidate_config.$field = value;
+                        let candidate = Self::evaluate_prior_search_candidate(
+                            paths,
+                            &candidate_config,
+                            window_start,
+                            window_end,
+                        )?;
+                        if Self::better_prior_search_evaluation(&candidate, &best_prior) {
+                            best_prior_config = candidate_config;
+                            best_prior = candidate;
+                            improved = true;
+                        }
+                    }
+                    if !improved {
+                        break;
+                    }
+                }
+            }};
+        }
+
+        search_dimension!(base_seed_weight, [0.75, 1.0, 1.25]);
+        search_dimension!(base_history_only_weight, [0.10, 0.20, 0.25, 0.33, 0.50]);
+        search_dimension!(cooldown_days, [90_i64, 120, 180, 240, 365]);
+        search_dimension!(cooldown_floor, [0.0, 0.01, 0.02, 0.05]);
+        search_dimension!(midpoint_days, [365.0, 540.0, 720.0, 900.0, 1080.0]);
+        search_dimension!(logistic_k, [0.005, 0.01, 0.015, 0.02]);
+
+        let validation_start = window_end
+            .checked_sub_days(Days::new(6))
+            .map_or(window_start, |date| date.max(window_start));
+        let current = Self::evaluate_tuning_candidate(paths, config, validation_start, window_end)?;
+        let best = Self::evaluate_tuning_candidate(
+            paths,
+            &best_prior_config,
+            validation_start,
+            window_end,
+        )?;
+
+        let replacement_toml = format!(
+            concat!(
+                "base_seed_weight = {:.2}\n",
+                "base_history_only_weight = {:.2}\n",
+                "cooldown_days = {}\n",
+                "cooldown_floor = {:.2}\n",
+                "midpoint_days = {:.1}\n",
+                "logistic_k = {:.3}\n",
+                "exact_threshold = {}\n",
+                "exact_exhaustive_threshold = {}\n",
+                "exact_candidate_pool = {}\n",
+                "lookahead_threshold = {}\n",
+                "lookahead_candidate_pool = {}\n",
+                "lookahead_reply_pool = {}\n",
+            ),
+            best.config.base_seed_weight,
+            best.config.base_history_only_weight,
+            best.config.cooldown_days,
+            best.config.cooldown_floor,
+            best.config.midpoint_days,
+            best.config.logistic_k,
+            best.config.exact_threshold,
+            best.config.exact_exhaustive_threshold,
+            best.config.exact_candidate_pool,
+            best.config.lookahead_threshold,
+            best.config.lookahead_candidate_pool,
+            best.config.lookahead_reply_pool,
+        );
+
+        Ok(TunePriorSummary {
+            search_window_start: window_start,
+            search_window_end: window_end,
+            validation_window_start: validation_start,
+            validation_window_end: window_end,
+            current,
+            best,
+            replacement_toml,
+        })
     }
 
     fn initial_prior_metrics(&self, target: &str, date: NaiveDate) -> Option<PriorMetrics> {
@@ -645,31 +802,430 @@ impl Solver {
         })
     }
 
+    fn benchmark_predictive_latency(&self, runs: usize) -> Result<f64> {
+        let run_count = runs.max(1);
+        let state = self.initial_state(Self::today());
+        let mut samples = Vec::with_capacity(run_count);
+        for _ in 0..run_count {
+            let start = Instant::now();
+            let _ = self.suggestions(&state, 10)?;
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(|left, right| left.total_cmp(right));
+        let p95_index = ((samples.len() as f64) * 0.95).ceil() as usize;
+        Ok(samples[p95_index.saturating_sub(1)].max(0.0))
+    }
+
+    fn evaluate_tuning_candidate(
+        paths: &ProjectPaths,
+        config: &PriorConfig,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<TuningEvaluation> {
+        let solver = Self::from_paths_with_settings(
+            paths,
+            config,
+            WeightMode::Weighted,
+            ModelVariant::SeedPlusHistory,
+        )?;
+        let report = solver.experiment_report(from, to, 5)?;
+        Ok(TuningEvaluation {
+            config: config.clone(),
+            average_guesses: report.backtest.average_guesses,
+            failures: report.backtest.failures,
+            coverage_gaps: report.backtest.coverage_gaps,
+            average_log_loss: report.average_log_loss,
+            average_target_rank: report.average_target_rank,
+            latency_p95_ms: report.latency_p95_ms,
+        })
+    }
+
+    fn evaluate_prior_search_candidate(
+        paths: &ProjectPaths,
+        config: &PriorConfig,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<PriorSearchEvaluation> {
+        let solver = Self::from_paths_with_settings(
+            paths,
+            config,
+            WeightMode::Weighted,
+            ModelVariant::SeedPlusHistory,
+        )?;
+        let games = solver
+            .history_dates
+            .iter()
+            .filter(|entry| entry.print_date >= from && entry.print_date <= to)
+            .collect::<Vec<_>>();
+        if games.is_empty() {
+            bail!("no games found in the requested experiment range");
+        }
+
+        let mut total_log_loss = 0.0;
+        let mut total_target_rank = 0.0;
+        let mut total_target_probability = 0.0;
+        let mut measured = 0usize;
+        for entry in games {
+            if let Some(metrics) = solver.initial_prior_metrics(&entry.solution, entry.print_date) {
+                total_log_loss += metrics.log_loss;
+                total_target_rank += metrics.target_rank as f64;
+                total_target_probability += metrics.target_probability;
+                measured += 1;
+            }
+        }
+
+        let divisor = measured.max(1) as f64;
+        Ok(PriorSearchEvaluation {
+            average_log_loss: total_log_loss / divisor,
+            average_target_rank: total_target_rank / divisor,
+            average_target_probability: total_target_probability / divisor,
+        })
+    }
+
+    fn better_prior_search_evaluation(
+        candidate: &PriorSearchEvaluation,
+        incumbent: &PriorSearchEvaluation,
+    ) -> bool {
+        candidate
+            .average_log_loss
+            .total_cmp(&incumbent.average_log_loss)
+            .then_with(|| {
+                candidate
+                    .average_target_rank
+                    .total_cmp(&incumbent.average_target_rank)
+            })
+            .then_with(|| {
+                incumbent
+                    .average_target_probability
+                    .total_cmp(&candidate.average_target_probability)
+            })
+            == std::cmp::Ordering::Less
+    }
+
+    fn score_guess_metrics_for_subset(
+        &self,
+        subset: &[usize],
+        weights: &[f64],
+        small_state_table: &SmallStateTable,
+    ) -> Vec<GuessMetrics> {
+        let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
+        let mut posterior_answer_probability = vec![0.0; self.guesses.len()];
+        if total_weight > 0.0 {
+            for answer_index in subset {
+                if let Some(guess_index) = self.guess_index.get(&self.answers[*answer_index].word) {
+                    posterior_answer_probability[*guess_index] =
+                        weights[*answer_index] / total_weight;
+                }
+            }
+        }
+
+        (0..self.guesses.len())
+            .into_par_iter()
+            .map_init(GuessMetricScratch::new, |scratch, guess_index| {
+                self.score_guess_metrics(
+                    guess_index,
+                    subset,
+                    weights,
+                    total_weight,
+                    small_state_table,
+                    posterior_answer_probability[guess_index],
+                    scratch,
+                )
+            })
+            .collect()
+    }
+
+    fn score_guess_metrics(
+        &self,
+        guess_index: usize,
+        subset: &[usize],
+        weights: &[f64],
+        total_weight: f64,
+        small_state_table: &SmallStateTable,
+        posterior_answer_probability: f64,
+        scratch: &mut GuessMetricScratch,
+    ) -> GuessMetrics {
+        scratch.reset();
+        for answer_index in subset {
+            let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
+            if scratch.counts[pattern] == 0 {
+                scratch.touched_patterns.push(pattern as u8);
+            }
+            let weight = weights[*answer_index];
+            scratch.masses[pattern] += weight;
+            scratch.counts[pattern] += 1;
+            if weight > 0.0 {
+                scratch.weighted_log_sums[pattern] += weight * weight.log2();
+            }
+        }
+
+        let pattern_space_log = (PATTERN_SPACE as f64).log2();
+        let mut entropy = 0.0;
+        let mut expected_remaining = 0.0;
+        let mut solve_probability = 0.0;
+        let mut proxy_cost = 1.0;
+
+        for pattern in scratch.touched_patterns.iter().copied() {
+            let index = pattern as usize;
+            let mass = scratch.masses[index];
+            let probability = if total_weight > 0.0 {
+                mass / total_weight
+            } else {
+                0.0
+            };
+            if probability > 0.0 {
+                entropy -= probability * probability.log2();
+            }
+            expected_remaining += probability * scratch.counts[index] as f64;
+            if pattern == ALL_GREEN_PATTERN {
+                solve_probability = probability;
+            }
+            let child_proxy = if pattern == ALL_GREEN_PATTERN {
+                0.0
+            } else if scratch.counts[index] == 1 {
+                1.0
+            } else if scratch.counts[index] <= self.config.exact_exhaustive_threshold {
+                small_state_table.lower_bound(scratch.counts[index])
+            } else {
+                let expected_remaining_floor =
+                    (scratch.counts[index] as f64 / PATTERN_SPACE as f64).max(1.0);
+                let entropy_bits = if mass > 0.0 {
+                    mass.log2() - (scratch.weighted_log_sums[index] / mass)
+                } else {
+                    0.0
+                };
+                let entropy_floor = (entropy_bits / pattern_space_log).max(1.0);
+                expected_remaining_floor.max(entropy_floor)
+            };
+            proxy_cost += probability * child_proxy;
+        }
+
+        GuessMetrics {
+            guess_index,
+            entropy,
+            solve_probability,
+            expected_remaining,
+            proxy_cost,
+            posterior_answer_probability,
+        }
+    }
+
     fn collect_exact_candidates(
         &self,
         state: &SolveState,
         suggestions: &[Suggestion],
     ) -> Result<Vec<usize>> {
-        let mut candidate_indexes = suggestions
+        let pool = self.config.exact_candidate_pool.max(1);
+        let surviving_guess_indexes = state
+            .surviving
             .iter()
-            .take(self.config.exact_candidate_pool)
+            .filter_map(|answer_index| self.guess_index.get(&self.answers[*answer_index].word))
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut candidate_indexes = Vec::new();
+        let mut seen = HashSet::new();
+        let mut push_candidate = |guess_index: usize| {
+            if seen.insert(guess_index) {
+                candidate_indexes.push(guess_index);
+            }
+        };
+
+        for suggestion in suggestions.iter().take(pool / 2) {
+            let guess_index = self
+                .guess_index
+                .get(&suggestion.word)
+                .copied()
+                .with_context(|| format!("missing guess {}", suggestion.word))?;
+            push_candidate(guess_index);
+        }
+
+        let mut by_entropy = suggestions.iter().collect::<Vec<_>>();
+        by_entropy.sort_by(|left, right| {
+            right
+                .entropy
+                .total_cmp(&left.entropy)
+                .then_with(|| left.word.cmp(&right.word))
+        });
+        for suggestion in by_entropy.into_iter().take(pool / 4) {
+            let guess_index = self
+                .guess_index
+                .get(&suggestion.word)
+                .copied()
+                .with_context(|| format!("missing guess {}", suggestion.word))?;
+            push_candidate(guess_index);
+        }
+
+        let mut by_solve_prob = suggestions.iter().collect::<Vec<_>>();
+        by_solve_prob.sort_by(|left, right| {
+            right
+                .solve_probability
+                .total_cmp(&left.solve_probability)
+                .then_with(|| left.word.cmp(&right.word))
+        });
+        for suggestion in by_solve_prob.into_iter().take(pool / 8) {
+            let guess_index = self
+                .guess_index
+                .get(&suggestion.word)
+                .copied()
+                .with_context(|| format!("missing guess {}", suggestion.word))?;
+            push_candidate(guess_index);
+        }
+
+        let mut by_posterior = suggestions
+            .iter()
+            .filter(|suggestion| suggestion.posterior_answer_probability > 0.0)
+            .collect::<Vec<_>>();
+        by_posterior.sort_by(|left, right| {
+            right
+                .posterior_answer_probability
+                .total_cmp(&left.posterior_answer_probability)
+                .then_with(|| left.word.cmp(&right.word))
+        });
+        for suggestion in by_posterior.into_iter().take(pool / 8) {
+            let guess_index = self
+                .guess_index
+                .get(&suggestion.word)
+                .copied()
+                .with_context(|| format!("missing guess {}", suggestion.word))?;
+            push_candidate(guess_index);
+        }
+
+        for answer_index in &state.surviving {
+            if let Some(guess_index) = self.guess_index.get(&self.answers[*answer_index].word) {
+                push_candidate(*guess_index);
+            }
+        }
+
+        let extra_limit = self.config.exact_candidate_pool + surviving_guess_indexes.len();
+        if candidate_indexes.len() > extra_limit {
+            let mut trimmed = Vec::with_capacity(extra_limit);
+            let mut extra_count = 0usize;
+            for guess_index in candidate_indexes {
+                if surviving_guess_indexes.contains(&guess_index) {
+                    trimmed.push(guess_index);
+                    continue;
+                }
+                if extra_count < self.config.exact_candidate_pool {
+                    trimmed.push(guess_index);
+                    extra_count += 1;
+                }
+            }
+            return Ok(trimmed);
+        }
+
+        Ok(candidate_indexes)
+    }
+
+    fn lookahead_cost_for_guess(
+        &self,
+        guess_index: usize,
+        subset: &[usize],
+        weights: &[f64],
+        exact_memo: &mut HashMap<ExactSubsetKey, f64>,
+        exact_scratch: &mut ExactSearchScratch,
+        lookahead_memo: &mut HashMap<ExactSubsetKey, f64>,
+    ) -> Result<f64> {
+        let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
+        if total_weight <= 0.0 {
+            bail!("cannot evaluate lookahead on a zero-mass subset");
+        }
+
+        let mut ordered_patterns = [0u8; PATTERN_SPACE];
+        let ordered_len = {
+            let frame = exact_scratch.frame_mut(0);
+            for answer_index in subset {
+                let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
+                if frame.child_subsets[pattern].is_empty() {
+                    frame.touched_patterns.push(pattern as u8);
+                }
+                frame.masses[pattern] += weights[*answer_index];
+                frame.child_subsets[pattern].push(*answer_index);
+            }
+            let len = frame.touched_patterns.len();
+            ordered_patterns[..len].copy_from_slice(&frame.touched_patterns);
+            len
+        };
+
+        let mut total_cost = 1.0;
+        for pattern in ordered_patterns[..ordered_len].iter().copied() {
+            let mass = exact_scratch.frames[0].masses[pattern as usize];
+            let probability = mass / total_weight;
+            let child_value = if pattern == ALL_GREEN_PATTERN {
+                0.0
+            } else {
+                let child_subset =
+                    std::mem::take(&mut exact_scratch.frames[0].child_subsets[pattern as usize]);
+                let result =
+                    if child_subset.len() == subset.len() && child_subset.as_slice() == subset {
+                        f64::INFINITY
+                    } else {
+                        self.lookahead_child_value(
+                            &child_subset,
+                            weights,
+                            exact_memo,
+                            exact_scratch,
+                            lookahead_memo,
+                        )?
+                    };
+                exact_scratch.frames[0].child_subsets[pattern as usize] = child_subset;
+                result
+            };
+            total_cost += probability * child_value;
+        }
+        Ok(total_cost)
+    }
+
+    fn lookahead_child_value(
+        &self,
+        subset: &[usize],
+        weights: &[f64],
+        exact_memo: &mut HashMap<ExactSubsetKey, f64>,
+        exact_scratch: &mut ExactSearchScratch,
+        lookahead_memo: &mut HashMap<ExactSubsetKey, f64>,
+    ) -> Result<f64> {
+        if subset.is_empty() {
+            return Ok(0.0);
+        }
+        if subset.len() <= self.config.exact_threshold {
+            return self.exact_best_cost(
+                subset,
+                weights,
+                &self.exact_small_state_table,
+                exact_memo,
+                exact_scratch,
+                1,
+            );
+        }
+
+        let key = ExactSubsetKey::from_sorted_subset(subset);
+        if let Some(cached) = lookahead_memo.get(&key) {
+            return Ok(*cached);
+        }
+
+        let mut metrics =
+            self.score_guess_metrics_for_subset(subset, weights, &self.exact_small_state_table);
+        metrics.sort_by(|left, right| compare_guess_metrics(left, right, &self.guesses));
+        let best_reply = metrics
+            .into_iter()
+            .take(self.config.lookahead_reply_pool.max(1))
+            .map(|metric| metric.proxy_cost)
+            .fold(f64::INFINITY, f64::min);
+        let child_value = 1.0 + best_reply;
+        lookahead_memo.insert(key, child_value);
+        Ok(child_value)
+    }
+
+    fn collect_lookahead_candidates(&self, suggestions: &[Suggestion]) -> Result<Vec<usize>> {
+        suggestions
+            .iter()
+            .take(self.config.lookahead_candidate_pool.max(1))
             .map(|suggestion| {
                 self.guess_index
                     .get(&suggestion.word)
                     .copied()
                     .with_context(|| format!("missing guess {}", suggestion.word))
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        for answer_index in &state.surviving {
-            if let Some(guess_index) = self.guess_index.get(&self.answers[*answer_index].word) {
-                candidate_indexes.push(*guess_index);
-            }
-        }
-
-        candidate_indexes.sort_unstable();
-        candidate_indexes.dedup();
-        Ok(candidate_indexes)
+            .collect()
     }
 
     fn exact_cost_for_guess(
@@ -765,7 +1321,8 @@ impl Solver {
             return Ok(*cached);
         }
 
-        let scores = match exact_suggestion_mode(&self.config, subset.len()) {
+        let suggestion_mode = exact_suggestion_mode(&self.config, subset.len());
+        let scores = match suggestion_mode {
             Some(ExactSuggestionMode::Exhaustive) => (0..self.guesses.len()).collect::<Vec<_>>(),
             Some(ExactSuggestionMode::Pooled) | None => {
                 self.top_guess_indexes_for_subset(subset, weights, self.config.exact_candidate_pool)
@@ -776,7 +1333,7 @@ impl Solver {
             debug_assert!(u16::try_from(*answer_index).is_ok());
         }
         let mut best_cost = f64::INFINITY;
-        for guess_index in scores {
+        for guess_index in scores.iter().copied() {
             let cost = self.exact_cost_for_guess(
                 guess_index,
                 subset,
@@ -791,6 +1348,32 @@ impl Solver {
                 best_cost = cost;
                 if best_cost <= lower_bound {
                     break;
+                }
+            }
+        }
+        if !best_cost.is_finite()
+            && matches!(suggestion_mode, Some(ExactSuggestionMode::Pooled) | None)
+        {
+            let shortlisted = scores.into_iter().collect::<HashSet<_>>();
+            for guess_index in 0..self.guesses.len() {
+                if shortlisted.contains(&guess_index) {
+                    continue;
+                }
+                let cost = self.exact_cost_for_guess(
+                    guess_index,
+                    subset,
+                    weights,
+                    small_state_table,
+                    memo,
+                    best_cost,
+                    scratch,
+                    depth,
+                )?;
+                if cost < best_cost {
+                    best_cost = cost;
+                    if best_cost <= lower_bound {
+                        break;
+                    }
                 }
             }
         }
@@ -810,21 +1393,14 @@ impl Solver {
         weights: &[f64],
         count: usize,
     ) -> Vec<usize> {
-        let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
-        let mut scores = (0..self.guesses.len())
-            .into_par_iter()
-            .map_init(ExactEntropyScratch::new, |scratch, guess_index| {
-                scratch.score_guess(self, guess_index, subset, weights, total_weight)
-            })
-            .collect::<Vec<_>>();
-        scores.sort_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        scores.truncate(count);
-        scores.into_iter().map(|(index, _)| index).collect()
+        let mut metrics =
+            self.score_guess_metrics_for_subset(subset, weights, &self.exact_small_state_table);
+        metrics.sort_by(|left, right| compare_guess_metrics(left, right, &self.guesses));
+        metrics.truncate(count);
+        metrics
+            .into_iter()
+            .map(|metric| metric.guess_index)
+            .collect()
     }
 }
 
@@ -854,22 +1430,66 @@ fn exact_suggestion_mode(
     }
 }
 
+fn predictive_search_mode(config: &PriorConfig, surviving_answers: usize) -> PredictiveSearchMode {
+    if let Some(mode) = exact_suggestion_mode(config, surviving_answers) {
+        PredictiveSearchMode::Exact(mode)
+    } else if surviving_answers <= config.lookahead_threshold {
+        PredictiveSearchMode::Lookahead
+    } else {
+        PredictiveSearchMode::ProxyOnly
+    }
+}
+
+fn compare_guess_metrics(
+    left: &GuessMetrics,
+    right: &GuessMetrics,
+    guesses: &[String],
+) -> std::cmp::Ordering {
+    left.proxy_cost
+        .total_cmp(&right.proxy_cost)
+        .then_with(|| right.solve_probability.total_cmp(&left.solve_probability))
+        .then_with(|| right.entropy.total_cmp(&left.entropy))
+        .then_with(|| left.expected_remaining.total_cmp(&right.expected_remaining))
+        .then_with(|| {
+            right
+                .posterior_answer_probability
+                .total_cmp(&left.posterior_answer_probability)
+        })
+        .then_with(|| guesses[left.guess_index].cmp(&guesses[right.guess_index]))
+}
+
 fn compare_suggestions(
+    left: &Suggestion,
+    right: &Suggestion,
+    _surviving_words: &HashSet<&str>,
+) -> std::cmp::Ordering {
+    left.proxy_cost
+        .unwrap_or(f64::INFINITY)
+        .total_cmp(&right.proxy_cost.unwrap_or(f64::INFINITY))
+        .then_with(|| right.solve_probability.total_cmp(&left.solve_probability))
+        .then_with(|| right.entropy.total_cmp(&left.entropy))
+        .then_with(|| left.expected_remaining.total_cmp(&right.expected_remaining))
+        .then_with(|| {
+            right
+                .posterior_answer_probability
+                .total_cmp(&left.posterior_answer_probability)
+        })
+        .then_with(|| left.word.cmp(&right.word))
+}
+
+fn compare_lookahead(
     left: &Suggestion,
     right: &Suggestion,
     surviving_words: &HashSet<&str>,
 ) -> std::cmp::Ordering {
-    right
-        .entropy
-        .total_cmp(&left.entropy)
-        .then_with(|| right.solve_probability.total_cmp(&left.solve_probability))
-        .then_with(|| left.expected_remaining.total_cmp(&right.expected_remaining))
-        .then_with(|| {
-            let left_surviving = surviving_words.contains(left.word.as_str());
-            let right_surviving = surviving_words.contains(right.word.as_str());
-            right_surviving.cmp(&left_surviving)
-        })
-        .then_with(|| left.word.cmp(&right.word))
+    match (left.lookahead_cost, right.lookahead_cost) {
+        (Some(left_cost), Some(right_cost)) => left_cost
+            .total_cmp(&right_cost)
+            .then_with(|| compare_suggestions(left, right, surviving_words)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => compare_suggestions(left, right, surviving_words),
+    }
 }
 
 fn compare_exact(
@@ -919,9 +1539,48 @@ mod tests {
     };
 
     use super::{
-        ExactSearchScratch, ExactSubsetKey, ExactSubsetStorage, ExactSuggestionMode, Solver,
-        exact_suggestion_mode,
+        ExactSearchScratch, ExactSubsetKey, ExactSubsetStorage, ExactSuggestionMode, GuessMetrics,
+        Solver, compare_guess_metrics, exact_suggestion_mode,
     };
+
+    fn test_solver(words: &[&str]) -> Solver {
+        let guesses = words
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>();
+        let answers = words
+            .iter()
+            .map(|word| AnswerRecord {
+                word: (*word).to_string(),
+                in_seed: true,
+                manual_entry: false,
+                manual_weight: 1.0,
+                history_dates: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let pattern_root: PathBuf =
+            std::env::temp_dir().join(format!("maybe-wordle-solver-test-{}", words.join("-")));
+        let _ = std::fs::remove_dir_all(&pattern_root);
+        std::fs::create_dir_all(&pattern_root).expect("pattern root");
+        let pattern_table =
+            PatternTable::load_or_build_at(&pattern_root.join("pattern.bin"), &guesses, &answers)
+                .expect("pattern table");
+        Solver {
+            config: PriorConfig::default(),
+            mode: WeightMode::Uniform,
+            variant: ModelVariant::SeedPlusHistory,
+            guesses: guesses.clone(),
+            answers,
+            history_dates: Vec::new(),
+            exact_small_state_table: SmallStateTable::build(4),
+            pattern_table,
+            guess_index: guesses
+                .iter()
+                .enumerate()
+                .map(|(index, guess)| (guess.clone(), index))
+                .collect::<HashMap<_, _>>(),
+        }
+    }
 
     #[test]
     fn parse_observations_rejects_length_mismatch() {
@@ -945,7 +1604,7 @@ mod tests {
             in_seed: true,
             manual_entry: false,
             manual_weight: 1.0,
-            history_dates: vec![NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid")],
+            history_dates: vec![NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid")],
         };
         let state_weight = crate::model::weight_snapshot(
             &answer,
@@ -990,6 +1649,102 @@ mod tests {
         let subset = (0..17).collect::<Vec<_>>();
         let key = ExactSubsetKey::from_sorted_subset(&subset);
         assert!(matches!(key, ExactSubsetKey(ExactSubsetStorage::Heap(_))));
+    }
+
+    #[test]
+    fn proxy_ordering_beats_raw_entropy() {
+        let guesses = vec!["alpha".to_string(), "bravo".to_string()];
+        let better_proxy = GuessMetrics {
+            guess_index: 0,
+            entropy: 3.0,
+            solve_probability: 0.1,
+            expected_remaining: 2.0,
+            proxy_cost: 1.8,
+            posterior_answer_probability: 0.0,
+        };
+        let worse_proxy = GuessMetrics {
+            guess_index: 1,
+            entropy: 4.0,
+            solve_probability: 0.1,
+            expected_remaining: 2.0,
+            proxy_cost: 2.2,
+            posterior_answer_probability: 0.0,
+        };
+        assert_eq!(
+            compare_guess_metrics(&better_proxy, &worse_proxy, &guesses),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn pooled_exact_candidates_keep_surviving_answers() {
+        let solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake", "blush"]);
+        let state = super::SolveState {
+            surviving: vec![0, 1],
+            weights: vec![1.0; solver.answers.len()],
+            total_weight: 2.0,
+        };
+        let suggestions = vec![
+            super::Suggestion {
+                word: "humph".into(),
+                entropy: 5.0,
+                solve_probability: 0.0,
+                expected_remaining: 2.0,
+                proxy_cost: Some(1.5),
+                posterior_answer_probability: 0.0,
+                lookahead_cost: None,
+                exact_cost: None,
+            },
+            super::Suggestion {
+                word: "awake".into(),
+                entropy: 4.0,
+                solve_probability: 0.0,
+                expected_remaining: 2.0,
+                proxy_cost: Some(1.6),
+                posterior_answer_probability: 0.0,
+                lookahead_cost: None,
+                exact_cost: None,
+            },
+        ];
+
+        let candidates = solver
+            .collect_exact_candidates(&state, &suggestions)
+            .expect("candidates");
+        assert!(candidates.contains(&0));
+        assert!(candidates.contains(&1));
+    }
+
+    #[test]
+    fn lookahead_uses_exact_recursion_for_small_children() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        solver.config.exact_threshold = 2;
+        solver.config.lookahead_threshold = 4;
+        let subset = vec![0, 1];
+        let weights = vec![1.0; solver.answers.len()];
+        let mut exact_memo = HashMap::new();
+        let mut exact_scratch = ExactSearchScratch::new();
+        let mut lookahead_memo = HashMap::new();
+
+        let lookahead_value = solver
+            .lookahead_child_value(
+                &subset,
+                &weights,
+                &mut exact_memo,
+                &mut exact_scratch,
+                &mut lookahead_memo,
+            )
+            .expect("lookahead value");
+        let exact_value = solver
+            .exact_best_cost(
+                &subset,
+                &weights,
+                &solver.exact_small_state_table,
+                &mut HashMap::new(),
+                &mut ExactSearchScratch::new(),
+                0,
+            )
+            .expect("exact value");
+        assert!((lookahead_value - exact_value).abs() < 1e-9);
     }
 
     #[test]
