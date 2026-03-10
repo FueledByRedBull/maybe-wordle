@@ -2,7 +2,9 @@ use std::{
     array,
     collections::{HashMap, HashSet},
     fs,
+    io::Write,
     path::PathBuf,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -33,9 +35,14 @@ pub struct Suggestion {
     pub solve_probability: f64,
     pub expected_remaining: f64,
     pub force_in_two: bool,
+    pub known_absent_letter_hits: usize,
     pub worst_non_green_bucket_size: usize,
     pub largest_non_green_bucket_mass: f64,
+    pub large_non_green_bucket_count: usize,
+    pub dangerous_mass_bucket_count: usize,
+    pub non_green_mass_in_large_buckets: f64,
     pub proxy_cost: Option<f64>,
+    pub large_state_score: Option<f64>,
     pub posterior_answer_probability: f64,
     pub lookahead_cost: Option<f64>,
     pub exact_cost: Option<f64>,
@@ -68,6 +75,9 @@ pub struct SuggestionSnapshot {
     pub force_in_two: bool,
     pub worst_non_green_bucket_size: usize,
     pub largest_non_green_bucket_mass: f64,
+    pub large_non_green_bucket_count: usize,
+    pub dangerous_mass_bucket_count: usize,
+    pub non_green_mass_in_large_buckets: f64,
     pub proxy_cost: Option<f64>,
     pub lookahead_cost: Option<f64>,
     pub exact_cost: Option<f64>,
@@ -220,7 +230,7 @@ pub struct PredictiveReplyBuildSummary {
     pub config_fingerprint: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 struct PredictiveBookIdentity {
     mode: String,
     variant: String,
@@ -270,6 +280,37 @@ struct ForcedOpenerEvaluation {
 }
 
 #[derive(Clone, Debug)]
+pub struct ProxyCalibrationRow {
+    pub state_id: String,
+    pub date: NaiveDate,
+    pub step_index: usize,
+    pub surviving_answers: usize,
+    pub guess: String,
+    pub entropy: f64,
+    pub largest_non_green_bucket_mass: f64,
+    pub worst_non_green_bucket_size: usize,
+    pub high_mass_ambiguous_bucket_count: usize,
+    pub proxy_cost: f64,
+    pub solve_probability: f64,
+    pub posterior_answer_probability: f64,
+    pub smoothness_penalty: f64,
+    pub known_absent_letter_hits: usize,
+    pub large_non_green_bucket_count: usize,
+    pub dangerous_mass_bucket_count: usize,
+    pub non_green_mass_in_large_buckets: f64,
+    pub realized_cost: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyWeightFitSummary {
+    pub row_count: usize,
+    pub state_count: usize,
+    pub training_average_guesses: f64,
+    pub validation_average_guesses: f64,
+    pub replacement_toml: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct Solver {
     pub config: PriorConfig,
     pub mode: WeightMode,
@@ -281,6 +322,8 @@ pub struct Solver {
     pattern_table: PatternTable,
     guess_index: HashMap<String, usize>,
     artifact_dir: PathBuf,
+    session_opener_cache: Arc<Mutex<HashMap<PredictiveBookIdentity, Option<String>>>>,
+    session_reply_cache: Arc<Mutex<HashMap<(PredictiveBookIdentity, String, u8), Option<String>>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,10 +366,16 @@ struct GuessMetrics {
     solve_probability: f64,
     expected_remaining: f64,
     force_in_two: bool,
+    known_absent_letter_hits: usize,
     worst_non_green_bucket_size: usize,
     largest_non_green_bucket_mass: f64,
     high_mass_ambiguous_bucket_count: usize,
+    smoothness_penalty: f64,
+    large_non_green_bucket_count: usize,
+    dangerous_mass_bucket_count: usize,
+    non_green_mass_in_large_buckets: f64,
     proxy_cost: f64,
+    large_state_score: f64,
     posterior_answer_probability: f64,
 }
 
@@ -351,7 +400,15 @@ struct PredictiveContext<'a> {
     observations: &'a [(String, u8)],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PredictiveBookUsage {
+    None,
+    DiskOnly,
+    Full,
+}
+
 const EXACT_SUBSET_INLINE_CAPACITY: usize = 16;
+const ZERO_WEIGHT_FALLBACK_SCALE: f64 = 1e-6;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ExactSubsetKey(ExactSubsetStorage);
@@ -513,6 +570,8 @@ impl Solver {
             pattern_table,
             guess_index,
             artifact_dir: paths.derived_predictive.clone(),
+            session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -527,9 +586,17 @@ impl Solver {
 
         for (index, answer) in self.answers.iter().enumerate() {
             let snapshot = weight_snapshot_for_mode(answer, &self.config, as_of, self.mode);
-            if snapshot.final_weight > 0.0 {
-                weights[index] = snapshot.final_weight;
-                total_weight += snapshot.final_weight;
+            let weight = if snapshot.final_weight > 0.0 {
+                snapshot.final_weight
+            } else if snapshot.base_weight > 0.0 {
+                (snapshot.base_weight * snapshot.manual_weight * ZERO_WEIGHT_FALLBACK_SCALE)
+                    .max(f64::MIN_POSITIVE)
+            } else {
+                0.0
+            };
+            if weight > 0.0 {
+                weights[index] = weight;
+                total_weight += weight;
                 surviving.push(index);
             }
         }
@@ -580,7 +647,7 @@ impl Solver {
 
     pub fn suggestions(&self, state: &SolveState, top: usize) -> Result<Vec<Suggestion>> {
         Ok(self
-            .suggestion_batch_internal(state, top, None, false)?
+            .suggestion_batch_internal(state, top, None, PredictiveBookUsage::None)?
             .suggestions)
     }
 
@@ -599,7 +666,27 @@ impl Solver {
                     as_of,
                     observations,
                 }),
-                true,
+                PredictiveBookUsage::Full,
+            )?
+            .suggestions)
+    }
+
+    pub fn suggestions_for_history_disk_books_only(
+        &self,
+        as_of: NaiveDate,
+        observations: &[(String, u8)],
+        top: usize,
+    ) -> Result<Vec<Suggestion>> {
+        let state = self.apply_history(as_of, observations)?;
+        Ok(self
+            .suggestion_batch_internal(
+                &state,
+                top,
+                Some(PredictiveContext {
+                    as_of,
+                    observations,
+                }),
+                PredictiveBookUsage::DiskOnly,
             )?
             .suggestions)
     }
@@ -610,6 +697,7 @@ impl Solver {
         observations: &[(String, u8)],
         state: &SolveState,
         top: usize,
+        book_usage: PredictiveBookUsage,
     ) -> Result<SuggestionBatch> {
         self.suggestion_batch_internal(
             state,
@@ -618,7 +706,7 @@ impl Solver {
                 as_of,
                 observations,
             }),
-            true,
+            book_usage,
         )
     }
 
@@ -627,17 +715,42 @@ impl Solver {
         state: &SolveState,
         top: usize,
         context: Option<PredictiveContext<'_>>,
-        use_books: bool,
+        book_usage: PredictiveBookUsage,
     ) -> Result<SuggestionBatch> {
         if state.surviving.is_empty() {
             bail!("cannot score guesses with an empty state");
         }
         let split_first = state.surviving.len() > self.config.large_state_split_threshold;
+        let known_absent_mask = context
+            .as_ref()
+            .map(|context| known_absent_letter_mask(context.observations))
+            .unwrap_or(0);
         let mut metrics = self.score_guess_metrics_for_subset(
             &state.surviving,
             &state.weights,
             &self.exact_small_state_table,
         );
+        if known_absent_mask != 0 {
+            for metric in &mut metrics {
+                metric.known_absent_letter_hits =
+                    count_masked_letters(&self.guesses[metric.guess_index], known_absent_mask);
+                metric.large_state_score = proxy_row_score_from_weights(
+                    &self.config.proxy_weights,
+                    metric.entropy,
+                    metric.largest_non_green_bucket_mass,
+                    metric.worst_non_green_bucket_size,
+                    metric.high_mass_ambiguous_bucket_count,
+                    metric.proxy_cost,
+                    metric.solve_probability,
+                    metric.posterior_answer_probability,
+                    metric.smoothness_penalty,
+                    metric.known_absent_letter_hits,
+                    metric.large_non_green_bucket_count,
+                    metric.dangerous_mass_bucket_count,
+                    metric.non_green_mass_in_large_buckets,
+                );
+            }
+        }
         metrics.sort_by(|left, right| {
             compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
         });
@@ -651,18 +764,38 @@ impl Solver {
                 solve_probability: metric.solve_probability,
                 expected_remaining: metric.expected_remaining,
                 force_in_two: metric.force_in_two,
+                known_absent_letter_hits: metric.known_absent_letter_hits,
                 worst_non_green_bucket_size: metric.worst_non_green_bucket_size,
                 largest_non_green_bucket_mass: metric.largest_non_green_bucket_mass,
+                large_non_green_bucket_count: metric.large_non_green_bucket_count,
+                dangerous_mass_bucket_count: metric.dangerous_mass_bucket_count,
+                non_green_mass_in_large_buckets: metric.non_green_mass_in_large_buckets,
                 proxy_cost: Some(metric.proxy_cost),
+                large_state_score: Some(metric.large_state_score),
                 posterior_answer_probability: metric.posterior_answer_probability,
                 lookahead_cost: None,
                 exact_cost: None,
             })
             .collect::<Vec<_>>();
+        let lookahead_pool = self.expanded_pool_size(
+            &suggestions,
+            self.config.lookahead_candidate_pool,
+            split_first,
+            assessment,
+        );
+        let exact_pool = self.expanded_pool_size(
+            &suggestions,
+            self.config.exact_candidate_pool,
+            split_first,
+            assessment,
+        );
 
         if let PredictiveSearchMode::Lookahead = search_mode {
-            let root_candidates =
-                self.collect_lookahead_candidates(&suggestions, assessment.dangerous_lookahead)?;
+            let root_candidates = self.collect_lookahead_candidates(
+                &suggestions,
+                assessment.dangerous_lookahead,
+                lookahead_pool,
+            )?;
             let mut exact_memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
             let mut lookahead_memo = PredictiveMemoMap::default();
@@ -693,11 +826,9 @@ impl Solver {
         if let PredictiveSearchMode::Exact(exact_mode) = search_mode {
             let exact_candidates = match exact_mode {
                 ExactSuggestionMode::Exhaustive => (0..self.guesses.len()).collect::<Vec<_>>(),
-                ExactSuggestionMode::Pooled => self.collect_exact_candidates(
-                    state,
-                    &suggestions,
-                    self.config.exact_candidate_pool,
-                )?,
+                ExactSuggestionMode::Pooled => {
+                    self.collect_exact_candidates(state, &suggestions, exact_pool)?
+                }
             };
             let mut memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
@@ -747,7 +878,7 @@ impl Solver {
             let exact_candidates = self.collect_exact_candidates(
                 state,
                 &suggestions,
-                self.config.danger_exact_root_pool.max(1),
+                self.config.danger_exact_root_pool.max(1).max(exact_pool),
             )?;
             let mut memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
@@ -786,10 +917,14 @@ impl Solver {
             });
         }
 
-        if use_books {
+        if book_usage != PredictiveBookUsage::None {
             if let Some(context) = context {
                 if let Some(cached_word) =
-                    self.cached_predictive_choice(context.as_of, context.observations)
+                    self.cached_predictive_choice(
+                        context.as_of,
+                        context.observations,
+                        book_usage == PredictiveBookUsage::Full,
+                    )
                 {
                     promote_cached_suggestion(&mut suggestions, &cached_word);
                 }
@@ -820,7 +955,13 @@ impl Solver {
         let as_of = date
             .checked_sub_days(Days::new(1))
             .ok_or_else(|| anyhow!("cannot solve before launch date"))?;
-        self.solve_target_from_state_detailed(target, as_of, date, top)
+        self.solve_target_from_state_detailed(
+            target,
+            as_of,
+            date,
+            top,
+            PredictiveBookUsage::Full,
+        )
     }
 
     fn solve_target_from_state_detailed(
@@ -829,6 +970,7 @@ impl Solver {
         as_of: NaiveDate,
         date: NaiveDate,
         top: usize,
+        book_usage: PredictiveBookUsage,
     ) -> Result<DetailedSolveRun> {
         let target = target.to_ascii_lowercase();
         let mut state = self.initial_state(as_of);
@@ -850,8 +992,13 @@ impl Solver {
         let mut steps = Vec::new();
         while steps.len() < 6 {
             let surviving_before = state.surviving.len();
-            let batch =
-                self.suggestion_batch_for_history(as_of, &observations, &state, top.max(1))?;
+            let batch = self.suggestion_batch_for_history(
+                as_of,
+                &observations,
+                &state,
+                top.max(1),
+                book_usage,
+            )?;
             let chosen = batch
                 .suggestions
                 .first()
@@ -932,7 +1079,17 @@ impl Solver {
         let mut runs = Vec::new();
 
         for entry in games {
-            let run = self.solve_target_detailed(&entry.solution, entry.print_date, top)?;
+            let as_of = entry
+                .print_date
+                .checked_sub_days(Days::new(1))
+                .ok_or_else(|| anyhow!("cannot solve before launch date"))?;
+            let run = self.solve_target_from_state_detailed(
+                &entry.solution,
+                as_of,
+                entry.print_date,
+                top,
+                PredictiveBookUsage::DiskOnly,
+            )?;
             if run.steps.is_empty() {
                 coverage_gaps += 1;
                 failures += 1;
@@ -981,7 +1138,13 @@ impl Solver {
         let mut guess_total = 0usize;
 
         for (label, target) in cases {
-            let run = self.solve_target_from_state_detailed(&target, as_of, as_of, top)?;
+            let run = self.solve_target_from_state_detailed(
+                &target,
+                as_of,
+                as_of,
+                top,
+                PredictiveBookUsage::DiskOnly,
+            )?;
             if !run.solved {
                 failures += 1;
             }
@@ -1113,7 +1276,7 @@ impl Solver {
                     as_of,
                     observations: &[],
                 }),
-                false,
+                PredictiveBookUsage::None,
             )?
             .suggestions
             .into_iter()
@@ -1194,7 +1357,7 @@ impl Solver {
                     as_of,
                     observations: &[(opener_artifact.opener.clone(), pattern)],
                 }),
-                false,
+                PredictiveBookUsage::None,
             )?;
             let mut best_reply: Option<(Suggestion, ForcedOpenerEvaluation)> = None;
             for suggestion in batch
@@ -1323,12 +1486,343 @@ impl Solver {
         Ok(rows)
     }
 
+    pub fn build_proxy_calibration_set(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<ProxyCalibrationRow>> {
+        let started = Instant::now();
+        let emit_progress = |message: String| {
+            eprintln!("{message}");
+            let _ = std::io::stderr().flush();
+        };
+        let games = self
+            .history_dates
+            .iter()
+            .filter(|entry| entry.print_date >= from && entry.print_date <= to)
+            .collect::<Vec<_>>();
+        if games.is_empty() {
+            bail!("no games found in the requested calibration range");
+        }
+
+        let mut rows = Vec::new();
+        let total_games = games.len();
+        emit_progress(format!(
+            "fit-proxy-weights phase=calibration-start games={} from={} to={} elapsed_s=0.0",
+            total_games, from, to
+        ));
+        for (game_index, entry) in games.into_iter().enumerate() {
+            let date = entry.print_date;
+            let as_of = date
+                .checked_sub_days(Days::new(1))
+                .ok_or_else(|| anyhow!("cannot calibrate before launch date"))?;
+            let target = entry.solution.to_ascii_lowercase();
+            let mut state = self.initial_state(as_of);
+            if !state
+                .surviving
+                .iter()
+                .any(|index| self.answers[*index].word == target)
+            {
+                continue;
+            }
+
+            let mut observations = Vec::new();
+            let mut step_index = 0usize;
+            while step_index < 6 && state.surviving.len() > self.config.large_state_split_threshold
+            {
+                let mut metrics = self.score_guess_metrics_for_subset(
+                    &state.surviving,
+                    &state.weights,
+                    &self.exact_small_state_table,
+                );
+                let known_absent_mask = known_absent_letter_mask(&observations);
+                for metric in &mut metrics {
+                    metric.known_absent_letter_hits =
+                        count_masked_letters(&self.guesses[metric.guess_index], known_absent_mask);
+                    metric.large_state_score = proxy_row_score_from_weights(
+                        &self.config.proxy_weights,
+                        metric.entropy,
+                        metric.largest_non_green_bucket_mass,
+                        metric.worst_non_green_bucket_size,
+                        metric.high_mass_ambiguous_bucket_count,
+                        metric.proxy_cost,
+                        metric.solve_probability,
+                        metric.posterior_answer_probability,
+                        metric.smoothness_penalty,
+                        metric.known_absent_letter_hits,
+                        metric.large_non_green_bucket_count,
+                        metric.dangerous_mass_bucket_count,
+                        metric.non_green_mass_in_large_buckets,
+                    );
+                }
+                metrics.sort_by(|left, right| {
+                    compare_guess_metrics_for_state(left, right, &self.guesses, true)
+                });
+
+                let state_id = format!("{date}:{step_index}");
+                for metric in metrics
+                    .iter()
+                    .take(self.config.session_opener_pool.max(8).min(metrics.len()))
+                {
+                    let guess = self.guesses[metric.guess_index].clone();
+                    let mut forced = observations.clone();
+                    forced.push((guess.clone(), 0));
+                    let run =
+                        self.solve_target_with_forced_prefix(&target, as_of, date, &forced, 3)?;
+                    let realized_cost = if run.solved {
+                        run.steps.len().saturating_sub(observations.len()) as f64
+                    } else {
+                        7.0
+                    };
+                    rows.push(ProxyCalibrationRow {
+                        state_id: state_id.clone(),
+                        date,
+                        step_index,
+                        surviving_answers: state.surviving.len(),
+                        guess,
+                        entropy: metric.entropy,
+                        largest_non_green_bucket_mass: metric.largest_non_green_bucket_mass,
+                        worst_non_green_bucket_size: metric.worst_non_green_bucket_size,
+                        high_mass_ambiguous_bucket_count: metric.high_mass_ambiguous_bucket_count,
+                        proxy_cost: metric.proxy_cost,
+                        solve_probability: metric.solve_probability,
+                        posterior_answer_probability: metric.posterior_answer_probability,
+                        smoothness_penalty: metric.smoothness_penalty,
+                        known_absent_letter_hits: metric.known_absent_letter_hits,
+                        large_non_green_bucket_count: metric.large_non_green_bucket_count,
+                        dangerous_mass_bucket_count: metric.dangerous_mass_bucket_count,
+                        non_green_mass_in_large_buckets: metric.non_green_mass_in_large_buckets,
+                        realized_cost,
+                    });
+                }
+
+                let chosen = metrics
+                    .first()
+                    .ok_or_else(|| anyhow!("missing top calibration guess"))?;
+                let guess = self.guesses[chosen.guess_index].clone();
+                let feedback = score_guess(&guess, &target);
+                observations.push((guess.clone(), feedback));
+                if feedback == ALL_GREEN_PATTERN {
+                    break;
+                }
+                self.apply_feedback(&mut state, &guess, feedback)?;
+                step_index += 1;
+            }
+
+            if game_index < 3 || (game_index + 1) % 10 == 0 || game_index + 1 == total_games {
+                emit_progress(format!(
+                    "fit-proxy-weights phase=calibration games={}/{} rows={} elapsed_s={:.1}",
+                    game_index + 1,
+                    total_games,
+                    rows.len(),
+                    started.elapsed().as_secs_f64(),
+                ));
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn fit_proxy_weights(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<ProxyWeightFitSummary> {
+        let started = Instant::now();
+        let emit_progress = |message: String| {
+            eprintln!("{message}");
+            let _ = std::io::stderr().flush();
+        };
+        emit_progress(format!(
+            "fit-proxy-weights phase=start from={} to={} elapsed_s=0.0",
+            from, to
+        ));
+        let rows = self.build_proxy_calibration_set(from, to)?;
+        if rows.is_empty() {
+            bail!("no large-state calibration rows found in the requested range");
+        }
+        emit_progress(format!(
+            "fit-proxy-weights phase=grouping rows={} elapsed_s={:.1}",
+            rows.len(),
+            started.elapsed().as_secs_f64(),
+        ));
+
+        let mut grouped = std::collections::BTreeMap::<String, Vec<&ProxyCalibrationRow>>::new();
+        for row in &rows {
+            grouped.entry(row.state_id.clone()).or_default().push(row);
+        }
+        let groups = grouped.into_iter().collect::<Vec<_>>();
+        let split = ((groups.len() as f64) * 0.8).floor() as usize;
+        let split = split.clamp(1, groups.len());
+        let (train_groups, validation_groups) = groups.split_at(split);
+
+        let evaluate = |weights: &crate::config::ProxyWeights,
+                        sample: &[(String, Vec<&ProxyCalibrationRow>)]|
+         -> f64 {
+            if sample.is_empty() {
+                return 0.0;
+            }
+            sample
+                .iter()
+                .map(|(_, rows)| {
+                    rows.iter()
+                        .max_by(|left, right| {
+                            let left_score = proxy_row_score_from_weights(
+                                weights,
+                                left.entropy,
+                                left.largest_non_green_bucket_mass,
+                                left.worst_non_green_bucket_size,
+                                left.high_mass_ambiguous_bucket_count,
+                                left.proxy_cost,
+                                left.solve_probability,
+                                left.posterior_answer_probability,
+                                left.smoothness_penalty,
+                                left.known_absent_letter_hits,
+                                left.large_non_green_bucket_count,
+                                left.dangerous_mass_bucket_count,
+                                left.non_green_mass_in_large_buckets,
+                            );
+                            let right_score = proxy_row_score_from_weights(
+                                weights,
+                                right.entropy,
+                                right.largest_non_green_bucket_mass,
+                                right.worst_non_green_bucket_size,
+                                right.high_mass_ambiguous_bucket_count,
+                                right.proxy_cost,
+                                right.solve_probability,
+                                right.posterior_answer_probability,
+                                right.smoothness_penalty,
+                                right.known_absent_letter_hits,
+                                right.large_non_green_bucket_count,
+                                right.dangerous_mass_bucket_count,
+                                right.non_green_mass_in_large_buckets,
+                            );
+                            right_score.total_cmp(&left_score)
+                        })
+                        .map(|row| row.realized_cost)
+                        .unwrap_or(7.0)
+                })
+                .sum::<f64>()
+                / sample.len() as f64
+        };
+
+        emit_progress(format!(
+            "fit-proxy-weights phase=search train_states={} validation_states={} baseline_train_avg={:.4} elapsed_s={:.1}",
+            train_groups.len(),
+            validation_groups.len(),
+            evaluate(&self.config.proxy_weights, train_groups),
+            started.elapsed().as_secs_f64(),
+        ));
+
+        let mut best = self.config.proxy_weights.clone();
+        let mut best_train = evaluate(&best, train_groups);
+        macro_rules! search_weight {
+            ($field:ident) => {{
+                emit_progress(format!(
+                    "fit-proxy-weights phase=field name={} current={:.4} train_avg={:.4} elapsed_s={:.1}",
+                    stringify!($field),
+                    best.$field,
+                    best_train,
+                    started.elapsed().as_secs_f64(),
+                ));
+                for _ in 0..2 {
+                    let mut improved = false;
+                    let base = best.$field;
+                    for scale in [0.50, 0.75, 0.90, 1.00, 1.10, 1.25, 1.50, 2.00] {
+                        let candidate_value = (base * scale).max(0.001);
+                        if (candidate_value - base).abs() <= 1e-9 {
+                            continue;
+                        }
+                        let mut candidate = best.clone();
+                        candidate.$field = candidate_value;
+                        let train_score = evaluate(&candidate, train_groups);
+                        if train_score + 1e-9 < best_train {
+                            best = candidate;
+                            best_train = train_score;
+                            improved = true;
+                            emit_progress(format!(
+                                "fit-proxy-weights phase=improved name={} value={:.4} train_avg={:.4} elapsed_s={:.1}",
+                                stringify!($field),
+                                best.$field,
+                                best_train,
+                                started.elapsed().as_secs_f64(),
+                            ));
+                        }
+                    }
+                    if !improved {
+                        break;
+                    }
+                }
+            }};
+        }
+
+        search_weight!(entropy_w);
+        search_weight!(bucket_mass_w);
+        search_weight!(bucket_size_w);
+        search_weight!(ambiguous_w);
+        search_weight!(proxy_w);
+        search_weight!(solve_prob_w);
+        search_weight!(posterior_w);
+        search_weight!(smoothness_w);
+        search_weight!(gray_reuse_w);
+        search_weight!(large_bucket_count_w);
+        search_weight!(dangerous_mass_count_w);
+        search_weight!(large_bucket_mass_w);
+
+        let validation_average = evaluate(&best, validation_groups);
+        emit_progress(format!(
+            "fit-proxy-weights phase=done train_avg={:.4} validation_avg={:.4} elapsed_s={:.1}",
+            best_train,
+            validation_average,
+            started.elapsed().as_secs_f64(),
+        ));
+        let replacement_toml = format!(
+            concat!(
+                "[proxy_weights]\n",
+                "entropy_w = {:.4}\n",
+                "bucket_mass_w = {:.4}\n",
+                "bucket_size_w = {:.4}\n",
+                "ambiguous_w = {:.4}\n",
+                "proxy_w = {:.4}\n",
+                "solve_prob_w = {:.4}\n",
+                "posterior_w = {:.4}\n",
+                "smoothness_w = {:.4}\n",
+                "gray_reuse_w = {:.4}\n",
+                "large_bucket_count_w = {:.4}\n",
+                "dangerous_mass_count_w = {:.4}\n",
+                "large_bucket_mass_w = {:.4}\n",
+            ),
+            best.entropy_w,
+            best.bucket_mass_w,
+            best.bucket_size_w,
+            best.ambiguous_w,
+            best.proxy_w,
+            best.solve_prob_w,
+            best.posterior_w,
+            best.smoothness_w,
+            best.gray_reuse_w,
+            best.large_bucket_count_w,
+            best.dangerous_mass_count_w,
+            best.large_bucket_mass_w,
+        );
+
+        Ok(ProxyWeightFitSummary {
+            row_count: rows.len(),
+            state_count: train_groups.len() + validation_groups.len(),
+            training_average_guesses: best_train,
+            validation_average_guesses: validation_average,
+            replacement_toml,
+        })
+    }
+
     fn snapshot_suggestion(suggestion: &Suggestion) -> SuggestionSnapshot {
         SuggestionSnapshot {
             word: suggestion.word.clone(),
             force_in_two: suggestion.force_in_two,
             worst_non_green_bucket_size: suggestion.worst_non_green_bucket_size,
             largest_non_green_bucket_mass: suggestion.largest_non_green_bucket_mass,
+            large_non_green_bucket_count: suggestion.large_non_green_bucket_count,
+            dangerous_mass_bucket_count: suggestion.dangerous_mass_bucket_count,
+            non_green_mass_in_large_buckets: suggestion.non_green_mass_in_large_buckets,
             proxy_cost: suggestion.proxy_cost,
             lookahead_cost: suggestion.lookahead_cost,
             exact_cost: suggestion.exact_cost,
@@ -1867,8 +2361,9 @@ impl Solver {
             .last()
             .map(|entry| entry.print_date)
             .ok_or_else(|| anyhow!("missing recent history"))?;
+        let window_days = self.config.session_window_days.saturating_sub(1) as u64;
         let window_start = window_end
-            .checked_sub_days(Days::new(29))
+            .checked_sub_days(Days::new(window_days))
             .map_or(entries[0].print_date, |date| {
                 date.max(entries[0].print_date)
             });
@@ -2052,7 +2547,7 @@ impl Solver {
                     as_of,
                     observations: &observations,
                 }),
-                false,
+                PredictiveBookUsage::None,
             )?;
             let chosen = batch
                 .suggestions
@@ -2173,17 +2668,146 @@ impl Solver {
         Ok((artifact.identity == self.predictive_book_identity(as_of)).then_some(artifact))
     }
 
+    fn session_root_guess(&self, as_of: NaiveDate) -> Result<Option<String>> {
+        let identity = self.predictive_book_identity(as_of);
+        if let Some(cached) = self
+            .session_opener_cache
+            .lock()
+            .expect("session opener cache")
+            .get(&identity)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let computed = self.evaluate_session_opener(as_of)?;
+        self.session_opener_cache
+            .lock()
+            .expect("session opener cache")
+            .insert(identity, computed.clone());
+        Ok(computed)
+    }
+
+    fn evaluate_session_opener(&self, as_of: NaiveDate) -> Result<Option<String>> {
+        let offline = self.offline_book_solver();
+        let (_, _, targets) = offline.recent_history_targets_for_books(as_of)?;
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        let state = offline.initial_state(as_of);
+        let candidates = offline
+            .suggestion_batch_internal(
+                &state,
+                offline.config.session_opener_pool.max(1),
+                Some(PredictiveContext {
+                    as_of,
+                    observations: &[],
+                }),
+                PredictiveBookUsage::None,
+            )?
+            .suggestions;
+        let best = candidates
+            .par_iter()
+            .filter_map(|suggestion| {
+                let guess_index = offline.guess_index.get(&suggestion.word).copied()?;
+                let evaluation = offline
+                    .evaluate_forced_opener(as_of, &targets, guess_index, 3)
+                    .ok()?;
+                Some((suggestion.word.clone(), evaluation))
+            })
+            .min_by(|left, right| compare_forced_openers(&left.1, &right.1, &offline.guesses));
+        Ok(best.map(|(word, _)| word))
+    }
+
+    fn session_reply_guess(
+        &self,
+        as_of: NaiveDate,
+        opener: &str,
+        pattern: u8,
+    ) -> Result<Option<String>> {
+        let identity = self.predictive_book_identity(as_of);
+        let key = (identity, opener.to_string(), pattern);
+        if let Some(cached) = self
+            .session_reply_cache
+            .lock()
+            .expect("session reply cache")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let computed = self.evaluate_session_reply(as_of, opener, pattern)?;
+        self.session_reply_cache
+            .lock()
+            .expect("session reply cache")
+            .insert(key, computed.clone());
+        Ok(computed)
+    }
+
+    fn evaluate_session_reply(
+        &self,
+        as_of: NaiveDate,
+        opener: &str,
+        pattern: u8,
+    ) -> Result<Option<String>> {
+        let offline = self.offline_book_solver();
+        let (_, _, targets) = offline.recent_history_targets_for_books(as_of)?;
+        let scoped_targets = targets
+            .into_iter()
+            .filter(|(_, target)| score_guess(opener, target) == pattern)
+            .collect::<Vec<_>>();
+        if scoped_targets.is_empty() {
+            return Ok(None);
+        }
+        let root = offline.initial_state(as_of);
+        let mut child = root.clone();
+        offline.apply_feedback(&mut child, opener, pattern)?;
+        if child.surviving.len() <= 1 {
+            return Ok(None);
+        }
+        let observation = [(opener.to_string(), pattern)];
+        let candidates = offline
+            .suggestion_batch_internal(
+                &child,
+                offline.config.session_reply_pool.max(1),
+                Some(PredictiveContext {
+                    as_of,
+                    observations: &observation,
+                }),
+                PredictiveBookUsage::None,
+            )?
+            .suggestions;
+        let best = candidates
+            .par_iter()
+            .filter_map(|suggestion| {
+                let guess_index = offline.guess_index.get(&suggestion.word).copied()?;
+                let evaluation = offline
+                    .evaluate_forced_reply(opener, pattern, &scoped_targets, guess_index, 3)
+                    .ok()?;
+                Some((suggestion.word.clone(), evaluation))
+            })
+            .min_by(|left, right| compare_forced_openers(&left.1, &right.1, &offline.guesses));
+        Ok(best.map(|(word, _)| word))
+    }
+
     fn cached_predictive_choice(
         &self,
         as_of: NaiveDate,
         observations: &[(String, u8)],
+        allow_session_fallback: bool,
     ) -> Option<String> {
         match observations {
             [] => self
                 .load_predictive_opener_artifact(as_of)
                 .ok()
                 .flatten()
-                .map(|artifact| artifact.opener),
+                .map(|artifact| artifact.opener)
+                .or_else(|| {
+                    allow_session_fallback
+                        .then(|| self.session_root_guess(as_of).ok().flatten())
+                        .flatten()
+                }),
             [(guess, pattern)] => self
                 .load_predictive_reply_book(as_of)
                 .ok()
@@ -2195,6 +2819,11 @@ impl Solver {
                         .into_iter()
                         .find(|entry| entry.feedback_pattern == *pattern)
                         .map(|entry| entry.reply)
+                })
+                .or_else(|| {
+                    allow_session_fallback
+                        .then(|| self.session_reply_guess(as_of, guess, *pattern).ok().flatten())
+                        .flatten()
                 }),
             _ => None,
         }
@@ -2265,6 +2894,12 @@ impl Solver {
         let mut worst_non_green_bucket_size = 0usize;
         let mut largest_non_green_bucket_mass = 0.0_f64;
         let mut high_mass_ambiguous_bucket_count = 0usize;
+        let mut large_non_green_bucket_count = 0usize;
+        let mut dangerous_mass_bucket_count = 0usize;
+        let mut non_green_mass_in_large_buckets = 0.0_f64;
+        let mut non_green_bucket_count = 0usize;
+        let mut non_green_mass = 0.0_f64;
+        let mut non_green_mass_square_sum = 0.0_f64;
         let mut proxy_cost = 1.0;
 
         for pattern in scratch.touched_patterns.iter().copied() {
@@ -2282,9 +2917,19 @@ impl Solver {
             if pattern == ALL_GREEN_PATTERN {
                 solve_probability = probability;
             } else {
+                non_green_bucket_count += 1;
+                non_green_mass += probability;
+                non_green_mass_square_sum += probability * probability;
                 worst_non_green_bucket_size =
                     worst_non_green_bucket_size.max(scratch.counts[index]);
                 largest_non_green_bucket_mass = largest_non_green_bucket_mass.max(probability);
+                if scratch.counts[index] >= self.config.trap_size_threshold {
+                    large_non_green_bucket_count += 1;
+                    non_green_mass_in_large_buckets += probability;
+                }
+                if probability >= self.config.trap_mass_threshold {
+                    dangerous_mass_bucket_count += 1;
+                }
                 if scratch.counts[index] > 1 {
                     force_in_two = false;
                     if probability >= 0.10 {
@@ -2311,11 +2956,32 @@ impl Solver {
             };
             proxy_cost += probability * child_proxy;
         }
+        let smoothness_penalty = normalized_concentration_penalty(
+            non_green_mass,
+            non_green_mass_square_sum,
+            non_green_bucket_count,
+        );
+        proxy_cost += 0.25 * smoothness_penalty;
         let entropy = if total_weight > 0.0 {
             total_weight.log2() - (sum_mass_log_mass / total_weight)
         } else {
             0.0
         };
+        let large_state_score = proxy_row_score_from_weights(
+            &self.config.proxy_weights,
+            entropy,
+            largest_non_green_bucket_mass,
+            worst_non_green_bucket_size,
+            high_mass_ambiguous_bucket_count,
+            proxy_cost,
+            solve_probability,
+            posterior_answer_probability,
+            smoothness_penalty,
+            0,
+            large_non_green_bucket_count,
+            dangerous_mass_bucket_count,
+            non_green_mass_in_large_buckets,
+        );
 
         GuessMetrics {
             guess_index,
@@ -2323,12 +2989,60 @@ impl Solver {
             solve_probability,
             expected_remaining,
             force_in_two,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size,
             largest_non_green_bucket_mass,
             high_mass_ambiguous_bucket_count,
+            smoothness_penalty,
+            large_non_green_bucket_count,
+            dangerous_mass_bucket_count,
+            non_green_mass_in_large_buckets,
             proxy_cost,
+            large_state_score,
             posterior_answer_probability,
         }
+    }
+
+    fn expanded_pool_size(
+        &self,
+        suggestions: &[Suggestion],
+        base_pool: usize,
+        split_first: bool,
+        assessment: StateDangerAssessment,
+    ) -> usize {
+        let base = base_pool.max(1).min(suggestions.len().max(1));
+        if suggestions.is_empty() {
+            return base;
+        }
+        let kth = base
+            .saturating_sub(1)
+            .min(suggestions.len().saturating_sub(1));
+        let gap = if split_first {
+            let top = suggestions[0]
+                .large_state_score
+                .unwrap_or(f64::NEG_INFINITY);
+            let kth_score = suggestions[kth]
+                .large_state_score
+                .unwrap_or(f64::NEG_INFINITY);
+            (top - kth_score).abs()
+        } else {
+            let top = suggestions[0].proxy_cost.unwrap_or(f64::INFINITY);
+            let kth_score = suggestions[kth].proxy_cost.unwrap_or(f64::INFINITY);
+            (kth_score - top).abs()
+        };
+        let expanded = if gap < self.config.pool_tight_gap_threshold {
+            base.saturating_mul(5) / 2
+        } else if gap < self.config.pool_medium_gap_threshold {
+            base.saturating_mul(3) / 2
+        } else {
+            base
+        };
+        let expanded = if assessment.dangerous_lookahead || assessment.dangerous_exact {
+            expanded.saturating_add(self.config.danger_reply_pool_bonus)
+        } else {
+            expanded
+        };
+        expanded.min(suggestions.len())
     }
 
     fn collect_exact_candidates(
@@ -2461,6 +3175,26 @@ impl Solver {
             }
         }
 
+        let mut diversity_ranked = suggestions.iter().collect::<Vec<_>>();
+        diversity_ranked.sort_by(|left, right| {
+            left.worst_non_green_bucket_size
+                .cmp(&right.worst_non_green_bucket_size)
+                .then_with(|| {
+                    left.largest_non_green_bucket_mass
+                        .total_cmp(&right.largest_non_green_bucket_mass)
+                })
+                .then_with(|| compare_suggestions(left, right))
+        });
+        let stride = self.config.pool_diversity_stride.max(1);
+        for suggestion in diversity_ranked.into_iter().step_by(stride) {
+            let guess_index = self
+                .guess_index
+                .get(&suggestion.word)
+                .copied()
+                .with_context(|| format!("missing guess {}", suggestion.word))?;
+            push_candidate(guess_index);
+        }
+
         let extra_limit = non_surviving_limit + surviving_guess_indexes.len();
         if candidate_indexes.len() > extra_limit {
             let mut trimmed = Vec::with_capacity(extra_limit);
@@ -2514,9 +3248,13 @@ impl Solver {
 
         let mut total_cost = 1.0;
         let mut worst_child_probability = 0.0_f64;
+        let mut large_bucket_count = 0usize;
+        let mut dangerous_mass_bucket_count = 0usize;
+        let mut non_green_mass_in_large_buckets = 0.0_f64;
         for pattern in ordered_patterns[..ordered_len].iter().copied() {
             let mass = exact_scratch.frames[0].masses[pattern as usize];
             let probability = mass / total_weight;
+            let child_len = exact_scratch.frames[0].child_subsets[pattern as usize].len();
             let child_value = if pattern == ALL_GREEN_PATTERN {
                 0.0
             } else {
@@ -2541,9 +3279,20 @@ impl Solver {
             total_cost += probability * child_value;
             if pattern != ALL_GREEN_PATTERN {
                 worst_child_probability = worst_child_probability.max(probability);
+                if child_len >= self.config.trap_size_threshold {
+                    large_bucket_count += 1;
+                    non_green_mass_in_large_buckets += probability;
+                }
+                if probability >= self.config.trap_mass_threshold {
+                    dangerous_mass_bucket_count += 1;
+                }
             }
         }
-        Ok(total_cost + (self.config.lookahead_trap_penalty * worst_child_probability))
+        Ok(total_cost
+            + (self.config.lookahead_trap_penalty * worst_child_probability)
+            + (self.config.lookahead_large_bucket_penalty * large_bucket_count as f64)
+            + (self.config.lookahead_dangerous_mass_penalty * dangerous_mass_bucket_count as f64)
+            + (self.config.lookahead_large_bucket_mass_penalty * non_green_mass_in_large_buckets))
     }
 
     fn lookahead_child_value(
@@ -2558,7 +3307,7 @@ impl Solver {
         if subset.is_empty() {
             return Ok(0.0);
         }
-        if subset.len() <= self.config.exact_threshold {
+        if subset.len() <= self.config.exact_exhaustive_threshold {
             return self.exact_best_cost(
                 subset,
                 weights,
@@ -2576,9 +3325,12 @@ impl Solver {
 
         let mut metrics =
             self.score_guess_metrics_for_subset(subset, weights, &self.exact_small_state_table);
+        let split_first = subset.len() > self.config.large_state_split_threshold;
+        metrics.sort_by(|left, right| {
+            compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
+        });
         let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
         let assessment = self.assess_subset_danger(subset, weights, total_weight, &metrics);
-        metrics.sort_by(|left, right| compare_guess_metrics(left, right, &self.guesses));
         let reply_pool = self.config.lookahead_reply_pool.max(1)
             + if expanded || assessment.dangerous_lookahead {
                 self.config.danger_reply_pool_bonus
@@ -2617,11 +3369,19 @@ impl Solver {
         let best_reply = reply_candidates
             .into_iter()
             .map(|metric| {
+                let bucket_ratio =
+                    metric.worst_non_green_bucket_size as f64 / subset.len().max(1) as f64;
                 metric.proxy_cost
-                    + self.config.lookahead_trap_penalty
-                        * ((metric.worst_non_green_bucket_size as f64 / subset.len().max(1) as f64)
+                    + (self.config.lookahead_trap_penalty
+                        * (bucket_ratio
                             + metric.largest_non_green_bucket_mass
-                            + (metric.high_mass_ambiguous_bucket_count as f64 / 4.0).min(1.0))
+                            + (metric.high_mass_ambiguous_bucket_count as f64 / 4.0).min(1.0)))
+                    + (self.config.lookahead_large_bucket_penalty
+                        * metric.large_non_green_bucket_count as f64)
+                    + (self.config.lookahead_dangerous_mass_penalty
+                        * metric.dangerous_mass_bucket_count as f64)
+                    + (self.config.lookahead_large_bucket_mass_penalty
+                        * metric.non_green_mass_in_large_buckets)
             })
             .fold(f64::INFINITY, f64::min);
         let child_value = 1.0 + best_reply;
@@ -2633,8 +3393,9 @@ impl Solver {
         &self,
         suggestions: &[Suggestion],
         expanded: bool,
+        base_pool: usize,
     ) -> Result<Vec<usize>> {
-        let pool = self.config.lookahead_candidate_pool.max(1)
+        let pool = base_pool.max(1)
             + if expanded {
                 self.config.danger_reply_pool_bonus
             } else {
@@ -2646,6 +3407,7 @@ impl Solver {
             } else {
                 0
             };
+        let diversity_take = pool.div_ceil(self.config.pool_diversity_stride.max(1));
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         for suggestion in suggestions.iter().take(pool) {
@@ -2662,6 +3424,79 @@ impl Solver {
             .iter()
             .take(force_scan)
             .filter(|suggestion| suggestion.force_in_two)
+        {
+            let guess_index = self
+                .guess_index
+                .get(&suggestion.word)
+                .copied()
+                .with_context(|| format!("missing guess {}", suggestion.word))?;
+            if seen.insert(guess_index) {
+                candidates.push(guess_index);
+            }
+        }
+        let stride = self.config.pool_diversity_stride.max(1);
+        let mut by_entropy = suggestions.iter().collect::<Vec<_>>();
+        by_entropy.sort_by(|left, right| {
+            right
+                .entropy
+                .total_cmp(&left.entropy)
+                .then_with(|| compare_suggestions(left, right))
+        });
+        for suggestion in by_entropy.into_iter().step_by(stride).take(diversity_take) {
+            let guess_index = self
+                .guess_index
+                .get(&suggestion.word)
+                .copied()
+                .with_context(|| format!("missing guess {}", suggestion.word))?;
+            if seen.insert(guess_index) {
+                candidates.push(guess_index);
+            }
+        }
+        let mut by_worst_bucket = suggestions.iter().collect::<Vec<_>>();
+        by_worst_bucket.sort_by(|left, right| {
+            left.worst_non_green_bucket_size
+                .cmp(&right.worst_non_green_bucket_size)
+                .then_with(|| compare_suggestions(left, right))
+        });
+        for suggestion in by_worst_bucket
+            .into_iter()
+            .step_by(stride)
+            .take(diversity_take)
+        {
+            let guess_index = self
+                .guess_index
+                .get(&suggestion.word)
+                .copied()
+                .with_context(|| format!("missing guess {}", suggestion.word))?;
+            if seen.insert(guess_index) {
+                candidates.push(guess_index);
+            }
+        }
+        let mut by_mass_reducer = suggestions.iter().collect::<Vec<_>>();
+        by_mass_reducer.sort_by(|left, right| {
+            left.largest_non_green_bucket_mass
+                .total_cmp(&right.largest_non_green_bucket_mass)
+                .then_with(|| compare_suggestions(left, right))
+        });
+        for suggestion in by_mass_reducer
+            .into_iter()
+            .step_by(stride)
+            .take(diversity_take)
+        {
+            let guess_index = self
+                .guess_index
+                .get(&suggestion.word)
+                .copied()
+                .with_context(|| format!("missing guess {}", suggestion.word))?;
+            if seen.insert(guess_index) {
+                candidates.push(guess_index);
+            }
+        }
+        for suggestion in suggestions
+            .iter()
+            .skip(stride - 1)
+            .step_by(stride)
+            .take(diversity_take)
         {
             let guess_index = self
                 .guess_index
@@ -2984,6 +3819,73 @@ fn compare_forced_openers(
         .then_with(|| guesses[left.guess_index].cmp(&guesses[right.guess_index]))
 }
 
+fn known_absent_letter_mask(observations: &[(String, u8)]) -> u32 {
+    let mut gray_mask = 0u32;
+    let mut present_mask = 0u32;
+    for (guess, pattern) in observations {
+        let mut value = *pattern;
+        for byte in guess.bytes().take(5) {
+            let letter_bit = 1u32 << ((byte - b'a') as u32);
+            let trit = value % 3;
+            value /= 3;
+            if trit == 0 {
+                gray_mask |= letter_bit;
+            } else {
+                present_mask |= letter_bit;
+            }
+        }
+    }
+    gray_mask & !present_mask
+}
+
+fn count_masked_letters(word: &str, mask: u32) -> usize {
+    word.bytes()
+        .filter(|byte| (mask & (1u32 << ((byte - b'a') as u32))) != 0)
+        .count()
+}
+
+fn normalized_concentration_penalty(
+    total_mass: f64,
+    mass_square_sum: f64,
+    bucket_count: usize,
+) -> f64 {
+    if total_mass <= 0.0 || bucket_count <= 1 {
+        return 0.0;
+    }
+    let concentration = mass_square_sum / (total_mass * total_mass);
+    let uniform = 1.0 / bucket_count as f64;
+    ((concentration - uniform) / (1.0 - uniform)).clamp(0.0, 1.0)
+}
+
+fn proxy_row_score_from_weights(
+    weights: &crate::config::ProxyWeights,
+    entropy: f64,
+    largest_non_green_bucket_mass: f64,
+    worst_non_green_bucket_size: usize,
+    high_mass_ambiguous_bucket_count: usize,
+    proxy_cost: f64,
+    solve_probability: f64,
+    posterior_answer_probability: f64,
+    smoothness_penalty: f64,
+    known_absent_letter_hits: usize,
+    large_non_green_bucket_count: usize,
+    dangerous_mass_bucket_count: usize,
+    non_green_mass_in_large_buckets: f64,
+) -> f64 {
+    (weights.entropy_w * entropy)
+        - (weights.bucket_mass_w * largest_non_green_bucket_mass)
+        - (weights.bucket_size_w * worst_non_green_bucket_size as f64)
+        - (weights.ambiguous_w * high_mass_ambiguous_bucket_count as f64)
+        - (weights.proxy_w * proxy_cost)
+        + (weights.solve_prob_w * solve_probability)
+        + (weights.posterior_w * posterior_answer_probability)
+        - (weights.smoothness_w * smoothness_penalty)
+        - (weights.gray_reuse_w * known_absent_letter_hits as f64)
+        - (weights.large_bucket_count_w * large_non_green_bucket_count as f64)
+        - (weights.dangerous_mass_count_w * dangerous_mass_bucket_count as f64)
+        - (weights.large_bucket_mass_w * non_green_mass_in_large_buckets)
+}
+
 fn flatten_weighted_config(config: &PriorConfig, keep_factor: f64) -> PriorConfig {
     let mut flattened = config.clone();
     let blend = |value: f64| 1.0 + ((value - 1.0) * keep_factor);
@@ -3013,9 +3915,14 @@ fn compare_guess_metrics_for_state(
     split_first: bool,
 ) -> std::cmp::Ordering {
     if split_first {
-        right
-            .entropy
-            .total_cmp(&left.entropy)
+        let score_cmp = right.large_state_score.total_cmp(&left.large_state_score);
+        if score_cmp != std::cmp::Ordering::Equal
+            && !approx_tie(left.large_state_score, right.large_state_score)
+        {
+            return score_cmp;
+        }
+        left.known_absent_letter_hits
+            .cmp(&right.known_absent_letter_hits)
             .then_with(|| {
                 left.largest_non_green_bucket_mass
                     .total_cmp(&right.largest_non_green_bucket_mass)
@@ -3024,6 +3931,15 @@ fn compare_guess_metrics_for_state(
                 left.worst_non_green_bucket_size
                     .cmp(&right.worst_non_green_bucket_size)
             })
+            .then_with(|| {
+                left.large_non_green_bucket_count
+                    .cmp(&right.large_non_green_bucket_count)
+            })
+            .then_with(|| {
+                left.dangerous_mass_bucket_count
+                    .cmp(&right.dangerous_mass_bucket_count)
+            })
+            .then_with(|| right.entropy.total_cmp(&left.entropy))
             .then_with(|| left.expected_remaining.total_cmp(&right.expected_remaining))
             .then_with(|| left.proxy_cost.total_cmp(&right.proxy_cost))
             .then_with(|| compare_force_in_two(left.force_in_two, right.force_in_two))
@@ -3066,9 +3982,14 @@ fn compare_suggestions_for_state(
     split_first: bool,
 ) -> std::cmp::Ordering {
     if split_first {
-        right
-            .entropy
-            .total_cmp(&left.entropy)
+        let left_score = left.large_state_score.unwrap_or(f64::NEG_INFINITY);
+        let right_score = right.large_state_score.unwrap_or(f64::NEG_INFINITY);
+        let score_cmp = right_score.total_cmp(&left_score);
+        if score_cmp != std::cmp::Ordering::Equal && !approx_tie(left_score, right_score) {
+            return score_cmp;
+        }
+        left.known_absent_letter_hits
+            .cmp(&right.known_absent_letter_hits)
             .then_with(|| {
                 left.largest_non_green_bucket_mass
                     .total_cmp(&right.largest_non_green_bucket_mass)
@@ -3076,6 +3997,18 @@ fn compare_suggestions_for_state(
             .then_with(|| {
                 left.worst_non_green_bucket_size
                     .cmp(&right.worst_non_green_bucket_size)
+            })
+            .then_with(|| {
+                left.large_non_green_bucket_count
+                    .cmp(&right.large_non_green_bucket_count)
+            })
+            .then_with(|| {
+                left.dangerous_mass_bucket_count
+                    .cmp(&right.dangerous_mass_bucket_count)
+            })
+            .then_with(|| {
+                left.non_green_mass_in_large_buckets
+                    .total_cmp(&right.non_green_mass_in_large_buckets)
             })
             .then_with(|| left.expected_remaining.total_cmp(&right.expected_remaining))
             .then_with(|| {
@@ -3104,6 +4037,18 @@ fn compare_suggestions_for_state(
             .then_with(|| {
                 left.largest_non_green_bucket_mass
                     .total_cmp(&right.largest_non_green_bucket_mass)
+            })
+            .then_with(|| {
+                left.large_non_green_bucket_count
+                    .cmp(&right.large_non_green_bucket_count)
+            })
+            .then_with(|| {
+                left.dangerous_mass_bucket_count
+                    .cmp(&right.dangerous_mass_bucket_count)
+            })
+            .then_with(|| {
+                left.non_green_mass_in_large_buckets
+                    .total_cmp(&right.non_green_mass_in_large_buckets)
             })
             .then_with(|| {
                 right
@@ -3188,10 +4133,11 @@ mod tests {
 
     use super::{
         ExactSearchScratch, ExactSubsetKey, ExactSubsetStorage, ExactSuggestionMode, GuessMetrics,
-        PredictiveMemoMap, PredictiveSearchMode, Solver, StateDangerAssessment, Suggestion,
-        compare_exact_costs, compare_guess_metrics, compare_guess_metrics_for_state,
-        compare_lookahead, compare_suggestions, compare_suggestions_for_state,
-        exact_suggestion_mode, predictive_search_mode,
+        PredictiveBookUsage, PredictiveMemoMap, PredictiveSearchMode, Solver,
+        StateDangerAssessment, Suggestion, compare_exact_costs, compare_guess_metrics,
+        compare_guess_metrics_for_state, compare_lookahead, compare_suggestions,
+        compare_suggestions_for_state, count_masked_letters, exact_suggestion_mode,
+        known_absent_letter_mask, predictive_search_mode,
     };
 
     fn test_solver(words: &[&str]) -> Solver {
@@ -3237,6 +4183,8 @@ mod tests {
                 .map(|(index, guess)| (guess.clone(), index))
                 .collect::<HashMap<_, _>>(),
             artifact_dir: pattern_root.join("predictive"),
+            session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -3255,6 +4203,22 @@ mod tests {
     }
 
     #[test]
+    fn known_absent_letters_ignore_letters_seen_as_present() {
+        let observations = vec![("slate".to_string(), 0)];
+        let mask = known_absent_letter_mask(&observations);
+        assert_eq!(count_masked_letters("crony", mask), 0);
+        assert_eq!(count_masked_letters("stare", mask), 4);
+
+        let observations = vec![
+            ("slate".to_string(), 0),
+            ("crony".to_string(), score_guess("crony", "cigar")),
+        ];
+        let mask = known_absent_letter_mask(&observations);
+        assert_eq!(count_masked_letters("crony", mask), 3);
+        assert_eq!(count_masked_letters("cigar", mask), 1);
+    }
+
+    #[test]
     fn initial_state_includes_seed_words() {
         let config = PriorConfig::default();
         let answer = AnswerRecord {
@@ -3270,6 +4234,55 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 3, 1).expect("valid"),
         );
         assert!(state_weight.final_weight > 0.0);
+    }
+
+    #[test]
+    fn initial_state_keeps_recent_zero_weight_answers_as_tiny_fallbacks() {
+        let guesses = vec!["noisy".to_string()];
+        let answers = vec![AnswerRecord {
+            word: "noisy".to_string(),
+            in_seed: false,
+            manual_entry: false,
+            manual_weight: 1.0,
+            history_dates: vec![NaiveDate::from_ymd_opt(2025, 9, 14).expect("valid")],
+        }];
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let pattern_root: PathBuf =
+            std::env::temp_dir().join(format!("maybe-wordle-zero-weight-test-{unique}"));
+        let _ = std::fs::remove_dir_all(&pattern_root);
+        std::fs::create_dir_all(&pattern_root).expect("pattern root");
+        let pattern_table =
+            PatternTable::load_or_build_at(&pattern_root.join("pattern.bin"), &guesses, &answers)
+                .expect("pattern table");
+        let mut config = PriorConfig::default();
+        config.cooldown_days = 365;
+        config.cooldown_floor = 0.0;
+        let solver = Solver {
+            config,
+            mode: WeightMode::Weighted,
+            variant: ModelVariant::SeedPlusHistory,
+            guesses: guesses.clone(),
+            answers,
+            history_dates: Vec::new(),
+            exact_small_state_table: SmallStateTable::build(4),
+            pattern_table,
+            guess_index: guesses
+                .iter()
+                .enumerate()
+                .map(|(index, guess)| (guess.clone(), index))
+                .collect::<HashMap<_, _>>(),
+            artifact_dir: pattern_root.join("predictive"),
+            session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        let state = solver.initial_state(NaiveDate::from_ymd_opt(2026, 3, 10).expect("valid"));
+        assert_eq!(state.surviving.len(), 1);
+        assert!(state.total_weight > 0.0);
+        assert!(state.weights[0] > 0.0);
+        assert!(state.weights[0] < 0.001);
     }
 
     #[test]
@@ -3318,10 +4331,16 @@ mod tests {
             solve_probability: 0.1,
             expected_remaining: 2.0,
             force_in_two: false,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size: 2,
             largest_non_green_bucket_mass: 0.25,
             high_mass_ambiguous_bucket_count: 1,
+            smoothness_penalty: 0.10,
+            large_non_green_bucket_count: 1,
+            dangerous_mass_bucket_count: 1,
+            non_green_mass_in_large_buckets: 0.25,
             proxy_cost: 1.8,
+            large_state_score: 1.0,
             posterior_answer_probability: 0.0,
         };
         let worse_proxy = GuessMetrics {
@@ -3330,10 +4349,16 @@ mod tests {
             solve_probability: 0.1,
             expected_remaining: 2.0,
             force_in_two: false,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size: 3,
             largest_non_green_bucket_mass: 0.35,
             high_mass_ambiguous_bucket_count: 2,
+            smoothness_penalty: 0.35,
+            large_non_green_bucket_count: 2,
+            dangerous_mass_bucket_count: 2,
+            non_green_mass_in_large_buckets: 0.35,
             proxy_cost: 2.2,
+            large_state_score: 0.2,
             posterior_answer_probability: 0.0,
         };
         assert_eq!(
@@ -3350,9 +4375,14 @@ mod tests {
             solve_probability: 0.1,
             expected_remaining: 2.0,
             force_in_two: true,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size: 1,
             largest_non_green_bucket_mass: 0.20,
+            large_non_green_bucket_count: 0,
+            dangerous_mass_bucket_count: 0,
+            non_green_mass_in_large_buckets: 0.0,
             proxy_cost: Some(2.0),
+            large_state_score: Some(1.0),
             posterior_answer_probability: 0.0,
             lookahead_cost: None,
             exact_cost: None,
@@ -3363,9 +4393,14 @@ mod tests {
             solve_probability: 0.1,
             expected_remaining: 2.0,
             force_in_two: false,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size: 1,
             largest_non_green_bucket_mass: 0.20,
+            large_non_green_bucket_count: 0,
+            dangerous_mass_bucket_count: 0,
+            non_green_mass_in_large_buckets: 0.0,
             proxy_cost: Some(2.0),
+            large_state_score: Some(0.8),
             posterior_answer_probability: 0.0,
             lookahead_cost: None,
             exact_cost: None,
@@ -3393,9 +4428,14 @@ mod tests {
             solve_probability: 0.1,
             expected_remaining: 2.0,
             force_in_two: true,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size: 1,
             largest_non_green_bucket_mass: 0.20,
+            large_non_green_bucket_count: 0,
+            dangerous_mass_bucket_count: 0,
+            non_green_mass_in_large_buckets: 0.0,
             proxy_cost: Some(2.0),
+            large_state_score: Some(1.0),
             posterior_answer_probability: 0.0,
             lookahead_cost: Some(2.0),
             exact_cost: Some(3.0),
@@ -3440,9 +4480,14 @@ mod tests {
             solve_probability: 0.1,
             expected_remaining: 2.0,
             force_in_two: true,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size: 1,
             largest_non_green_bucket_mass: 0.20,
+            large_non_green_bucket_count: 0,
+            dangerous_mass_bucket_count: 0,
+            non_green_mass_in_large_buckets: 0.0,
             proxy_cost: Some(2.0),
+            large_state_score: Some(1.0),
             posterior_answer_probability: 0.0,
             lookahead_cost: Some(3.0),
             exact_cost: None,
@@ -3468,10 +4513,16 @@ mod tests {
             solve_probability: 0.0,
             expected_remaining: 3.0,
             force_in_two: false,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size: 4,
             largest_non_green_bucket_mass: 0.18,
             high_mass_ambiguous_bucket_count: 1,
+            smoothness_penalty: 0.08,
+            large_non_green_bucket_count: 1,
+            dangerous_mass_bucket_count: 1,
+            non_green_mass_in_large_buckets: 0.18,
             proxy_cost: 1.8,
+            large_state_score: 1.2,
             posterior_answer_probability: 0.0,
         };
         let gambler = GuessMetrics {
@@ -3480,10 +4531,16 @@ mod tests {
             solve_probability: 0.3,
             expected_remaining: 3.0,
             force_in_two: false,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size: 6,
             largest_non_green_bucket_mass: 0.32,
             high_mass_ambiguous_bucket_count: 2,
+            smoothness_penalty: 0.28,
+            large_non_green_bucket_count: 2,
+            dangerous_mass_bucket_count: 2,
+            non_green_mass_in_large_buckets: 0.32,
             proxy_cost: 1.8,
+            large_state_score: 0.5,
             posterior_answer_probability: 0.4,
         };
         assert_eq!(
@@ -3496,9 +4553,14 @@ mod tests {
             solve_probability: safer_split.solve_probability,
             expected_remaining: safer_split.expected_remaining,
             force_in_two: safer_split.force_in_two,
+            known_absent_letter_hits: safer_split.known_absent_letter_hits,
             worst_non_green_bucket_size: safer_split.worst_non_green_bucket_size,
             largest_non_green_bucket_mass: safer_split.largest_non_green_bucket_mass,
+            large_non_green_bucket_count: safer_split.large_non_green_bucket_count,
+            dangerous_mass_bucket_count: safer_split.dangerous_mass_bucket_count,
+            non_green_mass_in_large_buckets: safer_split.non_green_mass_in_large_buckets,
             proxy_cost: Some(safer_split.proxy_cost),
+            large_state_score: Some(safer_split.large_state_score),
             posterior_answer_probability: safer_split.posterior_answer_probability,
             lookahead_cost: None,
             exact_cost: None,
@@ -3509,15 +4571,52 @@ mod tests {
             solve_probability: gambler.solve_probability,
             expected_remaining: gambler.expected_remaining,
             force_in_two: gambler.force_in_two,
+            known_absent_letter_hits: gambler.known_absent_letter_hits,
             worst_non_green_bucket_size: gambler.worst_non_green_bucket_size,
             largest_non_green_bucket_mass: gambler.largest_non_green_bucket_mass,
+            large_non_green_bucket_count: gambler.large_non_green_bucket_count,
+            dangerous_mass_bucket_count: gambler.dangerous_mass_bucket_count,
+            non_green_mass_in_large_buckets: gambler.non_green_mass_in_large_buckets,
             proxy_cost: Some(gambler.proxy_cost),
+            large_state_score: Some(gambler.large_state_score),
             posterior_answer_probability: gambler.posterior_answer_probability,
             lookahead_cost: None,
             exact_cost: None,
         };
         assert_eq!(
             compare_suggestions_for_state(&safer_suggestion, &gambler_suggestion, true),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn large_state_split_ordering_prefers_fewer_known_absent_letters_on_entropy_ties() {
+        let guesses = vec!["alpha".to_string(), "bravo".to_string()];
+        let cleaner = GuessMetrics {
+            guess_index: 0,
+            entropy: 4.5,
+            solve_probability: 0.0,
+            expected_remaining: 3.0,
+            force_in_two: false,
+            known_absent_letter_hits: 0,
+            worst_non_green_bucket_size: 4,
+            largest_non_green_bucket_mass: 0.20,
+            high_mass_ambiguous_bucket_count: 1,
+            smoothness_penalty: 0.10,
+            large_non_green_bucket_count: 1,
+            dangerous_mass_bucket_count: 1,
+            non_green_mass_in_large_buckets: 0.20,
+            proxy_cost: 1.8,
+            large_state_score: 1.0,
+            posterior_answer_probability: 0.0,
+        };
+        let grayer = GuessMetrics {
+            guess_index: 1,
+            known_absent_letter_hits: 2,
+            ..cleaner
+        };
+        assert_eq!(
+            compare_guess_metrics_for_state(&cleaner, &grayer, &guesses, true),
             std::cmp::Ordering::Less
         );
     }
@@ -3537,9 +4636,14 @@ mod tests {
                 solve_probability: 0.0,
                 expected_remaining: 2.0,
                 force_in_two: false,
+                known_absent_letter_hits: 0,
                 worst_non_green_bucket_size: 2,
                 largest_non_green_bucket_mass: 0.40,
+                large_non_green_bucket_count: 1,
+                dangerous_mass_bucket_count: 1,
+                non_green_mass_in_large_buckets: 0.40,
                 proxy_cost: Some(1.5),
+                large_state_score: Some(0.6),
                 posterior_answer_probability: 0.0,
                 lookahead_cost: None,
                 exact_cost: None,
@@ -3550,9 +4654,14 @@ mod tests {
                 solve_probability: 0.0,
                 expected_remaining: 2.0,
                 force_in_two: false,
+                known_absent_letter_hits: 0,
                 worst_non_green_bucket_size: 2,
                 largest_non_green_bucket_mass: 0.35,
+                large_non_green_bucket_count: 1,
+                dangerous_mass_bucket_count: 1,
+                non_green_mass_in_large_buckets: 0.35,
                 proxy_cost: Some(1.6),
+                large_state_score: Some(0.7),
                 posterior_answer_probability: 0.0,
                 lookahead_cost: None,
                 exact_cost: None,
@@ -3581,9 +4690,14 @@ mod tests {
                 solve_probability: 0.0,
                 expected_remaining: 2.0,
                 force_in_two: false,
+                known_absent_letter_hits: 0,
                 worst_non_green_bucket_size: 4,
                 largest_non_green_bucket_mass: 0.45,
+                large_non_green_bucket_count: 2,
+                dangerous_mass_bucket_count: 2,
+                non_green_mass_in_large_buckets: 0.45,
                 proxy_cost: Some(1.5),
+                large_state_score: Some(0.5),
                 posterior_answer_probability: 0.0,
                 lookahead_cost: None,
                 exact_cost: None,
@@ -3594,9 +4708,14 @@ mod tests {
                 solve_probability: 0.0,
                 expected_remaining: 2.0,
                 force_in_two: true,
+                known_absent_letter_hits: 0,
                 worst_non_green_bucket_size: 3,
                 largest_non_green_bucket_mass: 0.25,
+                large_non_green_bucket_count: 1,
+                dangerous_mass_bucket_count: 1,
+                non_green_mass_in_large_buckets: 0.25,
                 proxy_cost: Some(1.6),
+                large_state_score: Some(0.8),
                 posterior_answer_probability: 0.0,
                 lookahead_cost: None,
                 exact_cost: None,
@@ -3607,9 +4726,14 @@ mod tests {
                 solve_probability: 0.0,
                 expected_remaining: 2.0,
                 force_in_two: false,
+                known_absent_letter_hits: 0,
                 worst_non_green_bucket_size: 1,
                 largest_non_green_bucket_mass: 0.05,
+                large_non_green_bucket_count: 0,
+                dangerous_mass_bucket_count: 0,
+                non_green_mass_in_large_buckets: 0.0,
                 proxy_cost: Some(1.7),
+                large_state_score: Some(0.9),
                 posterior_answer_probability: 0.0,
                 lookahead_cost: None,
                 exact_cost: None,
@@ -3655,6 +4779,140 @@ mod tests {
             )
             .expect("exact value");
         assert!((lookahead_value - exact_value).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lookahead_candidates_include_secondary_rankings() {
+        let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let suggestions = vec![
+            Suggestion {
+                word: "cigar".into(),
+                entropy: 3.0,
+                solve_probability: 0.0,
+                expected_remaining: 2.0,
+                force_in_two: false,
+                known_absent_letter_hits: 0,
+                worst_non_green_bucket_size: 5,
+                largest_non_green_bucket_mass: 0.40,
+                large_non_green_bucket_count: 2,
+                dangerous_mass_bucket_count: 2,
+                non_green_mass_in_large_buckets: 0.40,
+                proxy_cost: Some(1.0),
+                large_state_score: Some(1.0),
+                posterior_answer_probability: 0.0,
+                lookahead_cost: None,
+                exact_cost: None,
+            },
+            Suggestion {
+                word: "rebut".into(),
+                entropy: 5.0,
+                solve_probability: 0.0,
+                expected_remaining: 2.0,
+                force_in_two: false,
+                known_absent_letter_hits: 0,
+                worst_non_green_bucket_size: 4,
+                largest_non_green_bucket_mass: 0.35,
+                large_non_green_bucket_count: 1,
+                dangerous_mass_bucket_count: 1,
+                non_green_mass_in_large_buckets: 0.35,
+                proxy_cost: Some(1.2),
+                large_state_score: Some(0.9),
+                posterior_answer_probability: 0.0,
+                lookahead_cost: None,
+                exact_cost: None,
+            },
+            Suggestion {
+                word: "sissy".into(),
+                entropy: 2.5,
+                solve_probability: 0.0,
+                expected_remaining: 2.0,
+                force_in_two: false,
+                known_absent_letter_hits: 0,
+                worst_non_green_bucket_size: 1,
+                largest_non_green_bucket_mass: 0.10,
+                large_non_green_bucket_count: 0,
+                dangerous_mass_bucket_count: 0,
+                non_green_mass_in_large_buckets: 0.0,
+                proxy_cost: Some(1.3),
+                large_state_score: Some(0.8),
+                posterior_answer_probability: 0.0,
+                lookahead_cost: None,
+                exact_cost: None,
+            },
+            Suggestion {
+                word: "humph".into(),
+                entropy: 2.0,
+                solve_probability: 0.0,
+                expected_remaining: 2.0,
+                force_in_two: false,
+                known_absent_letter_hits: 0,
+                worst_non_green_bucket_size: 3,
+                largest_non_green_bucket_mass: 0.15,
+                large_non_green_bucket_count: 1,
+                dangerous_mass_bucket_count: 1,
+                non_green_mass_in_large_buckets: 0.15,
+                proxy_cost: Some(1.4),
+                large_state_score: Some(0.7),
+                posterior_answer_probability: 0.0,
+                lookahead_cost: None,
+                exact_cost: None,
+            },
+        ];
+
+        let candidates = solver
+            .collect_lookahead_candidates(&suggestions, false, 1)
+            .expect("candidates");
+
+        assert!(candidates.contains(solver.guess_index.get("cigar").expect("cigar")));
+        assert!(candidates.contains(solver.guess_index.get("rebut").expect("rebut")));
+        assert!(candidates.contains(solver.guess_index.get("sissy").expect("sissy")));
+    }
+
+    #[test]
+    fn suggestion_tie_breaks_keep_trap_signals() {
+        let safer = Suggestion {
+            word: "alpha".into(),
+            entropy: 3.0,
+            solve_probability: 0.0,
+            expected_remaining: 2.0,
+            force_in_two: false,
+            known_absent_letter_hits: 0,
+            worst_non_green_bucket_size: 3,
+            largest_non_green_bucket_mass: 0.20,
+            large_non_green_bucket_count: 1,
+            dangerous_mass_bucket_count: 1,
+            non_green_mass_in_large_buckets: 0.20,
+            proxy_cost: Some(2.0),
+            large_state_score: Some(1.0),
+            posterior_answer_probability: 0.0,
+            lookahead_cost: Some(3.0),
+            exact_cost: Some(3.0),
+        };
+        let trap_heavier = Suggestion {
+            word: "bravo".into(),
+            large_non_green_bucket_count: 3,
+            dangerous_mass_bucket_count: 2,
+            non_green_mass_in_large_buckets: 0.45,
+            ..safer.clone()
+        };
+        assert_eq!(
+            compare_suggestions_for_state(&safer, &trap_heavier, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_lookahead(&safer, &trap_heavier, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_exact_costs(
+                &safer,
+                &trap_heavier,
+                safer.exact_cost,
+                trap_heavier.exact_cost,
+                false
+            ),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]
@@ -3743,10 +5001,26 @@ mod tests {
     }
 
     #[test]
+    fn normalized_concentration_penalty_prefers_smoother_partitions() {
+        let smooth = super::normalized_concentration_penalty(1.0, 0.25 * 0.25 * 4.0, 4);
+        let spiky =
+            super::normalized_concentration_penalty(1.0, 0.70 * 0.70 + 0.10 * 0.10 * 3.0, 4);
+        assert_eq!(smooth, 0.0);
+        assert!(spiky > smooth);
+        assert!(spiky <= 1.0);
+    }
+
+    #[test]
     fn detailed_run_tracks_step_diagnostics() {
         let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
         let run = solver
-            .solve_target_from_state_detailed("cigar", Solver::today(), Solver::today(), 3)
+            .solve_target_from_state_detailed(
+                "cigar",
+                Solver::today(),
+                Solver::today(),
+                3,
+                PredictiveBookUsage::Full,
+            )
             .expect("detailed run");
         assert!(!run.steps.is_empty());
         assert!(!run.steps[0].top_suggestions.is_empty());
@@ -3825,6 +5099,8 @@ mod tests {
                 .map(|(index, guess)| (guess.clone(), index))
                 .collect::<HashMap<_, _>>(),
             artifact_dir: pattern_root.join("predictive"),
+            session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         let mut memo = PredictiveMemoMap::default();
         let mut scratch = ExactSearchScratch::new();

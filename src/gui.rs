@@ -494,14 +494,17 @@ fn spawn_worker(
     let (request_sender, request_receiver) = mpsc::channel::<WorkerRequest>();
     let (response_sender, response_receiver) = mpsc::channel::<WorkerResponse>();
     thread::spawn(move || {
-        while let Ok(request) = request_receiver.recv() {
+        while let Ok(mut request) = request_receiver.recv() {
+            while let Ok(newer_request) = request_receiver.try_recv() {
+                request = newer_request;
+            }
             let payload = match request.mode {
                 GuiSolverMode::Predictive => {
                     let result = (|| -> Result<WorkerPayload> {
                         let date = NaiveDate::parse_from_str(&request.date_text, "%Y-%m-%d")
                             .with_context(|| format!("invalid date: {}", request.date_text))?;
                         let state = predictive_solver.apply_history(date, &request.observations)?;
-                        let suggestions = predictive_solver.suggestions_for_history(
+                        let suggestions = predictive_solver.suggestions_for_history_disk_books_only(
                             date,
                             &request.observations,
                             request.top,

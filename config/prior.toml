@@ -7,17 +7,42 @@ logistic_k = 0.020
 exact_threshold = 64
 exact_exhaustive_threshold = 12
 exact_candidate_pool = 96
+session_opener_pool = 32
+session_reply_pool = 20
+session_window_days = 30
 lookahead_threshold = 160
 lookahead_candidate_pool = 24
 lookahead_reply_pool = 12
 lookahead_root_force_in_two_scan = 64
 large_state_split_threshold = 50
+pool_tight_gap_threshold = 0.05
+pool_medium_gap_threshold = 0.15
+pool_diversity_stride = 4
 danger_lookahead_threshold = 0.58
 danger_exact_threshold = 0.72
 danger_reply_pool_bonus = 8
 danger_exact_root_pool = 24
 danger_exact_survivor_cap = 192
 lookahead_trap_penalty = 0.35
+lookahead_large_bucket_penalty = 0.12
+lookahead_dangerous_mass_penalty = 0.08
+lookahead_large_bucket_mass_penalty = 0.10
+trap_size_threshold = 6
+trap_mass_threshold = 0.15
 sync_reverify_days = 3
+
+[proxy_weights]
+entropy_w = 0.90
+bucket_mass_w = 1.40
+bucket_size_w = 0.12
+ambiguous_w = 0.30
+proxy_w = 1.00
+solve_prob_w = 0.10
+posterior_w = 0.05
+smoothness_w = 0.45
+gray_reuse_w = 0.08
+large_bucket_count_w = 0.18
+dangerous_mass_count_w = 0.22
+large_bucket_mass_w = 0.40
 
 [manual_weights]

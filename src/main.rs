@@ -132,6 +132,12 @@ enum Command {
         top: usize,
     },
     TunePrior,
+    FitProxyWeights {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+    },
     Benchmark {
         #[arg(long, default_value_t = 3)]
         runs: usize,
@@ -686,6 +692,28 @@ fn run() -> Result<()> {
             );
             println!("{}", summary.replacement_toml.trim_end());
         }
+        Command::FitProxyWeights { from, to } => {
+            let (history_start, history_end) = Solver::latest_history_range(&paths)?
+                .ok_or_else(|| anyhow!("run sync-data before fitting proxy weights"))?;
+            let default_from = history_end
+                .checked_sub_days(chrono::Days::new(364))
+                .map_or(history_start, |date| date.max(history_start));
+            let from = parse_date(from.as_deref())?.unwrap_or(default_from);
+            let to = parse_date(to.as_deref())?.unwrap_or(history_end);
+            if from > to {
+                bail!("--from cannot be after --to");
+            }
+            let solver = Solver::from_paths(&paths, &config)?;
+            let summary = solver.fit_proxy_weights(from, to)?;
+            println!(
+                "rows={} states={} train_avg={:.4} validation_avg={:.4}",
+                summary.row_count,
+                summary.state_count,
+                summary.training_average_guesses,
+                summary.validation_average_guesses
+            );
+            println!("{}", summary.replacement_toml.trim_end());
+        }
         Command::Benchmark { runs, mode, model } => {
             if runs == 0 {
                 bail!("runs must be greater than 0");
@@ -884,9 +912,14 @@ mod tests {
             solve_probability: 0.2,
             expected_remaining: 3.0,
             force_in_two: true,
+            known_absent_letter_hits: 0,
             worst_non_green_bucket_size: 1,
             largest_non_green_bucket_mass: 0.05,
+            large_non_green_bucket_count: 0,
+            dangerous_mass_bucket_count: 0,
+            non_green_mass_in_large_buckets: 0.0,
             proxy_cost: Some(2.0),
+            large_state_score: Some(1.0),
             posterior_answer_probability: 0.1,
             lookahead_cost: None,
             exact_cost: Some(2.5),

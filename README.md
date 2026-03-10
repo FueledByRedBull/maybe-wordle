@@ -50,6 +50,7 @@ build-predictive-opener
 build-predictive-replies
 experiments
 tune-prior
+fit-proxy-weights
 benchmark
 ```
 
@@ -148,6 +149,8 @@ Predictive mode now has a separate experiment and cache surface:
 - `cargo run -- build-predictive-replies --date YYYY-MM-DD`
 
 The opener and reply caches are predictive-only artifacts under [`data/derived/predictive`](./data/derived/predictive). They are keyed by weight mode, model variant, date context, and a fingerprint of the current predictive config. If a cache is missing or stale, predictive mode falls back to live scoring automatically.
+
+Predictive weighting can still heavily down-rank recently used answers, but eligible modeled answers are no longer dropped completely when their computed prior weight reaches zero. The live solver now keeps them with a tiny fallback weight so valid boards remain representable instead of collapsing to "no answers remain".
 
 The GUI no longer recomputes suggestions on the UI thread. Heavy predictive or formal recomputes now run in a background worker, so `Suggest`, `Undo`, `Reset`, mode switches, and date changes stay responsive while results are pending.
 

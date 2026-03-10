@@ -5,6 +5,42 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ProxyWeights {
+    pub entropy_w: f64,
+    pub bucket_mass_w: f64,
+    pub bucket_size_w: f64,
+    pub ambiguous_w: f64,
+    pub proxy_w: f64,
+    pub solve_prob_w: f64,
+    pub posterior_w: f64,
+    pub smoothness_w: f64,
+    pub gray_reuse_w: f64,
+    pub large_bucket_count_w: f64,
+    pub dangerous_mass_count_w: f64,
+    pub large_bucket_mass_w: f64,
+}
+
+impl Default for ProxyWeights {
+    fn default() -> Self {
+        Self {
+            entropy_w: 0.90,
+            bucket_mass_w: 1.40,
+            bucket_size_w: 0.12,
+            ambiguous_w: 0.30,
+            proxy_w: 1.00,
+            solve_prob_w: 0.10,
+            posterior_w: 0.05,
+            smoothness_w: 0.45,
+            gray_reuse_w: 0.08,
+            large_bucket_count_w: 0.18,
+            dangerous_mass_count_w: 0.22,
+            large_bucket_mass_w: 0.40,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PriorConfig {
     pub base_seed_weight: f64,
     pub base_history_only_weight: f64,
@@ -15,18 +51,30 @@ pub struct PriorConfig {
     pub exact_threshold: usize,
     pub exact_exhaustive_threshold: usize,
     pub exact_candidate_pool: usize,
+    pub session_opener_pool: usize,
+    pub session_reply_pool: usize,
+    pub session_window_days: usize,
     pub lookahead_threshold: usize,
     pub lookahead_candidate_pool: usize,
     pub lookahead_reply_pool: usize,
     pub lookahead_root_force_in_two_scan: usize,
     pub large_state_split_threshold: usize,
+    pub pool_tight_gap_threshold: f64,
+    pub pool_medium_gap_threshold: f64,
+    pub pool_diversity_stride: usize,
     pub danger_lookahead_threshold: f64,
     pub danger_exact_threshold: f64,
     pub danger_reply_pool_bonus: usize,
     pub danger_exact_root_pool: usize,
     pub danger_exact_survivor_cap: usize,
     pub lookahead_trap_penalty: f64,
+    pub lookahead_large_bucket_penalty: f64,
+    pub lookahead_dangerous_mass_penalty: f64,
+    pub lookahead_large_bucket_mass_penalty: f64,
+    pub trap_size_threshold: usize,
+    pub trap_mass_threshold: f64,
     pub sync_reverify_days: i64,
+    pub proxy_weights: ProxyWeights,
     pub manual_weights: BTreeMap<String, f64>,
 }
 
@@ -42,18 +90,30 @@ impl Default for PriorConfig {
             exact_threshold: 64,
             exact_exhaustive_threshold: 12,
             exact_candidate_pool: 96,
+            session_opener_pool: 32,
+            session_reply_pool: 20,
+            session_window_days: 30,
             lookahead_threshold: 160,
             lookahead_candidate_pool: 24,
             lookahead_reply_pool: 12,
             lookahead_root_force_in_two_scan: 64,
             large_state_split_threshold: 50,
+            pool_tight_gap_threshold: 0.05,
+            pool_medium_gap_threshold: 0.15,
+            pool_diversity_stride: 4,
             danger_lookahead_threshold: 0.58,
             danger_exact_threshold: 0.72,
             danger_reply_pool_bonus: 8,
             danger_exact_root_pool: 24,
             danger_exact_survivor_cap: 192,
             lookahead_trap_penalty: 0.35,
+            lookahead_large_bucket_penalty: 0.12,
+            lookahead_dangerous_mass_penalty: 0.08,
+            lookahead_large_bucket_mass_penalty: 0.10,
+            trap_size_threshold: 6,
+            trap_mass_threshold: 0.15,
             sync_reverify_days: 3,
+            proxy_weights: ProxyWeights::default(),
             manual_weights: BTreeMap::new(),
         }
     }
@@ -98,43 +158,79 @@ mod tests {
     fn prior_config_round_trips_lookahead_fields() {
         let mut config = PriorConfig::default();
         config.exact_exhaustive_threshold = 14;
+        config.session_opener_pool = 36;
+        config.session_reply_pool = 24;
+        config.session_window_days = 45;
         config.lookahead_threshold = 144;
         config.lookahead_candidate_pool = 18;
         config.lookahead_reply_pool = 9;
         config.lookahead_root_force_in_two_scan = 72;
         config.large_state_split_threshold = 48;
+        config.pool_tight_gap_threshold = 0.04;
+        config.pool_medium_gap_threshold = 0.11;
+        config.pool_diversity_stride = 6;
         config.danger_lookahead_threshold = 0.61;
         config.danger_exact_threshold = 0.77;
         config.danger_reply_pool_bonus = 6;
         config.danger_exact_root_pool = 28;
         config.danger_exact_survivor_cap = 176;
         config.lookahead_trap_penalty = 0.42;
+        config.lookahead_large_bucket_penalty = 0.16;
+        config.lookahead_dangerous_mass_penalty = 0.09;
+        config.lookahead_large_bucket_mass_penalty = 0.13;
+        config.trap_size_threshold = 7;
+        config.trap_mass_threshold = 0.18;
+        config.proxy_weights.entropy_w = 1.1;
         let encoded = toml::to_string_pretty(&config).expect("encode");
         assert!(encoded.contains("exact_exhaustive_threshold = 14"));
+        assert!(encoded.contains("session_opener_pool = 36"));
+        assert!(encoded.contains("session_reply_pool = 24"));
+        assert!(encoded.contains("session_window_days = 45"));
         assert!(encoded.contains("lookahead_threshold = 144"));
         assert!(encoded.contains("lookahead_candidate_pool = 18"));
         assert!(encoded.contains("lookahead_reply_pool = 9"));
         assert!(encoded.contains("lookahead_root_force_in_two_scan = 72"));
         assert!(encoded.contains("large_state_split_threshold = 48"));
+        assert!(encoded.contains("pool_tight_gap_threshold = 0.04"));
+        assert!(encoded.contains("pool_medium_gap_threshold = 0.11"));
+        assert!(encoded.contains("pool_diversity_stride = 6"));
         assert!(encoded.contains("danger_lookahead_threshold = 0.61"));
         assert!(encoded.contains("danger_exact_threshold = 0.77"));
         assert!(encoded.contains("danger_reply_pool_bonus = 6"));
         assert!(encoded.contains("danger_exact_root_pool = 28"));
         assert!(encoded.contains("danger_exact_survivor_cap = 176"));
         assert!(encoded.contains("lookahead_trap_penalty = 0.42"));
+        assert!(encoded.contains("lookahead_large_bucket_penalty = 0.16"));
+        assert!(encoded.contains("lookahead_dangerous_mass_penalty = 0.09"));
+        assert!(encoded.contains("lookahead_large_bucket_mass_penalty = 0.13"));
+        assert!(encoded.contains("trap_size_threshold = 7"));
+        assert!(encoded.contains("trap_mass_threshold = 0.18"));
+        assert!(encoded.contains("entropy_w = 1.1"));
 
         let decoded: PriorConfig = toml::from_str(&encoded).expect("decode");
         assert_eq!(decoded.exact_exhaustive_threshold, 14);
+        assert_eq!(decoded.session_opener_pool, 36);
+        assert_eq!(decoded.session_reply_pool, 24);
+        assert_eq!(decoded.session_window_days, 45);
         assert_eq!(decoded.lookahead_threshold, 144);
         assert_eq!(decoded.lookahead_candidate_pool, 18);
         assert_eq!(decoded.lookahead_reply_pool, 9);
         assert_eq!(decoded.lookahead_root_force_in_two_scan, 72);
         assert_eq!(decoded.large_state_split_threshold, 48);
+        assert_eq!(decoded.pool_tight_gap_threshold, 0.04);
+        assert_eq!(decoded.pool_medium_gap_threshold, 0.11);
+        assert_eq!(decoded.pool_diversity_stride, 6);
         assert_eq!(decoded.danger_lookahead_threshold, 0.61);
         assert_eq!(decoded.danger_exact_threshold, 0.77);
         assert_eq!(decoded.danger_reply_pool_bonus, 6);
         assert_eq!(decoded.danger_exact_root_pool, 28);
         assert_eq!(decoded.danger_exact_survivor_cap, 176);
         assert_eq!(decoded.lookahead_trap_penalty, 0.42);
+        assert_eq!(decoded.lookahead_large_bucket_penalty, 0.16);
+        assert_eq!(decoded.lookahead_dangerous_mass_penalty, 0.09);
+        assert_eq!(decoded.lookahead_large_bucket_mass_penalty, 0.13);
+        assert_eq!(decoded.trap_size_threshold, 7);
+        assert_eq!(decoded.trap_mass_threshold, 0.18);
+        assert_eq!(decoded.proxy_weights.entropy_w, 1.1);
     }
 }
