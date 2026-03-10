@@ -19,6 +19,7 @@ pub struct PriorConfig {
     pub lookahead_candidate_pool: usize,
     pub lookahead_reply_pool: usize,
     pub lookahead_root_force_in_two_scan: usize,
+    pub large_state_split_threshold: usize,
     pub danger_lookahead_threshold: f64,
     pub danger_exact_threshold: f64,
     pub danger_reply_pool_bonus: usize,
@@ -45,6 +46,7 @@ impl Default for PriorConfig {
             lookahead_candidate_pool: 24,
             lookahead_reply_pool: 12,
             lookahead_root_force_in_two_scan: 64,
+            large_state_split_threshold: 50,
             danger_lookahead_threshold: 0.58,
             danger_exact_threshold: 0.72,
             danger_reply_pool_bonus: 8,
@@ -100,6 +102,7 @@ mod tests {
         config.lookahead_candidate_pool = 18;
         config.lookahead_reply_pool = 9;
         config.lookahead_root_force_in_two_scan = 72;
+        config.large_state_split_threshold = 48;
         config.danger_lookahead_threshold = 0.61;
         config.danger_exact_threshold = 0.77;
         config.danger_reply_pool_bonus = 6;
@@ -112,6 +115,7 @@ mod tests {
         assert!(encoded.contains("lookahead_candidate_pool = 18"));
         assert!(encoded.contains("lookahead_reply_pool = 9"));
         assert!(encoded.contains("lookahead_root_force_in_two_scan = 72"));
+        assert!(encoded.contains("large_state_split_threshold = 48"));
         assert!(encoded.contains("danger_lookahead_threshold = 0.61"));
         assert!(encoded.contains("danger_exact_threshold = 0.77"));
         assert!(encoded.contains("danger_reply_pool_bonus = 6"));
@@ -125,6 +129,7 @@ mod tests {
         assert_eq!(decoded.lookahead_candidate_pool, 18);
         assert_eq!(decoded.lookahead_reply_pool, 9);
         assert_eq!(decoded.lookahead_root_force_in_two_scan, 72);
+        assert_eq!(decoded.large_state_split_threshold, 48);
         assert_eq!(decoded.danger_lookahead_threshold, 0.61);
         assert_eq!(decoded.danger_exact_threshold, 0.77);
         assert_eq!(decoded.danger_reply_pool_bonus, 6);

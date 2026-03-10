@@ -28,6 +28,7 @@ pub struct ProjectPaths {
     pub derived_answer_history: PathBuf,
     pub derived_modeled_answers: PathBuf,
     pub derived_seed_reconciliation: PathBuf,
+    pub derived_predictive: PathBuf,
     pub pattern_table: PathBuf,
 }
 
@@ -46,6 +47,7 @@ impl ProjectPaths {
             derived_answer_history: root.join("data/derived/answer_history.csv"),
             derived_modeled_answers: root.join("data/derived/modeled_answers.csv"),
             derived_seed_reconciliation: root.join("data/derived/seed_reconciliation.csv"),
+            derived_predictive: root.join("data/derived/predictive"),
             pattern_table: root.join("data/derived/pattern_table.bin"),
             root,
         }
@@ -57,6 +59,7 @@ impl ProjectPaths {
             self.root.join("data/raw"),
             self.root.join("data/seed"),
             self.root.join("data/derived"),
+            self.derived_predictive.clone(),
             self.root.join("data/formal"),
             self.root.join("src"),
             self.root.join("tests"),

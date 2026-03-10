@@ -99,6 +99,30 @@ enum Command {
         #[arg(long, default_value_t = false)]
         failures_only: bool,
     },
+    PredictiveAblations {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+    },
+    BuildPredictiveOpener {
+        #[arg(long)]
+        date: Option<String>,
+        #[arg(long, default_value = "weighted")]
+        weight_mode: String,
+        #[arg(long, default_value = "seed_plus_history")]
+        variant: String,
+    },
+    BuildPredictiveReplies {
+        #[arg(long)]
+        date: Option<String>,
+        #[arg(long, default_value = "weighted")]
+        weight_mode: String,
+        #[arg(long, default_value = "seed_plus_history")]
+        variant: String,
+    },
     Experiments {
         #[arg(long)]
         from: Option<String>,
@@ -261,7 +285,7 @@ fn run() -> Result<()> {
                     state.surviving.len(),
                     state.total_weight
                 );
-                for suggestion in solver.suggestions(&state, top)? {
+                for suggestion in solver.suggestions_for_history(as_of, &observations, top)? {
                     println!("{}", format_predictive_suggestion(&suggestion));
                 }
             }
@@ -309,7 +333,7 @@ fn run() -> Result<()> {
                         state.surviving.len(),
                         state.total_weight
                     );
-                    for suggestion in solver.suggestions(&state, top)? {
+                    for suggestion in solver.suggestions_for_history(as_of, &observations, top)? {
                         println!("{}", format_predictive_suggestion(&suggestion));
                     }
 
@@ -513,6 +537,82 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::PredictiveAblations { from, to, top } => {
+            let (default_from, default_to) = Solver::latest_history_range(&paths)?
+                .ok_or_else(|| anyhow!("run sync-data before predictive-ablations"))?;
+            let from = parse_date(from.as_deref())?.unwrap_or(default_from);
+            let to = parse_date(to.as_deref())?.unwrap_or(default_to);
+            if from > to {
+                bail!("--from cannot be after --to");
+            }
+            for row in Solver::predictive_ablation_report(&paths, &config, from, to, top)? {
+                println!(
+                    "label={} config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3}",
+                    row.label,
+                    row.result.config_id,
+                    row.result.mode.label(),
+                    row.result.variant.label(),
+                    row.result.backtest.games,
+                    row.result.backtest.average_guesses,
+                    row.result.backtest.p95_guesses,
+                    row.result.backtest.max_guesses,
+                    row.result.backtest.failures,
+                    row.result.average_target_probability,
+                    row.result.average_target_rank,
+                    row.result.latency_p95_ms,
+                );
+            }
+        }
+        Command::BuildPredictiveOpener {
+            date,
+            weight_mode,
+            variant,
+        } => {
+            let as_of = parse_or_today(date.as_deref())?;
+            let solver = Solver::from_paths_with_settings(
+                &paths,
+                &config,
+                parse_weight_mode(&weight_mode)?,
+                parse_model_variant(&variant)?,
+            )?;
+            let summary = solver.build_predictive_opener_cache(as_of)?;
+            println!(
+                "mode={} variant={} as_of={} opener={} games={} avg_guesses={:.4} failures={} fingerprint={} path={}",
+                solver.mode.label(),
+                solver.variant.label(),
+                summary.as_of,
+                summary.opener,
+                summary.games,
+                summary.average_guesses,
+                summary.failures,
+                summary.config_fingerprint,
+                summary.path.display()
+            );
+        }
+        Command::BuildPredictiveReplies {
+            date,
+            weight_mode,
+            variant,
+        } => {
+            let as_of = parse_or_today(date.as_deref())?;
+            let solver = Solver::from_paths_with_settings(
+                &paths,
+                &config,
+                parse_weight_mode(&weight_mode)?,
+                parse_model_variant(&variant)?,
+            )?;
+            let summary = solver.build_predictive_reply_book(as_of)?;
+            println!(
+                "mode={} variant={} as_of={} opener={} replies={} fingerprint={} path={}",
+                solver.mode.label(),
+                solver.variant.label(),
+                summary.as_of,
+                summary.opener,
+                summary.reply_count,
+                summary.config_fingerprint,
+                summary.path.display()
+            );
+        }
         Command::Experiments { from, to, top } => {
             let (default_from, default_to) = Solver::latest_history_range(&paths)?
                 .ok_or_else(|| anyhow!("run sync-data before experiments"))?;
@@ -712,6 +812,25 @@ fn parse_solver_mode(raw: &str) -> Result<SolverMode> {
         "predictive" => Ok(SolverMode::Predictive),
         "formal-optimal" | "formal_optimal" | "formal" | "optimal" => Ok(SolverMode::FormalOptimal),
         _ => bail!("mode must be one of: predictive, formal-optimal"),
+    }
+}
+
+fn parse_weight_mode(raw: &str) -> Result<WeightMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "weighted" => Ok(WeightMode::Weighted),
+        "uniform" => Ok(WeightMode::Uniform),
+        "cooldown_only" | "cooldown-only" => Ok(WeightMode::CooldownOnly),
+        _ => bail!("weight mode must be one of: weighted, uniform, cooldown_only"),
+    }
+}
+
+fn parse_model_variant(raw: &str) -> Result<ModelVariant> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "seed_only" | "seed-only" => Ok(ModelVariant::SeedOnly),
+        "seed_plus_history" | "seed-plus-history" | "seed" | "default" => {
+            Ok(ModelVariant::SeedPlusHistory)
+        }
+        _ => bail!("variant must be one of: seed_only, seed_plus_history"),
     }
 }
 

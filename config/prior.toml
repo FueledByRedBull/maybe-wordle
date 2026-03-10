@@ -11,6 +11,7 @@ lookahead_threshold = 160
 lookahead_candidate_pool = 24
 lookahead_reply_pool = 12
 lookahead_root_force_in_two_scan = 64
+large_state_split_threshold = 50
 danger_lookahead_threshold = 0.58
 danger_exact_threshold = 0.72
 danger_reply_pool_bonus = 8

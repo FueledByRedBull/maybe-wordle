@@ -196,5 +196,37 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
     let hard_cases = solver.hard_case_report(5).expect("hard cases");
     assert!(!hard_cases.cases.is_empty());
     assert!(summary.current.hard_case_failures <= hard_cases.cases.len());
+
+    let ablations = Solver::predictive_ablation_report(
+        &paths,
+        &config,
+        NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"),
+        NaiveDate::from_ymd_opt(2024, 1, 4).expect("date"),
+        5,
+    )
+    .expect("ablations");
+    assert!(ablations.len() >= 6);
+    assert!(ablations.iter().any(|row| row.label == "weighted_baseline"));
+
+    let as_of = NaiveDate::from_ymd_opt(2024, 1, 5).expect("date");
+    let opener = solver
+        .build_predictive_opener_cache(as_of)
+        .expect("build opener");
+    let root_suggestions = solver
+        .suggestions_for_history(as_of, &[], 1)
+        .expect("root suggestions");
+    assert_eq!(root_suggestions[0].word, opener.opener);
+
+    let replies = solver
+        .build_predictive_reply_book(as_of)
+        .expect("build replies");
+    let target = solver.answers[0].word.clone();
+    let first_feedback = score_guess(&opener.opener, &target);
+    if replies.reply_count > 0 && first_feedback != parse_feedback("22222").expect("green") {
+        let second_move = solver
+            .suggestions_for_history(as_of, &[(opener.opener.clone(), first_feedback)], 1)
+            .expect("second move");
+        assert!(!second_move.is_empty());
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

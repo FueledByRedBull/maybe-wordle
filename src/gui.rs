@@ -1,4 +1,9 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -52,7 +57,6 @@ enum GuiSolverMode {
 }
 
 struct WordleGuiApp {
-    predictive_solver: Solver,
     formal_solver: Option<FormalPolicyRuntime>,
     mode: GuiSolverMode,
     date_text: String,
@@ -66,6 +70,37 @@ struct WordleGuiApp {
     top: usize,
     status: String,
     formal_explanation: Option<FormalStateExplanation>,
+    request_sender: Sender<WorkerRequest>,
+    response_receiver: Receiver<WorkerResponse>,
+    latest_generation: u64,
+    computing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WorkerRequest {
+    generation: u64,
+    mode: GuiSolverMode,
+    date_text: String,
+    observations: Vec<(String, u8)>,
+    top: usize,
+}
+
+#[derive(Clone, Debug)]
+enum WorkerPayload {
+    Predictive {
+        state: SolveState,
+        suggestions: Vec<Suggestion>,
+    },
+    Formal {
+        explanation: FormalStateExplanation,
+        suggestions: Vec<FormalSuggestion>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct WorkerResponse {
+    generation: u64,
+    payload: std::result::Result<WorkerPayload, String>,
 }
 
 impl WordleGuiApp {
@@ -76,8 +111,9 @@ impl WordleGuiApp {
         } else {
             GuiSolverMode::Predictive
         };
+        let (request_sender, response_receiver) =
+            spawn_worker(predictive_solver.clone(), formal_solver.clone());
         let mut app = Self {
-            predictive_solver,
             formal_solver,
             mode,
             date_text,
@@ -91,15 +127,39 @@ impl WordleGuiApp {
             top: 10,
             status: String::new(),
             formal_explanation: None,
+            request_sender,
+            response_receiver,
+            latest_generation: 0,
+            computing: false,
         };
-        app.recompute();
+        app.schedule_recompute();
         app
     }
 
-    fn recompute(&mut self) {
-        match self.mode {
-            GuiSolverMode::Predictive => match self.try_recompute_predictive() {
-                Ok((state, suggestions)) => {
+    fn schedule_recompute(&mut self) {
+        self.latest_generation = self.latest_generation.wrapping_add(1);
+        let request = WorkerRequest {
+            generation: self.latest_generation,
+            mode: self.mode,
+            date_text: self.date_text.clone(),
+            observations: self.observations.clone(),
+            top: self.top,
+        };
+        self.computing = true;
+        self.status = "Computing...".to_string();
+        if let Err(error) = self.request_sender.send(request) {
+            self.set_error(anyhow::anyhow!(error.to_string()));
+        }
+    }
+
+    fn drain_worker_responses(&mut self) {
+        while let Ok(response) = self.response_receiver.try_recv() {
+            if !worker_response_is_current(self.latest_generation, response.generation) {
+                continue;
+            }
+            self.computing = false;
+            match response.payload {
+                Ok(WorkerPayload::Predictive { state, suggestions }) => {
                     self.surviving_count = state.surviving.len();
                     self.total_weight = state.total_weight;
                     self.predictive_suggestions = suggestions;
@@ -107,10 +167,10 @@ impl WordleGuiApp {
                     self.formal_explanation = None;
                     self.status.clear();
                 }
-                Err(error) => self.set_error(error),
-            },
-            GuiSolverMode::FormalOptimal => match self.try_recompute_formal() {
-                Ok((explanation, suggestions)) => {
+                Ok(WorkerPayload::Formal {
+                    explanation,
+                    suggestions,
+                }) => {
                     self.surviving_count = explanation.surviving_answers;
                     self.total_weight = 0.0;
                     self.formal_explanation = Some(explanation);
@@ -118,30 +178,9 @@ impl WordleGuiApp {
                     self.predictive_suggestions.clear();
                     self.status.clear();
                 }
-                Err(error) => self.set_error(error),
-            },
+                Err(error) => self.set_error(anyhow::anyhow!(error)),
+            }
         }
-    }
-
-    fn try_recompute_predictive(&self) -> Result<(SolveState, Vec<Suggestion>)> {
-        let date = NaiveDate::parse_from_str(&self.date_text, "%Y-%m-%d")
-            .with_context(|| format!("invalid date: {}", self.date_text))?;
-        let state = self
-            .predictive_solver
-            .apply_history(date, &self.observations)?;
-        let suggestions = self.predictive_solver.suggestions(&state, self.top)?;
-        Ok((state, suggestions))
-    }
-
-    fn try_recompute_formal(&self) -> Result<(FormalStateExplanation, Vec<FormalSuggestion>)> {
-        let runtime = self
-            .formal_solver
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("formal-optimal artifacts are not available"))?;
-        let state = runtime.apply_history(&self.observations)?;
-        let explanation = runtime.explain_state(&state, self.top)?;
-        let suggestions = runtime.suggest(&state, self.top)?;
-        Ok((explanation, suggestions))
     }
 
     fn set_error(&mut self, error: anyhow::Error) {
@@ -151,12 +190,13 @@ impl WordleGuiApp {
         self.formal_explanation = None;
         self.surviving_count = 0;
         self.total_weight = 0.0;
+        self.computing = false;
     }
 
     fn commit_current_row(&mut self) {
         let guess = self.current_guess.trim().to_ascii_lowercase();
         if guess.is_empty() {
-            self.recompute();
+            self.schedule_recompute();
             return;
         }
         match self.row_pattern() {
@@ -164,7 +204,7 @@ impl WordleGuiApp {
                 self.observations.push((guess, pattern));
                 self.current_guess.clear();
                 self.current_feedback = [0; 5];
-                self.recompute();
+                self.schedule_recompute();
             }
             Err(error) => self.status = error.to_string(),
         }
@@ -185,6 +225,10 @@ impl WordleGuiApp {
 
 impl eframe::App for WordleGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_worker_responses();
+        if self.computing {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -211,6 +255,7 @@ impl eframe::App for WordleGuiApp {
 
                 ui.horizontal(|ui| {
                     let formal_available = self.formal_solver.is_some();
+                    let previous_mode = self.mode;
                     ui.label("Mode");
                     ui.selectable_value(
                         &mut self.mode,
@@ -229,13 +274,19 @@ impl eframe::App for WordleGuiApp {
                     if !formal_available {
                         ui.colored_label(Color32::from_rgb(150, 45, 45), "build-optimal-policy first");
                     }
+                    if self.mode != previous_mode {
+                        self.schedule_recompute();
+                    }
                 });
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label("Date");
+                    let mut date_changed = false;
                     ui.add_enabled_ui(self.mode == GuiSolverMode::Predictive, |ui| {
-                        ui.add_sized([120.0, 24.0], egui::TextEdit::singleline(&mut self.date_text));
+                        date_changed = ui
+                            .add_sized([120.0, 24.0], egui::TextEdit::singleline(&mut self.date_text))
+                            .changed();
                     });
                     if self.mode == GuiSolverMode::FormalOptimal {
                         if let Some(explanation) = &self.formal_explanation {
@@ -248,19 +299,22 @@ impl eframe::App for WordleGuiApp {
                         }
                     }
                     ui.label("Top");
-                    ui.add(egui::Slider::new(&mut self.top, 3..=20));
+                    let top_changed = ui.add(egui::Slider::new(&mut self.top, 3..=20)).changed();
                     if ui.button("Suggest").clicked() {
                         self.commit_current_row();
                     }
                     if ui.button("Undo").clicked() {
                         self.observations.pop();
-                        self.recompute();
+                        self.schedule_recompute();
                     }
                     if ui.button("Reset").clicked() {
                         self.observations.clear();
                         self.current_guess.clear();
                         self.current_feedback = [0; 5];
-                        self.recompute();
+                        self.schedule_recompute();
+                    }
+                    if date_changed || top_changed {
+                        self.schedule_recompute();
                     }
                 });
 
@@ -329,7 +383,12 @@ impl eframe::App for WordleGuiApp {
 
                 if !self.status.is_empty() {
                     ui.add_space(8.0);
-                    ui.colored_label(Color32::from_rgb(150, 45, 45), &self.status);
+                    let color = if self.computing {
+                        Color32::from_rgb(92, 72, 54)
+                    } else {
+                        Color32::from_rgb(150, 45, 45)
+                    };
+                    ui.colored_label(color, &self.status);
                 }
 
                 ui.add_space(16.0);
@@ -379,8 +438,13 @@ impl eframe::App for WordleGuiApp {
                                         ui.label(format!("entropy {:.4}", suggestion.entropy));
                                         ui.label(format!("solve {:.4}", suggestion.solve_probability));
                                         ui.label(format!("remain {:.2}", suggestion.expected_remaining));
+                                        if suggestion.force_in_two {
+                                            ui.label("force_in_two");
+                                        }
                                         if let Some(exact_cost) = suggestion.exact_cost {
                                             ui.label(format!("exact {:.4}", exact_cost));
+                                        } else if let Some(lookahead_cost) = suggestion.lookahead_cost {
+                                            ui.label(format!("lookahead {:.4}", lookahead_cost));
                                         }
                                     });
                                     ui.separator();
@@ -423,6 +487,63 @@ impl eframe::App for WordleGuiApp {
     }
 }
 
+fn spawn_worker(
+    predictive_solver: Solver,
+    formal_solver: Option<FormalPolicyRuntime>,
+) -> (Sender<WorkerRequest>, Receiver<WorkerResponse>) {
+    let (request_sender, request_receiver) = mpsc::channel::<WorkerRequest>();
+    let (response_sender, response_receiver) = mpsc::channel::<WorkerResponse>();
+    thread::spawn(move || {
+        while let Ok(request) = request_receiver.recv() {
+            let payload = match request.mode {
+                GuiSolverMode::Predictive => {
+                    let result = (|| -> Result<WorkerPayload> {
+                        let date = NaiveDate::parse_from_str(&request.date_text, "%Y-%m-%d")
+                            .with_context(|| format!("invalid date: {}", request.date_text))?;
+                        let state = predictive_solver.apply_history(date, &request.observations)?;
+                        let suggestions = predictive_solver.suggestions_for_history(
+                            date,
+                            &request.observations,
+                            request.top,
+                        )?;
+                        Ok(WorkerPayload::Predictive { state, suggestions })
+                    })();
+                    result.map_err(|error| error.to_string())
+                }
+                GuiSolverMode::FormalOptimal => {
+                    let result = (|| -> Result<WorkerPayload> {
+                        let runtime = formal_solver.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("formal-optimal artifacts are not available")
+                        })?;
+                        let state = runtime.apply_history(&request.observations)?;
+                        let explanation = runtime.explain_state(&state, request.top)?;
+                        let suggestions = runtime.suggest(&state, request.top)?;
+                        Ok(WorkerPayload::Formal {
+                            explanation,
+                            suggestions,
+                        })
+                    })();
+                    result.map_err(|error| error.to_string())
+                }
+            };
+            if response_sender
+                .send(WorkerResponse {
+                    generation: request.generation,
+                    payload,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (request_sender, response_receiver)
+}
+
+fn worker_response_is_current(latest_generation: u64, response_generation: u64) -> bool {
+    latest_generation == response_generation
+}
+
 fn tile_label_and_color(value: u8) -> (&'static str, Color32) {
     match value {
         0 => ("Gray", Color32::from_rgb(124, 126, 130)),
@@ -439,4 +560,16 @@ fn decode_pattern(pattern: &u8) -> [u8; 5] {
         value /= 3;
     }
     decoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_response_is_current;
+
+    #[test]
+    fn worker_response_discards_stale_generations() {
+        assert!(worker_response_is_current(7, 7));
+        assert!(!worker_response_is_current(7, 6));
+        assert!(!worker_response_is_current(7, 8));
+    }
 }

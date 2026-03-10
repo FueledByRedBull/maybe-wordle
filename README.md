@@ -45,7 +45,11 @@ suggest
 solve-interactive
 explain-state
 backtest
+predictive-ablations
+build-predictive-opener
+build-predictive-replies
 experiments
+tune-prior
 benchmark
 ```
 
@@ -56,6 +60,7 @@ cargo run -- sync-data
 cargo run -- build-model
 cargo run -- suggest --guess crane --feedback 00000 --top 5
 cargo run -- solve-interactive
+cargo run -- predictive-ablations --from 2026-02-08 --to 2026-03-09
 ```
 
 Example predictive query from this repo's current tracked artifacts:
@@ -133,6 +138,18 @@ The formal build is intentionally offline-heavy. On the full pinned model it can
 Formal artifacts are versioned. If the model inputs or serialized state format change, stale files are rejected and should be rebuilt.
 
 If you only want fast suggestions, predictive mode works with the derived artifacts under [`data/derived`](./data/derived).
+
+## Predictive experiments and books
+
+Predictive mode now has a separate experiment and cache surface:
+
+- `cargo run -- predictive-ablations --from YYYY-MM-DD --to YYYY-MM-DD`
+- `cargo run -- build-predictive-opener --date YYYY-MM-DD`
+- `cargo run -- build-predictive-replies --date YYYY-MM-DD`
+
+The opener and reply caches are predictive-only artifacts under [`data/derived/predictive`](./data/derived/predictive). They are keyed by weight mode, model variant, date context, and a fingerprint of the current predictive config. If a cache is missing or stale, predictive mode falls back to live scoring automatically.
+
+The GUI no longer recomputes suggestions on the UI thread. Heavy predictive or formal recomputes now run in a background worker, so `Suggest`, `Undo`, `Reset`, mode switches, and date changes stay responsive while results are pending.
 
 ## Quality bar
 
