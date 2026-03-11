@@ -94,6 +94,11 @@ pub struct DetailedSolveStep {
     pub danger_score: f64,
     pub danger_escalated: bool,
     pub regime_used: PredictiveRegime,
+    pub lookahead_pool_base: usize,
+    pub lookahead_pool_size: usize,
+    pub exact_pool_base: usize,
+    pub exact_pool_size: usize,
+    pub root_candidate_count: usize,
     pub top_suggestions: Vec<SuggestionSnapshot>,
 }
 
@@ -144,10 +149,14 @@ pub struct ExperimentResult {
     pub average_target_probability: f64,
     pub average_target_rank: f64,
     pub latency_p95_ms: f64,
+    pub session_fallback_cold_ms: f64,
+    pub session_fallback_warm_ms: f64,
     pub proxy_step_pct: f64,
     pub lookahead_step_pct: f64,
     pub escalated_exact_step_pct: f64,
     pub exact_step_pct: f64,
+    pub average_lookahead_pool_ratio: f64,
+    pub average_exact_pool_ratio: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -392,6 +401,11 @@ struct SuggestionBatch {
     danger_score: f64,
     danger_escalated: bool,
     regime_used: PredictiveRegime,
+    lookahead_pool_base: usize,
+    lookahead_pool_size: usize,
+    exact_pool_base: usize,
+    exact_pool_size: usize,
+    root_candidate_count: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -789,6 +803,7 @@ impl Solver {
             split_first,
             assessment,
         );
+        let mut root_candidate_count = 0usize;
 
         if let PredictiveSearchMode::Lookahead = search_mode {
             let root_candidates = self.collect_lookahead_candidates(
@@ -796,6 +811,7 @@ impl Solver {
                 assessment.dangerous_lookahead,
                 lookahead_pool,
             )?;
+            root_candidate_count = root_candidates.len();
             let mut exact_memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
             let mut lookahead_memo = PredictiveMemoMap::default();
@@ -830,6 +846,7 @@ impl Solver {
                     self.collect_exact_candidates(state, &suggestions, exact_pool)?
                 }
             };
+            root_candidate_count = exact_candidates.len();
             let mut memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
             let mut exact_costs = vec![None; self.guesses.len()];
@@ -880,6 +897,7 @@ impl Solver {
                 &suggestions,
                 self.config.danger_exact_root_pool.max(1).max(exact_pool),
             )?;
+            root_candidate_count = exact_candidates.len();
             let mut memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
             let mut exact_costs = vec![None; self.guesses.len()];
@@ -939,6 +957,11 @@ impl Solver {
                 || (matches!(search_mode, PredictiveSearchMode::Lookahead)
                     && assessment.dangerous_lookahead),
             regime_used: regime_from_search_mode(search_mode),
+            lookahead_pool_base: self.config.lookahead_candidate_pool,
+            lookahead_pool_size: lookahead_pool,
+            exact_pool_base: self.config.exact_candidate_pool,
+            exact_pool_size: exact_pool,
+            root_candidate_count,
         })
     }
 
@@ -1026,6 +1049,11 @@ impl Solver {
                 danger_score: batch.danger_score,
                 danger_escalated: batch.danger_escalated,
                 regime_used: batch.regime_used,
+                lookahead_pool_base: batch.lookahead_pool_base,
+                lookahead_pool_size: batch.lookahead_pool_size,
+                exact_pool_base: batch.exact_pool_base,
+                exact_pool_size: batch.exact_pool_size,
+                root_candidate_count: batch.root_candidate_count,
                 top_suggestions: batch
                     .suggestions
                     .iter()
@@ -1184,6 +1212,24 @@ impl Solver {
         let backtest = detailed.summary.clone();
         let (proxy_step_pct, lookahead_step_pct, escalated_exact_step_pct, exact_step_pct) =
             Self::regime_mix(&detailed.runs);
+        let mut lookahead_pool_ratio_sum = 0.0;
+        let mut lookahead_pool_ratio_count = 0usize;
+        let mut exact_pool_ratio_sum = 0.0;
+        let mut exact_pool_ratio_count = 0usize;
+        for run in &detailed.runs {
+            for step in &run.steps {
+                if step.lookahead_pool_base > 0 && step.lookahead_pool_size > 0 {
+                    lookahead_pool_ratio_sum +=
+                        step.lookahead_pool_size as f64 / step.lookahead_pool_base as f64;
+                    lookahead_pool_ratio_count += 1;
+                }
+                if step.exact_pool_base > 0 && step.exact_pool_size > 0 {
+                    exact_pool_ratio_sum +=
+                        step.exact_pool_size as f64 / step.exact_pool_base as f64;
+                    exact_pool_ratio_count += 1;
+                }
+            }
+        }
         let mut total_log_loss = 0.0;
         let mut total_brier = 0.0;
         let mut total_target_probability = 0.0;
@@ -1220,10 +1266,22 @@ impl Solver {
             average_target_probability: total_target_probability / divisor,
             average_target_rank: total_rank / divisor,
             latency_p95_ms: self.benchmark_predictive_latency(5)?,
+            session_fallback_cold_ms: 0.0,
+            session_fallback_warm_ms: 0.0,
             proxy_step_pct,
             lookahead_step_pct,
             escalated_exact_step_pct,
             exact_step_pct,
+            average_lookahead_pool_ratio: if lookahead_pool_ratio_count == 0 {
+                0.0
+            } else {
+                lookahead_pool_ratio_sum / lookahead_pool_ratio_count as f64
+            },
+            average_exact_pool_ratio: if exact_pool_ratio_count == 0 {
+                0.0
+            } else {
+                exact_pool_ratio_sum / exact_pool_ratio_count as f64
+            },
         })
     }
 
@@ -2232,6 +2290,28 @@ impl Solver {
         Ok(samples[p95_index.saturating_sub(1)].max(0.0))
     }
 
+    fn benchmark_session_fallback_latency(&self, warm_cache: bool) -> Result<f64> {
+        let as_of = self
+            .history_dates
+            .last()
+            .map(|entry| entry.print_date + Days::new(1))
+            .unwrap_or_else(Self::today);
+        self.session_opener_cache
+            .lock()
+            .expect("session opener cache")
+            .clear();
+        self.session_reply_cache
+            .lock()
+            .expect("session reply cache")
+            .clear();
+        if warm_cache {
+            let _ = self.suggestions_for_history(as_of, &[], 1)?;
+        }
+        let start = Instant::now();
+        let _ = self.suggestions_for_history(as_of, &[], 1)?;
+        Ok(start.elapsed().as_secs_f64() * 1000.0)
+    }
+
     fn evaluate_tuning_candidate(
         paths: &ProjectPaths,
         config: &PriorConfig,
@@ -2524,6 +2604,11 @@ impl Solver {
                 danger_score: 0.0,
                 danger_escalated: false,
                 regime_used: PredictiveRegime::Proxy,
+                lookahead_pool_base: 0,
+                lookahead_pool_size: 0,
+                exact_pool_base: 0,
+                exact_pool_size: 0,
+                root_candidate_count: 0,
                 top_suggestions: Vec::new(),
             });
             if feedback == ALL_GREEN_PATTERN {
@@ -2576,6 +2661,11 @@ impl Solver {
                 danger_score: batch.danger_score,
                 danger_escalated: batch.danger_escalated,
                 regime_used: batch.regime_used,
+                lookahead_pool_base: batch.lookahead_pool_base,
+                lookahead_pool_size: batch.lookahead_pool_size,
+                exact_pool_base: batch.exact_pool_base,
+                exact_pool_size: batch.exact_pool_size,
+                root_candidate_count: batch.root_candidate_count,
                 top_suggestions: batch
                     .suggestions
                     .iter()
@@ -4125,6 +4215,7 @@ mod tests {
 
     use crate::{
         config::PriorConfig,
+        data::NytDailyEntry,
         model::{AnswerRecord, ModelVariant, WeightMode},
         pattern_table::PatternTable,
         scoring::{format_feedback_letters, score_guess},
@@ -4283,6 +4374,79 @@ mod tests {
         assert!(state.total_weight > 0.0);
         assert!(state.weights[0] > 0.0);
         assert!(state.weights[0] < 0.001);
+    }
+
+    #[test]
+    fn suggestions_for_history_populates_session_opener_cache_without_disk_books() {
+        let guesses = vec!["cigar".to_string(), "rebut".to_string(), "sissy".to_string()];
+        let answers = guesses
+            .iter()
+            .map(|word| AnswerRecord {
+                word: word.clone(),
+                in_seed: true,
+                manual_entry: false,
+                manual_weight: 1.0,
+                history_dates: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let pattern_root =
+            std::env::temp_dir().join(format!("maybe-wordle-session-cache-test-{unique}"));
+        let _ = std::fs::remove_dir_all(&pattern_root);
+        std::fs::create_dir_all(&pattern_root).expect("pattern root");
+        let pattern_table =
+            PatternTable::load_or_build_at(&pattern_root.join("pattern.bin"), &guesses, &answers)
+                .expect("pattern table");
+        let mut config = PriorConfig::default();
+        config.session_window_days = 1;
+        let as_of = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
+        let solver = Solver {
+            config,
+            mode: WeightMode::Weighted,
+            variant: ModelVariant::SeedPlusHistory,
+            guesses: guesses.clone(),
+            answers,
+            history_dates: vec![NytDailyEntry {
+                id: Some(1),
+                solution: "cigar".to_string(),
+                print_date: as_of,
+                days_since_launch: Some(1),
+                editor: None,
+            }],
+            exact_small_state_table: SmallStateTable::build(4),
+            pattern_table,
+            guess_index: guesses
+                .iter()
+                .enumerate()
+                .map(|(index, guess)| (guess.clone(), index))
+                .collect::<HashMap<_, _>>(),
+            artifact_dir: pattern_root.join("predictive"),
+            session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        assert_eq!(
+            solver
+                .session_opener_cache
+                .lock()
+                .expect("session opener cache")
+                .len(),
+            0
+        );
+        let suggestions = solver
+            .suggestions_for_history(as_of, &[], 1)
+            .expect("session suggestions");
+        assert!(!suggestions.is_empty());
+        assert_eq!(
+            solver
+                .session_opener_cache
+                .lock()
+                .expect("session opener cache")
+                .len(),
+            1
+        );
     }
 
     #[test]

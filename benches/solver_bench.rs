@@ -101,6 +101,24 @@ fn bench_predictive_hard_cases(c: &mut Criterion) {
     });
 }
 
+fn bench_predictive_session_fallback_warm(c: &mut Criterion) {
+    let fixture = predictive_fixture();
+    let paths = ProjectPaths::new(&fixture.root);
+    let solver = Solver::from_paths(&paths, &PriorConfig::default()).expect("solver");
+    let as_of = bench_date();
+    let _ = solver
+        .suggestions_for_history(as_of, &[], 1)
+        .expect("prime session fallback");
+
+    c.bench_function("predictive_session_fallback_root_warm", |bench| {
+        bench.iter(|| {
+            solver
+                .suggestions_for_history(as_of, &[], 1)
+                .expect("session fallback suggestions")
+        });
+    });
+}
+
 fn bench_formal_build(c: &mut Criterion) {
     let fixture = formal_fixture();
     let paths = ProjectPaths::new(&fixture.root);
@@ -253,6 +271,7 @@ criterion_group!(
     bench_predictive_lookahead,
     bench_predictive_danger_escalated_exact,
     bench_predictive_hard_cases,
+    bench_predictive_session_fallback_warm,
     bench_formal_build,
     bench_formal_suggest,
     bench_formal_verify_certificate,

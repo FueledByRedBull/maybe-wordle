@@ -553,7 +553,7 @@ fn run() -> Result<()> {
             }
             for row in Solver::predictive_ablation_report(&paths, &config, from, to, top)? {
                 println!(
-                    "label={} config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3}",
+                    "label={} config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3} session_cold_ms={:.3} session_warm_ms={:.3} lookahead_pool_ratio={:.3} exact_pool_ratio={:.3}",
                     row.label,
                     row.result.config_id,
                     row.result.mode.label(),
@@ -566,6 +566,10 @@ fn run() -> Result<()> {
                     row.result.average_target_probability,
                     row.result.average_target_rank,
                     row.result.latency_p95_ms,
+                    row.result.session_fallback_cold_ms,
+                    row.result.session_fallback_warm_ms,
+                    row.result.average_lookahead_pool_ratio,
+                    row.result.average_exact_pool_ratio,
                 );
             }
         }
@@ -636,7 +640,7 @@ fn run() -> Result<()> {
                     let solver = Solver::from_paths_with_settings(&paths, &config, mode, variant)?;
                     let result = solver.experiment_report(from, to, top)?;
                     println!(
-                        "config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_log_loss={:.6} avg_brier={:.6} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3}",
+                        "config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_log_loss={:.6} avg_brier={:.6} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3} session_cold_ms={:.3} session_warm_ms={:.3} lookahead_pool_ratio={:.3} exact_pool_ratio={:.3}",
                         result.config_id,
                         result.mode.label(),
                         result.variant.label(),
@@ -649,7 +653,11 @@ fn run() -> Result<()> {
                         result.average_brier,
                         result.average_target_probability,
                         result.average_target_rank,
-                        result.latency_p95_ms
+                        result.latency_p95_ms,
+                        result.session_fallback_cold_ms,
+                        result.session_fallback_warm_ms,
+                        result.average_lookahead_pool_ratio,
+                        result.average_exact_pool_ratio
                     );
                 }
             }
