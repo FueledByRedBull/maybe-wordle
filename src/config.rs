@@ -55,9 +55,13 @@ pub struct PriorConfig {
     pub session_reply_pool: usize,
     pub session_window_days: usize,
     pub lookahead_threshold: usize,
+    pub medium_state_lookahead_threshold: usize,
     pub lookahead_candidate_pool: usize,
+    pub medium_state_lookahead_candidate_pool: usize,
     pub lookahead_reply_pool: usize,
+    pub medium_state_lookahead_reply_pool: usize,
     pub lookahead_root_force_in_two_scan: usize,
+    pub medium_state_force_in_two_scan: usize,
     pub large_state_split_threshold: usize,
     pub pool_tight_gap_threshold: f64,
     pub pool_medium_gap_threshold: f64,
@@ -94,9 +98,13 @@ impl Default for PriorConfig {
             session_reply_pool: 20,
             session_window_days: 30,
             lookahead_threshold: 160,
+            medium_state_lookahead_threshold: 80,
             lookahead_candidate_pool: 24,
+            medium_state_lookahead_candidate_pool: 48,
             lookahead_reply_pool: 12,
+            medium_state_lookahead_reply_pool: 20,
             lookahead_root_force_in_two_scan: 64,
+            medium_state_force_in_two_scan: 160,
             large_state_split_threshold: 50,
             pool_tight_gap_threshold: 0.05,
             pool_medium_gap_threshold: 0.15,
@@ -162,9 +170,13 @@ mod tests {
         config.session_reply_pool = 24;
         config.session_window_days = 45;
         config.lookahead_threshold = 144;
+        config.medium_state_lookahead_threshold = 88;
         config.lookahead_candidate_pool = 18;
+        config.medium_state_lookahead_candidate_pool = 40;
         config.lookahead_reply_pool = 9;
+        config.medium_state_lookahead_reply_pool = 18;
         config.lookahead_root_force_in_two_scan = 72;
+        config.medium_state_force_in_two_scan = 144;
         config.large_state_split_threshold = 48;
         config.pool_tight_gap_threshold = 0.04;
         config.pool_medium_gap_threshold = 0.11;
@@ -187,9 +199,13 @@ mod tests {
         assert!(encoded.contains("session_reply_pool = 24"));
         assert!(encoded.contains("session_window_days = 45"));
         assert!(encoded.contains("lookahead_threshold = 144"));
+        assert!(encoded.contains("medium_state_lookahead_threshold = 88"));
         assert!(encoded.contains("lookahead_candidate_pool = 18"));
+        assert!(encoded.contains("medium_state_lookahead_candidate_pool = 40"));
         assert!(encoded.contains("lookahead_reply_pool = 9"));
+        assert!(encoded.contains("medium_state_lookahead_reply_pool = 18"));
         assert!(encoded.contains("lookahead_root_force_in_two_scan = 72"));
+        assert!(encoded.contains("medium_state_force_in_two_scan = 144"));
         assert!(encoded.contains("large_state_split_threshold = 48"));
         assert!(encoded.contains("pool_tight_gap_threshold = 0.04"));
         assert!(encoded.contains("pool_medium_gap_threshold = 0.11"));
@@ -213,9 +229,13 @@ mod tests {
         assert_eq!(decoded.session_reply_pool, 24);
         assert_eq!(decoded.session_window_days, 45);
         assert_eq!(decoded.lookahead_threshold, 144);
+        assert_eq!(decoded.medium_state_lookahead_threshold, 88);
         assert_eq!(decoded.lookahead_candidate_pool, 18);
+        assert_eq!(decoded.medium_state_lookahead_candidate_pool, 40);
         assert_eq!(decoded.lookahead_reply_pool, 9);
+        assert_eq!(decoded.medium_state_lookahead_reply_pool, 18);
         assert_eq!(decoded.lookahead_root_force_in_two_scan, 72);
+        assert_eq!(decoded.medium_state_force_in_two_scan, 144);
         assert_eq!(decoded.large_state_split_threshold, 48);
         assert_eq!(decoded.pool_tight_gap_threshold, 0.04);
         assert_eq!(decoded.pool_medium_gap_threshold, 0.11);

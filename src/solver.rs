@@ -791,9 +791,10 @@ impl Solver {
                 exact_cost: None,
             })
             .collect::<Vec<_>>();
+        let lookahead_pool_base = self.lookahead_candidate_pool_for_state(state.surviving.len());
         let lookahead_pool = self.expanded_pool_size(
             &suggestions,
-            self.config.lookahead_candidate_pool,
+            lookahead_pool_base,
             split_first,
             matches!(search_mode, PredictiveSearchMode::Lookahead)
                 && state.surviving.len() > self.config.large_state_split_threshold,
@@ -812,6 +813,7 @@ impl Solver {
         if let PredictiveSearchMode::Lookahead = search_mode {
             let root_candidates = self.collect_lookahead_candidates(
                 &suggestions,
+                state.surviving.len(),
                 assessment.dangerous_lookahead,
                 lookahead_pool,
             )?;
@@ -961,7 +963,7 @@ impl Solver {
                 || (matches!(search_mode, PredictiveSearchMode::Lookahead)
                     && assessment.dangerous_lookahead),
             regime_used: regime_from_search_mode(search_mode),
-            lookahead_pool_base: self.config.lookahead_candidate_pool,
+            lookahead_pool_base,
             lookahead_pool_size: lookahead_pool,
             exact_pool_base: self.config.exact_candidate_pool,
             exact_pool_size: exact_pool,
@@ -2202,9 +2204,13 @@ impl Solver {
                 "exact_exhaustive_threshold = {}\n",
                 "exact_candidate_pool = {}\n",
                 "lookahead_threshold = {}\n",
+                "medium_state_lookahead_threshold = {}\n",
                 "lookahead_candidate_pool = {}\n",
+                "medium_state_lookahead_candidate_pool = {}\n",
                 "lookahead_reply_pool = {}\n",
+                "medium_state_lookahead_reply_pool = {}\n",
                 "lookahead_root_force_in_two_scan = {}\n",
+                "medium_state_force_in_two_scan = {}\n",
                 "large_state_split_threshold = {}\n",
                 "danger_lookahead_threshold = {:.2}\n",
                 "danger_exact_threshold = {:.2}\n",
@@ -2223,9 +2229,13 @@ impl Solver {
             best.config.exact_exhaustive_threshold,
             best.config.exact_candidate_pool,
             best.config.lookahead_threshold,
+            best.config.medium_state_lookahead_threshold,
             best.config.lookahead_candidate_pool,
+            best.config.medium_state_lookahead_candidate_pool,
             best.config.lookahead_reply_pool,
+            best.config.medium_state_lookahead_reply_pool,
             best.config.lookahead_root_force_in_two_scan,
+            best.config.medium_state_force_in_two_scan,
             best.config.large_state_split_threshold,
             best.config.danger_lookahead_threshold,
             best.config.danger_exact_threshold,
@@ -2389,8 +2399,15 @@ impl Solver {
 
     fn offline_book_solver(&self) -> Self {
         let mut config = self.config.clone();
+        config.medium_state_lookahead_threshold =
+            config.medium_state_lookahead_threshold.max(96);
         config.lookahead_candidate_pool = config.lookahead_candidate_pool.max(150);
+        config.medium_state_lookahead_candidate_pool =
+            config.medium_state_lookahead_candidate_pool.max(96);
         config.lookahead_reply_pool = config.lookahead_reply_pool.max(50);
+        config.medium_state_lookahead_reply_pool =
+            config.medium_state_lookahead_reply_pool.max(32);
+        config.medium_state_force_in_two_scan = config.medium_state_force_in_two_scan.max(192);
         config.exact_candidate_pool = config.exact_candidate_pool.max(160);
         config.lookahead_threshold = config.lookahead_threshold.max(224);
         config.danger_exact_root_pool = config.danger_exact_root_pool.max(32);
@@ -2404,6 +2421,35 @@ impl Solver {
         cloned.exact_small_state_table =
             SmallStateTable::build(config.exact_exhaustive_threshold.max(2));
         cloned
+    }
+
+    fn is_medium_state_lookahead(&self, surviving_answers: usize) -> bool {
+        surviving_answers > self.config.exact_threshold
+            && surviving_answers <= self.config.medium_state_lookahead_threshold
+    }
+
+    fn lookahead_candidate_pool_for_state(&self, surviving_answers: usize) -> usize {
+        if self.is_medium_state_lookahead(surviving_answers) {
+            self.config.medium_state_lookahead_candidate_pool
+        } else {
+            self.config.lookahead_candidate_pool
+        }
+    }
+
+    fn lookahead_reply_pool_for_state(&self, surviving_answers: usize) -> usize {
+        if self.is_medium_state_lookahead(surviving_answers) {
+            self.config.medium_state_lookahead_reply_pool
+        } else {
+            self.config.lookahead_reply_pool
+        }
+    }
+
+    fn force_in_two_scan_for_state(&self, surviving_answers: usize) -> usize {
+        if self.is_medium_state_lookahead(surviving_answers) {
+            self.config.medium_state_force_in_two_scan
+        } else {
+            self.config.lookahead_root_force_in_two_scan
+        }
     }
 
     fn recent_history_targets_for_books(
@@ -2874,6 +2920,7 @@ impl Solver {
         );
         let mut candidate_indexes = offline.collect_lookahead_candidates(
             &batch.suggestions,
+            child.surviving.len(),
             assessment.dangerous_lookahead,
             lookahead_pool,
         )?;
@@ -3456,7 +3503,7 @@ impl Solver {
         });
         let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
         let assessment = self.assess_subset_danger(subset, weights, total_weight, &metrics);
-        let reply_pool = self.config.lookahead_reply_pool.max(1)
+        let reply_pool = self.lookahead_reply_pool_for_state(subset.len()).max(1)
             + if expanded || assessment.dangerous_lookahead {
                 self.config.danger_reply_pool_bonus
             } else {
@@ -3536,6 +3583,7 @@ impl Solver {
     fn collect_lookahead_candidates(
         &self,
         suggestions: &[Suggestion],
+        surviving_answers: usize,
         expanded: bool,
         base_pool: usize,
     ) -> Result<Vec<usize>> {
@@ -3545,7 +3593,7 @@ impl Solver {
             } else {
                 0
             };
-        let force_scan = self.config.lookahead_root_force_in_two_scan.max(1)
+        let force_scan = self.force_in_two_scan_for_state(surviving_answers).max(1)
             + if expanded {
                 self.config.danger_reply_pool_bonus
             } else {
@@ -5147,7 +5195,7 @@ mod tests {
         ];
 
         let candidates = solver
-            .collect_lookahead_candidates(&suggestions, false, 1)
+            .collect_lookahead_candidates(&suggestions, 32, false, 1)
             .expect("candidates");
 
         assert!(candidates.contains(solver.guess_index.get("cigar").expect("cigar")));
@@ -5200,6 +5248,25 @@ mod tests {
             ),
             std::cmp::Ordering::Less
         );
+    }
+
+    #[test]
+    fn medium_state_uses_deeper_force_in_two_scan_and_pools() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake"]);
+        solver.config.lookahead_root_force_in_two_scan = 2;
+        solver.config.medium_state_force_in_two_scan = 5;
+        solver.config.medium_state_lookahead_threshold = 80;
+        solver.config.lookahead_candidate_pool = 12;
+        solver.config.medium_state_lookahead_candidate_pool = 36;
+        solver.config.lookahead_reply_pool = 6;
+        solver.config.medium_state_lookahead_reply_pool = 18;
+
+        assert_eq!(solver.force_in_two_scan_for_state(120), 2);
+        assert_eq!(solver.force_in_two_scan_for_state(72), 5);
+        assert_eq!(solver.lookahead_candidate_pool_for_state(120), 12);
+        assert_eq!(solver.lookahead_candidate_pool_for_state(72), 36);
+        assert_eq!(solver.lookahead_reply_pool_for_state(120), 6);
+        assert_eq!(solver.lookahead_reply_pool_for_state(72), 18);
     }
 
     #[test]
