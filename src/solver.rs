@@ -735,6 +735,31 @@ impl Solver {
             .suggestions)
     }
 
+    pub fn force_in_two_suggestions_for_history_disk_books_only(
+        &self,
+        as_of: NaiveDate,
+        observations: &[(String, u8)],
+        top: usize,
+    ) -> Result<Vec<Suggestion>> {
+        let state = self.apply_history(as_of, observations)?;
+        let mut suggestions = self
+            .suggestion_batch_internal(
+                &state,
+                self.guesses.len(),
+                Some(PredictiveContext {
+                    as_of,
+                    observations,
+                }),
+                PredictiveBookUsage::DiskOnly,
+            )?
+            .suggestions
+            .into_iter()
+            .filter(|suggestion| suggestion.force_in_two)
+            .collect::<Vec<_>>();
+        suggestions.truncate(top.min(suggestions.len()));
+        Ok(suggestions)
+    }
+
     pub fn absurdle_suggestions(
         &self,
         observations: &[(String, u8)],

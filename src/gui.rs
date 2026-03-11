@@ -81,6 +81,7 @@ struct WordleGuiApp {
     surviving_count: usize,
     total_weight: f64,
     top: usize,
+    force_in_two_only: bool,
     status: String,
     formal_explanation: Option<FormalStateExplanation>,
     request_sender: Sender<WorkerRequest>,
@@ -96,6 +97,7 @@ struct WorkerRequest {
     date_text: String,
     observations: Vec<(String, u8)>,
     top: usize,
+    force_in_two_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +145,7 @@ impl WordleGuiApp {
             surviving_count: 0,
             total_weight: 0.0,
             top: 10,
+            force_in_two_only: false,
             status: String::new(),
             formal_explanation: None,
             request_sender,
@@ -162,6 +165,7 @@ impl WordleGuiApp {
             date_text: self.date_text.clone(),
             observations: self.observations.clone(),
             top: self.top,
+            force_in_two_only: self.force_in_two_only,
         };
         self.computing = true;
         self.status = "Computing...".to_string();
@@ -350,6 +354,13 @@ impl eframe::App for WordleGuiApp {
                         self.current_feedback = [0; 5];
                         self.schedule_recompute();
                     }
+                    if self.mode == GuiSolverMode::Predictive {
+                        let force_changed =
+                            ui.checkbox(&mut self.force_in_two_only, "Force In 2 Only").changed();
+                        if force_changed {
+                            self.schedule_recompute();
+                        }
+                    }
                     if date_changed || top_changed {
                         self.schedule_recompute();
                     }
@@ -488,7 +499,9 @@ impl eframe::App for WordleGuiApp {
                         ui.add_space(8.0);
                         match self.mode {
                             GuiSolverMode::Predictive => {
+                                let mut shown_any = false;
                                 for suggestion in &self.predictive_suggestions {
+                                    shown_any = true;
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label(
                                             RichText::new(suggestion.word.to_ascii_uppercase())
@@ -509,6 +522,14 @@ impl eframe::App for WordleGuiApp {
                                         }
                                     });
                                     ui.separator();
+                                }
+                                if !shown_any {
+                                    ui.label(
+                                        RichText::new(
+                                            "No force_in_two suggestions found for this state.",
+                                        )
+                                        .color(Color32::from_rgb(92, 72, 54)),
+                                    );
                                 }
                             }
                             GuiSolverMode::Absurdle => {
@@ -588,12 +609,19 @@ fn spawn_worker(
                         let date = NaiveDate::parse_from_str(&request.date_text, "%Y-%m-%d")
                             .with_context(|| format!("invalid date: {}", request.date_text))?;
                         let state = predictive_solver.apply_history(date, &request.observations)?;
-                        let suggestions = predictive_solver
-                            .suggestions_for_history_disk_books_only(
+                        let suggestions = if request.force_in_two_only {
+                            predictive_solver.force_in_two_suggestions_for_history_disk_books_only(
                                 date,
                                 &request.observations,
                                 request.top,
-                            )?;
+                            )?
+                        } else {
+                            predictive_solver.suggestions_for_history_disk_books_only(
+                                date,
+                                &request.observations,
+                                request.top,
+                            )?
+                        };
                         Ok(WorkerPayload::Predictive { state, suggestions })
                     })();
                     result.map_err(|error| error.to_string())
