@@ -23,7 +23,8 @@ use crate::{
     },
     pattern_table::PatternTable,
     scoring::{
-        ALL_GREEN_PATTERN, PATTERN_SPACE, format_feedback_letters, parse_feedback, score_guess,
+        ALL_GREEN_PATTERN, PATTERN_SPACE, decode_feedback, format_feedback_letters,
+        parse_feedback, score_guess,
     },
     small_state::SmallStateTable,
 };
@@ -32,6 +33,7 @@ const PROXY_CALIBRATION_MAX_STEPS: usize = 3;
 const PROXY_CALIBRATION_MAX_CANDIDATES_PER_STATE: usize = 10;
 const PROXY_CALIBRATION_MAX_SURVIVORS_FOR_FORCED_ROWS: usize = 192;
 const PROXY_CALIBRATION_MAX_GAME_SECONDS: f64 = 20.0;
+const HARD_MODE_WORD_LENGTH: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct Suggestion {
@@ -715,6 +717,22 @@ impl Solver {
             .suggestions)
     }
 
+    pub fn suggestions_for_history_hard_mode(
+        &self,
+        as_of: NaiveDate,
+        observations: &[(String, u8)],
+        top: usize,
+    ) -> Result<Vec<Suggestion>> {
+        self.filtered_suggestions_for_history(
+            as_of,
+            observations,
+            top,
+            PredictiveBookUsage::Full,
+            true,
+            false,
+        )
+    }
+
     pub fn suggestions_for_history_disk_books_only(
         &self,
         as_of: NaiveDate,
@@ -735,29 +753,37 @@ impl Solver {
             .suggestions)
     }
 
+    pub fn suggestions_for_history_disk_books_only_with_filters(
+        &self,
+        as_of: NaiveDate,
+        observations: &[(String, u8)],
+        top: usize,
+        hard_mode: bool,
+        force_in_two_only: bool,
+    ) -> Result<Vec<Suggestion>> {
+        self.filtered_suggestions_for_history(
+            as_of,
+            observations,
+            top,
+            PredictiveBookUsage::DiskOnly,
+            hard_mode,
+            force_in_two_only,
+        )
+    }
+
     pub fn force_in_two_suggestions_for_history_disk_books_only(
         &self,
         as_of: NaiveDate,
         observations: &[(String, u8)],
         top: usize,
     ) -> Result<Vec<Suggestion>> {
-        let state = self.apply_history(as_of, observations)?;
-        let mut suggestions = self
-            .suggestion_batch_internal(
-                &state,
-                self.guesses.len(),
-                Some(PredictiveContext {
-                    as_of,
-                    observations,
-                }),
-                PredictiveBookUsage::DiskOnly,
-            )?
-            .suggestions
-            .into_iter()
-            .filter(|suggestion| suggestion.force_in_two)
-            .collect::<Vec<_>>();
-        suggestions.truncate(top.min(suggestions.len()));
-        Ok(suggestions)
+        self.suggestions_for_history_disk_books_only_with_filters(
+            as_of,
+            observations,
+            top,
+            false,
+            true,
+        )
     }
 
     pub fn absurdle_suggestions(
@@ -787,6 +813,14 @@ impl Solver {
         Ok(suggestions)
     }
 
+    pub fn hard_mode_violation(
+        &self,
+        observations: &[(String, u8)],
+        guess: &str,
+    ) -> Option<String> {
+        hard_mode_violation(observations, guess)
+    }
+
     fn suggestion_batch_for_history(
         &self,
         as_of: NaiveDate,
@@ -804,6 +838,44 @@ impl Solver {
             }),
             book_usage,
         )
+    }
+
+    fn filtered_suggestions_for_history(
+        &self,
+        as_of: NaiveDate,
+        observations: &[(String, u8)],
+        top: usize,
+        book_usage: PredictiveBookUsage,
+        hard_mode: bool,
+        force_in_two_only: bool,
+    ) -> Result<Vec<Suggestion>> {
+        let state = self.apply_history(as_of, observations)?;
+        let limit = if hard_mode || force_in_two_only {
+            self.guesses.len()
+        } else {
+            top
+        };
+        let mut suggestions = self
+            .suggestion_batch_internal(
+                &state,
+                limit,
+                Some(PredictiveContext {
+                    as_of,
+                    observations,
+                }),
+                book_usage,
+            )?
+            .suggestions;
+        if hard_mode {
+            suggestions.retain(|suggestion| {
+                self.hard_mode_violation(observations, &suggestion.word).is_none()
+            });
+        }
+        if force_in_two_only {
+            suggestions.retain(|suggestion| suggestion.force_in_two);
+        }
+        suggestions.truncate(top.min(suggestions.len()));
+        Ok(suggestions)
     }
 
     fn suggestion_batch_internal(
@@ -4316,6 +4388,99 @@ fn count_masked_letters(word: &str, mask: u32) -> usize {
         .count()
 }
 
+fn hard_mode_violation(observations: &[(String, u8)], guess: &str) -> Option<String> {
+    if observations.is_empty() {
+        return None;
+    }
+    if guess.len() != HARD_MODE_WORD_LENGTH || !guess.bytes().all(|byte| byte.is_ascii_lowercase())
+    {
+        return Some("hard mode guess must be exactly 5 lowercase letters".to_string());
+    }
+
+    let constraints = build_hard_mode_constraints(observations);
+    let guess_bytes = guess.as_bytes();
+    let mut guess_counts = [0u8; 26];
+    for (index, &byte) in guess_bytes.iter().enumerate() {
+        let letter_index = (byte - b'a') as usize;
+        guess_counts[letter_index] += 1;
+
+        if let Some(expected) = constraints.greens[index] {
+            if byte != expected {
+                return Some(format!(
+                    "hard mode requires {} in position {}",
+                    char::from(expected).to_ascii_uppercase(),
+                    index + 1
+                ));
+            }
+        }
+
+        if (constraints.yellow_forbidden[index] & (1u32 << letter_index)) != 0 {
+            return Some(format!(
+                "hard mode forbids {} in position {}",
+                char::from(byte).to_ascii_uppercase(),
+                index + 1
+            ));
+        }
+    }
+
+    for (letter_index, &required) in constraints.required_counts.iter().enumerate() {
+        if required > 0 && guess_counts[letter_index] < required {
+            let letter = char::from(b'a' + letter_index as u8).to_ascii_uppercase();
+            return Some(format!(
+                "hard mode requires {} occurrence{} of {}",
+                required,
+                if required == 1 { "" } else { "s" },
+                letter
+            ));
+        }
+    }
+
+    None
+}
+
+struct HardModeConstraints {
+    greens: [Option<u8>; HARD_MODE_WORD_LENGTH],
+    yellow_forbidden: [u32; HARD_MODE_WORD_LENGTH],
+    required_counts: [u8; 26],
+}
+
+fn build_hard_mode_constraints(observations: &[(String, u8)]) -> HardModeConstraints {
+    let mut constraints = HardModeConstraints {
+        greens: [None; HARD_MODE_WORD_LENGTH],
+        yellow_forbidden: [0; HARD_MODE_WORD_LENGTH],
+        required_counts: [0; 26],
+    };
+
+    for (guess, pattern) in observations {
+        let feedback = decode_feedback(*pattern);
+        let guess_bytes = guess.as_bytes();
+        let mut positive_counts = [0u8; 26];
+
+        for index in 0..HARD_MODE_WORD_LENGTH {
+            let byte = guess_bytes[index];
+            let letter_index = (byte - b'a') as usize;
+            match feedback[index] {
+                2 => {
+                    constraints.greens[index] = Some(byte);
+                    positive_counts[letter_index] += 1;
+                }
+                1 => {
+                    constraints.yellow_forbidden[index] |= 1u32 << letter_index;
+                    positive_counts[letter_index] += 1;
+                }
+                _ => {}
+            }
+        }
+
+        for (letter_index, &count) in positive_counts.iter().enumerate() {
+            constraints.required_counts[letter_index] =
+                constraints.required_counts[letter_index].max(count);
+        }
+    }
+
+    constraints
+}
+
 fn normalized_concentration_penalty(
     total_mass: f64,
     mass_square_sum: f64,
@@ -4629,7 +4794,7 @@ mod tests {
         compare_absurdle_suggestions, compare_exact_costs, compare_guess_metrics,
         compare_guess_metrics_for_state, compare_lookahead, compare_suggestions,
         compare_suggestions_for_state, count_masked_letters, exact_suggestion_mode,
-        known_absent_letter_mask, predictive_search_mode,
+        hard_mode_violation, known_absent_letter_mask, predictive_search_mode,
     };
 
     fn test_solver(words: &[&str]) -> Solver {
@@ -4768,6 +4933,24 @@ mod tests {
         let mask = known_absent_letter_mask(&observations);
         assert_eq!(count_masked_letters("crony", mask), 3);
         assert_eq!(count_masked_letters("cigar", mask), 1);
+    }
+
+    #[test]
+    fn hard_mode_requires_green_positions_and_yellow_letters() {
+        let observations = vec![("crane".to_string(), score_guess("crane", "cigar"))];
+        assert_eq!(
+            hard_mode_violation(&observations, "chair").expect("must fail"),
+            "hard mode forbids A in position 3"
+        );
+        assert!(hard_mode_violation(&observations, "cigar").is_none());
+    }
+
+    #[test]
+    fn hard_mode_requires_repeated_revealed_letters() {
+        let observations = vec![("added".to_string(), score_guess("added", "dread"))];
+        let error = hard_mode_violation(&observations, "tread").expect("must fail");
+        assert!(error.contains("2 occurrences of D"));
+        assert!(hard_mode_violation(&observations, "dread").is_none());
     }
 
     #[test]

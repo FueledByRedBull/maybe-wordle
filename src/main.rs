@@ -64,6 +64,8 @@ enum Command {
         date: Option<String>,
         #[arg(long, default_value = "predictive")]
         mode: String,
+        #[arg(long, default_value_t = false)]
+        hard: bool,
         #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
         model: String,
     },
@@ -74,6 +76,8 @@ enum Command {
         date: Option<String>,
         #[arg(long, default_value = "predictive")]
         mode: String,
+        #[arg(long, default_value_t = false)]
+        hard: bool,
         #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
         model: String,
     },
@@ -279,6 +283,7 @@ fn run() -> Result<()> {
             top,
             date,
             mode,
+            hard,
             model,
         } => match parse_solver_mode(&mode)? {
             SolverMode::Predictive => {
@@ -292,11 +297,16 @@ fn run() -> Result<()> {
                     state.surviving.len(),
                     state.total_weight
                 );
-                for suggestion in solver.suggestions_for_history(as_of, &observations, top)? {
+                for suggestion in if hard {
+                    solver.suggestions_for_history_hard_mode(as_of, &observations, top)?
+                } else {
+                    solver.suggestions_for_history(as_of, &observations, top)?
+                } {
                     println!("{}", format_predictive_suggestion(&suggestion));
                 }
             }
             SolverMode::Absurdle => {
+                reject_hard_mode_for_non_predictive(hard, "absurdle")?;
                 let observations = Solver::parse_observations(&guess, &feedback)?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let state = solver.absurdle_apply_history(&observations)?;
@@ -306,6 +316,7 @@ fn run() -> Result<()> {
                 }
             }
             SolverMode::FormalOptimal => {
+                reject_hard_mode_for_non_predictive(hard, "formal-optimal")?;
                 let observations = parse_formal_observations(&guess, &feedback)?;
                 let runtime = FormalPolicyRuntime::load(&paths, &model)?;
                 let state = runtime.apply_history(&observations)?;
@@ -335,6 +346,7 @@ fn run() -> Result<()> {
             top,
             date,
             mode,
+            hard,
             model,
         } => match parse_solver_mode(&mode)? {
             SolverMode::Predictive => {
@@ -349,7 +361,11 @@ fn run() -> Result<()> {
                         state.surviving.len(),
                         state.total_weight
                     );
-                    for suggestion in solver.suggestions_for_history(as_of, &observations, top)? {
+                    for suggestion in if hard {
+                        solver.suggestions_for_history_hard_mode(as_of, &observations, top)?
+                    } else {
+                        solver.suggestions_for_history(as_of, &observations, top)?
+                    } {
                         println!("{}", format_predictive_suggestion(&suggestion));
                     }
 
@@ -368,6 +384,12 @@ fn run() -> Result<()> {
                             continue;
                         }
                     };
+                    if hard {
+                        if let Some(error) = solver.hard_mode_violation(&observations, &guess) {
+                            println!("error: {error}");
+                            continue;
+                        }
+                    }
 
                     print!("feedback (01020 or bgybb): ");
                     io::stdout().flush().context("failed to flush stdout")?;
@@ -381,6 +403,7 @@ fn run() -> Result<()> {
                 }
             }
             SolverMode::Absurdle => {
+                reject_hard_mode_for_non_predictive(hard, "absurdle")?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let mut observations = Vec::new();
 
@@ -419,6 +442,7 @@ fn run() -> Result<()> {
                 }
             }
             SolverMode::FormalOptimal => {
+                reject_hard_mode_for_non_predictive(hard, "formal-optimal")?;
                 let runtime = FormalPolicyRuntime::load(&paths, &model)?;
                 let mut observations = Vec::new();
 
@@ -920,6 +944,13 @@ fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy> {
     }
 }
 
+fn reject_hard_mode_for_non_predictive(hard: bool, mode: &str) -> Result<()> {
+    if hard {
+        bail!("--hard is only supported in predictive Wordle mode, not {mode}");
+    }
+    Ok(())
+}
+
 fn parse_solver_mode(raw: &str) -> Result<SolverMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "predictive" => Ok(SolverMode::Predictive),
@@ -955,7 +986,7 @@ mod tests {
 
     use super::{
         format_absurdle_suggestion, format_predictive_suggestion, normalize_interactive_guess,
-        parse_solver_mode, try_append_observation,
+        parse_solver_mode, reject_hard_mode_for_non_predictive, try_append_observation,
     };
 
     #[test]
@@ -1035,5 +1066,11 @@ mod tests {
             parse_solver_mode("absurdle").expect("mode"),
             super::SolverMode::Absurdle
         ));
+    }
+
+    #[test]
+    fn reject_hard_mode_for_non_predictive_modes() {
+        assert!(reject_hard_mode_for_non_predictive(false, "absurdle").is_ok());
+        assert!(reject_hard_mode_for_non_predictive(true, "absurdle").is_err());
     }
 }

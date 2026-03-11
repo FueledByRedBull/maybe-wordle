@@ -69,6 +69,7 @@ impl GuiSolverMode {
 }
 
 struct WordleGuiApp {
+    predictive_solver: Solver,
     formal_solver: Option<FormalPolicyRuntime>,
     mode: GuiSolverMode,
     date_text: String,
@@ -82,6 +83,7 @@ struct WordleGuiApp {
     total_weight: f64,
     top: usize,
     force_in_two_only: bool,
+    hard_mode: bool,
     status: String,
     formal_explanation: Option<FormalStateExplanation>,
     request_sender: Sender<WorkerRequest>,
@@ -98,6 +100,7 @@ struct WorkerRequest {
     observations: Vec<(String, u8)>,
     top: usize,
     force_in_two_only: bool,
+    hard_mode: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +136,7 @@ impl WordleGuiApp {
         let (request_sender, response_receiver) =
             spawn_worker(predictive_solver.clone(), formal_solver.clone());
         let mut app = Self {
+            predictive_solver,
             formal_solver,
             mode,
             date_text,
@@ -146,6 +150,7 @@ impl WordleGuiApp {
             total_weight: 0.0,
             top: 10,
             force_in_two_only: false,
+            hard_mode: false,
             status: String::new(),
             formal_explanation: None,
             request_sender,
@@ -166,6 +171,7 @@ impl WordleGuiApp {
             observations: self.observations.clone(),
             top: self.top,
             force_in_two_only: self.force_in_two_only,
+            hard_mode: self.hard_mode,
         };
         self.computing = true;
         self.status = "Computing...".to_string();
@@ -232,6 +238,16 @@ impl WordleGuiApp {
         if guess.is_empty() {
             self.schedule_recompute();
             return;
+        }
+        if self.mode == GuiSolverMode::Predictive {
+            if let Some(error) = self
+                .predictive_solver
+                .hard_mode_violation(&self.observations, &guess)
+                .filter(|_| self.hard_mode)
+            {
+                self.status = error;
+                return;
+            }
         }
         match self.row_pattern() {
             Ok(pattern) => {
@@ -355,6 +371,11 @@ impl eframe::App for WordleGuiApp {
                         self.schedule_recompute();
                     }
                     if self.mode == GuiSolverMode::Predictive {
+                        let hard_changed =
+                            ui.checkbox(&mut self.hard_mode, "Hard Mode").changed();
+                        if hard_changed {
+                            self.schedule_recompute();
+                        }
                         let force_changed =
                             ui.checkbox(&mut self.force_in_two_only, "Force In 2 Only").changed();
                         if force_changed {
@@ -610,16 +631,20 @@ fn spawn_worker(
                             .with_context(|| format!("invalid date: {}", request.date_text))?;
                         let state = predictive_solver.apply_history(date, &request.observations)?;
                         let suggestions = if request.force_in_two_only {
-                            predictive_solver.force_in_two_suggestions_for_history_disk_books_only(
+                            predictive_solver.suggestions_for_history_disk_books_only_with_filters(
                                 date,
                                 &request.observations,
                                 request.top,
+                                request.hard_mode,
+                                true,
                             )?
                         } else {
-                            predictive_solver.suggestions_for_history_disk_books_only(
+                            predictive_solver.suggestions_for_history_disk_books_only_with_filters(
                                 date,
                                 &request.observations,
                                 request.top,
+                                request.hard_mode,
+                                false,
                             )?
                         };
                         Ok(WorkerPayload::Predictive { state, suggestions })
