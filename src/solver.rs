@@ -28,6 +28,11 @@ use crate::{
     small_state::SmallStateTable,
 };
 
+const PROXY_CALIBRATION_MAX_STEPS: usize = 3;
+const PROXY_CALIBRATION_MAX_CANDIDATES_PER_STATE: usize = 10;
+const PROXY_CALIBRATION_MAX_SURVIVORS_FOR_FORCED_ROWS: usize = 192;
+const PROXY_CALIBRATION_MAX_GAME_SECONDS: f64 = 20.0;
+
 #[derive(Clone, Debug)]
 pub struct Suggestion {
     pub word: String,
@@ -1592,8 +1597,21 @@ impl Solver {
 
             let mut observations = Vec::new();
             let mut step_index = 0usize;
-            while step_index < 6 && state.surviving.len() > self.config.large_state_split_threshold
+            let game_started = Instant::now();
+            while step_index < PROXY_CALIBRATION_MAX_STEPS
+                && state.surviving.len() > self.config.large_state_split_threshold
             {
+                if game_started.elapsed().as_secs_f64() > PROXY_CALIBRATION_MAX_GAME_SECONDS {
+                    emit_progress(format!(
+                        "fit-proxy-weights phase=calibration-skip game={}/{} date={} reason=budget rows={} elapsed_s={:.1}",
+                        game_index + 1,
+                        total_games,
+                        date,
+                        rows.len(),
+                        started.elapsed().as_secs_f64(),
+                    ));
+                    break;
+                }
                 let mut metrics = self.score_guess_metrics_for_subset(
                     &state.surviving,
                     &state.weights,
@@ -1624,10 +1642,47 @@ impl Solver {
                 });
 
                 let state_id = format!("{date}:{step_index}");
-                for metric in metrics
-                    .iter()
-                    .take(self.config.session_opener_pool.max(8).min(metrics.len()))
+                let candidate_limit = if state.surviving.len()
+                    <= PROXY_CALIBRATION_MAX_SURVIVORS_FOR_FORCED_ROWS
                 {
+                    PROXY_CALIBRATION_MAX_CANDIDATES_PER_STATE.min(metrics.len())
+                } else {
+                    0
+                };
+                if candidate_limit == 0 {
+                    emit_progress(format!(
+                        "fit-proxy-weights phase=calibration-step game={}/{} date={} step={} survivors={} candidates=0 reason=survivor-cap elapsed_s={:.1}",
+                        game_index + 1,
+                        total_games,
+                        date,
+                        step_index,
+                        state.surviving.len(),
+                        started.elapsed().as_secs_f64(),
+                    ));
+                } else {
+                    emit_progress(format!(
+                        "fit-proxy-weights phase=calibration-step game={}/{} date={} step={} survivors={} candidates={} elapsed_s={:.1}",
+                        game_index + 1,
+                        total_games,
+                        date,
+                        step_index,
+                        state.surviving.len(),
+                        candidate_limit,
+                        started.elapsed().as_secs_f64(),
+                    ));
+                }
+                for metric in metrics.iter().take(candidate_limit) {
+                    if game_started.elapsed().as_secs_f64() > PROXY_CALIBRATION_MAX_GAME_SECONDS {
+                        emit_progress(format!(
+                            "fit-proxy-weights phase=calibration-skip game={}/{} date={} reason=budget rows={} elapsed_s={:.1}",
+                            game_index + 1,
+                            total_games,
+                            date,
+                            rows.len(),
+                            started.elapsed().as_secs_f64(),
+                        ));
+                        break;
+                    }
                     let guess = self.guesses[metric.guess_index].clone();
                     let mut forced = observations.clone();
                     forced.push((guess.clone(), 0));

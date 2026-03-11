@@ -23,7 +23,7 @@ pub struct ProxyWeights {
 impl Default for ProxyWeights {
     fn default() -> Self {
         Self {
-            entropy_w: 0.90,
+            entropy_w: 1.35,
             bucket_mass_w: 1.40,
             bucket_size_w: 0.12,
             ambiguous_w: 0.30,
@@ -32,7 +32,7 @@ impl Default for ProxyWeights {
             posterior_w: 0.05,
             smoothness_w: 0.45,
             gray_reuse_w: 0.08,
-            large_bucket_count_w: 0.18,
+            large_bucket_count_w: 0.198,
             dangerous_mass_count_w: 0.22,
             large_bucket_mass_w: 0.40,
         }
