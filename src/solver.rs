@@ -948,13 +948,11 @@ impl Solver {
 
         if book_usage != PredictiveBookUsage::None {
             if let Some(context) = context {
-                if let Some(cached_word) =
-                    self.cached_predictive_choice(
-                        context.as_of,
-                        context.observations,
-                        book_usage == PredictiveBookUsage::Full,
-                    )
-                {
+                if let Some(cached_word) = self.cached_predictive_choice(
+                    context.as_of,
+                    context.observations,
+                    book_usage == PredictiveBookUsage::Full,
+                ) {
                     promote_cached_suggestion(&mut suggestions, &cached_word);
                 }
             }
@@ -989,13 +987,7 @@ impl Solver {
         let as_of = date
             .checked_sub_days(Days::new(1))
             .ok_or_else(|| anyhow!("cannot solve before launch date"))?;
-        self.solve_target_from_state_detailed(
-            target,
-            as_of,
-            date,
-            top,
-            PredictiveBookUsage::Full,
-        )
+        self.solve_target_from_state_detailed(target, as_of, date, top, PredictiveBookUsage::Full)
     }
 
     fn solve_target_from_state_detailed(
@@ -1642,13 +1634,12 @@ impl Solver {
                 });
 
                 let state_id = format!("{date}:{step_index}");
-                let candidate_limit = if state.surviving.len()
-                    <= PROXY_CALIBRATION_MAX_SURVIVORS_FOR_FORCED_ROWS
-                {
-                    PROXY_CALIBRATION_MAX_CANDIDATES_PER_STATE.min(metrics.len())
-                } else {
-                    0
-                };
+                let candidate_limit =
+                    if state.surviving.len() <= PROXY_CALIBRATION_MAX_SURVIVORS_FOR_FORCED_ROWS {
+                        PROXY_CALIBRATION_MAX_CANDIDATES_PER_STATE.min(metrics.len())
+                    } else {
+                        0
+                    };
                 if candidate_limit == 0 {
                     emit_progress(format!(
                         "fit-proxy-weights phase=calibration-step game={}/{} date={} step={} survivors={} candidates=0 reason=survivor-cap elapsed_s={:.1}",
@@ -2176,12 +2167,20 @@ impl Solver {
     }
 
     pub fn tune_prior(paths: &ProjectPaths, config: &PriorConfig) -> Result<TunePriorSummary> {
+        use std::io::Write;
+
         let (history_start, history_end) = Self::latest_history_range(paths)?
             .ok_or_else(|| anyhow!("run sync-data before tune-prior"))?;
         let window_end = history_end;
         let window_start = history_end
             .checked_sub_days(Days::new(364))
             .map_or(history_start, |date| date.max(history_start));
+        let started = Instant::now();
+        eprintln!(
+            "tune-prior phase=start search_window={}..{} elapsed_s=0.0",
+            window_start, window_end
+        );
+        let _ = std::io::stderr().flush();
         let mut best_prior_config = config.clone();
         let mut best_prior = Self::evaluate_prior_search_candidate(
             paths,
@@ -2191,7 +2190,14 @@ impl Solver {
         )?;
 
         macro_rules! search_dimension {
-            ($field:ident, $values:expr) => {{
+            ($field:ident, $label:literal, $values:expr) => {{
+                eprintln!(
+                    "tune-prior phase=field name={} current={} elapsed_s={:.1}",
+                    $label,
+                    best_prior_config.$field,
+                    started.elapsed().as_secs_f64()
+                );
+                let _ = std::io::stderr().flush();
                 loop {
                     let mut improved = false;
                     for value in $values {
@@ -2209,6 +2215,16 @@ impl Solver {
                         if Self::better_prior_search_evaluation(&candidate, &best_prior) {
                             best_prior_config = candidate_config;
                             best_prior = candidate;
+                            eprintln!(
+                                "tune-prior phase=improved name={} value={} log_loss={:.6} target_rank={:.2} target_probability={:.6} elapsed_s={:.1}",
+                                $label,
+                                best_prior_config.$field,
+                                best_prior.average_log_loss,
+                                best_prior.average_target_rank,
+                                best_prior.average_target_probability,
+                                started.elapsed().as_secs_f64()
+                            );
+                            let _ = std::io::stderr().flush();
                             improved = true;
                         }
                     }
@@ -2219,12 +2235,75 @@ impl Solver {
             }};
         }
 
-        search_dimension!(base_seed_weight, [0.75, 1.0, 1.25]);
-        search_dimension!(base_history_only_weight, [0.10, 0.20, 0.25, 0.33, 0.50]);
-        search_dimension!(cooldown_days, [90_i64, 120, 180, 240, 365]);
-        search_dimension!(cooldown_floor, [0.0, 0.01, 0.02, 0.05]);
-        search_dimension!(midpoint_days, [365.0, 540.0, 720.0, 900.0, 1080.0]);
-        search_dimension!(logistic_k, [0.005, 0.01, 0.015, 0.02]);
+        search_dimension!(base_seed_weight, "base_seed_weight", [0.75, 1.0, 1.25]);
+        search_dimension!(
+            base_history_only_weight,
+            "base_history_only_weight",
+            [0.10, 0.20, 0.25, 0.33, 0.50]
+        );
+        search_dimension!(cooldown_days, "cooldown_days", [90_i64, 120, 180, 240, 365]);
+        search_dimension!(cooldown_floor, "cooldown_floor", [0.0, 0.01, 0.02, 0.05]);
+        search_dimension!(
+            midpoint_days,
+            "midpoint_days",
+            [365.0, 540.0, 720.0, 900.0, 1080.0]
+        );
+        search_dimension!(logistic_k, "logistic_k", [0.005, 0.01, 0.015, 0.02]);
+        search_dimension!(
+            pool_tight_gap_threshold,
+            "pool_tight_gap_threshold",
+            [0.03, 0.05, 0.07]
+        );
+        search_dimension!(
+            pool_medium_gap_threshold,
+            "pool_medium_gap_threshold",
+            [0.10, 0.15, 0.20]
+        );
+        search_dimension!(
+            danger_lookahead_threshold,
+            "danger_lookahead_threshold",
+            [0.52, 0.58, 0.64]
+        );
+        search_dimension!(
+            danger_exact_threshold,
+            "danger_exact_threshold",
+            [0.68, 0.72, 0.76]
+        );
+        search_dimension!(
+            lookahead_trap_penalty,
+            "lookahead_trap_penalty",
+            [0.25, 0.35, 0.45]
+        );
+        search_dimension!(
+            lookahead_large_bucket_penalty,
+            "lookahead_large_bucket_penalty",
+            [0.08, 0.12, 0.16]
+        );
+        search_dimension!(
+            lookahead_dangerous_mass_penalty,
+            "lookahead_dangerous_mass_penalty",
+            [0.05, 0.08, 0.12]
+        );
+        search_dimension!(
+            lookahead_large_bucket_mass_penalty,
+            "lookahead_large_bucket_mass_penalty",
+            [0.06, 0.10, 0.14]
+        );
+        search_dimension!(
+            medium_state_lookahead_candidate_pool,
+            "medium_state_lookahead_candidate_pool",
+            [32, 48, 64]
+        );
+        search_dimension!(
+            medium_state_lookahead_reply_pool,
+            "medium_state_lookahead_reply_pool",
+            [16, 20, 28]
+        );
+        search_dimension!(
+            medium_state_force_in_two_scan,
+            "medium_state_force_in_two_scan",
+            [96, 160, 224]
+        );
 
         let validation_start = window_end
             .checked_sub_days(Days::new(6))
@@ -2246,6 +2325,15 @@ impl Solver {
         } else {
             current.clone()
         };
+        eprintln!(
+            "tune-prior phase=done current_avg_guesses={:.4} best_avg_guesses={:.4} current_latency_p95_ms={:.3} best_latency_p95_ms={:.3} elapsed_s={:.1}",
+            current.average_guesses,
+            best.average_guesses,
+            current.latency_p95_ms,
+            best.latency_p95_ms,
+            started.elapsed().as_secs_f64()
+        );
+        let _ = std::io::stderr().flush();
 
         let replacement_toml = format!(
             concat!(
@@ -2267,12 +2355,17 @@ impl Solver {
                 "lookahead_root_force_in_two_scan = {}\n",
                 "medium_state_force_in_two_scan = {}\n",
                 "large_state_split_threshold = {}\n",
+                "pool_tight_gap_threshold = {:.2}\n",
+                "pool_medium_gap_threshold = {:.2}\n",
                 "danger_lookahead_threshold = {:.2}\n",
                 "danger_exact_threshold = {:.2}\n",
                 "danger_reply_pool_bonus = {}\n",
                 "danger_exact_root_pool = {}\n",
                 "danger_exact_survivor_cap = {}\n",
                 "lookahead_trap_penalty = {:.2}\n",
+                "lookahead_large_bucket_penalty = {:.2}\n",
+                "lookahead_dangerous_mass_penalty = {:.2}\n",
+                "lookahead_large_bucket_mass_penalty = {:.2}\n",
             ),
             best.config.base_seed_weight,
             best.config.base_history_only_weight,
@@ -2292,12 +2385,17 @@ impl Solver {
             best.config.lookahead_root_force_in_two_scan,
             best.config.medium_state_force_in_two_scan,
             best.config.large_state_split_threshold,
+            best.config.pool_tight_gap_threshold,
+            best.config.pool_medium_gap_threshold,
             best.config.danger_lookahead_threshold,
             best.config.danger_exact_threshold,
             best.config.danger_reply_pool_bonus,
             best.config.danger_exact_root_pool,
             best.config.danger_exact_survivor_cap,
             best.config.lookahead_trap_penalty,
+            best.config.lookahead_large_bucket_penalty,
+            best.config.lookahead_dangerous_mass_penalty,
+            best.config.lookahead_large_bucket_mass_penalty,
         );
 
         Ok(TunePriorSummary {
@@ -2454,14 +2552,12 @@ impl Solver {
 
     fn offline_book_solver(&self) -> Self {
         let mut config = self.config.clone();
-        config.medium_state_lookahead_threshold =
-            config.medium_state_lookahead_threshold.max(96);
+        config.medium_state_lookahead_threshold = config.medium_state_lookahead_threshold.max(96);
         config.lookahead_candidate_pool = config.lookahead_candidate_pool.max(150);
         config.medium_state_lookahead_candidate_pool =
             config.medium_state_lookahead_candidate_pool.max(96);
         config.lookahead_reply_pool = config.lookahead_reply_pool.max(50);
-        config.medium_state_lookahead_reply_pool =
-            config.medium_state_lookahead_reply_pool.max(32);
+        config.medium_state_lookahead_reply_pool = config.medium_state_lookahead_reply_pool.max(32);
         config.medium_state_force_in_two_scan = config.medium_state_force_in_two_scan.max(192);
         config.exact_candidate_pool = config.exact_candidate_pool.max(160);
         config.lookahead_threshold = config.lookahead_threshold.max(224);
@@ -2940,16 +3036,15 @@ impl Solver {
             return Ok(None);
         }
         let observation = [(opener.to_string(), pattern)];
-        let batch = offline
-            .suggestion_batch_internal(
-                &child,
-                offline.config.session_reply_pool.max(1),
-                Some(PredictiveContext {
-                    as_of,
-                    observations: &observation,
-                }),
-                PredictiveBookUsage::None,
-            )?;
+        let batch = offline.suggestion_batch_internal(
+            &child,
+            offline.config.session_reply_pool.max(1),
+            Some(PredictiveContext {
+                as_of,
+                observations: &observation,
+            }),
+            PredictiveBookUsage::None,
+        )?;
         let split_first = child.surviving.len() > offline.config.large_state_split_threshold;
         let mut metrics = offline.score_guess_metrics_for_subset(
             &child.surviving,
@@ -2959,13 +3054,13 @@ impl Solver {
         metrics.sort_by(|left, right| {
             compare_guess_metrics_for_state(left, right, &offline.guesses, split_first)
         });
-        let total_weight = child.surviving.iter().map(|index| child.weights[*index]).sum::<f64>();
-        let assessment = offline.assess_subset_danger(
-            &child.surviving,
-            &child.weights,
-            total_weight,
-            &metrics,
-        );
+        let total_weight = child
+            .surviving
+            .iter()
+            .map(|index| child.weights[*index])
+            .sum::<f64>();
+        let assessment =
+            offline.assess_subset_danger(&child.surviving, &child.weights, total_weight, &metrics);
         let lookahead_pool = offline.expanded_pool_size(
             &batch.suggestions,
             offline.config.session_reply_pool.max(1),
@@ -3041,7 +3136,11 @@ impl Solver {
                 })
                 .or_else(|| {
                     allow_session_fallback
-                        .then(|| self.session_reply_guess(as_of, guess, *pattern).ok().flatten())
+                        .then(|| {
+                            self.session_reply_guess(as_of, guess, *pattern)
+                                .ok()
+                                .flatten()
+                        })
                         .flatten()
                 }),
             _ => None,
@@ -3617,8 +3716,7 @@ impl Solver {
         (self.config.lookahead_trap_penalty
             * (worst_branch_mass + (high_mass_ambiguous_bucket_count as f64 / 4.0).min(1.0)))
             + (self.config.lookahead_large_bucket_penalty
-                * (large_bucket_count as f64
-                    + (high_mass_ambiguous_bucket_count as f64 * 0.5)))
+                * (large_bucket_count as f64 + (high_mass_ambiguous_bucket_count as f64 * 0.5)))
             + (self.config.lookahead_dangerous_mass_penalty
                 * (dangerous_mass_bucket_count as f64 + high_mass_ambiguous_bucket_count as f64))
             + (self.config.lookahead_large_bucket_mass_penalty * compounded_large_mass)
@@ -4535,7 +4633,11 @@ mod tests {
 
     #[test]
     fn suggestions_for_history_populates_session_opener_cache_without_disk_books() {
-        let guesses = vec!["cigar".to_string(), "rebut".to_string(), "sissy".to_string()];
+        let guesses = vec![
+            "cigar".to_string(),
+            "rebut".to_string(),
+            "sissy".to_string(),
+        ];
         let answers = guesses
             .iter()
             .map(|word| AnswerRecord {
