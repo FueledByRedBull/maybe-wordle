@@ -54,6 +54,15 @@ pub struct Suggestion {
 }
 
 #[derive(Clone, Debug)]
+pub struct AbsurdleSuggestion {
+    pub word: String,
+    pub entropy: f64,
+    pub largest_bucket_size: usize,
+    pub second_largest_bucket_size: usize,
+    pub multi_answer_bucket_count: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct SolveState {
     pub surviving: Vec<usize>,
     pub weights: Vec<f64>,
@@ -639,6 +648,22 @@ impl Solver {
         Ok(state)
     }
 
+    pub fn absurdle_initial_state(&self) -> SolveState {
+        SolveState {
+            surviving: (0..self.answers.len()).collect(),
+            weights: vec![1.0; self.answers.len()],
+            total_weight: self.answers.len() as f64,
+        }
+    }
+
+    pub fn absurdle_apply_history(&self, observations: &[(String, u8)]) -> Result<SolveState> {
+        let mut state = self.absurdle_initial_state();
+        for (guess, pattern) in observations {
+            self.apply_feedback(&mut state, guess, *pattern)?;
+        }
+        Ok(state)
+    }
+
     pub fn apply_feedback(&self, state: &mut SolveState, guess: &str, pattern: u8) -> Result<()> {
         let guess_index = self
             .guess_index
@@ -708,6 +733,33 @@ impl Solver {
                 PredictiveBookUsage::DiskOnly,
             )?
             .suggestions)
+    }
+
+    pub fn absurdle_suggestions(
+        &self,
+        observations: &[(String, u8)],
+        top: usize,
+    ) -> Result<Vec<AbsurdleSuggestion>> {
+        let state = self.absurdle_apply_history(observations)?;
+        self.absurdle_suggestions_for_state(&state, top)
+    }
+
+    pub fn absurdle_suggestions_for_state(
+        &self,
+        state: &SolveState,
+        top: usize,
+    ) -> Result<Vec<AbsurdleSuggestion>> {
+        if state.surviving.is_empty() {
+            bail!("cannot score guesses with an empty state");
+        }
+        let total = state.surviving.len() as f64;
+        let mut suggestions = (0..self.guesses.len())
+            .into_par_iter()
+            .map(|guess_index| self.absurdle_score_guess(guess_index, &state.surviving, total))
+            .collect::<Vec<_>>();
+        suggestions.sort_by(|left, right| compare_absurdle_suggestions(left, right));
+        suggestions.truncate(top.min(suggestions.len()));
+        Ok(suggestions)
     }
 
     fn suggestion_batch_for_history(
@@ -3180,6 +3232,56 @@ impl Solver {
             .collect()
     }
 
+    fn absurdle_score_guess(
+        &self,
+        guess_index: usize,
+        subset: &[usize],
+        total: f64,
+    ) -> AbsurdleSuggestion {
+        let mut counts = [0usize; PATTERN_SPACE];
+        let mut touched_patterns = Vec::new();
+        for answer_index in subset {
+            let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
+            if counts[pattern] == 0 {
+                touched_patterns.push(pattern as u8);
+            }
+            counts[pattern] += 1;
+        }
+
+        let mut largest_bucket_size = 0usize;
+        let mut second_largest_bucket_size = 0usize;
+        let mut multi_answer_bucket_count = 0usize;
+        let mut entropy = 0.0;
+
+        for pattern in touched_patterns {
+            if pattern == ALL_GREEN_PATTERN {
+                continue;
+            }
+            let count = counts[pattern as usize];
+            if count > 1 {
+                multi_answer_bucket_count += 1;
+            }
+            if count > largest_bucket_size {
+                second_largest_bucket_size = largest_bucket_size;
+                largest_bucket_size = count;
+            } else if count > second_largest_bucket_size {
+                second_largest_bucket_size = count;
+            }
+            let probability = count as f64 / total;
+            if probability > 0.0 {
+                entropy -= probability * probability.log2();
+            }
+        }
+
+        AbsurdleSuggestion {
+            word: self.guesses[guess_index].clone(),
+            entropy,
+            largest_bucket_size,
+            second_largest_bucket_size,
+            multi_answer_bucket_count,
+        }
+    }
+
     fn score_guess_metrics(
         &self,
         guess_index: usize,
@@ -4253,6 +4355,24 @@ fn compare_guess_metrics(
     compare_guess_metrics_for_state(left, right, guesses, false)
 }
 
+fn compare_absurdle_suggestions(
+    left: &AbsurdleSuggestion,
+    right: &AbsurdleSuggestion,
+) -> std::cmp::Ordering {
+    left.largest_bucket_size
+        .cmp(&right.largest_bucket_size)
+        .then_with(|| {
+            left.second_largest_bucket_size
+                .cmp(&right.second_largest_bucket_size)
+        })
+        .then_with(|| {
+            left.multi_answer_bucket_count
+                .cmp(&right.multi_answer_bucket_count)
+        })
+        .then_with(|| right.entropy.total_cmp(&left.entropy))
+        .then_with(|| left.word.cmp(&right.word))
+}
+
 fn compare_guess_metrics_for_state(
     left: &GuessMetrics,
     right: &GuessMetrics,
@@ -4478,9 +4598,10 @@ mod tests {
     };
 
     use super::{
-        ExactSearchScratch, ExactSubsetKey, ExactSubsetStorage, ExactSuggestionMode, GuessMetrics,
-        PredictiveBookUsage, PredictiveMemoMap, PredictiveSearchMode, Solver,
-        StateDangerAssessment, Suggestion, compare_exact_costs, compare_guess_metrics,
+        AbsurdleSuggestion, ExactSearchScratch, ExactSubsetKey, ExactSubsetStorage,
+        ExactSuggestionMode, GuessMetrics, PredictiveBookUsage, PredictiveMemoMap,
+        PredictiveSearchMode, Solver, StateDangerAssessment, Suggestion,
+        compare_absurdle_suggestions, compare_exact_costs, compare_guess_metrics,
         compare_guess_metrics_for_state, compare_lookahead, compare_suggestions,
         compare_suggestions_for_state, count_masked_letters, exact_suggestion_mode,
         known_absent_letter_mask, predictive_search_mode,
@@ -4538,6 +4659,66 @@ mod tests {
     fn parse_observations_rejects_length_mismatch() {
         let error = Solver::parse_observations(&["crane".into()], &[]).expect_err("must fail");
         assert!(error.to_string().contains("same number"));
+    }
+
+    #[test]
+    fn absurdle_comparator_prefers_smaller_worst_bucket() {
+        let better = AbsurdleSuggestion {
+            word: "crane".into(),
+            entropy: 2.0,
+            largest_bucket_size: 4,
+            second_largest_bucket_size: 2,
+            multi_answer_bucket_count: 1,
+        };
+        let worse = AbsurdleSuggestion {
+            word: "slate".into(),
+            entropy: 3.5,
+            largest_bucket_size: 5,
+            second_largest_bucket_size: 1,
+            multi_answer_bucket_count: 1,
+        };
+        assert_eq!(
+            compare_absurdle_suggestions(&better, &worse),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn absurdle_comparator_breaks_ties_with_second_largest_bucket() {
+        let better = AbsurdleSuggestion {
+            word: "crane".into(),
+            entropy: 2.0,
+            largest_bucket_size: 4,
+            second_largest_bucket_size: 1,
+            multi_answer_bucket_count: 1,
+        };
+        let worse = AbsurdleSuggestion {
+            word: "slate".into(),
+            entropy: 2.0,
+            largest_bucket_size: 4,
+            second_largest_bucket_size: 2,
+            multi_answer_bucket_count: 1,
+        };
+        assert_eq!(
+            compare_absurdle_suggestions(&better, &worse),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn absurdle_apply_history_matches_wordle_filtering() {
+        let solver = test_solver(&["cigar", "rebut", "sissy"]);
+        let pattern = score_guess("cigar", "rebut");
+        let absurdle = solver
+            .absurdle_apply_history(&[("cigar".to_string(), pattern)])
+            .expect("state");
+        let wordle = solver
+            .apply_history(
+                NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid"),
+                &[("cigar".to_string(), pattern)],
+            )
+            .expect("state");
+        assert_eq!(absurdle.surviving, wordle.surviving);
     }
 
     #[test]

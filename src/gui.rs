@@ -17,7 +17,7 @@ use crate::{
         artifacts_exist,
     },
     scoring::parse_feedback,
-    solver::{SolveState, Solver, Suggestion},
+    solver::{AbsurdleSuggestion, SolveState, Solver, Suggestion},
 };
 
 pub fn run_gui(root: PathBuf) -> Result<()> {
@@ -54,6 +54,18 @@ pub fn run_gui(root: PathBuf) -> Result<()> {
 enum GuiSolverMode {
     FormalOptimal,
     Predictive,
+    Absurdle,
+}
+
+impl GuiSolverMode {
+    fn label(self, formal_available: bool) -> &'static str {
+        match self {
+            Self::FormalOptimal if formal_available => "Formal Optimal",
+            Self::FormalOptimal => "Formal Unavailable",
+            Self::Predictive => "Wordle",
+            Self::Absurdle => "Absurdle",
+        }
+    }
 }
 
 struct WordleGuiApp {
@@ -64,6 +76,7 @@ struct WordleGuiApp {
     current_feedback: [u8; 5],
     observations: Vec<(String, u8)>,
     predictive_suggestions: Vec<Suggestion>,
+    absurdle_suggestions: Vec<AbsurdleSuggestion>,
     formal_suggestions: Vec<FormalSuggestion>,
     surviving_count: usize,
     total_weight: f64,
@@ -90,6 +103,10 @@ enum WorkerPayload {
     Predictive {
         state: SolveState,
         suggestions: Vec<Suggestion>,
+    },
+    Absurdle {
+        state: SolveState,
+        suggestions: Vec<AbsurdleSuggestion>,
     },
     Formal {
         explanation: FormalStateExplanation,
@@ -121,6 +138,7 @@ impl WordleGuiApp {
             current_feedback: [0; 5],
             observations: Vec::new(),
             predictive_suggestions: Vec::new(),
+            absurdle_suggestions: Vec::new(),
             formal_suggestions: Vec::new(),
             surviving_count: 0,
             total_weight: 0.0,
@@ -163,6 +181,16 @@ impl WordleGuiApp {
                     self.surviving_count = state.surviving.len();
                     self.total_weight = state.total_weight;
                     self.predictive_suggestions = suggestions;
+                    self.absurdle_suggestions.clear();
+                    self.formal_suggestions.clear();
+                    self.formal_explanation = None;
+                    self.status.clear();
+                }
+                Ok(WorkerPayload::Absurdle { state, suggestions }) => {
+                    self.surviving_count = state.surviving.len();
+                    self.total_weight = 0.0;
+                    self.absurdle_suggestions = suggestions;
+                    self.predictive_suggestions.clear();
                     self.formal_suggestions.clear();
                     self.formal_explanation = None;
                     self.status.clear();
@@ -176,6 +204,7 @@ impl WordleGuiApp {
                     self.formal_explanation = Some(explanation);
                     self.formal_suggestions = suggestions;
                     self.predictive_suggestions.clear();
+                    self.absurdle_suggestions.clear();
                     self.status.clear();
                 }
                 Err(error) => self.set_error(anyhow::anyhow!(error)),
@@ -186,6 +215,7 @@ impl WordleGuiApp {
     fn set_error(&mut self, error: anyhow::Error) {
         self.status = error.to_string();
         self.predictive_suggestions.clear();
+        self.absurdle_suggestions.clear();
         self.formal_suggestions.clear();
         self.formal_explanation = None;
         self.surviving_count = 0;
@@ -257,20 +287,27 @@ impl eframe::App for WordleGuiApp {
                     let formal_available = self.formal_solver.is_some();
                     let previous_mode = self.mode;
                     ui.label("Mode");
-                    ui.selectable_value(
-                        &mut self.mode,
-                        if formal_available {
-                            GuiSolverMode::FormalOptimal
-                        } else {
-                            GuiSolverMode::Predictive
-                        },
-                        if formal_available {
-                            "Formal Optimal"
-                        } else {
-                            "Formal Unavailable"
-                        },
-                    );
-                    ui.selectable_value(&mut self.mode, GuiSolverMode::Predictive, "Predictive");
+                    egui::ComboBox::from_id_salt("solver-mode")
+                        .selected_text(self.mode.label(formal_available))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.mode,
+                                GuiSolverMode::Predictive,
+                                GuiSolverMode::Predictive.label(formal_available),
+                            );
+                            ui.selectable_value(
+                                &mut self.mode,
+                                GuiSolverMode::Absurdle,
+                                GuiSolverMode::Absurdle.label(formal_available),
+                            );
+                            if formal_available {
+                                ui.selectable_value(
+                                    &mut self.mode,
+                                    GuiSolverMode::FormalOptimal,
+                                    GuiSolverMode::FormalOptimal.label(formal_available),
+                                );
+                            }
+                        });
                     if !formal_available {
                         ui.colored_label(Color32::from_rgb(150, 45, 45), "build-optimal-policy first");
                     }
@@ -362,6 +399,13 @@ impl eframe::App for WordleGuiApp {
                             .color(Color32::from_rgb(67, 53, 39)),
                         );
                     }
+                    GuiSolverMode::Absurdle => {
+                        ui.label(
+                            RichText::new(format!("Remaining candidates: {}", self.surviving_count))
+                                .strong()
+                                .color(Color32::from_rgb(67, 53, 39)),
+                        );
+                    }
                     GuiSolverMode::FormalOptimal => {
                         let summary = if let Some(explanation) = &self.formal_explanation {
                             format!(
@@ -423,7 +467,24 @@ impl eframe::App for WordleGuiApp {
                     });
 
                     columns[1].group(|ui| {
-                        ui.heading("Suggestions");
+                        let (heading, summary) = match self.mode {
+                            GuiSolverMode::Predictive => (
+                                "Wordle Suggestions",
+                                "Ranks guesses by predictive expected progress.",
+                            ),
+                            GuiSolverMode::Absurdle => (
+                                "Absurdle Suggestions",
+                                "Ranks guesses by minimizing the largest surviving bucket.",
+                            ),
+                            GuiSolverMode::FormalOptimal => (
+                                "Formal Suggestions",
+                                "Ranks guesses by the formal optimal-policy objective.",
+                            ),
+                        };
+                        ui.heading(heading);
+                        ui.label(
+                            RichText::new(summary).color(Color32::from_rgb(92, 72, 54)),
+                        );
                         ui.add_space(8.0);
                         match self.mode {
                             GuiSolverMode::Predictive => {
@@ -446,6 +507,29 @@ impl eframe::App for WordleGuiApp {
                                         } else if let Some(lookahead_cost) = suggestion.lookahead_cost {
                                             ui.label(format!("lookahead {:.4}", lookahead_cost));
                                         }
+                                    });
+                                    ui.separator();
+                                }
+                            }
+                            GuiSolverMode::Absurdle => {
+                                for suggestion in &self.absurdle_suggestions {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new(suggestion.word.to_ascii_uppercase())
+                                                .size(18.0)
+                                                .strong()
+                                                .color(Color32::from_rgb(58, 44, 32)),
+                                        );
+                                        ui.label(format!("worst {}", suggestion.largest_bucket_size));
+                                        ui.label(format!(
+                                            "second {}",
+                                            suggestion.second_largest_bucket_size
+                                        ));
+                                        ui.label(format!(
+                                            "multi {}",
+                                            suggestion.multi_answer_bucket_count
+                                        ));
+                                        ui.label(format!("entropy {:.4}", suggestion.entropy));
                                     });
                                     ui.separator();
                                 }
@@ -504,12 +588,23 @@ fn spawn_worker(
                         let date = NaiveDate::parse_from_str(&request.date_text, "%Y-%m-%d")
                             .with_context(|| format!("invalid date: {}", request.date_text))?;
                         let state = predictive_solver.apply_history(date, &request.observations)?;
-                        let suggestions = predictive_solver.suggestions_for_history_disk_books_only(
-                            date,
-                            &request.observations,
-                            request.top,
-                        )?;
+                        let suggestions = predictive_solver
+                            .suggestions_for_history_disk_books_only(
+                                date,
+                                &request.observations,
+                                request.top,
+                            )?;
                         Ok(WorkerPayload::Predictive { state, suggestions })
+                    })();
+                    result.map_err(|error| error.to_string())
+                }
+                GuiSolverMode::Absurdle => {
+                    let result = (|| -> Result<WorkerPayload> {
+                        let state =
+                            predictive_solver.absurdle_apply_history(&request.observations)?;
+                        let suggestions = predictive_solver
+                            .absurdle_suggestions(&request.observations, request.top)?;
+                        Ok(WorkerPayload::Absurdle { state, suggestions })
                     })();
                     result.map_err(|error| error.to_string())
                 }

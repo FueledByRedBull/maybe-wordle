@@ -17,7 +17,7 @@ use maybe_wordle::{
     model::build_model_artifacts,
     model::{ModelVariant, WeightMode},
     seed::{MergeStrategy, add_manual_addition, merge_seed_lists, reconcile_seed_lists},
-    solver::Solver,
+    solver::{AbsurdleSuggestion, Solver},
 };
 
 #[derive(Parser, Debug)]
@@ -151,6 +151,7 @@ enum Command {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SolverMode {
     Predictive,
+    Absurdle,
     FormalOptimal,
 }
 
@@ -295,6 +296,15 @@ fn run() -> Result<()> {
                     println!("{}", format_predictive_suggestion(&suggestion));
                 }
             }
+            SolverMode::Absurdle => {
+                let observations = Solver::parse_observations(&guess, &feedback)?;
+                let solver = Solver::from_paths(&paths, &config)?;
+                let state = solver.absurdle_apply_history(&observations)?;
+                println!("mode=absurdle surviving={}", state.surviving.len());
+                for suggestion in solver.absurdle_suggestions(&observations, top)? {
+                    println!("{}", format_absurdle_suggestion(&suggestion));
+                }
+            }
             SolverMode::FormalOptimal => {
                 let observations = parse_formal_observations(&guess, &feedback)?;
                 let runtime = FormalPolicyRuntime::load(&paths, &model)?;
@@ -364,6 +374,44 @@ fn run() -> Result<()> {
                     let feedback = read_line()?;
                     match try_append_observation(&observations, &guess, &feedback, |next| {
                         solver.apply_history(as_of, next).map(|_| ())
+                    }) {
+                        Ok(next) => observations = next,
+                        Err(error) => println!("error: {error}"),
+                    }
+                }
+            }
+            SolverMode::Absurdle => {
+                let solver = Solver::from_paths(&paths, &config)?;
+                let mut observations = Vec::new();
+
+                loop {
+                    let state = solver.absurdle_apply_history(&observations)?;
+                    println!("mode=absurdle surviving={}", state.surviving.len());
+                    for suggestion in solver.absurdle_suggestions(&observations, top)? {
+                        println!("{}", format_absurdle_suggestion(&suggestion));
+                    }
+
+                    print!("guess (blank to stop): ");
+                    io::stdout().flush().context("failed to flush stdout")?;
+                    let guess = read_line()?;
+                    if guess.trim().is_empty() {
+                        break;
+                    }
+                    let guess = match normalize_interactive_guess(&guess, |candidate| {
+                        solver.has_guess(candidate)
+                    }) {
+                        Ok(guess) => guess,
+                        Err(error) => {
+                            println!("error: {error}");
+                            continue;
+                        }
+                    };
+
+                    print!("feedback (01020 or bgybb): ");
+                    io::stdout().flush().context("failed to flush stdout")?;
+                    let feedback = read_line()?;
+                    match try_append_observation(&observations, &guess, &feedback, |next| {
+                        solver.absurdle_apply_history(next).map(|_| ())
                     }) {
                         Ok(next) => observations = next,
                         Err(error) => println!("error: {error}"),
@@ -745,6 +793,24 @@ fn run() -> Result<()> {
                         average_ms
                     );
                 }
+                SolverMode::Absurdle => {
+                    let solver = Solver::from_paths(&paths, &config)?;
+                    let state = solver.absurdle_initial_state();
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for _ in 0..runs {
+                        let started = std::time::Instant::now();
+                        let _ = solver.absurdle_suggestions_for_state(&state, 10)?;
+                        elapsed += started.elapsed();
+                    }
+                    let average_ms = elapsed.as_secs_f64() * 1000.0 / runs as f64;
+                    println!(
+                        "mode=absurdle runs={} surviving={} pattern_table_bytes={} average_ms={:.3}",
+                        runs,
+                        state.surviving.len(),
+                        solver.pattern_table_bytes(),
+                        average_ms
+                    );
+                }
                 SolverMode::FormalOptimal => {
                     let runtime = FormalPolicyRuntime::load(&paths, &model)?;
                     let state = runtime.initial_state();
@@ -835,6 +901,17 @@ fn format_predictive_suggestion(suggestion: &maybe_wordle::solver::Suggestion) -
     line
 }
 
+fn format_absurdle_suggestion(suggestion: &AbsurdleSuggestion) -> String {
+    format!(
+        "{} worst_bucket={} second_worst_bucket={} multi_answer_buckets={} entropy={:.5}",
+        suggestion.word,
+        suggestion.largest_bucket_size,
+        suggestion.second_largest_bucket_size,
+        suggestion.multi_answer_bucket_count,
+        suggestion.entropy
+    )
+}
+
 fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "union" => Ok(MergeStrategy::Union),
@@ -846,8 +923,9 @@ fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy> {
 fn parse_solver_mode(raw: &str) -> Result<SolverMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "predictive" => Ok(SolverMode::Predictive),
+        "absurdle" => Ok(SolverMode::Absurdle),
         "formal-optimal" | "formal_optimal" | "formal" | "optimal" => Ok(SolverMode::FormalOptimal),
-        _ => bail!("mode must be one of: predictive, formal-optimal"),
+        _ => bail!("mode must be one of: predictive, absurdle, formal-optimal"),
     }
 }
 
@@ -873,9 +951,11 @@ fn parse_model_variant(raw: &str) -> Result<ModelVariant> {
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
+    use maybe_wordle::solver::AbsurdleSuggestion;
 
     use super::{
-        format_predictive_suggestion, normalize_interactive_guess, try_append_observation,
+        format_absurdle_suggestion, format_predictive_suggestion, normalize_interactive_guess,
+        parse_solver_mode, try_append_observation,
     };
 
     #[test]
@@ -934,5 +1014,26 @@ mod tests {
         });
         assert!(formatted.contains("force_in_two=true"));
         assert!(formatted.contains("exact_cost=2.50000"));
+    }
+
+    #[test]
+    fn absurdle_suggestion_format_includes_worst_bucket_metrics() {
+        let formatted = format_absurdle_suggestion(&AbsurdleSuggestion {
+            word: "crane".into(),
+            entropy: 3.5,
+            largest_bucket_size: 8,
+            second_largest_bucket_size: 3,
+            multi_answer_bucket_count: 2,
+        });
+        assert!(formatted.contains("worst_bucket=8"));
+        assert!(formatted.contains("second_worst_bucket=3"));
+    }
+
+    #[test]
+    fn parse_solver_mode_accepts_absurdle() {
+        assert!(matches!(
+            parse_solver_mode("absurdle").expect("mode"),
+            super::SolverMode::Absurdle
+        ));
     }
 }
