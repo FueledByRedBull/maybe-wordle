@@ -23,8 +23,8 @@ use crate::{
     },
     pattern_table::PatternTable,
     scoring::{
-        ALL_GREEN_PATTERN, PATTERN_SPACE, decode_feedback, format_feedback_letters,
-        parse_feedback, score_guess,
+        ALL_GREEN_PATTERN, PATTERN_SPACE, decode_feedback, format_feedback_letters, parse_feedback,
+        score_guess,
     },
     small_state::SmallStateTable,
 };
@@ -251,6 +251,7 @@ pub struct PredictiveReplyBuildSummary {
     pub path: PathBuf,
     pub opener: String,
     pub reply_count: usize,
+    pub third_reply_count: usize,
     pub as_of: NaiveDate,
     pub config_fingerprint: String,
 }
@@ -278,8 +279,8 @@ struct PredictiveOpenerArtifact {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct PredictiveReplyEntry {
-    feedback_pattern: u8,
+struct PredictiveThirdReplyEntry {
+    second_feedback_pattern: u8,
     reply: String,
     surviving_answers: usize,
     proxy_cost: Option<f64>,
@@ -288,11 +289,28 @@ struct PredictiveReplyEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct PredictiveReplyEntry {
+    feedback_pattern: u8,
+    reply: String,
+    surviving_answers: usize,
+    proxy_cost: Option<f64>,
+    lookahead_cost: Option<f64>,
+    exact_cost: Option<f64>,
+    #[serde(default)]
+    third_replies: Vec<PredictiveThirdReplyEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PredictiveReplyBookArtifact {
     identity: PredictiveBookIdentity,
     opener: String,
     replies: Vec<PredictiveReplyEntry>,
 }
+
+type SessionReplyCacheKey = (PredictiveBookIdentity, String, u8);
+type SessionThirdCacheKey = (PredictiveBookIdentity, String, u8, String, u8);
+type SessionReplyCache = Arc<Mutex<HashMap<SessionReplyCacheKey, Option<String>>>>;
+type SessionThirdCache = Arc<Mutex<HashMap<SessionThirdCacheKey, Option<String>>>>;
 
 #[derive(Clone, Copy, Debug)]
 struct ForcedOpenerEvaluation {
@@ -348,7 +366,8 @@ pub struct Solver {
     guess_index: HashMap<String, usize>,
     artifact_dir: PathBuf,
     session_opener_cache: Arc<Mutex<HashMap<PredictiveBookIdentity, Option<String>>>>,
-    session_reply_cache: Arc<Mutex<HashMap<(PredictiveBookIdentity, String, u8), Option<String>>>>,
+    session_reply_cache: SessionReplyCache,
+    session_third_cache: SessionThirdCache,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -602,6 +621,7 @@ impl Solver {
             artifact_dir: paths.derived_predictive.clone(),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -868,7 +888,8 @@ impl Solver {
             .suggestions;
         if hard_mode {
             suggestions.retain(|suggestion| {
-                self.hard_mode_violation(observations, &suggestion.word).is_none()
+                self.hard_mode_violation(observations, &suggestion.word)
+                    .is_none()
             });
         }
         if force_in_two_only {
@@ -1560,12 +1581,13 @@ impl Solver {
             if scoped_targets.is_empty() {
                 continue;
             }
+            let observation = [(opener_artifact.opener.clone(), pattern)];
             let batch = offline.suggestion_batch_internal(
                 &child,
                 REPLY_BOOK_CANDIDATE_LIMIT,
                 Some(PredictiveContext {
                     as_of,
-                    observations: &[(opener_artifact.opener.clone(), pattern)],
+                    observations: &observation,
                 }),
                 PredictiveBookUsage::None,
             )?;
@@ -1595,13 +1617,95 @@ impl Solver {
                 }
             }
             if let Some((reply, _)) = best_reply {
+                let reply_word = reply.word.clone();
+                let reply_index = offline
+                    .guess_index
+                    .get(&reply_word)
+                    .copied()
+                    .ok_or_else(|| anyhow!("missing reply guess {}", reply_word))?;
+                let mut seen_second_patterns = HashSet::new();
+                let mut grandchild = child.clone();
+                let mut third_replies = Vec::new();
+                for target_index in &child.surviving {
+                    let second_feedback = offline.pattern_table.get(reply_index, *target_index);
+                    if second_feedback == ALL_GREEN_PATTERN
+                        || !seen_second_patterns.insert(second_feedback)
+                    {
+                        continue;
+                    }
+                    grandchild.clone_from(&child);
+                    offline.apply_feedback(&mut grandchild, &reply_word, second_feedback)?;
+                    if grandchild.surviving.len() <= 1 {
+                        continue;
+                    }
+                    let grand_targets = scoped_targets
+                        .iter()
+                        .filter(|(_, target)| score_guess(&reply_word, target) == second_feedback)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if grand_targets.is_empty() {
+                        continue;
+                    }
+                    let grand_observations = [
+                        (opener_artifact.opener.clone(), pattern),
+                        (reply_word.clone(), second_feedback),
+                    ];
+                    let grand_batch = offline.suggestion_batch_internal(
+                        &grandchild,
+                        REPLY_BOOK_CANDIDATE_LIMIT,
+                        Some(PredictiveContext {
+                            as_of,
+                            observations: &grand_observations,
+                        }),
+                        PredictiveBookUsage::None,
+                    )?;
+                    let mut best_third: Option<(Suggestion, ForcedOpenerEvaluation)> = None;
+                    for suggestion in grand_batch
+                        .suggestions
+                        .into_iter()
+                        .take(REPLY_BOOK_CANDIDATE_LIMIT)
+                    {
+                        let guess_index = offline
+                            .guess_index
+                            .get(&suggestion.word)
+                            .copied()
+                            .ok_or_else(|| anyhow!("missing third guess {}", suggestion.word))?;
+                        let evaluation = offline.evaluate_forced_continuation(
+                            &[opener_artifact.opener.clone(), reply_word.clone()],
+                            &grand_targets,
+                            guess_index,
+                            5,
+                        )?;
+                        if best_third.as_ref().is_none_or(|(_, current)| {
+                            compare_forced_openers(&evaluation, current, &offline.guesses)
+                                == std::cmp::Ordering::Less
+                        }) {
+                            best_third = Some((suggestion, evaluation));
+                        }
+                    }
+                    if let Some((third, _)) = best_third {
+                        third_replies.push(PredictiveThirdReplyEntry {
+                            second_feedback_pattern: second_feedback,
+                            reply: third.word,
+                            surviving_answers: grandchild.surviving.len(),
+                            proxy_cost: third.proxy_cost,
+                            lookahead_cost: third.lookahead_cost,
+                            exact_cost: third.exact_cost,
+                        });
+                    }
+                }
+                third_replies.sort_by(|left, right| {
+                    left.second_feedback_pattern
+                        .cmp(&right.second_feedback_pattern)
+                });
                 replies.push(PredictiveReplyEntry {
                     feedback_pattern: pattern,
-                    reply: reply.word,
+                    reply: reply_word,
                     surviving_answers: child.surviving.len(),
                     proxy_cost: reply.proxy_cost,
                     lookahead_cost: reply.lookahead_cost,
                     exact_cost: reply.exact_cost,
+                    third_replies,
                 });
             }
         }
@@ -1613,10 +1717,16 @@ impl Solver {
         };
         let path = self.reply_book_artifact_path(as_of);
         write_predictive_artifact(&path, &artifact)?;
+        let third_reply_count = artifact
+            .replies
+            .iter()
+            .map(|entry| entry.third_replies.len())
+            .sum();
         Ok(PredictiveReplyBuildSummary {
             path,
             opener: artifact.opener,
             reply_count: artifact.replies.len(),
+            third_reply_count,
             as_of,
             config_fingerprint: artifact.identity.config_fingerprint,
         })
@@ -2827,19 +2937,35 @@ impl Solver {
     fn evaluate_forced_reply(
         &self,
         opener: &str,
-        opener_feedback: u8,
+        _opener_feedback: u8,
         targets: &[(NaiveDate, String)],
         reply_guess_index: usize,
         top: usize,
     ) -> Result<ForcedOpenerEvaluation> {
-        let reply = self.guesses[reply_guess_index].clone();
+        self.evaluate_forced_continuation(&[opener.to_string()], targets, reply_guess_index, top)
+    }
+
+    fn evaluate_forced_continuation(
+        &self,
+        forced_prefix: &[String],
+        targets: &[(NaiveDate, String)],
+        guess_index: usize,
+        top: usize,
+    ) -> Result<ForcedOpenerEvaluation> {
+        let guess = self.guesses[guess_index].clone();
+        let forced_prefix = forced_prefix
+            .iter()
+            .cloned()
+            .map(|word| (word, 0))
+            .collect::<Vec<_>>();
         let mut guess_counts = Vec::with_capacity(targets.len());
         let mut failures = 0usize;
         for (date, target) in targets {
             let target_as_of = date
                 .checked_sub_days(Days::new(1))
                 .ok_or_else(|| anyhow!("cannot evaluate reply before launch date"))?;
-            let forced = [(opener.to_string(), opener_feedback), (reply.clone(), 0)];
+            let mut forced = forced_prefix.clone();
+            forced.push((guess.clone(), 0));
             let run =
                 self.solve_target_with_forced_prefix(target, target_as_of, *date, &forced, top)?;
             guess_counts.push(run.steps.len());
@@ -2855,7 +2981,7 @@ impl Solver {
         };
         let p95_index = ((guess_counts.len() as f64) * 0.95).ceil() as usize;
         Ok(ForcedOpenerEvaluation {
-            guess_index: reply_guess_index,
+            guess_index,
             games: guess_counts.len(),
             average_guesses,
             p95_guesses: guess_counts
@@ -3163,6 +3289,41 @@ impl Solver {
         Ok(computed)
     }
 
+    fn session_third_guess(
+        &self,
+        as_of: NaiveDate,
+        opener: &str,
+        opener_pattern: u8,
+        reply: &str,
+        reply_pattern: u8,
+    ) -> Result<Option<String>> {
+        let identity = self.predictive_book_identity(as_of);
+        let key = (
+            identity,
+            opener.to_string(),
+            opener_pattern,
+            reply.to_string(),
+            reply_pattern,
+        );
+        if let Some(cached) = self
+            .session_third_cache
+            .lock()
+            .expect("session third cache")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let computed =
+            self.evaluate_session_third(as_of, opener, opener_pattern, reply, reply_pattern)?;
+        self.session_third_cache
+            .lock()
+            .expect("session third cache")
+            .insert(key, computed.clone());
+        Ok(computed)
+    }
+
     fn evaluate_session_reply(
         &self,
         as_of: NaiveDate,
@@ -3184,73 +3345,123 @@ impl Solver {
         if child.surviving.len() <= 1 {
             return Ok(None);
         }
-        let observation = [(opener.to_string(), pattern)];
-        let batch = offline.suggestion_batch_internal(
-            &child,
-            offline.config.session_reply_pool.max(1),
+        let observations = vec![(opener.to_string(), pattern)];
+        offline.evaluate_session_branch_guess(as_of, &child, &observations, &scoped_targets)
+    }
+
+    fn evaluate_session_third(
+        &self,
+        as_of: NaiveDate,
+        opener: &str,
+        opener_pattern: u8,
+        reply: &str,
+        reply_pattern: u8,
+    ) -> Result<Option<String>> {
+        let offline = self.offline_book_solver();
+        let (_, _, targets) = offline.recent_history_targets_for_books(as_of)?;
+        let scoped_targets = targets
+            .into_iter()
+            .filter(|(_, target)| {
+                score_guess(opener, target) == opener_pattern
+                    && score_guess(reply, target) == reply_pattern
+            })
+            .collect::<Vec<_>>();
+        if scoped_targets.is_empty() {
+            return Ok(None);
+        }
+        let mut state = offline.initial_state(as_of);
+        offline.apply_feedback(&mut state, opener, opener_pattern)?;
+        if state.surviving.len() <= 1 {
+            return Ok(None);
+        }
+        offline.apply_feedback(&mut state, reply, reply_pattern)?;
+        if state.surviving.len() <= 1 {
+            return Ok(None);
+        }
+        let observations = vec![
+            (opener.to_string(), opener_pattern),
+            (reply.to_string(), reply_pattern),
+        ];
+        offline.evaluate_session_branch_guess(as_of, &state, &observations, &scoped_targets)
+    }
+
+    fn evaluate_session_branch_guess(
+        &self,
+        as_of: NaiveDate,
+        state: &SolveState,
+        observations: &[(String, u8)],
+        scoped_targets: &[(NaiveDate, String)],
+    ) -> Result<Option<String>> {
+        let batch = self.suggestion_batch_internal(
+            state,
+            self.config.session_reply_pool.max(1),
             Some(PredictiveContext {
                 as_of,
-                observations: &observation,
+                observations,
             }),
             PredictiveBookUsage::None,
         )?;
-        let split_first = child.surviving.len() > offline.config.large_state_split_threshold;
-        let mut metrics = offline.score_guess_metrics_for_subset(
-            &child.surviving,
-            &child.weights,
-            &offline.exact_small_state_table,
+        let split_first = state.surviving.len() > self.config.large_state_split_threshold;
+        let mut metrics = self.score_guess_metrics_for_subset(
+            &state.surviving,
+            &state.weights,
+            &self.exact_small_state_table,
         );
         metrics.sort_by(|left, right| {
-            compare_guess_metrics_for_state(left, right, &offline.guesses, split_first)
+            compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
         });
-        let total_weight = child
+        let total_weight = state
             .surviving
             .iter()
-            .map(|index| child.weights[*index])
+            .map(|index| state.weights[*index])
             .sum::<f64>();
         let assessment =
-            offline.assess_subset_danger(&child.surviving, &child.weights, total_weight, &metrics);
-        let lookahead_pool = offline.expanded_pool_size(
+            self.assess_subset_danger(&state.surviving, &state.weights, total_weight, &metrics);
+        let lookahead_pool = self.expanded_pool_size(
             &batch.suggestions,
-            offline.config.session_reply_pool.max(1),
+            self.config.session_reply_pool.max(1),
             split_first,
-            child.surviving.len() > offline.config.large_state_split_threshold,
+            state.surviving.len() > self.config.large_state_split_threshold,
             assessment,
         );
-        let mut candidate_indexes = offline.collect_lookahead_candidates(
+        let mut candidate_indexes = self.collect_lookahead_candidates(
             &batch.suggestions,
-            child.surviving.len(),
+            state.surviving.len(),
             assessment.dangerous_lookahead,
             lookahead_pool,
         )?;
         if assessment.dangerous_exact
-            && child.surviving.len() <= offline.config.danger_exact_survivor_cap
+            && state.surviving.len() <= self.config.danger_exact_survivor_cap
         {
-            let exact_pool = offline.expanded_pool_size(
+            let exact_pool = self.expanded_pool_size(
                 &batch.suggestions,
-                offline.config.session_reply_pool.max(1),
+                self.config.session_reply_pool.max(1),
                 split_first,
-                child.surviving.len() > offline.config.exact_threshold,
+                state.surviving.len() > self.config.exact_threshold,
                 assessment,
             );
             let mut seen = candidate_indexes.iter().copied().collect::<HashSet<_>>();
             for guess_index in
-                offline.collect_exact_candidates(&child, &batch.suggestions, exact_pool)?
+                self.collect_exact_candidates(state, &batch.suggestions, exact_pool)?
             {
                 if seen.insert(guess_index) {
                     candidate_indexes.push(guess_index);
                 }
             }
         }
+        let forced_prefix = observations
+            .iter()
+            .map(|(guess, _)| guess.clone())
+            .collect::<Vec<_>>();
         let best = candidate_indexes
             .par_iter()
             .filter_map(|guess_index| {
-                let evaluation = offline
-                    .evaluate_forced_reply(opener, pattern, &scoped_targets, *guess_index, 3)
+                let evaluation = self
+                    .evaluate_forced_continuation(&forced_prefix, scoped_targets, *guess_index, 3)
                     .ok()?;
-                Some((offline.guesses[*guess_index].clone(), evaluation))
+                Some((self.guesses[*guess_index].clone(), evaluation))
             })
-            .min_by(|left, right| compare_forced_openers(&left.1, &right.1, &offline.guesses));
+            .min_by(|left, right| compare_forced_openers(&left.1, &right.1, &self.guesses));
         Ok(best.map(|(word, _)| word))
     }
 
@@ -3289,6 +3500,42 @@ impl Solver {
                             self.session_reply_guess(as_of, guess, *pattern)
                                 .ok()
                                 .flatten()
+                        })
+                        .flatten()
+                }),
+            [(opener, opener_pattern), (reply, reply_pattern)] => self
+                .load_predictive_reply_book(as_of)
+                .ok()
+                .flatten()
+                .filter(|artifact| artifact.opener == opener.as_str())
+                .and_then(|artifact| {
+                    artifact
+                        .replies
+                        .into_iter()
+                        .find(|entry| {
+                            entry.feedback_pattern == *opener_pattern
+                                && entry.reply == reply.as_str()
+                        })
+                        .and_then(|entry| {
+                            entry
+                                .third_replies
+                                .into_iter()
+                                .find(|entry| entry.second_feedback_pattern == *reply_pattern)
+                                .map(|entry| entry.reply)
+                        })
+                })
+                .or_else(|| {
+                    allow_session_fallback
+                        .then(|| {
+                            self.session_third_guess(
+                                as_of,
+                                opener,
+                                *opener_pattern,
+                                reply,
+                                *reply_pattern,
+                            )
+                            .ok()
+                            .flatten()
                         })
                         .flatten()
                 }),
@@ -4225,11 +4472,26 @@ impl Solver {
         metrics.sort_by(|left, right| {
             compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
         });
-        metrics.truncate(count);
-        metrics
-            .into_iter()
-            .map(|metric| metric.guess_index)
-            .collect()
+        let surviving_guess_indexes = subset
+            .iter()
+            .filter_map(|answer_index| self.guess_index.get(&self.answers[*answer_index].word))
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut selected = Vec::new();
+        let mut seen = HashSet::new();
+        for metric in metrics.iter().take(count) {
+            if seen.insert(metric.guess_index) {
+                selected.push(metric.guess_index);
+            }
+        }
+        for metric in metrics.into_iter().skip(count) {
+            if surviving_guess_indexes.contains(&metric.guess_index)
+                && seen.insert(metric.guess_index)
+            {
+                selected.push(metric.guess_index);
+            }
+        }
+        selected
     }
 }
 
@@ -4287,10 +4549,6 @@ fn regime_from_search_mode(search_mode: PredictiveSearchMode) -> PredictiveRegim
         PredictiveSearchMode::EscalatedExact => PredictiveRegime::EscalatedExact,
         PredictiveSearchMode::Exact(_) => PredictiveRegime::Exact,
     }
-}
-
-fn approx_tie(left: f64, right: f64) -> bool {
-    (left - right).abs() <= 1e-9
 }
 
 fn compare_force_in_two(left: bool, right: bool) -> std::cmp::Ordering {
@@ -4571,9 +4829,7 @@ fn compare_guess_metrics_for_state(
 ) -> std::cmp::Ordering {
     if split_first {
         let score_cmp = right.large_state_score.total_cmp(&left.large_state_score);
-        if score_cmp != std::cmp::Ordering::Equal
-            && !approx_tie(left.large_state_score, right.large_state_score)
-        {
+        if score_cmp != std::cmp::Ordering::Equal {
             return score_cmp;
         }
         left.known_absent_letter_hits
@@ -4602,8 +4858,7 @@ fn compare_guess_metrics_for_state(
             .then_with(|| guesses[left.guess_index].cmp(&guesses[right.guess_index]))
     } else {
         let proxy_cmp = left.proxy_cost.total_cmp(&right.proxy_cost);
-        if proxy_cmp != std::cmp::Ordering::Equal && !approx_tie(left.proxy_cost, right.proxy_cost)
-        {
+        if proxy_cmp != std::cmp::Ordering::Equal {
             return proxy_cmp;
         }
         compare_force_in_two(left.force_in_two, right.force_in_two)
@@ -4640,7 +4895,7 @@ fn compare_suggestions_for_state(
         let left_score = left.large_state_score.unwrap_or(f64::NEG_INFINITY);
         let right_score = right.large_state_score.unwrap_or(f64::NEG_INFINITY);
         let score_cmp = right_score.total_cmp(&left_score);
-        if score_cmp != std::cmp::Ordering::Equal && !approx_tie(left_score, right_score) {
+        if score_cmp != std::cmp::Ordering::Equal {
             return score_cmp;
         }
         left.known_absent_letter_hits
@@ -4678,7 +4933,7 @@ fn compare_suggestions_for_state(
         let left_proxy = left.proxy_cost.unwrap_or(f64::INFINITY);
         let right_proxy = right.proxy_cost.unwrap_or(f64::INFINITY);
         let proxy_cmp = left_proxy.total_cmp(&right_proxy);
-        if proxy_cmp != std::cmp::Ordering::Equal && !approx_tie(left_proxy, right_proxy) {
+        if proxy_cmp != std::cmp::Ordering::Equal {
             return proxy_cmp;
         }
         compare_force_in_two(left.force_in_two, right.force_in_two)
@@ -4722,7 +4977,7 @@ fn compare_lookahead(
     match (left.lookahead_cost, right.lookahead_cost) {
         (Some(left_cost), Some(right_cost)) => {
             let cost_cmp = left_cost.total_cmp(&right_cost);
-            if cost_cmp != std::cmp::Ordering::Equal && !approx_tie(left_cost, right_cost) {
+            if cost_cmp != std::cmp::Ordering::Equal {
                 return cost_cmp;
             }
             compare_force_in_two(left.force_in_two, right.force_in_two)
@@ -4738,7 +4993,7 @@ fn compare_exact(left: &Suggestion, right: &Suggestion, split_first: bool) -> st
     match (left.exact_cost, right.exact_cost) {
         (Some(left_cost), Some(right_cost)) => {
             let cost_cmp = left_cost.total_cmp(&right_cost);
-            if cost_cmp != std::cmp::Ordering::Equal && !approx_tie(left_cost, right_cost) {
+            if cost_cmp != std::cmp::Ordering::Equal {
                 return cost_cmp;
             }
             compare_force_in_two(left.force_in_two, right.force_in_two)
@@ -4760,7 +5015,7 @@ fn compare_exact_costs(
     match (left_cost, right_cost) {
         (Some(left_cost), Some(right_cost)) => {
             let cost_cmp = left_cost.total_cmp(&right_cost);
-            if cost_cmp != std::cmp::Ordering::Equal && !approx_tie(left_cost, right_cost) {
+            if cost_cmp != std::cmp::Ordering::Equal {
                 return cost_cmp;
             }
             compare_force_in_two(left.force_in_two, right.force_in_two)
@@ -4790,11 +5045,13 @@ mod tests {
     use super::{
         AbsurdleSuggestion, ExactSearchScratch, ExactSubsetKey, ExactSubsetStorage,
         ExactSuggestionMode, GuessMetrics, PredictiveBookUsage, PredictiveMemoMap,
-        PredictiveSearchMode, Solver, StateDangerAssessment, Suggestion,
+        PredictiveReplyBookArtifact, PredictiveReplyEntry, PredictiveSearchMode,
+        PredictiveThirdReplyEntry, Solver, StateDangerAssessment, Suggestion,
         compare_absurdle_suggestions, compare_exact_costs, compare_guess_metrics,
         compare_guess_metrics_for_state, compare_lookahead, compare_suggestions,
         compare_suggestions_for_state, count_masked_letters, exact_suggestion_mode,
         hard_mode_violation, known_absent_letter_mask, predictive_search_mode,
+        write_predictive_artifact,
     };
 
     fn test_solver(words: &[&str]) -> Solver {
@@ -4842,6 +5099,7 @@ mod tests {
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -5012,6 +5270,7 @@ mod tests {
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         let state = solver.initial_state(NaiveDate::from_ymd_opt(2026, 3, 10).expect("valid"));
         assert_eq!(state.surviving.len(), 1);
@@ -5074,6 +5333,7 @@ mod tests {
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         assert_eq!(
             solver
@@ -5150,6 +5410,7 @@ mod tests {
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         let feedback = score_guess("cigar", "rebut");
         let suggestions = solver
@@ -5164,6 +5425,125 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn suggestions_for_history_populates_session_third_cache_without_disk_books() {
+        let guesses = vec![
+            "cigar".to_string(),
+            "rebut".to_string(),
+            "sissy".to_string(),
+            "humph".to_string(),
+            "awake".to_string(),
+        ];
+        let answers = guesses
+            .iter()
+            .map(|word| AnswerRecord {
+                word: word.clone(),
+                in_seed: true,
+                manual_entry: false,
+                manual_weight: 1.0,
+                history_dates: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let pattern_root =
+            std::env::temp_dir().join(format!("maybe-wordle-session-third-cache-test-{unique}"));
+        let _ = std::fs::remove_dir_all(&pattern_root);
+        std::fs::create_dir_all(&pattern_root).expect("pattern root");
+        let pattern_table =
+            PatternTable::load_or_build_at(&pattern_root.join("pattern.bin"), &guesses, &answers)
+                .expect("pattern table");
+        let as_of = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
+        let solver = Solver {
+            config: PriorConfig::default(),
+            mode: WeightMode::Weighted,
+            variant: ModelVariant::SeedPlusHistory,
+            guesses: guesses.clone(),
+            answers,
+            history_dates: vec![NytDailyEntry {
+                id: Some(1),
+                solution: "humph".to_string(),
+                print_date: as_of,
+                days_since_launch: Some(1),
+                editor: None,
+            }],
+            exact_small_state_table: SmallStateTable::build(4),
+            pattern_table,
+            guess_index: guesses
+                .iter()
+                .enumerate()
+                .map(|(index, guess)| (guess.clone(), index))
+                .collect::<HashMap<_, _>>(),
+            artifact_dir: pattern_root.join("predictive"),
+            session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        let first_feedback = score_guess("cigar", "humph");
+        let second_feedback = score_guess("rebut", "humph");
+        let suggestions = solver
+            .suggestions_for_history(
+                as_of,
+                &[
+                    ("cigar".to_string(), first_feedback),
+                    ("rebut".to_string(), second_feedback),
+                ],
+                1,
+            )
+            .expect("session third suggestions");
+        assert!(!suggestions.is_empty());
+        assert_eq!(
+            solver
+                .session_third_cache
+                .lock()
+                .expect("session third cache")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn cached_predictive_choice_reads_third_turn_from_disk_book() {
+        let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let as_of = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
+        let opener_pattern = score_guess("cigar", "humph");
+        let reply_pattern = score_guess("rebut", "humph");
+        let artifact = PredictiveReplyBookArtifact {
+            identity: solver.predictive_book_identity(as_of),
+            opener: "cigar".to_string(),
+            replies: vec![PredictiveReplyEntry {
+                feedback_pattern: opener_pattern,
+                reply: "rebut".to_string(),
+                surviving_answers: 2,
+                proxy_cost: None,
+                lookahead_cost: None,
+                exact_cost: None,
+                third_replies: vec![PredictiveThirdReplyEntry {
+                    second_feedback_pattern: reply_pattern,
+                    reply: "sissy".to_string(),
+                    surviving_answers: 2,
+                    proxy_cost: None,
+                    lookahead_cost: None,
+                    exact_cost: None,
+                }],
+            }],
+        };
+        write_predictive_artifact(&solver.reply_book_artifact_path(as_of), &artifact)
+            .expect("write reply book");
+
+        let choice = solver.cached_predictive_choice(
+            as_of,
+            &[
+                ("cigar".to_string(), opener_pattern),
+                ("rebut".to_string(), reply_pattern),
+            ],
+            false,
+        );
+        assert_eq!(choice.as_deref(), Some("sissy"));
     }
 
     #[test]
@@ -5626,6 +6006,20 @@ mod tests {
             .expect("candidates");
         assert!(candidates.contains(solver.guess_index.get("awake").expect("awake")));
         assert!(candidates.contains(solver.guess_index.get("blush").expect("blush")));
+    }
+
+    #[test]
+    fn top_guess_indexes_for_subset_appends_surviving_answers_after_cutoff() {
+        let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let subset = vec![0, 1];
+        let weights = vec![1.0; solver.answers.len()];
+
+        let full = solver.top_guess_indexes_for_subset(&subset, &weights, solver.guesses.len());
+        let shortlisted = solver.top_guess_indexes_for_subset(&subset, &weights, 1);
+
+        assert_eq!(shortlisted.first(), full.first());
+        assert!(shortlisted.contains(solver.guess_index.get("cigar").expect("cigar")));
+        assert!(shortlisted.contains(solver.guess_index.get("rebut").expect("rebut")));
     }
 
     #[test]
@@ -6099,6 +6493,7 @@ mod tests {
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         let mut memo = PredictiveMemoMap::default();
         let mut scratch = ExactSearchScratch::new();

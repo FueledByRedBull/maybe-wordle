@@ -685,12 +685,13 @@ fn run() -> Result<()> {
             )?;
             let summary = solver.build_predictive_reply_book(as_of)?;
             println!(
-                "mode={} variant={} as_of={} opener={} replies={} fingerprint={} path={}",
+                "mode={} variant={} as_of={} opener={} replies={} third_replies={} fingerprint={} path={}",
                 solver.mode.label(),
                 solver.variant.label(),
                 summary.as_of,
                 summary.opener,
                 summary.reply_count,
+                summary.third_reply_count,
                 summary.config_fingerprint,
                 summary.path.display()
             );
