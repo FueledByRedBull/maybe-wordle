@@ -222,6 +222,17 @@ pub struct TunePriorSummary {
     pub replacement_toml: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveConfigEvaluation {
+    pub config: PriorConfig,
+    pub average_guesses: f64,
+    pub failures: usize,
+    pub coverage_gaps: usize,
+    pub latency_p95_ms: f64,
+    pub hard_case_average_guesses: f64,
+    pub hard_case_failures: usize,
+}
+
 #[derive(Clone, Debug)]
 struct PriorSearchEvaluation {
     average_log_loss: f64,
@@ -1264,6 +1275,16 @@ impl Solver {
         to: NaiveDate,
         top: usize,
     ) -> Result<DetailedBacktestReport> {
+        self.backtest_detailed_with_book_usage(from, to, top, PredictiveBookUsage::DiskOnly)
+    }
+
+    fn backtest_detailed_with_book_usage(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+        top: usize,
+        book_usage: PredictiveBookUsage,
+    ) -> Result<DetailedBacktestReport> {
         let games = self
             .history_dates
             .iter()
@@ -1289,7 +1310,7 @@ impl Solver {
                 as_of,
                 entry.print_date,
                 top,
-                PredictiveBookUsage::DiskOnly,
+                book_usage,
             )?;
             if run.steps.is_empty() {
                 coverage_gaps += 1;
@@ -1332,6 +1353,14 @@ impl Solver {
     }
 
     pub fn hard_case_report(&self, top: usize) -> Result<HardCaseReport> {
+        self.hard_case_report_with_book_usage(top, PredictiveBookUsage::DiskOnly)
+    }
+
+    fn hard_case_report_with_book_usage(
+        &self,
+        top: usize,
+        book_usage: PredictiveBookUsage,
+    ) -> Result<HardCaseReport> {
         let as_of = Self::today();
         let cases = self.select_hard_case_targets(as_of, top)?;
         let mut results = Vec::new();
@@ -1339,13 +1368,8 @@ impl Solver {
         let mut guess_total = 0usize;
 
         for (label, target) in cases {
-            let run = self.solve_target_from_state_detailed(
-                &target,
-                as_of,
-                as_of,
-                top,
-                PredictiveBookUsage::DiskOnly,
-            )?;
+            let run =
+                self.solve_target_from_state_detailed(&target, as_of, as_of, top, book_usage)?;
             if !run.solved {
                 failures += 1;
             }
@@ -2665,6 +2689,34 @@ impl Solver {
             current,
             best,
             replacement_toml,
+        })
+    }
+
+    pub fn evaluate_live_config(
+        paths: &ProjectPaths,
+        config: &PriorConfig,
+        from: NaiveDate,
+        to: NaiveDate,
+        top: usize,
+    ) -> Result<LiveConfigEvaluation> {
+        let solver = Self::from_paths_with_settings(
+            paths,
+            config,
+            WeightMode::Weighted,
+            ModelVariant::SeedPlusHistory,
+        )?;
+        let backtest =
+            solver.backtest_detailed_with_book_usage(from, to, top, PredictiveBookUsage::None)?;
+        let hard_cases = solver.hard_case_report_with_book_usage(top, PredictiveBookUsage::None)?;
+        let latency_p95_ms = solver.benchmark_predictive_latency(3)?;
+        Ok(LiveConfigEvaluation {
+            config: config.clone(),
+            average_guesses: backtest.summary.average_guesses,
+            failures: backtest.summary.failures,
+            coverage_gaps: backtest.summary.coverage_gaps,
+            latency_p95_ms,
+            hard_case_average_guesses: hard_cases.average_guesses,
+            hard_case_failures: hard_cases.failures,
         })
     }
 
@@ -5544,6 +5596,25 @@ mod tests {
             false,
         );
         assert_eq!(choice.as_deref(), Some("sissy"));
+    }
+
+    #[test]
+    fn live_backtest_works_without_disk_books() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let date = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
+        solver.history_dates = vec![NytDailyEntry {
+            id: Some(1),
+            solution: "cigar".to_string(),
+            print_date: date,
+            days_since_launch: Some(1),
+            editor: None,
+        }];
+
+        let report = solver
+            .backtest_detailed_with_book_usage(date, date, 3, PredictiveBookUsage::None)
+            .expect("live backtest");
+        assert_eq!(report.summary.games, 1);
+        assert_eq!(report.summary.coverage_gaps, 0);
     }
 
     #[test]

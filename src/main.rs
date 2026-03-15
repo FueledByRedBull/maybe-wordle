@@ -111,6 +111,18 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         top: usize,
     },
+    EvaluateLiveConfig {
+        #[arg(long)]
+        config: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     BuildPredictiveOpener {
         #[arg(long)]
         date: Option<String>,
@@ -642,6 +654,41 @@ fn run() -> Result<()> {
                     row.result.session_fallback_warm_ms,
                     row.result.average_lookahead_pool_ratio,
                     row.result.average_exact_pool_ratio,
+                );
+            }
+        }
+        Command::EvaluateLiveConfig {
+            config: config_path,
+            from,
+            to,
+            top,
+            json,
+        } => {
+            let evaluation_config = PriorConfig::load(std::path::Path::new(&config_path))?;
+            let from = NaiveDate::parse_from_str(&from, "%Y-%m-%d")
+                .with_context(|| format!("invalid date '{}'", from))?;
+            let to = NaiveDate::parse_from_str(&to, "%Y-%m-%d")
+                .with_context(|| format!("invalid date '{}'", to))?;
+            if from > to {
+                bail!("--from cannot be after --to");
+            }
+            let evaluation =
+                Solver::evaluate_live_config(&paths, &evaluation_config, from, to, top)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&evaluation)
+                        .context("failed to serialize live config evaluation")?
+                );
+            } else {
+                println!(
+                    "avg_guesses={:.4} failures={} coverage_gaps={} latency_p95_ms={:.3} hard_case_avg_guesses={:.4} hard_case_failures={}",
+                    evaluation.average_guesses,
+                    evaluation.failures,
+                    evaluation.coverage_gaps,
+                    evaluation.latency_p95_ms,
+                    evaluation.hard_case_average_guesses,
+                    evaluation.hard_case_failures
                 );
             }
         }

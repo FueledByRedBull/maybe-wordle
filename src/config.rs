@@ -128,14 +128,18 @@ impl Default for PriorConfig {
 }
 
 impl PriorConfig {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut config: Self =
+            toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        config.normalize_manual_keys();
+        Ok(config)
+    }
+
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
-            let raw = fs::read_to_string(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            let mut config: Self = toml::from_str(&raw)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-            config.normalize_manual_keys();
-            return Ok(config);
+            return Self::load(path);
         }
 
         if let Some(parent) = path.parent() {
