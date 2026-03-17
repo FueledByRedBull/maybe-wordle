@@ -1,6 +1,7 @@
 use std::{
     env,
     io::{self, Write},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -197,8 +198,12 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let root = env::current_dir().context("failed to resolve current directory")?;
+    let args = env::args_os().collect::<Vec<_>>();
+    let root = resolve_project_root()?;
+    if args.len() == 1 {
+        return run_gui(root);
+    }
+    let cli = Cli::parse_from(args);
     let paths = ProjectPaths::new(root);
     paths.ensure_layout()?;
     let config = PriorConfig::load_or_create(&paths.config_prior)?;
@@ -994,6 +999,35 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn resolve_project_root() -> Result<PathBuf> {
+    let current_dir = env::current_dir().context("failed to resolve current directory")?;
+    if let Some(root) = find_project_root(&current_dir) {
+        return Ok(root);
+    }
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(root) = find_project_root(&current_exe)
+    {
+        return Ok(root);
+    }
+    Ok(current_dir)
+}
+
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    let anchor = if start.is_dir() {
+        start
+    } else {
+        start.parent()?
+    };
+    anchor
+        .ancestors()
+        .find(|candidate| {
+            candidate.join("config/prior.toml").is_file()
+                && candidate.join("data/seed/valid_guesses.txt").is_file()
+                && candidate.join("data/seed/candidate_answers.txt").is_file()
+        })
+        .map(Path::to_path_buf)
+}
+
 fn parse_or_today(raw: Option<&str>) -> Result<NaiveDate> {
     Ok(parse_date(raw)?.unwrap_or_else(Solver::today))
 }
@@ -1115,12 +1149,15 @@ fn parse_model_variant(raw: &str) -> Result<ModelVariant> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use anyhow::anyhow;
     use maybe_wordle::solver::AbsurdleSuggestion;
 
     use super::{
-        format_absurdle_suggestion, format_predictive_suggestion, normalize_interactive_guess,
-        parse_solver_mode, reject_hard_mode_for_non_predictive, try_append_observation,
+        find_project_root, format_absurdle_suggestion, format_predictive_suggestion,
+        normalize_interactive_guess, parse_solver_mode, reject_hard_mode_for_non_predictive,
+        try_append_observation,
     };
 
     #[test]
@@ -1206,5 +1243,28 @@ mod tests {
     fn reject_hard_mode_for_non_predictive_modes() {
         assert!(reject_hard_mode_for_non_predictive(false, "absurdle").is_ok());
         assert!(reject_hard_mode_for_non_predictive(true, "absurdle").is_err());
+    }
+
+    #[test]
+    fn find_project_root_walks_up_from_nested_binary_path() {
+        let temp_root =
+            std::env::temp_dir().join(format!("maybe-wordle-root-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(temp_root.join("config")).expect("config dir");
+        fs::create_dir_all(temp_root.join("data/seed")).expect("seed dir");
+        fs::create_dir_all(temp_root.join("target/release")).expect("release dir");
+        fs::write(temp_root.join("config/prior.toml"), "").expect("prior");
+        fs::write(temp_root.join("data/seed/valid_guesses.txt"), "crane\n").expect("guesses");
+        fs::write(temp_root.join("data/seed/candidate_answers.txt"), "crane\n").expect("answers");
+
+        let nested_exe = temp_root.join("target/release/maybe-wordle.exe");
+        fs::write(&nested_exe, "").expect("exe");
+
+        assert_eq!(
+            find_project_root(&nested_exe).expect("project root"),
+            temp_root
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 }
