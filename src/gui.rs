@@ -239,15 +239,14 @@ impl WordleGuiApp {
             self.schedule_recompute();
             return;
         }
-        if self.mode == GuiSolverMode::Predictive {
-            if let Some(error) = self
+        if self.mode == GuiSolverMode::Predictive
+            && let Some(error) = self
                 .predictive_solver
                 .hard_mode_violation(&self.observations, &guess)
                 .filter(|_| self.hard_mode)
-            {
-                self.status = error;
-                return;
-            }
+        {
+            self.status = error;
+            return;
         }
         match self.row_pattern() {
             Ok(pattern) => {

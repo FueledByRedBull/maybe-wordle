@@ -168,34 +168,36 @@ mod tests {
 
     #[test]
     fn prior_config_round_trips_lookahead_fields() {
-        let mut config = PriorConfig::default();
-        config.exact_exhaustive_threshold = 14;
-        config.session_opener_pool = 36;
-        config.session_reply_pool = 24;
-        config.session_window_days = 45;
-        config.lookahead_threshold = 144;
-        config.medium_state_lookahead_threshold = 88;
-        config.lookahead_candidate_pool = 18;
-        config.medium_state_lookahead_candidate_pool = 40;
-        config.lookahead_reply_pool = 9;
-        config.medium_state_lookahead_reply_pool = 18;
-        config.lookahead_root_force_in_two_scan = 72;
-        config.medium_state_force_in_two_scan = 144;
-        config.large_state_split_threshold = 48;
-        config.pool_tight_gap_threshold = 0.04;
-        config.pool_medium_gap_threshold = 0.11;
-        config.pool_diversity_stride = 6;
-        config.danger_lookahead_threshold = 0.61;
-        config.danger_exact_threshold = 0.77;
-        config.danger_reply_pool_bonus = 6;
-        config.danger_exact_root_pool = 28;
-        config.danger_exact_survivor_cap = 176;
-        config.lookahead_trap_penalty = 0.42;
-        config.lookahead_large_bucket_penalty = 0.16;
-        config.lookahead_dangerous_mass_penalty = 0.09;
-        config.lookahead_large_bucket_mass_penalty = 0.13;
-        config.trap_size_threshold = 7;
-        config.trap_mass_threshold = 0.18;
+        let mut config = PriorConfig {
+            exact_exhaustive_threshold: 14,
+            session_opener_pool: 36,
+            session_reply_pool: 24,
+            session_window_days: 45,
+            lookahead_threshold: 144,
+            medium_state_lookahead_threshold: 88,
+            lookahead_candidate_pool: 18,
+            medium_state_lookahead_candidate_pool: 40,
+            lookahead_reply_pool: 9,
+            medium_state_lookahead_reply_pool: 18,
+            lookahead_root_force_in_two_scan: 72,
+            medium_state_force_in_two_scan: 144,
+            large_state_split_threshold: 48,
+            pool_tight_gap_threshold: 0.04,
+            pool_medium_gap_threshold: 0.11,
+            pool_diversity_stride: 6,
+            danger_lookahead_threshold: 0.61,
+            danger_exact_threshold: 0.77,
+            danger_reply_pool_bonus: 6,
+            danger_exact_root_pool: 28,
+            danger_exact_survivor_cap: 176,
+            lookahead_trap_penalty: 0.42,
+            lookahead_large_bucket_penalty: 0.16,
+            lookahead_dangerous_mass_penalty: 0.09,
+            lookahead_large_bucket_mass_penalty: 0.13,
+            trap_size_threshold: 7,
+            trap_mass_threshold: 0.18,
+            ..PriorConfig::default()
+        };
         config.proxy_weights.entropy_w = 1.1;
         let encoded = toml::to_string_pretty(&config).expect("encode");
         assert!(encoded.contains("exact_exhaustive_threshold = 14"));
