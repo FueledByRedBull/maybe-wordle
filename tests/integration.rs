@@ -207,6 +207,21 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
     .expect("ablations");
     assert!(ablations.len() >= 6);
     assert!(ablations.iter().any(|row| row.label == "weighted_baseline"));
+    let three_guess_gap = Solver::three_guess_gap_report(
+        &paths,
+        &config,
+        NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"),
+        NaiveDate::from_ymd_opt(2024, 1, 4).expect("date"),
+        5,
+    )
+    .expect("three guess gap");
+    assert_eq!(three_guess_gap.games, 4);
+    assert!(three_guess_gap.base_four_guess_cases >= three_guess_gap.converted_by_aggressive);
+    assert!(three_guess_gap.base_four_guess_cases >= three_guess_gap.converted_by_targeted_search);
+    assert_eq!(
+        three_guess_gap.base_four_guess_cases,
+        three_guess_gap.cases.len()
+    );
 
     let as_of = NaiveDate::from_ymd_opt(2024, 1, 5).expect("date");
     let opener = solver

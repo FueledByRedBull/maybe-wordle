@@ -123,6 +123,24 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    ThreeGuessGap {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+    },
+    FourGuessOpeners {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        #[arg(long = "opener")]
+        opener: Vec<String>,
+    },
     BuildPredictiveOpener {
         #[arg(long)]
         date: Option<String>,
@@ -396,11 +414,9 @@ fn run() -> Result<()> {
                             continue;
                         }
                     };
-                    if hard {
-                        if let Some(error) = solver.hard_mode_violation(&observations, &guess) {
-                            println!("error: {error}");
-                            continue;
-                        }
+                    if hard && let Some(error) = solver.hard_mode_violation(&observations, &guess) {
+                        println!("error: {error}");
+                        continue;
                     }
 
                     print!("feedback (01020 or bgybb): ");
@@ -689,6 +705,76 @@ fn run() -> Result<()> {
                     evaluation.latency_p95_ms,
                     evaluation.hard_case_average_guesses,
                     evaluation.hard_case_failures
+                );
+            }
+        }
+        Command::ThreeGuessGap { from, to, top } => {
+            let from = NaiveDate::parse_from_str(&from, "%Y-%m-%d")
+                .with_context(|| format!("invalid date '{}'", from))?;
+            let to = NaiveDate::parse_from_str(&to, "%Y-%m-%d")
+                .with_context(|| format!("invalid date '{}'", to))?;
+            if from > to {
+                bail!("--from cannot be after --to");
+            }
+            let report = Solver::three_guess_gap_report(&paths, &config, from, to, top)?;
+            println!(
+                "games={} base_avg_guesses={:.4} aggressive_case_avg_guesses={:.4} base_four_guess_cases={} aggressive_four_guess_cases={} converted_by_aggressive={} converted_by_targeted_search={}",
+                report.games,
+                report.base_average_guesses,
+                report.aggressive_case_average_guesses,
+                report.base_four_guess_cases,
+                report.aggressive_four_guess_cases,
+                report.converted_by_aggressive,
+                report.converted_by_targeted_search
+            );
+            for case in report.cases {
+                println!(
+                    "target={} date={} base_guesses={} aggressive_guesses={} best_forced_guesses={} converted_by_aggressive={} converted_by_targeted_search={} base_path={} aggressive_path={} best_forced_path={}",
+                    case.target,
+                    case.date,
+                    case.base_guesses,
+                    case.aggressive_guesses,
+                    case.best_forced_guesses,
+                    case.converted_by_aggressive,
+                    case.converted_by_targeted_search,
+                    case.base_path.join("/"),
+                    case.aggressive_path.join("/"),
+                    case.best_forced_path.join("/")
+                );
+            }
+        }
+        Command::FourGuessOpeners {
+            from,
+            to,
+            top,
+            opener,
+        } => {
+            let from = NaiveDate::parse_from_str(&from, "%Y-%m-%d")
+                .with_context(|| format!("invalid date '{}'", from))?;
+            let to = NaiveDate::parse_from_str(&to, "%Y-%m-%d")
+                .with_context(|| format!("invalid date '{}'", to))?;
+            if from > to {
+                bail!("--from cannot be after --to");
+            }
+            let report = Solver::four_guess_opener_report(&paths, &config, from, to, top, &opener)?;
+            println!("games={}", report.games);
+            for target in report.targets {
+                println!(
+                    "target={} date={} base_path={}",
+                    target.target,
+                    target.date,
+                    target.base_path.join("/")
+                );
+            }
+            for evaluation in report.evaluations {
+                println!(
+                    "opener={} avg_guesses={:.4} three_guess_solves={} failures={} p95={} max={}",
+                    evaluation.opener,
+                    evaluation.average_guesses,
+                    evaluation.three_guess_solves,
+                    evaluation.failures,
+                    evaluation.p95_guesses,
+                    evaluation.max_guesses
                 );
             }
         }
