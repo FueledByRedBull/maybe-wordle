@@ -797,14 +797,19 @@ fn run() -> Result<()> {
             )?;
             let summary = solver.build_predictive_opener_cache(as_of)?;
             println!(
-                "mode={} variant={} as_of={} opener={} games={} avg_guesses={:.4} failures={} fingerprint={} path={}",
+                "mode={} variant={} as_of={} opener={} games={} four_guess_games={} avg_guesses={:.4} failures={} holdout_games={} holdout_four_guess_games={} holdout_avg_guesses={:.4} holdout_failures={} fingerprint={} path={}",
                 solver.mode.label(),
                 solver.variant.label(),
                 summary.as_of,
                 summary.opener,
                 summary.games,
+                summary.four_guess_games,
                 summary.average_guesses,
                 summary.failures,
+                summary.holdout_games,
+                summary.holdout_four_guess_games,
+                summary.holdout_average_guesses,
+                summary.holdout_failures,
                 summary.config_fingerprint,
                 summary.path.display()
             );

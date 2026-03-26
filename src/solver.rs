@@ -38,6 +38,8 @@ const THREE_GUESS_ROOT_CANDIDATE_LIMIT: usize = 1;
 const THREE_GUESS_REPLY_CANDIDATE_LIMIT: usize = 4;
 const MEDIUM_SECOND_GUESS_COVERAGE_POOL: usize = 24;
 const THREE_SOLVE_CHILD_CAP: usize = 24;
+const OPENER_HOLDOUT_SHORTLIST: usize = 4;
+const OPENER_ARTIFACT_FRESHNESS_DAYS: u64 = 14;
 
 #[derive(Clone, Debug)]
 pub struct Suggestion {
@@ -307,8 +309,13 @@ pub struct PredictiveOpenerBuildSummary {
     pub as_of: NaiveDate,
     pub config_fingerprint: String,
     pub games: usize,
+    pub four_guess_games: usize,
     pub average_guesses: f64,
     pub failures: usize,
+    pub holdout_games: usize,
+    pub holdout_four_guess_games: usize,
+    pub holdout_average_guesses: f64,
+    pub holdout_failures: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -336,8 +343,22 @@ struct PredictiveOpenerArtifact {
     search_window_start: NaiveDate,
     search_window_end: NaiveDate,
     games: usize,
+    #[serde(default)]
+    four_guess_games: usize,
     average_guesses: f64,
     failures: usize,
+    #[serde(default)]
+    holdout_window_start: Option<NaiveDate>,
+    #[serde(default)]
+    holdout_window_end: Option<NaiveDate>,
+    #[serde(default)]
+    holdout_games: usize,
+    #[serde(default)]
+    holdout_four_guess_games: usize,
+    #[serde(default)]
+    holdout_average_guesses: f64,
+    #[serde(default)]
+    holdout_failures: usize,
     proxy_cost: Option<f64>,
     lookahead_cost: Option<f64>,
     exact_cost: Option<f64>,
@@ -381,10 +402,24 @@ type SessionThirdCache = Arc<Mutex<HashMap<SessionThirdCacheKey, Option<String>>
 struct ForcedOpenerEvaluation {
     guess_index: usize,
     games: usize,
+    four_guess_games: usize,
     average_guesses: f64,
     p95_guesses: usize,
     max_guesses: usize,
     failures: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedOpenerEvaluation {
+    word: String,
+    primary: ForcedOpenerEvaluation,
+    holdout: Option<ForcedOpenerEvaluation>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ForcedSolveScore {
+    guesses: usize,
+    solved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1731,36 +1766,50 @@ impl Solver {
         let offline = self.offline_book_solver();
         let (window_start, window_end, targets) =
             offline.recent_history_targets_for_books(as_of)?;
+        let holdout = offline.previous_history_targets_for_books(window_start)?;
         let state = offline.initial_state(as_of);
-        let opener_guess = offline
+        let candidates = offline
             .suggestion_batch_internal(
                 &state,
-                1,
+                offline.config.session_opener_pool.max(1),
                 Some(PredictiveContext {
                     as_of,
                     observations: &[],
                 }),
                 PredictiveBookUsage::None,
             )?
-            .suggestions
-            .into_iter()
-            .next()
+            .suggestions;
+        let selected = offline
+            .select_validated_opener(
+                as_of,
+                &candidates,
+                &targets,
+                holdout.as_ref().map(|(_, _, entries)| entries.as_slice()),
+                5,
+            )?
             .ok_or_else(|| anyhow!("missing predictive opener candidate"))?;
-        let opener_guess_index = offline
-            .guess_index
-            .get(&opener_guess.word)
-            .copied()
-            .ok_or_else(|| anyhow!("missing opener guess {}", opener_guess.word))?;
-        let opener_eval = offline.evaluate_forced_opener(as_of, &targets, opener_guess_index, 5)?;
-        let opener = offline.guesses[opener_eval.guess_index].clone();
+        let opener = selected.word.clone();
         let artifact = PredictiveOpenerArtifact {
             identity: self.predictive_book_identity(as_of),
             opener: opener.clone(),
             search_window_start: window_start,
             search_window_end: window_end,
-            games: opener_eval.games,
-            average_guesses: opener_eval.average_guesses,
-            failures: opener_eval.failures,
+            games: selected.primary.games,
+            four_guess_games: selected.primary.four_guess_games,
+            average_guesses: selected.primary.average_guesses,
+            failures: selected.primary.failures,
+            holdout_window_start: holdout.as_ref().map(|(start, _, _)| *start),
+            holdout_window_end: holdout.as_ref().map(|(_, end, _)| *end),
+            holdout_games: selected.holdout.as_ref().map_or(0, |eval| eval.games),
+            holdout_four_guess_games: selected
+                .holdout
+                .as_ref()
+                .map_or(0, |eval| eval.four_guess_games),
+            holdout_average_guesses: selected
+                .holdout
+                .as_ref()
+                .map_or(0.0, |eval| eval.average_guesses),
+            holdout_failures: selected.holdout.as_ref().map_or(0, |eval| eval.failures),
             proxy_cost: None,
             lookahead_cost: None,
             exact_cost: None,
@@ -1773,8 +1822,13 @@ impl Solver {
             as_of,
             config_fingerprint: artifact.identity.config_fingerprint,
             games: artifact.games,
+            four_guess_games: artifact.four_guess_games,
             average_guesses: artifact.average_guesses,
             failures: artifact.failures,
+            holdout_games: artifact.holdout_games,
+            holdout_four_guess_games: artifact.holdout_four_guess_games,
+            holdout_average_guesses: artifact.holdout_average_guesses,
+            holdout_failures: artifact.holdout_failures,
         })
     }
 
@@ -3508,24 +3562,59 @@ impl Solver {
         Ok((window_start, window_end, targets))
     }
 
+    fn previous_history_targets_for_books(
+        &self,
+        current_window_start: NaiveDate,
+    ) -> Result<Option<BookTargetWindow>> {
+        let mut entries = self
+            .history_dates
+            .iter()
+            .filter(|entry| entry.print_date < current_window_start)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        entries.sort_by_key(|entry| entry.print_date);
+        let holdout_end = entries
+            .last()
+            .map(|entry| entry.print_date)
+            .ok_or_else(|| anyhow!("missing holdout history"))?;
+        let window_days = self.config.session_window_days.saturating_sub(1) as u64;
+        let holdout_start = holdout_end
+            .checked_sub_days(Days::new(window_days))
+            .map_or(entries[0].print_date, |date| {
+                date.max(entries[0].print_date)
+            });
+        let targets = entries
+            .into_iter()
+            .filter(|entry| entry.print_date >= holdout_start)
+            .map(|entry| (entry.print_date, entry.solution.clone()))
+            .collect::<Vec<_>>();
+        Ok(Some((holdout_start, holdout_end, targets)))
+    }
+
     fn evaluate_forced_opener(
         &self,
         _as_of: NaiveDate,
         targets: &[(NaiveDate, String)],
         guess_index: usize,
-        top: usize,
+        _top: usize,
     ) -> Result<ForcedOpenerEvaluation> {
         let opener = self.guesses[guess_index].clone();
         let mut guess_counts = Vec::with_capacity(targets.len());
+        let mut four_guess_games = 0usize;
         let mut failures = 0usize;
         for (date, target) in targets {
             let target_as_of = date
                 .checked_sub_days(Days::new(1))
                 .ok_or_else(|| anyhow!("cannot evaluate opener before launch date"))?;
-            let run =
-                self.solve_target_with_forced_opening(target, target_as_of, *date, &opener, top)?;
-            guess_counts.push(run.steps.len());
-            if !run.solved {
+            let score =
+                self.score_target_with_forced_opening(target, target_as_of, *date, &opener)?;
+            if score.guesses >= 4 {
+                four_guess_games += 1;
+            }
+            guess_counts.push(score.guesses);
+            if !score.solved {
                 failures += 1;
             }
         }
@@ -3539,6 +3628,7 @@ impl Solver {
         Ok(ForcedOpenerEvaluation {
             guess_index,
             games: guess_counts.len(),
+            four_guess_games,
             average_guesses,
             p95_guesses: guess_counts
                 .get(p95_index.saturating_sub(1))
@@ -3565,7 +3655,7 @@ impl Solver {
         forced_prefix: &[String],
         targets: &[(NaiveDate, String)],
         guess_index: usize,
-        top: usize,
+        _top: usize,
     ) -> Result<ForcedOpenerEvaluation> {
         let guess = self.guesses[guess_index].clone();
         let forced_prefix = forced_prefix
@@ -3581,10 +3671,10 @@ impl Solver {
                 .ok_or_else(|| anyhow!("cannot evaluate reply before launch date"))?;
             let mut forced = forced_prefix.clone();
             forced.push((guess.clone(), 0));
-            let run =
-                self.solve_target_with_forced_prefix(target, target_as_of, *date, &forced, top)?;
-            guess_counts.push(run.steps.len());
-            if !run.solved {
+            let score =
+                self.score_target_with_forced_prefix(target, target_as_of, *date, &forced)?;
+            guess_counts.push(score.guesses);
+            if !score.solved {
                 failures += 1;
             }
         }
@@ -3598,6 +3688,7 @@ impl Solver {
         Ok(ForcedOpenerEvaluation {
             guess_index,
             games: guess_counts.len(),
+            four_guess_games: guess_counts.iter().filter(|count| **count >= 4).count(),
             average_guesses,
             p95_guesses: guess_counts
                 .get(p95_index.saturating_sub(1))
@@ -3606,6 +3697,58 @@ impl Solver {
             max_guesses: guess_counts.last().copied().unwrap_or_default(),
             failures,
         })
+    }
+
+    fn select_validated_opener(
+        &self,
+        as_of: NaiveDate,
+        candidates: &[Suggestion],
+        primary_targets: &[(NaiveDate, String)],
+        holdout_targets: Option<&[(NaiveDate, String)]>,
+        top: usize,
+    ) -> Result<Option<ValidatedOpenerEvaluation>> {
+        let mut evaluations = candidates
+            .par_iter()
+            .filter_map(|suggestion| {
+                let guess_index = self.guess_index.get(&suggestion.word).copied()?;
+                let primary = self
+                    .evaluate_forced_opener(as_of, primary_targets, guess_index, top)
+                    .ok()?;
+                Some(ValidatedOpenerEvaluation {
+                    word: suggestion.word.clone(),
+                    primary,
+                    holdout: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        evaluations.sort_by(|left, right| {
+            compare_forced_openers(&left.primary, &right.primary, &self.guesses)
+        });
+        let shortlist_len = if holdout_targets.is_some() {
+            OPENER_HOLDOUT_SHORTLIST.min(evaluations.len())
+        } else {
+            evaluations.len()
+        };
+        let mut best: Option<ValidatedOpenerEvaluation> = None;
+        for mut evaluation in evaluations.into_iter().take(shortlist_len) {
+            if let Some(targets) = holdout_targets {
+                evaluation.holdout = self
+                    .evaluate_forced_opener(as_of, targets, evaluation.primary.guess_index, top)
+                    .ok();
+            }
+            if best.as_ref().is_none_or(|current| {
+                should_replace_forced_opener(
+                    &evaluation.primary,
+                    evaluation.holdout.as_ref(),
+                    &current.primary,
+                    current.holdout.as_ref(),
+                    &self.guesses,
+                )
+            }) {
+                best = Some(evaluation);
+            }
+        }
+        Ok(best)
     }
 
     fn solve_target_with_forced_opening(
@@ -3618,6 +3761,17 @@ impl Solver {
     ) -> Result<DetailedSolveRun> {
         let forced = [(opener.to_string(), 0)];
         self.solve_target_with_forced_prefix(target, as_of, date, &forced, top)
+    }
+
+    fn score_target_with_forced_opening(
+        &self,
+        target: &str,
+        as_of: NaiveDate,
+        date: NaiveDate,
+        opener: &str,
+    ) -> Result<ForcedSolveScore> {
+        let forced = [(opener.to_string(), 0)];
+        self.score_target_with_forced_prefix(target, as_of, date, &forced)
     }
 
     fn solve_target_with_forced_prefix(
@@ -3762,6 +3916,81 @@ impl Solver {
         })
     }
 
+    fn score_target_with_forced_prefix(
+        &self,
+        target: &str,
+        as_of: NaiveDate,
+        _date: NaiveDate,
+        forced: &[(String, u8)],
+    ) -> Result<ForcedSolveScore> {
+        let target = target.to_ascii_lowercase();
+        let mut state = self.initial_state(as_of);
+        if !state
+            .surviving
+            .iter()
+            .any(|index| self.answers[*index].word == target)
+        {
+            return Ok(ForcedSolveScore {
+                guesses: 0,
+                solved: false,
+            });
+        }
+
+        let mut guess_count = 0usize;
+        let mut observations = Vec::new();
+        for (position, (guess, expected_feedback)) in forced.iter().enumerate() {
+            let feedback = score_guess(guess, &target);
+            if position == 0 && *expected_feedback != 0 && *expected_feedback != feedback {
+                bail!(
+                    "forced opener feedback mismatch for {}: expected {}, got {}",
+                    guess,
+                    format_feedback_letters(*expected_feedback),
+                    format_feedback_letters(feedback)
+                );
+            }
+            guess_count += 1;
+            if feedback == ALL_GREEN_PATTERN {
+                return Ok(ForcedSolveScore {
+                    guesses: guess_count,
+                    solved: true,
+                });
+            }
+            observations.push((guess.clone(), feedback));
+            self.apply_feedback(&mut state, guess, feedback)?;
+        }
+
+        while guess_count < 6 {
+            let batch = self.suggestion_batch_internal(
+                &state,
+                1,
+                Some(PredictiveContext {
+                    as_of,
+                    observations: &observations,
+                }),
+                PredictiveBookUsage::None,
+            )?;
+            let chosen = batch
+                .suggestions
+                .first()
+                .ok_or_else(|| anyhow!("solver returned no suggestions"))?;
+            let feedback = score_guess(&chosen.word, &target);
+            guess_count += 1;
+            if feedback == ALL_GREEN_PATTERN {
+                return Ok(ForcedSolveScore {
+                    guesses: guess_count,
+                    solved: true,
+                });
+            }
+            observations.push((chosen.word.clone(), feedback));
+            self.apply_feedback(&mut state, &chosen.word, feedback)?;
+        }
+
+        Ok(ForcedSolveScore {
+            guesses: guess_count,
+            solved: false,
+        })
+    }
+
     fn predictive_book_identity(&self, as_of: NaiveDate) -> PredictiveBookIdentity {
         let config_toml =
             toml::to_string(&self.config).expect("predictive config serialization must succeed");
@@ -3815,6 +4044,22 @@ impl Solver {
         Ok(valid.then_some(artifact))
     }
 
+    fn load_recent_predictive_opener_artifact(
+        &self,
+        as_of: NaiveDate,
+        max_age_days: u64,
+    ) -> Result<Option<PredictiveOpenerArtifact>> {
+        for age_days in 1..=max_age_days {
+            let Some(candidate_date) = as_of.checked_sub_days(Days::new(age_days)) else {
+                break;
+            };
+            if let Some(artifact) = self.load_predictive_opener_artifact(candidate_date)? {
+                return Ok(Some(artifact));
+            }
+        }
+        Ok(None)
+    }
+
     fn load_predictive_reply_book(
         &self,
         as_of: NaiveDate,
@@ -3849,7 +4094,8 @@ impl Solver {
 
     fn evaluate_session_opener(&self, as_of: NaiveDate) -> Result<Option<String>> {
         let offline = self.offline_book_solver();
-        let (_, _, targets) = offline.recent_history_targets_for_books(as_of)?;
+        let (window_start, _, targets) = offline.recent_history_targets_for_books(as_of)?;
+        let holdout = offline.previous_history_targets_for_books(window_start)?;
         if targets.is_empty() {
             return Ok(None);
         }
@@ -3865,17 +4111,14 @@ impl Solver {
                 PredictiveBookUsage::None,
             )?
             .suggestions;
-        let best = candidates
-            .par_iter()
-            .filter_map(|suggestion| {
-                let guess_index = offline.guess_index.get(&suggestion.word).copied()?;
-                let evaluation = offline
-                    .evaluate_forced_opener(as_of, &targets, guess_index, 3)
-                    .ok()?;
-                Some((suggestion.word.clone(), evaluation))
-            })
-            .min_by(|left, right| compare_forced_openers(&left.1, &right.1, &offline.guesses));
-        Ok(best.map(|(word, _)| word))
+        let best = offline.select_validated_opener(
+            as_of,
+            &candidates,
+            &targets,
+            holdout.as_ref().map(|(_, _, entries)| entries.as_slice()),
+            3,
+        )?;
+        Ok(best.map(|evaluation| evaluation.word))
     }
 
     fn session_reply_guess(
@@ -4092,6 +4335,15 @@ impl Solver {
                 .ok()
                 .flatten()
                 .map(|artifact| artifact.opener)
+                .or_else(|| {
+                    self.load_recent_predictive_opener_artifact(
+                        as_of,
+                        OPENER_ARTIFACT_FRESHNESS_DAYS,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|artifact| artifact.opener)
+                })
                 .or_else(|| {
                     allow_session_fallback
                         .then(|| self.session_root_guess(as_of).ok().flatten())
@@ -5341,10 +5593,31 @@ fn compare_forced_openers(
 ) -> std::cmp::Ordering {
     left.failures
         .cmp(&right.failures)
+        .then_with(|| left.four_guess_games.cmp(&right.four_guess_games))
         .then_with(|| left.average_guesses.total_cmp(&right.average_guesses))
         .then_with(|| left.p95_guesses.cmp(&right.p95_guesses))
         .then_with(|| left.max_guesses.cmp(&right.max_guesses))
         .then_with(|| guesses[left.guess_index].cmp(&guesses[right.guess_index]))
+}
+
+fn should_replace_forced_opener(
+    candidate_primary: &ForcedOpenerEvaluation,
+    candidate_holdout: Option<&ForcedOpenerEvaluation>,
+    incumbent_primary: &ForcedOpenerEvaluation,
+    incumbent_holdout: Option<&ForcedOpenerEvaluation>,
+    guesses: &[String],
+) -> bool {
+    if compare_forced_openers(candidate_primary, incumbent_primary, guesses)
+        != std::cmp::Ordering::Less
+    {
+        return false;
+    }
+    match (candidate_holdout, incumbent_holdout) {
+        (Some(candidate), Some(incumbent)) => {
+            compare_forced_openers(candidate, incumbent, guesses) != std::cmp::Ordering::Greater
+        }
+        _ => true,
+    }
 }
 
 fn known_absent_letter_mask(observations: &[(String, u8)]) -> u32 {
@@ -5756,14 +6029,14 @@ mod tests {
 
     use super::{
         AbsurdleSuggestion, ExactSearchScratch, ExactSubsetKey, ExactSubsetStorage,
-        ExactSuggestionMode, GuessMetrics, PredictiveBookUsage, PredictiveMemoMap,
-        PredictiveReplyBookArtifact, PredictiveReplyEntry, PredictiveSearchMode,
-        PredictiveThirdReplyEntry, Solver, StateDangerAssessment, Suggestion,
-        compare_absurdle_suggestions, compare_exact_costs, compare_guess_metrics,
-        compare_guess_metrics_for_state, compare_lookahead, compare_suggestions,
-        compare_suggestions_for_state, count_masked_letters, exact_suggestion_mode,
-        hard_mode_violation, known_absent_letter_mask, predictive_search_mode,
-        write_predictive_artifact,
+        ExactSuggestionMode, ForcedOpenerEvaluation, GuessMetrics, PredictiveBookUsage,
+        PredictiveMemoMap, PredictiveOpenerArtifact, PredictiveReplyBookArtifact,
+        PredictiveReplyEntry, PredictiveSearchMode, PredictiveThirdReplyEntry, Solver,
+        StateDangerAssessment, Suggestion, compare_absurdle_suggestions, compare_exact_costs,
+        compare_forced_openers, compare_guess_metrics, compare_guess_metrics_for_state,
+        compare_lookahead, compare_suggestions, compare_suggestions_for_state,
+        count_masked_letters, exact_suggestion_mode, hard_mode_violation, known_absent_letter_mask,
+        predictive_search_mode, should_replace_forced_opener, write_predictive_artifact,
     };
 
     fn test_solver(words: &[&str]) -> Solver {
@@ -5863,6 +6136,81 @@ mod tests {
             compare_absurdle_suggestions(&better, &worse),
             std::cmp::Ordering::Less
         );
+    }
+
+    #[test]
+    fn forced_opener_comparator_penalizes_four_guess_paths_before_average() {
+        let guesses = vec!["crane".to_string(), "slate".to_string()];
+        let safer = ForcedOpenerEvaluation {
+            guess_index: 0,
+            games: 30,
+            four_guess_games: 2,
+            average_guesses: 3.20,
+            p95_guesses: 4,
+            max_guesses: 4,
+            failures: 0,
+        };
+        let riskier = ForcedOpenerEvaluation {
+            guess_index: 1,
+            games: 30,
+            four_guess_games: 4,
+            average_guesses: 3.18,
+            p95_guesses: 4,
+            max_guesses: 4,
+            failures: 0,
+        };
+        assert_eq!(
+            compare_forced_openers(&safer, &riskier, &guesses),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn stable_opener_switch_rejects_holdout_regressions() {
+        let guesses = vec!["crane".to_string(), "slate".to_string()];
+        let incumbent_primary = ForcedOpenerEvaluation {
+            guess_index: 0,
+            games: 30,
+            four_guess_games: 4,
+            average_guesses: 3.30,
+            p95_guesses: 4,
+            max_guesses: 4,
+            failures: 0,
+        };
+        let candidate_primary = ForcedOpenerEvaluation {
+            guess_index: 1,
+            games: 30,
+            four_guess_games: 2,
+            average_guesses: 3.20,
+            p95_guesses: 4,
+            max_guesses: 4,
+            failures: 0,
+        };
+        let incumbent_holdout = ForcedOpenerEvaluation {
+            guess_index: 0,
+            games: 30,
+            four_guess_games: 2,
+            average_guesses: 3.25,
+            p95_guesses: 4,
+            max_guesses: 4,
+            failures: 0,
+        };
+        let candidate_holdout = ForcedOpenerEvaluation {
+            guess_index: 1,
+            games: 30,
+            four_guess_games: 5,
+            average_guesses: 3.35,
+            p95_guesses: 4,
+            max_guesses: 4,
+            failures: 0,
+        };
+        assert!(!should_replace_forced_opener(
+            &candidate_primary,
+            Some(&candidate_holdout),
+            &incumbent_primary,
+            Some(&incumbent_holdout),
+            &guesses,
+        ));
     }
 
     #[test]
@@ -6260,6 +6608,89 @@ mod tests {
             false,
         );
         assert_eq!(choice.as_deref(), Some("sissy"));
+    }
+
+    #[test]
+    fn cached_predictive_choice_uses_recent_opener_artifact_when_exact_date_is_missing() {
+        let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let artifact_date = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
+        let request_date = NaiveDate::from_ymd_opt(2026, 3, 16).expect("valid");
+        let artifact = PredictiveOpenerArtifact {
+            identity: solver.predictive_book_identity(artifact_date),
+            opener: "cigar".to_string(),
+            search_window_start: NaiveDate::from_ymd_opt(2026, 2, 8).expect("valid"),
+            search_window_end: artifact_date,
+            games: 30,
+            four_guess_games: 10,
+            average_guesses: 3.3,
+            failures: 0,
+            holdout_window_start: None,
+            holdout_window_end: None,
+            holdout_games: 0,
+            holdout_four_guess_games: 0,
+            holdout_average_guesses: 0.0,
+            holdout_failures: 0,
+            proxy_cost: None,
+            lookahead_cost: None,
+            exact_cost: None,
+        };
+        write_predictive_artifact(&solver.opener_artifact_path(artifact_date), &artifact)
+            .expect("write opener artifact");
+
+        let choice = solver.cached_predictive_choice(request_date, &[], false);
+        assert_eq!(choice.as_deref(), Some("cigar"));
+    }
+
+    #[test]
+    fn cached_predictive_choice_prefers_exact_date_opener_artifact_over_recent_one() {
+        let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let older_date = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
+        let exact_date = NaiveDate::from_ymd_opt(2026, 3, 16).expect("valid");
+        let older = PredictiveOpenerArtifact {
+            identity: solver.predictive_book_identity(older_date),
+            opener: "cigar".to_string(),
+            search_window_start: NaiveDate::from_ymd_opt(2026, 2, 8).expect("valid"),
+            search_window_end: older_date,
+            games: 30,
+            four_guess_games: 10,
+            average_guesses: 3.3,
+            failures: 0,
+            holdout_window_start: None,
+            holdout_window_end: None,
+            holdout_games: 0,
+            holdout_four_guess_games: 0,
+            holdout_average_guesses: 0.0,
+            holdout_failures: 0,
+            proxy_cost: None,
+            lookahead_cost: None,
+            exact_cost: None,
+        };
+        let exact = PredictiveOpenerArtifact {
+            identity: solver.predictive_book_identity(exact_date),
+            opener: "rebut".to_string(),
+            search_window_start: NaiveDate::from_ymd_opt(2026, 2, 15).expect("valid"),
+            search_window_end: exact_date,
+            games: 30,
+            four_guess_games: 8,
+            average_guesses: 3.2,
+            failures: 0,
+            holdout_window_start: None,
+            holdout_window_end: None,
+            holdout_games: 0,
+            holdout_four_guess_games: 0,
+            holdout_average_guesses: 0.0,
+            holdout_failures: 0,
+            proxy_cost: None,
+            lookahead_cost: None,
+            exact_cost: None,
+        };
+        write_predictive_artifact(&solver.opener_artifact_path(older_date), &older)
+            .expect("write older opener artifact");
+        write_predictive_artifact(&solver.opener_artifact_path(exact_date), &exact)
+            .expect("write exact opener artifact");
+
+        let choice = solver.cached_predictive_choice(exact_date, &[], false);
+        assert_eq!(choice.as_deref(), Some("rebut"));
     }
 
     #[test]
