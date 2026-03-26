@@ -59,6 +59,7 @@ benchmark
 ```bash
 cargo run -- sync-data
 cargo run -- build-model
+cargo run -- build-predictive-opener --date YYYY-MM-DD
 cargo run -- suggest --guess crane --feedback 00000 --top 5
 cargo run -- solve-interactive
 cargo run -- predictive-ablations --from 2026-02-08 --to 2026-03-09
@@ -148,7 +149,17 @@ Predictive mode now has a separate experiment and cache surface:
 - `cargo run -- build-predictive-opener --date YYYY-MM-DD`
 - `cargo run -- build-predictive-replies --date YYYY-MM-DD`
 
-The opener and reply caches are predictive-only artifacts under [`data/derived/predictive`](./data/derived/predictive). They are keyed by weight mode, model variant, date context, and a fingerprint of the current predictive config. If a cache is missing or stale, predictive mode falls back to live scoring automatically.
+The opener and reply caches are predictive-only artifacts under [`data/derived/predictive`](./data/derived/predictive). They are keyed by weight mode, model variant, date context, and a fingerprint of the current predictive config.
+
+Opener artifacts are date-specific. For predictive root suggestions the solver uses this fallback chain:
+
+1. exact-date opener artifact
+2. newest earlier opener artifact within 14 days
+3. live session opener computation
+
+Reply-book artifacts still require an exact date/context match.
+
+`build-predictive-opener` is heavier than ordinary suggestion commands: it evaluates a bounded opener pool on a recent 30-day window, tracks four-guess tails explicitly, and validates opener switches against a previous-window holdout. If you want fast predictive GUI/root suggestions for a specific date, build the opener artifact for that date ahead of time.
 
 Predictive weighting can still heavily down-rank recently used answers, but eligible modeled answers are no longer dropped completely when their computed prior weight reaches zero. The live solver now keeps them with a tiny fallback weight so valid boards remain representable instead of collapsing to "no answers remain".
 
