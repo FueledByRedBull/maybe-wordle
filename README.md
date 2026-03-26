@@ -3,7 +3,7 @@
   <p><strong>A Wordle solver for the NYT era where the answer list stopped behaving like a fixed museum exhibit.</strong></p>
   <p>
     <img alt="Rust" src="https://img.shields.io/badge/Rust-2024%20edition-1f6feb?style=flat-square">
-    <img alt="CLI first" src="https://img.shields.io/badge/interface-CLI%20first-0f766e?style=flat-square">
+    <img alt="CLI and GUI" src="https://img.shields.io/badge/interface-CLI%20%2B%20GUI-0f766e?style=flat-square">
     <img alt="NYT aware" src="https://img.shields.io/badge/model-NYT%20history%20aware-b45309?style=flat-square">
     <img alt="Exact search" src="https://img.shields.io/badge/formal-exact%20policy%20builder-7c3aed?style=flat-square">
   </p>
@@ -46,6 +46,9 @@ solve-interactive
 explain-state
 backtest
 predictive-ablations
+evaluate-live-config
+three-guess-gap
+four-guess-openers
 build-predictive-opener
 build-predictive-replies
 experiments
@@ -59,11 +62,14 @@ benchmark
 ```bash
 cargo run -- sync-data
 cargo run -- build-model
+cargo run -- gui
 cargo run -- build-predictive-opener --date YYYY-MM-DD
 cargo run -- suggest --guess crane --feedback 00000 --top 5
 cargo run -- solve-interactive
 cargo run -- predictive-ablations --from 2026-02-08 --to 2026-03-09
 ```
+
+`cargo run` with no arguments also opens the GUI.
 
 Example predictive query from this repo's current tracked artifacts:
 
@@ -146,6 +152,9 @@ If you only want fast suggestions, predictive mode works with the derived artifa
 Predictive mode now has a separate experiment and cache surface:
 
 - `cargo run -- predictive-ablations --from YYYY-MM-DD --to YYYY-MM-DD`
+- `cargo run -- evaluate-live-config --config path/to/prior.toml --from YYYY-MM-DD --to YYYY-MM-DD`
+- `cargo run -- three-guess-gap --from YYYY-MM-DD --to YYYY-MM-DD`
+- `cargo run -- four-guess-openers --from YYYY-MM-DD --to YYYY-MM-DD --opener crane`
 - `cargo run -- build-predictive-opener --date YYYY-MM-DD`
 - `cargo run -- build-predictive-replies --date YYYY-MM-DD`
 
@@ -178,6 +187,7 @@ The GUI no longer recomputes suggestions on the UI thread. Heavy predictive or f
 - duplicate-letter scoring is tested explicitly
 - the formal solver has toy-universe consistency tests
 - seed-list maintenance has regression coverage
+- predictive promotion and recovery-mode behavior has characterization coverage
 - `cargo test` is green in the current repo state
 
 A sample release benchmark from the current machine and checked-in predictive artifacts:
@@ -197,16 +207,32 @@ config/
 data/
   raw/        # NYT history archive
   seed/       # pinned guess and answer seeds
-  derived/    # modeled answers and predictive pattern table
+  derived/    # modeled answers, predictive artifacts, and pattern tables
   formal/     # exact-policy artifacts by model id
 src/
+  predictive/
+    books.rs
+    policy.rs
+    recovery.rs
+    search.rs
+    state.rs
+    types.rs
+  solver/
+    books.rs
+  config.rs
   data.rs
-  model.rs
   formal.rs
-  solver.rs
-  scoring.rs
   gui.rs
+  main.rs
+  model.rs
+  pattern_table.rs
+  scoring.rs
+  seed.rs
+  small_state.rs
+  solver.rs
 tests/
+  integration.rs
+  predictive_characterization.rs
 PLAN.md
 ```
 
