@@ -33,7 +33,14 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     #[command(about = "Fetch NYT daily answer JSON into data/raw and reverify recent synced dates")]
-    SyncData,
+    SyncData {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Fail if any date could not be synced after retries"
+        )]
+        strict: bool,
+    },
     #[command(about = "Build modeled answers and the pattern table under data/derived")]
     BuildModel,
     #[command(about = "Build formal optimal-policy artifacts into data/formal")]
@@ -373,7 +380,7 @@ fn run() -> Result<()> {
     let config = PriorConfig::load_or_create(&paths.config_prior)?;
 
     match cli.command {
-        Command::SyncData => {
+        Command::SyncData { strict } => {
             let summary = sync_nyt_history(&paths, &config, Solver::today())?;
             println!("{}", format_sync_summary(&summary));
             if !summary.changed_dates.is_empty() {
@@ -407,6 +414,7 @@ fn run() -> Result<()> {
                     );
                 }
             }
+            enforce_sync_policy(strict, &summary)?;
         }
         Command::BuildModel => {
             let summary = build_model_artifacts(&paths, &config, Solver::today())?;
@@ -1288,6 +1296,21 @@ fn format_sync_summary(summary: &SyncSummary) -> String {
     )
 }
 
+fn enforce_sync_policy(strict: bool, summary: &SyncSummary) -> Result<()> {
+    if strict && summary.partial_sync {
+        bail!(
+            "partial sync encountered failed dates: {}",
+            summary
+                .failed_dates
+                .iter()
+                .map(|date| date.format("%Y-%m-%d").to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    Ok(())
+}
+
 fn predictive_warning_lines(
     as_of: NaiveDate,
     observations: &[(String, u8)],
@@ -1463,9 +1486,10 @@ mod tests {
     use maybe_wordle::solver::AbsurdleSuggestion;
 
     use super::{
-        Cli, find_project_root, format_absurdle_suggestion, format_predictive_suggestion,
-        format_sync_summary, normalize_interactive_guess, parse_solver_mode,
-        predictive_warning_lines, reject_hard_mode_for_non_predictive, try_append_observation,
+        Cli, enforce_sync_policy, find_project_root, format_absurdle_suggestion,
+        format_predictive_suggestion, format_sync_summary, normalize_interactive_guess,
+        parse_solver_mode, predictive_warning_lines, reject_hard_mode_for_non_predictive,
+        try_append_observation,
     };
 
     #[test]
@@ -1622,6 +1646,41 @@ mod tests {
             last_successful_date: Some(NaiveDate::from_ymd_opt(2021, 6, 23).expect("success")),
         };
         assert!(format_sync_summary(&summary).contains("sync_status=partial"));
+    }
+
+    #[test]
+    fn strict_sync_policy_rejects_partial_sync() {
+        let summary = SyncSummary {
+            fetched: 2,
+            reverified: 1,
+            changed: 0,
+            total: 5,
+            first_date: NaiveDate::from_ymd_opt(2021, 6, 19).expect("first"),
+            last_date: NaiveDate::from_ymd_opt(2021, 6, 23).expect("last"),
+            changed_dates: Vec::new(),
+            partial_sync: true,
+            failed_dates: vec![NaiveDate::from_ymd_opt(2021, 6, 24).expect("failed")],
+            last_successful_date: Some(NaiveDate::from_ymd_opt(2021, 6, 23).expect("success")),
+        };
+        let error = enforce_sync_policy(true, &summary).expect_err("strict should fail");
+        assert!(format!("{error:#}").contains("2021-06-24"));
+    }
+
+    #[test]
+    fn non_strict_sync_policy_allows_partial_sync() {
+        let summary = SyncSummary {
+            fetched: 2,
+            reverified: 1,
+            changed: 0,
+            total: 5,
+            first_date: NaiveDate::from_ymd_opt(2021, 6, 19).expect("first"),
+            last_date: NaiveDate::from_ymd_opt(2021, 6, 23).expect("last"),
+            changed_dates: Vec::new(),
+            partial_sync: true,
+            failed_dates: vec![NaiveDate::from_ymd_opt(2021, 6, 24).expect("failed")],
+            last_successful_date: Some(NaiveDate::from_ymd_opt(2021, 6, 23).expect("success")),
+        };
+        enforce_sync_policy(false, &summary).expect("non-strict should pass");
     }
 
     #[test]
