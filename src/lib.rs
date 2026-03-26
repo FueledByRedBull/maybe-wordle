@@ -4,6 +4,7 @@ pub mod formal;
 pub mod gui;
 pub mod model;
 pub mod pattern_table;
+pub mod predictive;
 pub mod scoring;
 pub mod seed;
 pub mod small_state;

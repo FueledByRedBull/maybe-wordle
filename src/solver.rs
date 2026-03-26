@@ -22,12 +22,20 @@ use crate::{
         weight_snapshot_for_mode,
     },
     pattern_table::PatternTable,
+    predictive::{
+        PredictivePromotionSource, PredictiveRegime, PredictiveStateSummary,
+        PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode,
+        RecoveryMode,
+    },
     scoring::{
         ALL_GREEN_PATTERN, PATTERN_SPACE, decode_feedback, format_feedback_letters, parse_feedback,
         score_guess,
     },
     small_state::SmallStateTable,
 };
+
+mod books;
+use self::books::write_predictive_artifact;
 
 const PROXY_CALIBRATION_MAX_STEPS: usize = 3;
 const PROXY_CALIBRATION_MAX_CANDIDATES_PER_STATE: usize = 10;
@@ -73,8 +81,12 @@ pub struct AbsurdleSuggestion {
 #[derive(Clone, Debug)]
 pub struct SolveState {
     pub surviving: Vec<usize>,
+    pub modeled_weights: Vec<f64>,
+    pub recovery_weights: Vec<f64>,
     pub weights: Vec<f64>,
+    pub modeled_total_weight: f64,
     pub total_weight: f64,
+    pub recovery_mode_used: Option<RecoveryMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -330,6 +342,7 @@ pub struct PredictiveReplyBuildSummary {
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 struct PredictiveBookIdentity {
+    policy_id: String,
     mode: String,
     variant: String,
     config_fingerprint: String,
@@ -484,25 +497,6 @@ enum PredictiveSearchMode {
     Exact(ExactSuggestionMode),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PredictiveRegime {
-    Proxy,
-    Lookahead,
-    EscalatedExact,
-    Exact,
-}
-
-impl PredictiveRegime {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Proxy => "proxy",
-            Self::Lookahead => "lookahead",
-            Self::EscalatedExact => "escalated_exact",
-            Self::Exact => "exact",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct GuessMetrics {
     guess_index: usize,
@@ -622,6 +616,8 @@ impl ProxyRowStats {
 #[derive(Clone, Debug)]
 struct SuggestionBatch {
     suggestions: Vec<Suggestion>,
+    promoted_word: Option<String>,
+    promotion_source: Option<PredictivePromotionSource>,
     danger_score: f64,
     danger_escalated: bool,
     regime_used: PredictiveRegime,
@@ -646,7 +642,12 @@ enum PredictiveBookUsage {
 }
 
 const EXACT_SUBSET_INLINE_CAPACITY: usize = 16;
-const ZERO_WEIGHT_FALLBACK_SCALE: f64 = 1e-6;
+
+#[derive(Clone, Debug)]
+struct PromotedPredictiveChoice {
+    word: String,
+    source: PredictivePromotionSource,
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ExactSubsetKey(ExactSubsetStorage);
@@ -819,31 +820,66 @@ impl Solver {
     }
 
     pub fn initial_state(&self, as_of: NaiveDate) -> SolveState {
+        let recovery_policy = &self.config.recovery;
+        let mut modeled_weights = vec![0.0; self.answers.len()];
+        let mut recovery_weights = vec![0.0; self.answers.len()];
         let mut weights = vec![0.0; self.answers.len()];
-        let mut surviving = Vec::new();
+        let mut positive_survivors = Vec::new();
+        let mut recovery_survivors = Vec::new();
+        let mut modeled_total_weight = 0.0;
         let mut total_weight = 0.0;
 
         for (index, answer) in self.answers.iter().enumerate() {
             let snapshot = weight_snapshot_for_mode(answer, &self.config, as_of, self.mode);
-            let weight = if snapshot.final_weight > 0.0 {
-                snapshot.final_weight
-            } else if snapshot.base_weight > 0.0 {
-                (snapshot.base_weight * snapshot.manual_weight * ZERO_WEIGHT_FALLBACK_SCALE)
-                    .max(f64::MIN_POSITIVE)
-            } else {
-                0.0
-            };
-            if weight > 0.0 {
-                weights[index] = weight;
-                total_weight += weight;
-                surviving.push(index);
+            let modeled_weight = snapshot.final_weight.max(0.0);
+            if snapshot.base_weight > 0.0 {
+                recovery_weights[index] = snapshot.base_weight * snapshot.manual_weight;
+                modeled_weights[index] = modeled_weight;
+                if modeled_weight > 0.0 {
+                    modeled_total_weight += modeled_weight;
+                    total_weight += modeled_weight;
+                    weights[index] = modeled_weight;
+                    positive_survivors.push(index);
+                } else {
+                    recovery_survivors.push(index);
+                }
             }
         }
 
+        let (surviving, recovery_mode_used) = if modeled_total_weight > 0.0 {
+            (positive_survivors, None)
+        } else {
+            let support_count = recovery_survivors.len();
+            match self.config.recovery.mode {
+                RecoveryMode::Strict => {
+                    for index in &recovery_survivors {
+                        weights[*index] = 0.0;
+                    }
+                    total_weight = 0.0;
+                    (recovery_survivors, None)
+                }
+                mode => {
+                    for index in &recovery_survivors {
+                        weights[*index] =
+                            recovery_policy.repair_weight(recovery_weights[*index], support_count);
+                    }
+                    total_weight = recovery_survivors
+                        .iter()
+                        .map(|index| weights[*index])
+                        .sum::<f64>();
+                    (recovery_survivors, Some(mode))
+                }
+            }
+        };
+
         SolveState {
             surviving,
+            modeled_weights,
+            recovery_weights,
             weights,
+            modeled_total_weight,
             total_weight,
+            recovery_mode_used,
         }
     }
 
@@ -862,8 +898,12 @@ impl Solver {
     pub fn absurdle_initial_state(&self) -> SolveState {
         SolveState {
             surviving: (0..self.answers.len()).collect(),
+            modeled_weights: vec![1.0; self.answers.len()],
+            recovery_weights: vec![1.0; self.answers.len()],
             weights: vec![1.0; self.answers.len()],
+            modeled_total_weight: self.answers.len() as f64,
             total_weight: self.answers.len() as f64,
+            recovery_mode_used: None,
         }
     }
 
@@ -884,15 +924,52 @@ impl Solver {
         state
             .surviving
             .retain(|answer_index| self.pattern_table.get(guess_index, *answer_index) == pattern);
-        state.total_weight = state
+        state.modeled_total_weight = state
             .surviving
             .iter()
-            .map(|index| state.weights[*index])
+            .map(|index| state.modeled_weights[*index])
             .sum::<f64>();
+        if state.modeled_total_weight > 0.0 && state.recovery_mode_used.is_none() {
+            for index in &state.surviving {
+                state.weights[*index] = state.modeled_weights[*index];
+            }
+            state.recovery_mode_used = None;
+            state.total_weight = state.modeled_total_weight;
+        } else {
+            state.recovery_mode_used = match self.config.recovery.mode {
+                RecoveryMode::Strict => {
+                    for index in &state.surviving {
+                        state.weights[*index] = 0.0;
+                    }
+                    None
+                }
+                mode => {
+                    for index in &state.surviving {
+                        state.weights[*index] = self
+                            .config
+                            .recovery
+                            .repair_weight(state.recovery_weights[*index], state.surviving.len());
+                    }
+                    Some(mode)
+                }
+            };
+            state.total_weight = state
+                .surviving
+                .iter()
+                .map(|index| state.weights[*index])
+                .sum::<f64>();
+        }
 
         if state.surviving.is_empty() {
             bail!(
                 "no answers remain after applying {} {}",
+                guess,
+                format_feedback_letters(pattern)
+            );
+        }
+        if state.total_weight <= 0.0 && matches!(self.config.recovery.mode, RecoveryMode::Strict) {
+            bail!(
+                "no positive answer mass remains after applying {} {}",
                 guess,
                 format_feedback_letters(pattern)
             );
@@ -906,23 +983,60 @@ impl Solver {
             .suggestions)
     }
 
+    pub fn suggest_predictive(
+        &self,
+        request: PredictiveSuggestRequest<'_>,
+    ) -> Result<PredictiveSuggestResponse> {
+        let state = self.apply_history(request.as_of, request.observations)?;
+        let suggestions = if request.hard_mode || request.force_in_two_only {
+            self.filtered_suggestion_batch_for_history(
+                request.as_of,
+                request.observations,
+                request.top,
+                request.mode,
+                request.hard_mode,
+                request.force_in_two_only,
+            )?
+        } else {
+            self.suggestion_batch_internal(
+                &state,
+                request.top,
+                Some(PredictiveContext {
+                    as_of: request.as_of,
+                    observations: request.observations,
+                }),
+                book_usage_for_mode(request.mode),
+            )?
+        };
+
+        Ok(PredictiveSuggestResponse {
+            state: PredictiveStateSummary {
+                surviving: state.surviving.len(),
+                modeled_total_weight: state.modeled_total_weight,
+                effective_total_weight: state.total_weight,
+                recovery_mode_used: state.recovery_mode_used,
+            },
+            suggestions: suggestions.suggestions,
+            promoted_word: suggestions.promoted_word,
+            promotion_source: suggestions.promotion_source,
+        })
+    }
+
     pub fn suggestions_for_history(
         &self,
         as_of: NaiveDate,
         observations: &[(String, u8)],
         top: usize,
     ) -> Result<Vec<Suggestion>> {
-        let state = self.apply_history(as_of, observations)?;
         Ok(self
-            .suggestion_batch_internal(
-                &state,
+            .suggest_predictive(PredictiveSuggestRequest {
+                as_of,
+                observations,
                 top,
-                Some(PredictiveContext {
-                    as_of,
-                    observations,
-                }),
-                PredictiveBookUsage::Full,
-            )?
+                hard_mode: false,
+                force_in_two_only: false,
+                mode: PredictiveSuggestionMode::Full,
+            })?
             .suggestions)
     }
 
@@ -932,14 +1046,16 @@ impl Solver {
         observations: &[(String, u8)],
         top: usize,
     ) -> Result<Vec<Suggestion>> {
-        self.filtered_suggestions_for_history(
-            as_of,
-            observations,
-            top,
-            PredictiveBookUsage::Full,
-            true,
-            false,
-        )
+        Ok(self
+            .suggest_predictive(PredictiveSuggestRequest {
+                as_of,
+                observations,
+                top,
+                hard_mode: true,
+                force_in_two_only: false,
+                mode: PredictiveSuggestionMode::Full,
+            })?
+            .suggestions)
     }
 
     pub fn suggestions_for_history_disk_books_only(
@@ -948,17 +1064,15 @@ impl Solver {
         observations: &[(String, u8)],
         top: usize,
     ) -> Result<Vec<Suggestion>> {
-        let state = self.apply_history(as_of, observations)?;
         Ok(self
-            .suggestion_batch_internal(
-                &state,
+            .suggest_predictive(PredictiveSuggestRequest {
+                as_of,
+                observations,
                 top,
-                Some(PredictiveContext {
-                    as_of,
-                    observations,
-                }),
-                PredictiveBookUsage::DiskOnly,
-            )?
+                hard_mode: false,
+                force_in_two_only: false,
+                mode: PredictiveSuggestionMode::FastDiskOnly,
+            })?
             .suggestions)
     }
 
@@ -970,14 +1084,16 @@ impl Solver {
         hard_mode: bool,
         force_in_two_only: bool,
     ) -> Result<Vec<Suggestion>> {
-        self.filtered_suggestions_for_history(
-            as_of,
-            observations,
-            top,
-            PredictiveBookUsage::DiskOnly,
-            hard_mode,
-            force_in_two_only,
-        )
+        Ok(self
+            .suggest_predictive(PredictiveSuggestRequest {
+                as_of,
+                observations,
+                top,
+                hard_mode,
+                force_in_two_only,
+                mode: PredictiveSuggestionMode::FastDiskOnly,
+            })?
+            .suggestions)
     }
 
     pub fn force_in_two_suggestions_for_history_disk_books_only(
@@ -1049,22 +1165,22 @@ impl Solver {
         )
     }
 
-    fn filtered_suggestions_for_history(
+    fn filtered_suggestion_batch_for_history(
         &self,
         as_of: NaiveDate,
         observations: &[(String, u8)],
         top: usize,
-        book_usage: PredictiveBookUsage,
+        mode: PredictiveSuggestionMode,
         hard_mode: bool,
         force_in_two_only: bool,
-    ) -> Result<Vec<Suggestion>> {
+    ) -> Result<SuggestionBatch> {
         let state = self.apply_history(as_of, observations)?;
         let limit = if hard_mode || force_in_two_only {
             self.guesses.len()
         } else {
             top
         };
-        let mut suggestions = self
+        let mut batch = self
             .suggestion_batch_internal(
                 &state,
                 limit,
@@ -1072,20 +1188,19 @@ impl Solver {
                     as_of,
                     observations,
                 }),
-                book_usage,
-            )?
-            .suggestions;
+                book_usage_for_mode(mode),
+            )?;
         if hard_mode {
-            suggestions.retain(|suggestion| {
+            batch.suggestions.retain(|suggestion| {
                 self.hard_mode_violation(observations, &suggestion.word)
                     .is_none()
             });
         }
         if force_in_two_only {
-            suggestions.retain(|suggestion| suggestion.force_in_two);
+            batch.suggestions.retain(|suggestion| suggestion.force_in_two);
         }
-        suggestions.truncate(top.min(suggestions.len()));
-        Ok(suggestions)
+        batch.suggestions.truncate(top.min(batch.suggestions.len()));
+        Ok(batch)
     }
 
     fn suggestion_batch_internal(
@@ -1097,6 +1212,9 @@ impl Solver {
     ) -> Result<SuggestionBatch> {
         if state.surviving.is_empty() {
             bail!("cannot score guesses with an empty state");
+        }
+        if state.total_weight <= 0.0 {
+            bail!("cannot score guesses when no positive answer mass remains");
         }
         let split_first = state.surviving.len() > self.config.large_state_split_threshold;
         let medium_second_guess = context
@@ -1372,20 +1490,26 @@ impl Solver {
             });
         }
 
+        let mut promoted_word = None;
+        let mut promotion_source = None;
         if book_usage != PredictiveBookUsage::None
             && let Some(context) = context
-            && let Some(cached_word) = self.cached_predictive_choice(
+            && let Some(choice) = self.cached_predictive_choice(
                 context.as_of,
                 context.observations,
                 book_usage == PredictiveBookUsage::Full,
             )
         {
-            promote_cached_suggestion(&mut suggestions, &cached_word);
+            promote_cached_suggestion(&mut suggestions, &choice.word);
+            promoted_word = Some(choice.word);
+            promotion_source = Some(choice.source);
         }
 
         suggestions.truncate(top);
         Ok(SuggestionBatch {
             suggestions,
+            promoted_word,
+            promotion_source,
             danger_score: assessment.danger_score,
             danger_escalated: matches!(search_mode, PredictiveSearchMode::EscalatedExact)
                 || (matches!(search_mode, PredictiveSearchMode::Lookahead)
@@ -3991,425 +4115,6 @@ impl Solver {
         })
     }
 
-    fn predictive_book_identity(&self, as_of: NaiveDate) -> PredictiveBookIdentity {
-        let config_toml =
-            toml::to_string(&self.config).expect("predictive config serialization must succeed");
-        let payload = format!(
-            "mode={};variant={};as_of={};guesses={};answers={};config={}",
-            self.mode.label(),
-            self.variant.label(),
-            as_of,
-            self.guesses.len(),
-            self.answers.len(),
-            config_toml
-        );
-        PredictiveBookIdentity {
-            mode: self.mode.label().to_string(),
-            variant: self.variant.label().to_string(),
-            config_fingerprint: stable_fingerprint(&payload),
-            as_of,
-        }
-    }
-
-    fn opener_artifact_path(&self, as_of: NaiveDate) -> PathBuf {
-        let identity = self.predictive_book_identity(as_of);
-        self.artifact_dir.join(format!(
-            "opener-{}-{}-{}-{}.json",
-            identity.mode, identity.variant, identity.config_fingerprint, identity.as_of
-        ))
-    }
-
-    fn reply_book_artifact_path(&self, as_of: NaiveDate) -> PathBuf {
-        let identity = self.predictive_book_identity(as_of);
-        self.artifact_dir.join(format!(
-            "reply-book-{}-{}-{}-{}.json",
-            identity.mode, identity.variant, identity.config_fingerprint, identity.as_of
-        ))
-    }
-
-    fn load_predictive_opener_artifact(
-        &self,
-        as_of: NaiveDate,
-    ) -> Result<Option<PredictiveOpenerArtifact>> {
-        let path = self.opener_artifact_path(as_of);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let artifact: PredictiveOpenerArtifact = read_predictive_artifact(&path)?;
-        let valid = artifact.identity == self.predictive_book_identity(as_of)
-            && artifact.games > 0
-            && artifact.average_guesses.is_finite()
-            && artifact.average_guesses > 0.0
-            && artifact.failures < artifact.games;
-        Ok(valid.then_some(artifact))
-    }
-
-    fn load_recent_predictive_opener_artifact(
-        &self,
-        as_of: NaiveDate,
-        max_age_days: u64,
-    ) -> Result<Option<PredictiveOpenerArtifact>> {
-        for age_days in 1..=max_age_days {
-            let Some(candidate_date) = as_of.checked_sub_days(Days::new(age_days)) else {
-                break;
-            };
-            if let Some(artifact) = self.load_predictive_opener_artifact(candidate_date)? {
-                return Ok(Some(artifact));
-            }
-        }
-        Ok(None)
-    }
-
-    fn load_predictive_reply_book(
-        &self,
-        as_of: NaiveDate,
-    ) -> Result<Option<PredictiveReplyBookArtifact>> {
-        let path = self.reply_book_artifact_path(as_of);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let artifact: PredictiveReplyBookArtifact = read_predictive_artifact(&path)?;
-        Ok((artifact.identity == self.predictive_book_identity(as_of)).then_some(artifact))
-    }
-
-    fn session_root_guess(&self, as_of: NaiveDate) -> Result<Option<String>> {
-        let identity = self.predictive_book_identity(as_of);
-        if let Some(cached) = self
-            .session_opener_cache
-            .lock()
-            .expect("session opener cache")
-            .get(&identity)
-            .cloned()
-        {
-            return Ok(cached);
-        }
-
-        let computed = self.evaluate_session_opener(as_of)?;
-        self.session_opener_cache
-            .lock()
-            .expect("session opener cache")
-            .insert(identity, computed.clone());
-        Ok(computed)
-    }
-
-    fn evaluate_session_opener(&self, as_of: NaiveDate) -> Result<Option<String>> {
-        let offline = self.offline_book_solver();
-        let (window_start, _, targets) = offline.recent_history_targets_for_books(as_of)?;
-        let holdout = offline.previous_history_targets_for_books(window_start)?;
-        if targets.is_empty() {
-            return Ok(None);
-        }
-        let state = offline.initial_state(as_of);
-        let candidates = offline
-            .suggestion_batch_internal(
-                &state,
-                offline.config.session_opener_pool.max(1),
-                Some(PredictiveContext {
-                    as_of,
-                    observations: &[],
-                }),
-                PredictiveBookUsage::None,
-            )?
-            .suggestions;
-        let best = offline.select_validated_opener(
-            as_of,
-            &candidates,
-            &targets,
-            holdout.as_ref().map(|(_, _, entries)| entries.as_slice()),
-            3,
-        )?;
-        Ok(best.map(|evaluation| evaluation.word))
-    }
-
-    fn session_reply_guess(
-        &self,
-        as_of: NaiveDate,
-        opener: &str,
-        pattern: u8,
-    ) -> Result<Option<String>> {
-        let identity = self.predictive_book_identity(as_of);
-        let key = (identity, opener.to_string(), pattern);
-        if let Some(cached) = self
-            .session_reply_cache
-            .lock()
-            .expect("session reply cache")
-            .get(&key)
-            .cloned()
-        {
-            return Ok(cached);
-        }
-
-        let computed = self.evaluate_session_reply(as_of, opener, pattern)?;
-        self.session_reply_cache
-            .lock()
-            .expect("session reply cache")
-            .insert(key, computed.clone());
-        Ok(computed)
-    }
-
-    fn session_third_guess(
-        &self,
-        as_of: NaiveDate,
-        opener: &str,
-        opener_pattern: u8,
-        reply: &str,
-        reply_pattern: u8,
-    ) -> Result<Option<String>> {
-        let identity = self.predictive_book_identity(as_of);
-        let key = (
-            identity,
-            opener.to_string(),
-            opener_pattern,
-            reply.to_string(),
-            reply_pattern,
-        );
-        if let Some(cached) = self
-            .session_third_cache
-            .lock()
-            .expect("session third cache")
-            .get(&key)
-            .cloned()
-        {
-            return Ok(cached);
-        }
-
-        let computed =
-            self.evaluate_session_third(as_of, opener, opener_pattern, reply, reply_pattern)?;
-        self.session_third_cache
-            .lock()
-            .expect("session third cache")
-            .insert(key, computed.clone());
-        Ok(computed)
-    }
-
-    fn evaluate_session_reply(
-        &self,
-        as_of: NaiveDate,
-        opener: &str,
-        pattern: u8,
-    ) -> Result<Option<String>> {
-        let offline = self.offline_book_solver();
-        let (_, _, targets) = offline.recent_history_targets_for_books(as_of)?;
-        let scoped_targets = targets
-            .into_iter()
-            .filter(|(_, target)| score_guess(opener, target) == pattern)
-            .collect::<Vec<_>>();
-        if scoped_targets.is_empty() {
-            return Ok(None);
-        }
-        let root = offline.initial_state(as_of);
-        let mut child = root.clone();
-        offline.apply_feedback(&mut child, opener, pattern)?;
-        if child.surviving.len() <= 1 {
-            return Ok(None);
-        }
-        let observations = vec![(opener.to_string(), pattern)];
-        offline.evaluate_session_branch_guess(as_of, &child, &observations, &scoped_targets)
-    }
-
-    fn evaluate_session_third(
-        &self,
-        as_of: NaiveDate,
-        opener: &str,
-        opener_pattern: u8,
-        reply: &str,
-        reply_pattern: u8,
-    ) -> Result<Option<String>> {
-        let offline = self.offline_book_solver();
-        let (_, _, targets) = offline.recent_history_targets_for_books(as_of)?;
-        let scoped_targets = targets
-            .into_iter()
-            .filter(|(_, target)| {
-                score_guess(opener, target) == opener_pattern
-                    && score_guess(reply, target) == reply_pattern
-            })
-            .collect::<Vec<_>>();
-        if scoped_targets.is_empty() {
-            return Ok(None);
-        }
-        let mut state = offline.initial_state(as_of);
-        offline.apply_feedback(&mut state, opener, opener_pattern)?;
-        if state.surviving.len() <= 1 {
-            return Ok(None);
-        }
-        offline.apply_feedback(&mut state, reply, reply_pattern)?;
-        if state.surviving.len() <= 1 {
-            return Ok(None);
-        }
-        let observations = vec![
-            (opener.to_string(), opener_pattern),
-            (reply.to_string(), reply_pattern),
-        ];
-        offline.evaluate_session_branch_guess(as_of, &state, &observations, &scoped_targets)
-    }
-
-    fn evaluate_session_branch_guess(
-        &self,
-        as_of: NaiveDate,
-        state: &SolveState,
-        observations: &[(String, u8)],
-        scoped_targets: &[(NaiveDate, String)],
-    ) -> Result<Option<String>> {
-        let batch = self.suggestion_batch_internal(
-            state,
-            self.config.session_reply_pool.max(1),
-            Some(PredictiveContext {
-                as_of,
-                observations,
-            }),
-            PredictiveBookUsage::None,
-        )?;
-        let split_first = state.surviving.len() > self.config.large_state_split_threshold;
-        let mut metrics = self.score_guess_metrics_for_subset(
-            &state.surviving,
-            &state.weights,
-            &self.exact_small_state_table,
-        );
-        metrics.sort_by(|left, right| {
-            compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
-        });
-        let total_weight = state
-            .surviving
-            .iter()
-            .map(|index| state.weights[*index])
-            .sum::<f64>();
-        let assessment =
-            self.assess_subset_danger(&state.surviving, &state.weights, total_weight, &metrics);
-        let lookahead_pool = self.expanded_pool_size(
-            &batch.suggestions,
-            self.config.session_reply_pool.max(1),
-            split_first,
-            state.surviving.len() > self.config.large_state_split_threshold,
-            assessment,
-        );
-        let mut candidate_indexes = self.collect_lookahead_candidates(
-            &batch.suggestions,
-            state.surviving.len(),
-            assessment.dangerous_lookahead,
-            lookahead_pool,
-        )?;
-        if assessment.dangerous_exact
-            && state.surviving.len() <= self.config.danger_exact_survivor_cap
-        {
-            let exact_pool = self.expanded_pool_size(
-                &batch.suggestions,
-                self.config.session_reply_pool.max(1),
-                split_first,
-                state.surviving.len() > self.config.exact_threshold,
-                assessment,
-            );
-            let mut seen = candidate_indexes.iter().copied().collect::<HashSet<_>>();
-            for guess_index in
-                self.collect_exact_candidates(state, &batch.suggestions, exact_pool)?
-            {
-                if seen.insert(guess_index) {
-                    candidate_indexes.push(guess_index);
-                }
-            }
-        }
-        let forced_prefix = observations
-            .iter()
-            .map(|(guess, _)| guess.clone())
-            .collect::<Vec<_>>();
-        let best = candidate_indexes
-            .par_iter()
-            .filter_map(|guess_index| {
-                let evaluation = self
-                    .evaluate_forced_continuation(&forced_prefix, scoped_targets, *guess_index, 3)
-                    .ok()?;
-                Some((self.guesses[*guess_index].clone(), evaluation))
-            })
-            .min_by(|left, right| compare_forced_openers(&left.1, &right.1, &self.guesses));
-        Ok(best.map(|(word, _)| word))
-    }
-
-    fn cached_predictive_choice(
-        &self,
-        as_of: NaiveDate,
-        observations: &[(String, u8)],
-        allow_session_fallback: bool,
-    ) -> Option<String> {
-        match observations {
-            [] => self
-                .load_predictive_opener_artifact(as_of)
-                .ok()
-                .flatten()
-                .map(|artifact| artifact.opener)
-                .or_else(|| {
-                    self.load_recent_predictive_opener_artifact(
-                        as_of,
-                        OPENER_ARTIFACT_FRESHNESS_DAYS,
-                    )
-                    .ok()
-                    .flatten()
-                    .map(|artifact| artifact.opener)
-                })
-                .or_else(|| {
-                    allow_session_fallback
-                        .then(|| self.session_root_guess(as_of).ok().flatten())
-                        .flatten()
-                }),
-            [(guess, pattern)] => self
-                .load_predictive_reply_book(as_of)
-                .ok()
-                .flatten()
-                .filter(|artifact| artifact.opener == guess.as_str())
-                .and_then(|artifact| {
-                    artifact
-                        .replies
-                        .into_iter()
-                        .find(|entry| entry.feedback_pattern == *pattern)
-                        .map(|entry| entry.reply)
-                })
-                .or_else(|| {
-                    allow_session_fallback
-                        .then(|| {
-                            self.session_reply_guess(as_of, guess, *pattern)
-                                .ok()
-                                .flatten()
-                        })
-                        .flatten()
-                }),
-            [(opener, opener_pattern), (reply, reply_pattern)] => self
-                .load_predictive_reply_book(as_of)
-                .ok()
-                .flatten()
-                .filter(|artifact| artifact.opener == opener.as_str())
-                .and_then(|artifact| {
-                    artifact
-                        .replies
-                        .into_iter()
-                        .find(|entry| {
-                            entry.feedback_pattern == *opener_pattern
-                                && entry.reply == reply.as_str()
-                        })
-                        .and_then(|entry| {
-                            entry
-                                .third_replies
-                                .into_iter()
-                                .find(|entry| entry.second_feedback_pattern == *reply_pattern)
-                                .map(|entry| entry.reply)
-                        })
-                })
-                .or_else(|| {
-                    allow_session_fallback
-                        .then(|| {
-                            self.session_third_guess(
-                                as_of,
-                                opener,
-                                *opener_pattern,
-                                reply,
-                                *reply_pattern,
-                            )
-                            .ok()
-                            .flatten()
-                        })
-                        .flatten()
-                }),
-            _ => None,
-        }
-    }
-
     fn score_guess_metrics_for_subset(
         &self,
         subset: &[usize],
@@ -5405,6 +5110,14 @@ fn exact_suggestion_mode(
     }
 }
 
+fn book_usage_for_mode(mode: PredictiveSuggestionMode) -> PredictiveBookUsage {
+    match mode {
+        PredictiveSuggestionMode::LiveOnly => PredictiveBookUsage::None,
+        PredictiveSuggestionMode::FastDiskOnly => PredictiveBookUsage::DiskOnly,
+        PredictiveSuggestionMode::Full => PredictiveBookUsage::Full,
+    }
+}
+
 fn predictive_search_mode(
     config: &PriorConfig,
     surviving_answers: usize,
@@ -5550,31 +5263,6 @@ fn hamming_distance(left: &str, right: &str) -> usize {
         .zip(right.bytes())
         .filter(|(left, right)| left != right)
         .count()
-}
-
-fn stable_fingerprint(input: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in input.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
-}
-
-fn write_predictive_artifact<T: Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let raw =
-        serde_json::to_vec_pretty(value).context("failed to serialize predictive artifact")?;
-    fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
-fn read_predictive_artifact<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Result<T> {
-    let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn promote_cached_suggestion(suggestions: &mut [Suggestion], cached_word: &str) {
@@ -6036,8 +5724,10 @@ mod tests {
         compare_forced_openers, compare_guess_metrics, compare_guess_metrics_for_state,
         compare_lookahead, compare_suggestions, compare_suggestions_for_state,
         count_masked_letters, exact_suggestion_mode, hard_mode_violation, known_absent_letter_mask,
-        predictive_search_mode, should_replace_forced_opener, write_predictive_artifact,
+        predictive_search_mode, should_replace_forced_opener,
     };
+
+    use super::books::write_predictive_artifact;
 
     fn test_solver(words: &[&str]) -> Solver {
         let guesses = words
@@ -6607,7 +6297,7 @@ mod tests {
             ],
             false,
         );
-        assert_eq!(choice.as_deref(), Some("sissy"));
+        assert_eq!(choice.map(|choice| choice.word), Some("sissy".to_string()));
     }
 
     #[test]
@@ -6638,7 +6328,7 @@ mod tests {
             .expect("write opener artifact");
 
         let choice = solver.cached_predictive_choice(request_date, &[], false);
-        assert_eq!(choice.as_deref(), Some("cigar"));
+        assert_eq!(choice.map(|choice| choice.word), Some("cigar".to_string()));
     }
 
     #[test]
@@ -6690,7 +6380,7 @@ mod tests {
             .expect("write exact opener artifact");
 
         let choice = solver.cached_predictive_choice(exact_date, &[], false);
-        assert_eq!(choice.as_deref(), Some("rebut"));
+        assert_eq!(choice.map(|choice| choice.word), Some("rebut".to_string()));
     }
 
     #[test]
@@ -7167,8 +6857,12 @@ mod tests {
         let solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake", "blush"]);
         let state = super::SolveState {
             surviving: vec![0, 1],
+            modeled_weights: vec![1.0; solver.answers.len()],
+            recovery_weights: vec![1.0; solver.answers.len()],
             weights: vec![1.0; solver.answers.len()],
+            modeled_total_weight: 2.0,
             total_weight: 2.0,
+            recovery_mode_used: None,
         };
         let suggestions = vec![
             super::Suggestion {
@@ -7221,8 +6915,12 @@ mod tests {
         let solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake", "blush"]);
         let state = super::SolveState {
             surviving: vec![0, 1],
+            modeled_weights: vec![1.0; solver.answers.len()],
+            recovery_weights: vec![1.0; solver.answers.len()],
             weights: vec![1.0; solver.answers.len()],
+            modeled_total_weight: 2.0,
             total_weight: 2.0,
+            recovery_mode_used: None,
         };
         let suggestions = vec![
             Suggestion {

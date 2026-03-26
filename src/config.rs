@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, fs, path::Path};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::predictive::{PredictivePolicy, RecoveryPolicy};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProxyWeights {
@@ -79,6 +81,7 @@ pub struct PriorConfig {
     pub trap_mass_threshold: f64,
     pub sync_reverify_days: i64,
     pub proxy_weights: ProxyWeights,
+    pub recovery: RecoveryPolicy,
     pub manual_weights: BTreeMap<String, f64>,
 }
 
@@ -122,6 +125,7 @@ impl Default for PriorConfig {
             trap_mass_threshold: 0.15,
             sync_reverify_days: 3,
             proxy_weights: ProxyWeights::default(),
+            recovery: RecoveryPolicy::default(),
             manual_weights: BTreeMap::new(),
         }
     }
@@ -151,6 +155,10 @@ impl PriorConfig {
         let raw = toml::to_string_pretty(&config).context("failed to serialize default config")?;
         fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(config)
+    }
+
+    pub fn predictive_policy(&self) -> PredictivePolicy {
+        PredictivePolicy::from(self)
     }
 
     fn normalize_manual_keys(&mut self) {
@@ -228,6 +236,7 @@ mod tests {
         assert!(encoded.contains("trap_size_threshold = 7"));
         assert!(encoded.contains("trap_mass_threshold = 0.18"));
         assert!(encoded.contains("entropy_w = 1.1"));
+        assert!(encoded.contains("mode = \"epsilon_repair\""));
 
         let decoded: PriorConfig = toml::from_str(&encoded).expect("decode");
         assert_eq!(decoded.exact_exhaustive_threshold, 14);
@@ -258,5 +267,6 @@ mod tests {
         assert_eq!(decoded.trap_size_threshold, 7);
         assert_eq!(decoded.trap_mass_threshold, 0.18);
         assert_eq!(decoded.proxy_weights.entropy_w, 1.1);
+        assert_eq!(decoded.recovery.mode.label(), "epsilon_repair");
     }
 }

@@ -16,6 +16,9 @@ use crate::{
         DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, FormalStateExplanation, FormalSuggestion,
         artifacts_exist,
     },
+    predictive::{
+        PredictiveStateSummary, PredictiveSuggestRequest, PredictiveSuggestionMode, RecoveryMode,
+    },
     scoring::parse_feedback,
     solver::{AbsurdleSuggestion, SolveState, Solver, Suggestion},
 };
@@ -81,6 +84,7 @@ struct WordleGuiApp {
     formal_suggestions: Vec<FormalSuggestion>,
     surviving_count: usize,
     total_weight: f64,
+    predictive_recovery_mode: Option<RecoveryMode>,
     top: usize,
     force_in_two_only: bool,
     hard_mode: bool,
@@ -106,7 +110,7 @@ struct WorkerRequest {
 #[derive(Clone, Debug)]
 enum WorkerPayload {
     Predictive {
-        state: SolveState,
+        state: PredictiveStateSummary,
         suggestions: Vec<Suggestion>,
     },
     Absurdle {
@@ -148,6 +152,7 @@ impl WordleGuiApp {
             formal_suggestions: Vec::new(),
             surviving_count: 0,
             total_weight: 0.0,
+            predictive_recovery_mode: None,
             top: 10,
             force_in_two_only: false,
             hard_mode: false,
@@ -188,8 +193,9 @@ impl WordleGuiApp {
             self.computing = false;
             match response.payload {
                 Ok(WorkerPayload::Predictive { state, suggestions }) => {
-                    self.surviving_count = state.surviving.len();
-                    self.total_weight = state.total_weight;
+                    self.surviving_count = state.surviving;
+                    self.total_weight = state.effective_total_weight;
+                    self.predictive_recovery_mode = state.recovery_mode_used;
                     self.predictive_suggestions = suggestions;
                     self.absurdle_suggestions.clear();
                     self.formal_suggestions.clear();
@@ -199,6 +205,7 @@ impl WordleGuiApp {
                 Ok(WorkerPayload::Absurdle { state, suggestions }) => {
                     self.surviving_count = state.surviving.len();
                     self.total_weight = 0.0;
+                    self.predictive_recovery_mode = None;
                     self.absurdle_suggestions = suggestions;
                     self.predictive_suggestions.clear();
                     self.formal_suggestions.clear();
@@ -211,6 +218,7 @@ impl WordleGuiApp {
                 }) => {
                     self.surviving_count = explanation.surviving_answers;
                     self.total_weight = 0.0;
+                    self.predictive_recovery_mode = None;
                     self.formal_explanation = Some(explanation);
                     self.formal_suggestions = suggestions;
                     self.predictive_suggestions.clear();
@@ -230,6 +238,7 @@ impl WordleGuiApp {
         self.formal_explanation = None;
         self.surviving_count = 0;
         self.total_weight = 0.0;
+        self.predictive_recovery_mode = None;
         self.computing = false;
     }
 
@@ -421,13 +430,17 @@ impl eframe::App for WordleGuiApp {
                 ui.add_space(12.0);
                 match self.mode {
                     GuiSolverMode::Predictive => {
+                        let mut summary = format!(
+                            "Remaining candidates: {}   total weight: {:.4}",
+                            self.surviving_count, self.total_weight
+                        );
+                        if let Some(mode) = self.predictive_recovery_mode {
+                            summary.push_str(&format!("   recovery: {}", mode.label()));
+                        }
                         ui.label(
-                            RichText::new(format!(
-                                "Remaining candidates: {}   total weight: {:.4}",
-                                self.surviving_count, self.total_weight
-                            ))
-                            .strong()
-                            .color(Color32::from_rgb(67, 53, 39)),
+                            RichText::new(summary)
+                                .strong()
+                                .color(Color32::from_rgb(67, 53, 39)),
                         );
                     }
                     GuiSolverMode::Absurdle => {
@@ -628,24 +641,16 @@ fn spawn_worker(
                     let result = (|| -> Result<WorkerPayload> {
                         let date = NaiveDate::parse_from_str(&request.date_text, "%Y-%m-%d")
                             .with_context(|| format!("invalid date: {}", request.date_text))?;
-                        let state = predictive_solver.apply_history(date, &request.observations)?;
-                        let suggestions = if request.force_in_two_only {
-                            predictive_solver.suggestions_for_history_disk_books_only_with_filters(
-                                date,
-                                &request.observations,
-                                request.top,
-                                request.hard_mode,
-                                true,
-                            )?
-                        } else {
-                            predictive_solver.suggestions_for_history_disk_books_only_with_filters(
-                                date,
-                                &request.observations,
-                                request.top,
-                                request.hard_mode,
-                                false,
-                            )?
-                        };
+                        let response = predictive_solver.suggest_predictive(PredictiveSuggestRequest {
+                            as_of: date,
+                            observations: &request.observations,
+                            top: request.top,
+                            hard_mode: request.hard_mode,
+                            force_in_two_only: request.force_in_two_only,
+                            mode: PredictiveSuggestionMode::FastDiskOnly,
+                        })?;
+                        let state = response.state;
+                        let suggestions = response.suggestions;
                         Ok(WorkerPayload::Predictive { state, suggestions })
                     })();
                     result.map_err(|error| error.to_string())

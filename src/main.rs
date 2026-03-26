@@ -17,6 +17,7 @@ use maybe_wordle::{
     gui::run_gui,
     model::build_model_artifacts,
     model::{ModelVariant, WeightMode},
+    predictive::{PredictiveSuggestRequest, PredictiveSuggestionMode},
     seed::{MergeStrategy, add_manual_addition, merge_seed_lists, reconcile_seed_lists},
     solver::{AbsurdleSuggestion, Solver},
 };
@@ -325,18 +326,24 @@ fn run() -> Result<()> {
                 let observations = Solver::parse_observations(&guess, &feedback)?;
                 let as_of = parse_or_today(date.as_deref())?;
                 let solver = Solver::from_paths(&paths, &config)?;
-                let state = solver.apply_history(as_of, &observations)?;
+                let response = solver.suggest_predictive(PredictiveSuggestRequest {
+                    as_of,
+                    observations: &observations,
+                    top,
+                    hard_mode: hard,
+                    force_in_two_only: false,
+                    mode: PredictiveSuggestionMode::Full,
+                })?;
                 println!(
                     "mode=predictive date={} surviving={} total_weight={:.4}",
                     as_of,
-                    state.surviving.len(),
-                    state.total_weight
+                    response.state.surviving,
+                    response.state.effective_total_weight
                 );
-                for suggestion in if hard {
-                    solver.suggestions_for_history_hard_mode(as_of, &observations, top)?
-                } else {
-                    solver.suggestions_for_history(as_of, &observations, top)?
-                } {
+                if let Some(mode) = response.state.recovery_mode_used {
+                    println!("recovery_mode={}", mode.label());
+                }
+                for suggestion in response.suggestions {
                     println!("{}", format_predictive_suggestion(&suggestion));
                 }
             }
@@ -390,17 +397,23 @@ fn run() -> Result<()> {
                 let mut observations = Vec::new();
 
                 loop {
-                    let state = solver.apply_history(as_of, &observations)?;
+                    let response = solver.suggest_predictive(PredictiveSuggestRequest {
+                        as_of,
+                        observations: &observations,
+                        top,
+                        hard_mode: hard,
+                        force_in_two_only: false,
+                        mode: PredictiveSuggestionMode::Full,
+                    })?;
                     println!(
                         "mode=predictive surviving={} total_weight={:.4}",
-                        state.surviving.len(),
-                        state.total_weight
+                        response.state.surviving,
+                        response.state.effective_total_weight
                     );
-                    for suggestion in if hard {
-                        solver.suggestions_for_history_hard_mode(as_of, &observations, top)?
-                    } else {
-                        solver.suggestions_for_history(as_of, &observations, top)?
-                    } {
+                    if let Some(mode) = response.state.recovery_mode_used {
+                        println!("recovery_mode={}", mode.label());
+                    }
+                    for suggestion in response.suggestions {
                         println!("{}", format_predictive_suggestion(&suggestion));
                     }
 
