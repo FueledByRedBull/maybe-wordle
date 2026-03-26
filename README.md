@@ -57,6 +57,38 @@ fit-proxy-weights
 benchmark
 ```
 
+## First run from scratch
+
+If you cloned the repo and want a working baseline, run these in order:
+
+```bash
+cargo run -- sync-data
+cargo run -- build-model
+```
+
+`sync-data` fetches the NYT daily JSON archive into `data/raw/`, one file per puzzle date. On a fresh checkout this is usually the slowest step because it has to backfill history over the network.
+
+`build-model` turns that raw history into the modeled answer universe and the shared pattern table under `data/derived/`. This is the core one-time setup for predictive mode.
+
+Optional but useful after that:
+
+```bash
+cargo run -- build-predictive-opener --date YYYY-MM-DD
+cargo run -- build-predictive-replies --date YYYY-MM-DD
+cargo run --release -- build-optimal-policy --model formal-v1
+```
+
+Predictive opener/reply artifacts live under `data/derived/predictive/`. They are slower to build than ordinary `suggest` calls, but they make the GUI and date-specific predictive queries more stable.
+
+Formal artifacts live under `data/formal/<model>/`. They are the heaviest build in the repo and are only needed if you want exact-policy analysis.
+
+Common first-run failures:
+
+- missing seed files or an incomplete checkout under `data/seed/`
+- no synced NYT history yet, so the requested date is outside the known range
+- predictive artifacts missing for the date you asked for, so the solver falls back to live-session behavior or shows no artifact
+- `formal-optimal` selected before `build-optimal-policy` has generated the matching `data/formal/<model>/` files
+
 ## Quick start
 
 ```bash
@@ -147,6 +179,13 @@ Formal artifacts are versioned. If the model inputs or serialized state format c
 
 If you only want fast suggestions, predictive mode works with the derived artifacts under [`data/derived`](./data/derived).
 
+## Data layout
+
+- [`data/raw`](./data/raw) stores the fetched NYT daily JSON archive.
+- [`data/derived`](./data/derived) stores the modeled answer universe, the pattern table, and other shared derived outputs.
+- [`data/derived/predictive`](./data/derived/predictive) stores predictive opener and reply caches.
+- [`data/formal`](./data/formal) stores exact-policy artifacts by model id.
+
 ## Predictive experiments and books
 
 Predictive mode now has a separate experiment and cache surface:
@@ -180,7 +219,16 @@ Predictive policy is now explicit and versioned. The config still loads from [`c
 
 Recovery behavior is also explicit. When the modeled prior leaves a state with no positive answer mass, predictive mode can either fail loudly (`Strict`) or repair the state with a declared recovery rule such as `EpsilonRepair`. The current default remains `EpsilonRepair`.
 
-The GUI no longer recomputes suggestions on the UI thread. Heavy predictive or formal recomputes now run in a background worker, so `Suggest`, `Undo`, `Reset`, mode switches, and date changes stay responsive while results are pending. The GUI uses the unified predictive suggestion API in `FastDiskOnly` mode by default, while the CLI uses `Full`.
+The GUI no longer recomputes suggestions on the UI thread. Heavy predictive or formal recomputes now run in a background worker, so `Suggest`, `Undo`, `Reset`, mode switches, and date changes stay responsive while results are pending.
+
+GUI predictive mode is intentionally conservative:
+
+- the GUI uses the unified predictive suggestion API in `FastDiskOnly` mode by default
+- the CLI predictive path uses `Full`
+- `FastDiskOnly` means "use disk artifacts, do not promote a live session fallback"
+- `Full` means "use disk artifacts first, then allow live-session fallback if the artifact chain is missing"
+- `recovery mode` means the solver had to repair a zero-mass state before it could keep ranking guesses
+- if predictive artifacts are missing, the GUI should make that explicit instead of implying a richer artifact-backed result exists
 
 ## Quality bar
 
@@ -207,7 +255,8 @@ config/
 data/
   raw/        # NYT history archive
   seed/       # pinned guess and answer seeds
-  derived/    # modeled answers, predictive artifacts, and pattern tables
+  derived/    # modeled answers, pattern tables, and shared derived outputs
+    predictive/  # predictive opener and reply caches
   formal/     # exact-policy artifacts by model id
 src/
   predictive/

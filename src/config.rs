@@ -80,6 +80,9 @@ pub struct PriorConfig {
     pub trap_size_threshold: usize,
     pub trap_mass_threshold: f64,
     pub sync_reverify_days: i64,
+    pub sync_request_timeout_seconds: u64,
+    pub sync_retry_attempts: usize,
+    pub sync_retry_backoff_millis: u64,
     pub proxy_weights: ProxyWeights,
     pub recovery: RecoveryPolicy,
     pub manual_weights: BTreeMap<String, f64>,
@@ -124,6 +127,9 @@ impl Default for PriorConfig {
             trap_size_threshold: 6,
             trap_mass_threshold: 0.15,
             sync_reverify_days: 3,
+            sync_request_timeout_seconds: 10,
+            sync_retry_attempts: 3,
+            sync_retry_backoff_millis: 500,
             proxy_weights: ProxyWeights::default(),
             recovery: RecoveryPolicy::default(),
             manual_weights: BTreeMap::new(),
@@ -266,6 +272,9 @@ mod tests {
         assert_eq!(decoded.lookahead_large_bucket_mass_penalty, 0.13);
         assert_eq!(decoded.trap_size_threshold, 7);
         assert_eq!(decoded.trap_mass_threshold, 0.18);
+        assert_eq!(decoded.sync_request_timeout_seconds, 10);
+        assert_eq!(decoded.sync_retry_attempts, 3);
+        assert_eq!(decoded.sync_retry_backoff_millis, 500);
         assert_eq!(decoded.proxy_weights.entropy_w, 1.1);
         assert_eq!(decoded.recovery.mode.label(), "epsilon_repair");
     }

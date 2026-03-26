@@ -1,3 +1,5 @@
+use crate::predictive::PredictiveArtifactState;
+
 use super::*;
 
 impl Solver {
@@ -205,6 +207,9 @@ impl Solver {
             suggestions: suggestions.suggestions,
             promoted_word: suggestions.promoted_word,
             promotion_source: suggestions.promotion_source,
+            artifact_state: PredictiveArtifactState::from_promotion_source(
+                suggestions.promotion_source,
+            ),
         })
     }
 

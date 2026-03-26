@@ -34,6 +34,12 @@ lookahead_large_bucket_mass_penalty = 0.10
 trap_size_threshold = 6
 trap_mass_threshold = 0.15
 sync_reverify_days = 3
+# Timeout for each NYT daily fetch, in seconds.
+sync_request_timeout_seconds = 10
+# Number of retry attempts after the first failure.
+sync_retry_attempts = 3
+# Delay between retries, in milliseconds.
+sync_retry_backoff_millis = 500
 
 [proxy_weights]
 entropy_w = 0.3375

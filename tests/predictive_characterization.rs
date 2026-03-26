@@ -5,8 +5,7 @@ use maybe_wordle::{
     config::PriorConfig,
     data::{NytDailyEntry, ProjectPaths, write_history_jsonl},
     predictive::{
-        PredictivePromotionSource, PredictiveSuggestRequest, PredictiveSuggestionMode,
-        RecoveryMode,
+        PredictivePromotionSource, PredictiveSuggestRequest, PredictiveSuggestionMode, RecoveryMode,
     },
     solver::Solver,
 };
@@ -109,7 +108,10 @@ fn write_zero_mass_fixture(paths: &ProjectPaths) {
 }
 
 fn fixture_paths(label: &str) -> ProjectPaths {
-    let root = std::env::temp_dir().join(format!("maybe-wordle-predictive-{label}-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "maybe-wordle-predictive-{label}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     let paths = ProjectPaths::new(&root);
     paths.ensure_layout().expect("layout");

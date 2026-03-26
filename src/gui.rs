@@ -17,7 +17,8 @@ use crate::{
         artifacts_exist,
     },
     predictive::{
-        PredictiveStateSummary, PredictiveSuggestRequest, PredictiveSuggestionMode, RecoveryMode,
+        PredictiveArtifactState, PredictiveStateSummary, PredictiveSuggestRequest,
+        PredictiveSuggestionMode, RecoveryMode,
     },
     scoring::parse_feedback,
     solver::{AbsurdleSuggestion, SolveState, Solver, Suggestion},
@@ -85,6 +86,7 @@ struct WordleGuiApp {
     surviving_count: usize,
     total_weight: f64,
     predictive_recovery_mode: Option<RecoveryMode>,
+    predictive_artifact_state: PredictiveArtifactState,
     top: usize,
     force_in_two_only: bool,
     hard_mode: bool,
@@ -112,6 +114,7 @@ enum WorkerPayload {
     Predictive {
         state: PredictiveStateSummary,
         suggestions: Vec<Suggestion>,
+        artifact_state: PredictiveArtifactState,
     },
     Absurdle {
         state: SolveState,
@@ -153,6 +156,7 @@ impl WordleGuiApp {
             surviving_count: 0,
             total_weight: 0.0,
             predictive_recovery_mode: None,
+            predictive_artifact_state: PredictiveArtifactState::NoPredictiveArtifactAvailable,
             top: 10,
             force_in_two_only: false,
             hard_mode: false,
@@ -179,7 +183,11 @@ impl WordleGuiApp {
             hard_mode: self.hard_mode,
         };
         self.computing = true;
-        self.status = "Computing...".to_string();
+        self.status = if self.mode == GuiSolverMode::Predictive {
+            predictive_compute_status(self.predictive_artifact_state)
+        } else {
+            "Computing...".to_string()
+        };
         if let Err(error) = self.request_sender.send(request) {
             self.set_error(anyhow::anyhow!(error.to_string()));
         }
@@ -192,10 +200,15 @@ impl WordleGuiApp {
             }
             self.computing = false;
             match response.payload {
-                Ok(WorkerPayload::Predictive { state, suggestions }) => {
+                Ok(WorkerPayload::Predictive {
+                    state,
+                    suggestions,
+                    artifact_state,
+                }) => {
                     self.surviving_count = state.surviving;
                     self.total_weight = state.effective_total_weight;
                     self.predictive_recovery_mode = state.recovery_mode_used;
+                    self.predictive_artifact_state = artifact_state;
                     self.predictive_suggestions = suggestions;
                     self.absurdle_suggestions.clear();
                     self.formal_suggestions.clear();
@@ -206,6 +219,8 @@ impl WordleGuiApp {
                     self.surviving_count = state.surviving.len();
                     self.total_weight = 0.0;
                     self.predictive_recovery_mode = None;
+                    self.predictive_artifact_state =
+                        PredictiveArtifactState::NoPredictiveArtifactAvailable;
                     self.absurdle_suggestions = suggestions;
                     self.predictive_suggestions.clear();
                     self.formal_suggestions.clear();
@@ -219,6 +234,8 @@ impl WordleGuiApp {
                     self.surviving_count = explanation.surviving_answers;
                     self.total_weight = 0.0;
                     self.predictive_recovery_mode = None;
+                    self.predictive_artifact_state =
+                        PredictiveArtifactState::NoPredictiveArtifactAvailable;
                     self.formal_explanation = Some(explanation);
                     self.formal_suggestions = suggestions;
                     self.predictive_suggestions.clear();
@@ -239,6 +256,7 @@ impl WordleGuiApp {
         self.surviving_count = 0;
         self.total_weight = 0.0;
         self.predictive_recovery_mode = None;
+        self.predictive_artifact_state = PredictiveArtifactState::NoPredictiveArtifactAvailable;
         self.computing = false;
     }
 
@@ -337,7 +355,7 @@ impl eframe::App for WordleGuiApp {
                             }
                         });
                     if !formal_available {
-                        ui.colored_label(Color32::from_rgb(150, 45, 45), "build-optimal-policy first");
+                        ui.colored_label(Color32::from_rgb(150, 45, 45), formal_unavailable_text());
                     }
                     if self.mode != previous_mode {
                         self.schedule_recompute();
@@ -442,6 +460,18 @@ impl eframe::App for WordleGuiApp {
                                 .strong()
                                 .color(Color32::from_rgb(67, 53, 39)),
                         );
+                        ui.label(
+                            RichText::new(predictive_banner_text(self.predictive_artifact_state))
+                                .color(Color32::from_rgb(92, 72, 54)),
+                        );
+                        if let Some(message) = predictive_reply_book_text(
+                            self.observations.len(),
+                            self.predictive_artifact_state,
+                        ) {
+                            ui.label(
+                                RichText::new(message).color(Color32::from_rgb(92, 72, 54)),
+                            );
+                        }
                     }
                     GuiSolverMode::Absurdle => {
                         ui.label(
@@ -641,17 +671,21 @@ fn spawn_worker(
                     let result = (|| -> Result<WorkerPayload> {
                         let date = NaiveDate::parse_from_str(&request.date_text, "%Y-%m-%d")
                             .with_context(|| format!("invalid date: {}", request.date_text))?;
-                        let response = predictive_solver.suggest_predictive(PredictiveSuggestRequest {
-                            as_of: date,
-                            observations: &request.observations,
-                            top: request.top,
-                            hard_mode: request.hard_mode,
-                            force_in_two_only: request.force_in_two_only,
-                            mode: PredictiveSuggestionMode::FastDiskOnly,
-                        })?;
-                        let state = response.state;
-                        let suggestions = response.suggestions;
-                        Ok(WorkerPayload::Predictive { state, suggestions })
+                        let response =
+                            predictive_solver.suggest_predictive(PredictiveSuggestRequest {
+                                as_of: date,
+                                observations: &request.observations,
+                                top: request.top,
+                                hard_mode: request.hard_mode,
+                                force_in_two_only: request.force_in_two_only,
+                                mode: PredictiveSuggestionMode::FastDiskOnly,
+                            })?;
+                        let artifact_state = response.artifact_state;
+                        Ok(WorkerPayload::Predictive {
+                            state: response.state,
+                            suggestions: response.suggestions,
+                            artifact_state,
+                        })
                     })();
                     result.map_err(|error| error.to_string())
                 }
@@ -719,7 +753,12 @@ fn decode_pattern(pattern: &u8) -> [u8; 5] {
 
 #[cfg(test)]
 mod tests {
-    use super::worker_response_is_current;
+    use crate::predictive::PredictiveArtifactState;
+
+    use super::{
+        formal_unavailable_text, predictive_banner_text, predictive_compute_status,
+        predictive_reply_book_text, worker_response_is_current,
+    };
 
     #[test]
     fn worker_response_discards_stale_generations() {
@@ -727,4 +766,89 @@ mod tests {
         assert!(!worker_response_is_current(7, 6));
         assert!(!worker_response_is_current(7, 8));
     }
+
+    #[test]
+    fn predictive_banner_text_matches_artifact_state() {
+        assert_eq!(
+            predictive_banner_text(PredictiveArtifactState::ExactDateArtifact),
+            "Using exact-date predictive artifact"
+        );
+        assert_eq!(
+            predictive_banner_text(PredictiveArtifactState::RecentOpenerArtifact),
+            "Using recent opener artifact"
+        );
+        assert_eq!(
+            predictive_banner_text(PredictiveArtifactState::LiveSessionFallback),
+            "Using live session fallback"
+        );
+        assert_eq!(
+            predictive_banner_text(PredictiveArtifactState::NoPredictiveArtifactAvailable),
+            "No predictive artifact available"
+        );
+    }
+
+    #[test]
+    fn predictive_compute_status_includes_path_hint() {
+        assert_eq!(
+            predictive_compute_status(PredictiveArtifactState::ExactDateArtifact),
+            "Computing... disk-backed"
+        );
+        assert_eq!(
+            predictive_compute_status(PredictiveArtifactState::LiveSessionFallback),
+            "Computing... live session fallback"
+        );
+    }
+
+    #[test]
+    fn predictive_reply_book_text_matches_branch_state() {
+        assert_eq!(
+            predictive_reply_book_text(1, PredictiveArtifactState::ExactDateArtifact),
+            Some("Reply-book artifact is available for this branch.")
+        );
+        assert_eq!(
+            predictive_reply_book_text(2, PredictiveArtifactState::LiveSessionFallback),
+            Some(
+                "Reply-book artifact is missing for this date or branch; showing live ranking only."
+            )
+        );
+        assert_eq!(
+            predictive_reply_book_text(0, PredictiveArtifactState::NoPredictiveArtifactAvailable),
+            None
+        );
+    }
+
+    #[test]
+    fn formal_unavailable_text_is_actionable() {
+        assert_eq!(
+            formal_unavailable_text(),
+            "Formal artifacts missing; run build-optimal-policy first."
+        );
+    }
+}
+
+fn predictive_banner_text(state: PredictiveArtifactState) -> &'static str {
+    state.banner_text()
+}
+
+fn predictive_compute_status(state: PredictiveArtifactState) -> String {
+    format!("Computing... {}", state.compute_text())
+}
+
+fn predictive_reply_book_text(
+    observation_count: usize,
+    state: PredictiveArtifactState,
+) -> Option<&'static str> {
+    match observation_count {
+        1 | 2 if state == PredictiveArtifactState::ExactDateArtifact => {
+            Some("Reply-book artifact is available for this branch.")
+        }
+        1 | 2 => Some(
+            "Reply-book artifact is missing for this date or branch; showing live ranking only.",
+        ),
+        _ => None,
+    }
+}
+
+fn formal_unavailable_text() -> &'static str {
+    "Formal artifacts missing; run build-optimal-policy first."
 }

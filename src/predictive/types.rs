@@ -2,6 +2,7 @@ use chrono::NaiveDate;
 
 use crate::solver::Suggestion;
 
+use super::state::PredictiveArtifactState;
 use super::{PredictivePromotionSource, PredictiveStateSummary};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,4 +28,11 @@ pub struct PredictiveSuggestResponse {
     pub suggestions: Vec<Suggestion>,
     pub promoted_word: Option<String>,
     pub promotion_source: Option<PredictivePromotionSource>,
+    pub artifact_state: PredictiveArtifactState,
+}
+
+impl PredictiveSuggestResponse {
+    pub fn artifact_state(&self) -> PredictiveArtifactState {
+        self.artifact_state
+    }
 }

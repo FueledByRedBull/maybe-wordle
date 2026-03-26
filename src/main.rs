@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use maybe_wordle::{
     config::PriorConfig,
-    data::{ProjectPaths, sync_nyt_history},
+    data::{ProjectPaths, SyncSummary, sync_nyt_history},
     formal::{
         DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, FormalVerificationMode, build_optimal_policy,
         parse_observations as parse_formal_observations, verify_optimal_policy_with_mode,
@@ -17,7 +17,7 @@ use maybe_wordle::{
     gui::run_gui,
     model::build_model_artifacts,
     model::{ModelVariant, WeightMode},
-    predictive::{PredictiveSuggestRequest, PredictiveSuggestionMode},
+    predictive::{PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode},
     seed::{MergeStrategy, add_manual_addition, merge_seed_lists, reconcile_seed_lists},
     solver::{AbsurdleSuggestion, Solver},
 };
@@ -32,154 +32,317 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[command(about = "Fetch NYT daily answer JSON into data/raw and reverify recent synced dates")]
     SyncData,
+    #[command(about = "Build modeled answers and the pattern table under data/derived")]
     BuildModel,
+    #[command(about = "Build formal optimal-policy artifacts into data/formal")]
     BuildOptimalPolicy {
-        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id to build")]
         model: String,
     },
+    #[command(about = "Verify a formal optimal-policy artifact by certificate or oracle checks")]
     VerifyOptimalPolicy {
-        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id to verify")]
         model: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Use the slower oracle verifier instead of certificate mode"
+        )]
         oracle: bool,
     },
+    #[command(about = "Open the desktop GUI")]
     Gui,
-    AddManual {
-        word: String,
-    },
+    #[command(about = "Append a manually curated answer candidate to the seed list")]
+    AddManual { word: String },
+    #[command(about = "Compare the primary and reference seed answer lists")]
     ReconcileSeeds,
+    #[command(about = "Merge the primary and reference seed answer lists")]
     MergeSeeds {
-        #[arg(long, default_value = "union")]
+        #[arg(
+            long,
+            default_value = "union",
+            help = "Seed merge strategy: union or keep_primary"
+        )]
         strategy: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Write the merged list back to the primary seed file"
+        )]
         apply: bool,
     },
+    #[command(
+        about = "Suggest the next move for predictive Wordle, Absurdle, or formal-optimal mode"
+    )]
     Suggest {
-        #[arg(long = "guess")]
+        #[arg(
+            long = "guess",
+            help = "Applied guesses in order; repeat once per committed row"
+        )]
         guess: Vec<String>,
-        #[arg(long = "feedback")]
+        #[arg(
+            long = "feedback",
+            help = "Feedback per guess in 01020 or bgybb form; repeat to match --guess"
+        )]
         feedback: Vec<String>,
-        #[arg(long, default_value_t = 10)]
+        #[arg(
+            long,
+            default_value_t = 10,
+            help = "Maximum number of suggestions to print"
+        )]
         top: usize,
-        #[arg(long)]
+        #[arg(long, help = "Predictive as-of date in YYYY-MM-DD; defaults to today")]
         date: Option<String>,
-        #[arg(long, default_value = "predictive")]
+        #[arg(
+            long,
+            default_value = "predictive",
+            help = "Solver mode: predictive, absurdle, or formal-optimal"
+        )]
         mode: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Require predictive guesses to satisfy hard mode constraints"
+        )]
         hard: bool,
-        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id when --mode formal-optimal is used")]
         model: String,
     },
+    #[command(
+        about = "Run an interactive suggestion loop in predictive, Absurdle, or formal-optimal mode"
+    )]
     SolveInteractive {
-        #[arg(long, default_value_t = 10)]
+        #[arg(
+            long,
+            default_value_t = 10,
+            help = "Maximum number of suggestions to print each turn"
+        )]
         top: usize,
-        #[arg(long)]
+        #[arg(long, help = "Predictive as-of date in YYYY-MM-DD; defaults to today")]
         date: Option<String>,
-        #[arg(long, default_value = "predictive")]
+        #[arg(
+            long,
+            default_value = "predictive",
+            help = "Solver mode: predictive, absurdle, or formal-optimal"
+        )]
         mode: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Require predictive guesses to satisfy hard mode constraints"
+        )]
         hard: bool,
-        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id when --mode formal-optimal is used")]
         model: String,
     },
+    #[command(about = "Explain a formal-optimal state after a sequence of guesses and feedback")]
     ExplainState {
-        #[arg(long = "guess")]
+        #[arg(
+            long = "guess",
+            help = "Applied guesses in order; repeat once per committed row"
+        )]
         guess: Vec<String>,
-        #[arg(long = "feedback")]
+        #[arg(
+            long = "feedback",
+            help = "Feedback per guess in 01020 or bgybb form; repeat to match --guess"
+        )]
         feedback: Vec<String>,
-        #[arg(long, default_value_t = 5)]
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "Maximum number of tied candidates to print"
+        )]
         top: usize,
-        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id to explain")]
         model: String,
     },
+    #[command(about = "Backtest the predictive solver across a synced NYT date range")]
     Backtest {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Backtest start date in YYYY-MM-DD; defaults to earliest synced date"
+        )]
         from: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Backtest end date in YYYY-MM-DD; defaults to latest synced date"
+        )]
         to: Option<String>,
-        #[arg(long, default_value_t = 5)]
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "Number of suggestions tracked per step in detailed output"
+        )]
         top: usize,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Print per-game and per-step detail"
+        )]
         detailed: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "With --detailed, print only failed runs"
+        )]
         failures_only: bool,
     },
+    #[command(about = "Compare predictive ablation configurations over a synced date range")]
     PredictiveAblations {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Evaluation start date in YYYY-MM-DD; defaults to earliest synced date"
+        )]
         from: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Evaluation end date in YYYY-MM-DD; defaults to latest synced date"
+        )]
         to: Option<String>,
-        #[arg(long, default_value_t = 5)]
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "Top suggestion count used during evaluation"
+        )]
         top: usize,
     },
+    #[command(about = "Evaluate an alternate prior config file against a fixed date window")]
     EvaluateLiveConfig {
-        #[arg(long)]
+        #[arg(long, help = "Path to the candidate prior TOML file to evaluate")]
         config: String,
-        #[arg(long)]
+        #[arg(long, help = "Evaluation start date in YYYY-MM-DD")]
         from: String,
-        #[arg(long)]
+        #[arg(long, help = "Evaluation end date in YYYY-MM-DD")]
         to: String,
-        #[arg(long, default_value_t = 5)]
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "Top suggestion count used during evaluation"
+        )]
         top: usize,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Emit the evaluation as JSON instead of a text summary"
+        )]
         json: bool,
     },
+    #[command(about = "Report states where aggressive three-guess play closes a gap")]
     ThreeGuessGap {
-        #[arg(long)]
+        #[arg(long, help = "Evaluation start date in YYYY-MM-DD")]
         from: String,
-        #[arg(long)]
+        #[arg(long, help = "Evaluation end date in YYYY-MM-DD")]
         to: String,
-        #[arg(long, default_value_t = 5)]
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "Top suggestion count used during evaluation"
+        )]
         top: usize,
     },
+    #[command(about = "Compare specified opener words against four-guess targets")]
     FourGuessOpeners {
-        #[arg(long)]
+        #[arg(long, help = "Evaluation start date in YYYY-MM-DD")]
         from: String,
-        #[arg(long)]
+        #[arg(long, help = "Evaluation end date in YYYY-MM-DD")]
         to: String,
-        #[arg(long, default_value_t = 5)]
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "Top suggestion count used during evaluation"
+        )]
         top: usize,
-        #[arg(long = "opener")]
+        #[arg(
+            long = "opener",
+            help = "Candidate opener word; repeat to compare multiple openers"
+        )]
         opener: Vec<String>,
     },
+    #[command(about = "Build a predictive opener artifact for one date and one model variant")]
     BuildPredictiveOpener {
-        #[arg(long)]
+        #[arg(long, help = "Artifact date in YYYY-MM-DD; defaults to today")]
         date: Option<String>,
-        #[arg(long, default_value = "weighted")]
+        #[arg(
+            long,
+            default_value = "weighted",
+            help = "Answer-weight model: weighted, uniform, or cooldown_only"
+        )]
         weight_mode: String,
-        #[arg(long, default_value = "seed_plus_history")]
+        #[arg(
+            long,
+            default_value = "seed_plus_history",
+            help = "Model variant: seed_only or seed_plus_history"
+        )]
         variant: String,
     },
+    #[command(about = "Build a predictive reply-book artifact for one date and one model variant")]
     BuildPredictiveReplies {
-        #[arg(long)]
+        #[arg(long, help = "Artifact date in YYYY-MM-DD; defaults to today")]
         date: Option<String>,
-        #[arg(long, default_value = "weighted")]
+        #[arg(
+            long,
+            default_value = "weighted",
+            help = "Answer-weight model: weighted, uniform, or cooldown_only"
+        )]
         weight_mode: String,
-        #[arg(long, default_value = "seed_plus_history")]
+        #[arg(
+            long,
+            default_value = "seed_plus_history",
+            help = "Model variant: seed_only or seed_plus_history"
+        )]
         variant: String,
     },
+    #[command(about = "Run the predictive experiment matrix over a synced date range")]
     Experiments {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Evaluation start date in YYYY-MM-DD; defaults to earliest synced date"
+        )]
         from: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Evaluation end date in YYYY-MM-DD; defaults to latest synced date"
+        )]
         to: Option<String>,
-        #[arg(long, default_value_t = 5)]
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "Top suggestion count used during evaluation"
+        )]
         top: usize,
     },
+    #[command(about = "Search for a better predictive prior policy and print a replacement TOML")]
     TunePrior,
+    #[command(about = "Fit proxy weights from synced history and print a replacement TOML")]
     FitProxyWeights {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Training start date in YYYY-MM-DD; defaults near the last year of synced history"
+        )]
         from: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Training end date in YYYY-MM-DD; defaults to the latest synced date"
+        )]
         to: Option<String>,
     },
+    #[command(about = "Benchmark predictive, Absurdle, or formal-optimal suggestion latency")]
     Benchmark {
-        #[arg(long, default_value_t = 3)]
+        #[arg(
+            long,
+            default_value_t = 3,
+            help = "Number of repeated suggestion runs to average"
+        )]
         runs: usize,
-        #[arg(long, default_value = "predictive")]
+        #[arg(
+            long,
+            default_value = "predictive",
+            help = "Solver mode: predictive, absurdle, or formal-optimal"
+        )]
         mode: String,
-        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID)]
+        #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id when --mode formal-optimal is used")]
         model: String,
     },
 }
@@ -212,15 +375,7 @@ fn run() -> Result<()> {
     match cli.command {
         Command::SyncData => {
             let summary = sync_nyt_history(&paths, &config, Solver::today())?;
-            println!(
-                "synced {} entries from {} to {} (fetched {}, reverified {}, changed {})",
-                summary.total,
-                summary.first_date,
-                summary.last_date,
-                summary.fetched,
-                summary.reverified,
-                summary.changed
-            );
+            println!("{}", format_sync_summary(&summary));
             if !summary.changed_dates.is_empty() {
                 println!(
                     "changed_dates={}",
@@ -231,6 +386,26 @@ fn run() -> Result<()> {
                         .collect::<Vec<_>>()
                         .join(",")
                 );
+            }
+            if summary.partial_sync {
+                println!(
+                    "failed_dates={}",
+                    summary
+                        .failed_dates
+                        .iter()
+                        .map(|date| date.format("%Y-%m-%d").to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                if summary.total > summary.fetched {
+                    println!(
+                        "preserved_existing_history=true last_successful_date={}",
+                        summary
+                            .last_successful_date
+                            .map(|date| date.format("%Y-%m-%d").to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    );
+                }
             }
         }
         Command::BuildModel => {
@@ -325,6 +500,7 @@ fn run() -> Result<()> {
             SolverMode::Predictive => {
                 let observations = Solver::parse_observations(&guess, &feedback)?;
                 let as_of = parse_or_today(date.as_deref())?;
+                warn_predictive_history_range(&paths, as_of)?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let response = solver.suggest_predictive(PredictiveSuggestRequest {
                     as_of,
@@ -334,11 +510,17 @@ fn run() -> Result<()> {
                     force_in_two_only: false,
                     mode: PredictiveSuggestionMode::Full,
                 })?;
+                for warning in predictive_warning_lines(
+                    as_of,
+                    &observations,
+                    PredictiveSuggestionMode::Full,
+                    &response,
+                ) {
+                    eprintln!("warning: {warning}");
+                }
                 println!(
                     "mode=predictive date={} surviving={} total_weight={:.4}",
-                    as_of,
-                    response.state.surviving,
-                    response.state.effective_total_weight
+                    as_of, response.state.surviving, response.state.effective_total_weight
                 );
                 if let Some(mode) = response.state.recovery_mode_used {
                     println!("recovery_mode={}", mode.label());
@@ -393,6 +575,7 @@ fn run() -> Result<()> {
         } => match parse_solver_mode(&mode)? {
             SolverMode::Predictive => {
                 let as_of = parse_or_today(date.as_deref())?;
+                warn_predictive_history_range(&paths, as_of)?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let mut observations = Vec::new();
 
@@ -405,10 +588,17 @@ fn run() -> Result<()> {
                         force_in_two_only: false,
                         mode: PredictiveSuggestionMode::Full,
                     })?;
+                    for warning in predictive_warning_lines(
+                        as_of,
+                        &observations,
+                        PredictiveSuggestionMode::Full,
+                        &response,
+                    ) {
+                        eprintln!("warning: {warning}");
+                    }
                     println!(
                         "mode=predictive surviving={} total_weight={:.4}",
-                        response.state.surviving,
-                        response.state.effective_total_weight
+                        response.state.surviving, response.state.effective_total_weight
                     );
                     if let Some(mode) = response.state.recovery_mode_used {
                         println!("recovery_mode={}", mode.label());
@@ -1058,6 +1248,102 @@ fn parse_date(raw: Option<&str>) -> Result<Option<NaiveDate>> {
     .transpose()
 }
 
+fn warn_predictive_history_range(paths: &ProjectPaths, as_of: NaiveDate) -> Result<()> {
+    let Some((first_synced, last_synced)) = Solver::latest_history_range(paths)? else {
+        eprintln!(
+            "warning: no synced NYT history found; run cargo run -- sync-data before relying on predictive history or artifacts"
+        );
+        return Ok(());
+    };
+    if as_of < first_synced {
+        eprintln!(
+            "warning: requested date {} is before the earliest synced NYT date {}; predictive history and artifacts may be incomplete",
+            as_of, first_synced
+        );
+    }
+    if as_of > last_synced {
+        eprintln!(
+            "warning: requested date {} is after the latest synced NYT date {}; predictive history and artifacts may be stale",
+            as_of, last_synced
+        );
+    }
+    Ok(())
+}
+
+fn format_sync_summary(summary: &SyncSummary) -> String {
+    let status = if summary.partial_sync {
+        "partial"
+    } else {
+        "complete"
+    };
+    format!(
+        "sync_status={} entries={} range={}..{} fetched={} reverified={} changed={}",
+        status,
+        summary.total,
+        summary.first_date,
+        summary.last_date,
+        summary.fetched,
+        summary.reverified,
+        summary.changed
+    )
+}
+
+fn predictive_warning_lines(
+    as_of: NaiveDate,
+    observations: &[(String, u8)],
+    mode: PredictiveSuggestionMode,
+    response: &PredictiveSuggestResponse,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let artifact_warning = match response.artifact_state {
+        maybe_wordle::predictive::PredictiveArtifactState::ExactDateArtifact => {
+            if observations.is_empty() {
+                Some(format!(
+                    "exact-date predictive opener artifact is available for {}",
+                    as_of
+                ))
+            } else {
+                Some(format!(
+                    "exact-date predictive reply-book artifact is available for {}",
+                    as_of
+                ))
+            }
+        }
+        maybe_wordle::predictive::PredictiveArtifactState::RecentOpenerArtifact => Some(format!(
+            "no exact-date opener artifact for {}; reusing a recent opener artifact",
+            as_of
+        )),
+        maybe_wordle::predictive::PredictiveArtifactState::LiveSessionFallback => {
+            Some("predictive artifact unavailable for this state; using live session fallback".to_string())
+        }
+        maybe_wordle::predictive::PredictiveArtifactState::NoPredictiveArtifactAvailable => {
+            Some(match mode {
+                PredictiveSuggestionMode::FastDiskOnly => {
+                    "predictive artifact unavailable for this state; disk-only mode will use live ranking without promotion".to_string()
+                }
+                PredictiveSuggestionMode::Full => {
+                    "predictive artifact unavailable for this state; using live ranking without artifact promotion".to_string()
+                }
+                PredictiveSuggestionMode::LiveOnly => {
+                    "predictive artifact lookup disabled; using live ranking only".to_string()
+                }
+            })
+        }
+    };
+    if let Some(warning) = artifact_warning {
+        warnings.push(warning);
+    }
+    if matches!(observations.len(), 1 | 2)
+        && response.artifact_state
+            != maybe_wordle::predictive::PredictiveArtifactState::ExactDateArtifact
+    {
+        warnings.push(
+            "reply-book artifact is missing for this date or branch; branch suggestions are coming from live evaluation".to_string(),
+        );
+    }
+    warnings
+}
+
 fn read_line() -> Result<String> {
     let mut buffer = String::new();
     io::stdin()
@@ -1170,12 +1456,16 @@ mod tests {
     use std::fs;
 
     use anyhow::anyhow;
+    use chrono::NaiveDate;
+    use clap::CommandFactory;
+    use maybe_wordle::data::SyncSummary;
+    use maybe_wordle::predictive::{PredictiveArtifactState, PredictiveSuggestResponse};
     use maybe_wordle::solver::AbsurdleSuggestion;
 
     use super::{
-        find_project_root, format_absurdle_suggestion, format_predictive_suggestion,
-        normalize_interactive_guess, parse_solver_mode, reject_hard_mode_for_non_predictive,
-        try_append_observation,
+        Cli, find_project_root, format_absurdle_suggestion, format_predictive_suggestion,
+        format_sync_summary, normalize_interactive_guess, parse_solver_mode,
+        predictive_warning_lines, reject_hard_mode_for_non_predictive, try_append_observation,
     };
 
     #[test]
@@ -1284,5 +1574,76 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn predictive_warning_lines_report_live_branch_fallback() {
+        let warnings = predictive_warning_lines(
+            NaiveDate::from_ymd_opt(2026, 3, 26).expect("date"),
+            &[("crane".to_string(), 17)],
+            maybe_wordle::predictive::PredictiveSuggestionMode::Full,
+            &PredictiveSuggestResponse {
+                state: maybe_wordle::predictive::PredictiveStateSummary {
+                    surviving: 3,
+                    modeled_total_weight: 1.0,
+                    effective_total_weight: 1.0,
+                    recovery_mode_used: None,
+                },
+                suggestions: Vec::new(),
+                promoted_word: None,
+                promotion_source: None,
+                artifact_state: PredictiveArtifactState::LiveSessionFallback,
+            },
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("live session fallback"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("reply-book artifact is missing"))
+        );
+    }
+
+    #[test]
+    fn format_sync_summary_marks_partial_sync() {
+        let summary = SyncSummary {
+            fetched: 2,
+            reverified: 1,
+            changed: 0,
+            total: 5,
+            first_date: NaiveDate::from_ymd_opt(2021, 6, 19).expect("first"),
+            last_date: NaiveDate::from_ymd_opt(2021, 6, 23).expect("last"),
+            changed_dates: Vec::new(),
+            partial_sync: true,
+            failed_dates: vec![NaiveDate::from_ymd_opt(2021, 6, 24).expect("failed")],
+            last_successful_date: Some(NaiveDate::from_ymd_opt(2021, 6, 23).expect("success")),
+        };
+        assert!(format_sync_summary(&summary).contains("sync_status=partial"));
+    }
+
+    #[test]
+    fn help_text_mentions_predictive_mode_and_weight_mode() {
+        let mut suggest = Cli::command()
+            .find_subcommand_mut("suggest")
+            .expect("suggest help")
+            .clone();
+        let mut suggest_help = Vec::new();
+        suggest.write_long_help(&mut suggest_help).expect("help");
+        let suggest_rendered = String::from_utf8(suggest_help).expect("utf8");
+        assert!(suggest_rendered.contains("Solver mode: predictive, absurdle, or formal-optimal"));
+
+        let mut opener = Cli::command()
+            .find_subcommand_mut("build-predictive-opener")
+            .expect("opener help")
+            .clone();
+        let mut opener_help = Vec::new();
+        opener.write_long_help(&mut opener_help).expect("help");
+        let opener_rendered = String::from_utf8(opener_help).expect("utf8");
+        assert!(
+            opener_rendered.contains("Answer-weight model: weighted, uniform, or cooldown_only")
+        );
     }
 }

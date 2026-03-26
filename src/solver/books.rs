@@ -466,7 +466,8 @@ pub(super) fn write_predictive_artifact<T: Serialize>(
     value: &T,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let bytes =
         serde_json::to_vec_pretty(value).context("failed to serialize predictive artifact")?;
