@@ -23,6 +23,10 @@ In February 2026, NYT started reusing past answers. That breaks a lot of old sol
 - the prior matters, because not all surviving answers are equally plausible
 - "optimal" should mean optimal for a declared model, not "I guessed what the editor was thinking"
 
+## Data and Network Use
+
+`sync-data` is intended for personal research and reproducible solver experiments. Keep synced NYT responses, generated artifacts, and request volume modest, and do not redistribute data unless you have the right to do so.
+
 ## What it does
 
 | Mode | What it optimizes | Best use |
