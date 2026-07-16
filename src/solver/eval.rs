@@ -184,6 +184,13 @@ impl Solver {
             .copied()
             .unwrap_or_default();
         let max_guesses = guess_counts.last().copied().unwrap_or_default();
+        let average_guesses_ci95 = mean_ci95(
+            &guess_counts
+                .iter()
+                .map(|count| *count as f64)
+                .collect::<Vec<_>>(),
+        );
+        let failure_rate_ci95 = wilson_interval(failures, games_played);
 
         Ok(DetailedBacktestReport {
             summary: BacktestStats {
@@ -193,6 +200,8 @@ impl Solver {
                 max_guesses,
                 failures,
                 coverage_gaps,
+                average_guesses_ci95,
+                failure_rate_ci95,
             },
             runs,
         })
@@ -1285,10 +1294,33 @@ impl Solver {
 
         let (history_start, history_end) = Self::latest_history_range(paths)?
             .ok_or_else(|| anyhow!("run sync-data before tune-prior"))?;
-        let window_end = history_end;
-        let window_start = history_end
+        let available_days = (history_end - history_start).num_days() + 1;
+        if available_days < 3 {
+            bail!("history is too short for rolling train/validation/test windows");
+        }
+        let test_days = (available_days / 3).clamp(1, 30) as u64;
+        let validation_days = ((available_days - test_days as i64) / 2).clamp(1, 30) as u64;
+        let test_end = history_end;
+        let test_start = test_end
+            .checked_sub_days(Days::new(test_days - 1))
+            .expect("test window stays in range");
+        let validation_end = test_start.checked_sub_days(Days::new(1)).ok_or_else(|| {
+            anyhow!("history is too short for rolling train/validation/test windows")
+        })?;
+        let validation_start = validation_end
+            .checked_sub_days(Days::new(validation_days - 1))
+            .expect("validation window stays in range");
+        let window_end = validation_start
+            .checked_sub_days(Days::new(1))
+            .ok_or_else(|| {
+                anyhow!("history is too short for rolling train/validation/test windows")
+            })?;
+        let window_start = window_end
             .checked_sub_days(Days::new(364))
             .map_or(history_start, |date| date.max(history_start));
+        if window_start > window_end || validation_start > validation_end || test_start > test_end {
+            bail!("history is too short for rolling train/validation/test windows");
+        }
         let started = Instant::now();
         eprintln!(
             "tune-prior phase=start search_window={}..{} elapsed_s=0.0",
@@ -1419,26 +1451,26 @@ impl Solver {
             [96, 160, 224]
         );
 
-        let validation_start = window_end
-            .checked_sub_days(Days::new(6))
-            .map_or(window_start, |date| date.max(window_start));
-        let current = Self::evaluate_tuning_candidate(paths, config, validation_start, window_end)?;
+        let validation_current =
+            Self::evaluate_tuning_candidate(paths, config, validation_start, validation_end)?;
         let candidate = Self::evaluate_tuning_candidate(
             paths,
             &best_prior_config,
             validation_start,
-            window_end,
+            validation_end,
         )?;
-        let best = if candidate.average_guesses < current.average_guesses
-            && candidate.failures <= current.failures
-            && candidate.hard_case_failures <= current.hard_case_failures
+        let selected_config = if candidate.average_guesses < validation_current.average_guesses
+            && candidate.failures <= validation_current.failures
             && candidate.latency_p95_ms
-                <= (current.latency_p95_ms * 3.0).max(current.latency_p95_ms)
+                <= (validation_current.latency_p95_ms * 3.0).max(validation_current.latency_p95_ms)
         {
-            candidate
+            candidate.config
         } else {
-            current.clone()
+            config.clone()
         };
+        // The final period is untouched until after selection.
+        let current = Self::evaluate_tuning_candidate(paths, config, test_start, test_end)?;
+        let best = Self::evaluate_tuning_candidate(paths, &selected_config, test_start, test_end)?;
         eprintln!(
             "tune-prior phase=done current_avg_guesses={:.4} best_avg_guesses={:.4} current_latency_p95_ms={:.3} best_latency_p95_ms={:.3} elapsed_s={:.1}",
             current.average_guesses,
@@ -1516,7 +1548,9 @@ impl Solver {
             search_window_start: window_start,
             search_window_end: window_end,
             validation_window_start: validation_start,
-            validation_window_end: window_end,
+            validation_window_end: validation_end,
+            test_window_start: test_start,
+            test_window_end: test_end,
             current,
             best,
             replacement_toml,
@@ -2599,4 +2633,34 @@ impl Solver {
             solved: false,
         })
     }
+}
+
+fn mean_ci95(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    if values.len() < 2 {
+        return (mean, mean);
+    }
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (values.len() - 1) as f64;
+    let margin = 1.96 * (variance / values.len() as f64).sqrt();
+    (mean - margin, mean + margin)
+}
+
+fn wilson_interval(successes: usize, trials: usize) -> (f64, f64) {
+    if trials == 0 {
+        return (0.0, 0.0);
+    }
+    let z = 1.96_f64;
+    let n = trials as f64;
+    let p = successes as f64 / n;
+    let denominator = 1.0 + z * z / n;
+    let center = (p + z * z / (2.0 * n)) / denominator;
+    let margin = z * ((p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt()) / denominator;
+    ((center - margin).max(0.0), (center + margin).min(1.0))
 }

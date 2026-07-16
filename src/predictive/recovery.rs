@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryMode {
     Strict,
     UniformOverSupport,
+    #[default]
     EpsilonRepair,
 }
 
@@ -15,12 +16,6 @@ impl RecoveryMode {
             Self::UniformOverSupport => "uniform_over_support",
             Self::EpsilonRepair => "epsilon_repair",
         }
-    }
-}
-
-impl Default for RecoveryMode {
-    fn default() -> Self {
-        Self::EpsilonRepair
     }
 }
 

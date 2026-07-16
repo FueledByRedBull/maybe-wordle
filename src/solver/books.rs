@@ -1,53 +1,6 @@
 use super::*;
 
 impl Solver {
-    pub(super) fn predictive_book_identity(&self, as_of: NaiveDate) -> PredictiveBookIdentity {
-        let policy = self.config.predictive_policy();
-        let config_toml =
-            toml::to_string(&self.config).expect("predictive config serialization must succeed");
-        let payload = format!(
-            "policy={};mode={};variant={};as_of={};guesses={};answers={};config={}",
-            policy.policy_id,
-            self.mode.label(),
-            self.variant.label(),
-            as_of,
-            self.guesses.len(),
-            self.answers.len(),
-            config_toml
-        );
-        PredictiveBookIdentity {
-            policy_id: policy.policy_id,
-            mode: self.mode.label().to_string(),
-            variant: self.variant.label().to_string(),
-            config_fingerprint: stable_fingerprint(&payload),
-            as_of,
-        }
-    }
-
-    pub(super) fn opener_artifact_path(&self, as_of: NaiveDate) -> PathBuf {
-        let identity = self.predictive_book_identity(as_of);
-        self.artifact_dir.join(format!(
-            "opener-{}-{}-{}-{}-{}.json",
-            identity.policy_id,
-            identity.mode,
-            identity.variant,
-            identity.config_fingerprint,
-            identity.as_of
-        ))
-    }
-
-    pub(super) fn reply_book_artifact_path(&self, as_of: NaiveDate) -> PathBuf {
-        let identity = self.predictive_book_identity(as_of);
-        self.artifact_dir.join(format!(
-            "reply-book-{}-{}-{}-{}-{}.json",
-            identity.policy_id,
-            identity.mode,
-            identity.variant,
-            identity.config_fingerprint,
-            identity.as_of
-        ))
-    }
-
     pub(super) fn load_predictive_opener_artifact(
         &self,
         as_of: NaiveDate,
@@ -456,23 +409,13 @@ impl Solver {
     }
 }
 
-pub(super) fn stable_fingerprint(input: &str) -> String {
-    let digest = crate::pattern_table::hash_bytes(1469598103934665603u64, input.as_bytes());
-    format!("{digest:016x}")
-}
-
 pub(super) fn write_predictive_artifact<T: Serialize>(
     path: &std::path::Path,
     value: &T,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let bytes =
         serde_json::to_vec_pretty(value).context("failed to serialize predictive artifact")?;
-    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    crate::atomic_file::atomic_write(path, &bytes)
 }
 
 pub(super) fn read_predictive_artifact<T: for<'de> Deserialize<'de>>(

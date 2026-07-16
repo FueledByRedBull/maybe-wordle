@@ -41,7 +41,7 @@ enum Command {
         )]
         strict: bool,
     },
-    #[command(about = "Build modeled answers and the pattern table under data/derived")]
+    #[command(about = "Build modeled answer CSVs under data/derived")]
     BuildModel,
     #[command(about = "Build formal optimal-policy artifacts into data/formal")]
     BuildOptimalPolicy {
@@ -114,6 +114,12 @@ enum Command {
             help = "Require predictive guesses to satisfy hard mode constraints"
         )]
         hard: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Allow slower predictive live-session promotion when disk artifacts are missing"
+        )]
+        live_fallback: bool,
         #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id when --mode formal-optimal is used")]
         model: String,
     },
@@ -141,6 +147,12 @@ enum Command {
             help = "Require predictive guesses to satisfy hard mode constraints"
         )]
         hard: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Allow slower predictive live-session promotion when disk artifacts are missing"
+        )]
+        live_fallback: bool,
         #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id when --mode formal-optimal is used")]
         model: String,
     },
@@ -503,6 +515,7 @@ fn run() -> Result<()> {
             date,
             mode,
             hard,
+            live_fallback,
             model,
         } => match parse_solver_mode(&mode)? {
             SolverMode::Predictive => {
@@ -510,25 +523,34 @@ fn run() -> Result<()> {
                 let as_of = parse_or_today(date.as_deref())?;
                 warn_predictive_history_range(&paths, as_of)?;
                 let solver = Solver::from_paths(&paths, &config)?;
+                let predictive_mode = predictive_cli_mode(live_fallback);
                 let response = solver.suggest_predictive(PredictiveSuggestRequest {
                     as_of,
                     observations: &observations,
                     top,
                     hard_mode: hard,
                     force_in_two_only: false,
-                    mode: PredictiveSuggestionMode::Full,
+                    mode: predictive_mode,
                 })?;
-                for warning in predictive_warning_lines(
-                    as_of,
-                    &observations,
-                    PredictiveSuggestionMode::Full,
-                    &response,
-                ) {
+                for warning in
+                    predictive_warning_lines(as_of, &observations, predictive_mode, &response)
+                {
                     eprintln!("warning: {warning}");
                 }
                 println!(
-                    "mode=predictive date={} surviving={} total_weight={:.4}",
-                    as_of, response.state.surviving, response.state.effective_total_weight
+                    "mode=predictive model={} manifest={} history_snapshot={} history_hash={} artifact_status={} promoted_from_cache={} date={} surviving={} total_weight={:.4}",
+                    response.model_version,
+                    response.model_manifest_hash,
+                    response
+                        .history_snapshot_date
+                        .map(|date| date.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    response.history_snapshot_hash,
+                    response.artifact_state.banner_text(),
+                    response.promotion_source.is_some(),
+                    as_of,
+                    response.state.surviving,
+                    response.state.effective_total_weight
                 );
                 if let Some(mode) = response.state.recovery_mode_used {
                     println!("recovery_mode={}", mode.label());
@@ -539,6 +561,7 @@ fn run() -> Result<()> {
             }
             SolverMode::Absurdle => {
                 reject_hard_mode_for_non_predictive(hard, "absurdle")?;
+                reject_live_fallback_for_non_predictive(live_fallback, "absurdle")?;
                 let observations = Solver::parse_observations(&guess, &feedback)?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let state = solver.absurdle_apply_history(&observations)?;
@@ -549,6 +572,7 @@ fn run() -> Result<()> {
             }
             SolverMode::FormalOptimal => {
                 reject_hard_mode_for_non_predictive(hard, "formal-optimal")?;
+                reject_live_fallback_for_non_predictive(live_fallback, "formal-optimal")?;
                 let observations = parse_formal_observations(&guess, &feedback)?;
                 let runtime = FormalPolicyRuntime::load(&paths, &model)?;
                 let state = runtime.apply_history(&observations)?;
@@ -579,6 +603,7 @@ fn run() -> Result<()> {
             date,
             mode,
             hard,
+            live_fallback,
             model,
         } => match parse_solver_mode(&mode)? {
             SolverMode::Predictive => {
@@ -586,6 +611,7 @@ fn run() -> Result<()> {
                 warn_predictive_history_range(&paths, as_of)?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let mut observations = Vec::new();
+                let predictive_mode = predictive_cli_mode(live_fallback);
 
                 loop {
                     let response = solver.suggest_predictive(PredictiveSuggestRequest {
@@ -594,14 +620,11 @@ fn run() -> Result<()> {
                         top,
                         hard_mode: hard,
                         force_in_two_only: false,
-                        mode: PredictiveSuggestionMode::Full,
+                        mode: predictive_mode,
                     })?;
-                    for warning in predictive_warning_lines(
-                        as_of,
-                        &observations,
-                        PredictiveSuggestionMode::Full,
-                        &response,
-                    ) {
+                    for warning in
+                        predictive_warning_lines(as_of, &observations, predictive_mode, &response)
+                    {
                         eprintln!("warning: {warning}");
                     }
                     println!(
@@ -648,6 +671,7 @@ fn run() -> Result<()> {
             }
             SolverMode::Absurdle => {
                 reject_hard_mode_for_non_predictive(hard, "absurdle")?;
+                reject_live_fallback_for_non_predictive(live_fallback, "absurdle")?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let mut observations = Vec::new();
 
@@ -687,6 +711,7 @@ fn run() -> Result<()> {
             }
             SolverMode::FormalOptimal => {
                 reject_hard_mode_for_non_predictive(hard, "formal-optimal")?;
+                reject_live_fallback_for_non_predictive(live_fallback, "formal-optimal")?;
                 let runtime = FormalPolicyRuntime::load(&paths, &model)?;
                 let mut observations = Vec::new();
 
@@ -798,12 +823,17 @@ fn run() -> Result<()> {
             let report = solver.backtest_detailed(from, to, top)?;
             let stats = &report.summary;
             println!(
-                "games={} average_guesses={:.4} p95={} max={} failures={} coverage_gaps={}",
+                "games={} coverage={} average_guesses={:.4} average_guesses_ci95={:.4}..{:.4} p95={} max={} failures={} failure_rate_ci95={:.6}..{:.6} coverage_gaps={}",
                 stats.games,
+                stats.games.saturating_sub(stats.coverage_gaps),
                 stats.average_guesses,
+                stats.average_guesses_ci95.0,
+                stats.average_guesses_ci95.1,
                 stats.p95_guesses,
                 stats.max_guesses,
                 stats.failures,
+                stats.failure_rate_ci95.0,
+                stats.failure_rate_ci95.1,
                 stats.coverage_gaps
             );
             if detailed {
@@ -848,7 +878,7 @@ fn run() -> Result<()> {
                                     .unwrap_or_default(),
                                 suggestion
                                     .exact_cost
-                                    .map(|value| format!(" exact_cost={:.5}", value))
+                                    .map(|value| format!(" candidate_pool_exact_cost={:.5}", value))
                                     .or_else(|| suggestion
                                         .lookahead_cost
                                         .map(|value| format!(" lookahead_cost={:.5}", value)))
@@ -1092,11 +1122,13 @@ fn run() -> Result<()> {
         Command::TunePrior => {
             let summary = Solver::tune_prior(&paths, &config)?;
             println!(
-                "search_window={}..{} validation_window={}..{} current_avg_guesses={:.4} current_failures={} current_coverage_gaps={} current_log_loss={:.6} current_target_rank={:.2} current_latency_p95_ms={:.3} current_hard_case_avg_guesses={:.4} current_hard_case_failures={} current_regime_mix=proxy:{:.1}%/lookahead:{:.1}%/escalated_exact:{:.1}%/exact:{:.1}%",
+                "train_window={}..{} validation_window={}..{} untouched_test_window={}..{} current_avg_guesses={:.4} current_failures={} current_coverage_gaps={} current_log_loss={:.6} current_target_rank={:.2} current_latency_p95_ms={:.3} current_hard_case_avg_guesses={:.4} current_hard_case_failures={} current_regime_mix=proxy:{:.1}%/lookahead:{:.1}%/escalated_exact:{:.1}%/exact:{:.1}%",
                 summary.search_window_start,
                 summary.search_window_end,
                 summary.validation_window_start,
                 summary.validation_window_end,
+                summary.test_window_start,
+                summary.test_window_end,
                 summary.current.average_guesses,
                 summary.current.failures,
                 summary.current.coverage_gaps,
@@ -1415,7 +1447,7 @@ fn format_predictive_suggestion(suggestion: &maybe_wordle::solver::Suggestion) -
         line.push_str(" force_in_two=true");
     }
     if let Some(exact_cost) = suggestion.exact_cost {
-        line.push_str(&format!(" exact_cost={:.5}", exact_cost));
+        line.push_str(&format!(" candidate_pool_exact_cost={:.5}", exact_cost));
     }
     line
 }
@@ -1444,6 +1476,21 @@ fn reject_hard_mode_for_non_predictive(hard: bool, mode: &str) -> Result<()> {
         bail!("--hard is only supported in predictive Wordle mode, not {mode}");
     }
     Ok(())
+}
+
+fn reject_live_fallback_for_non_predictive(live_fallback: bool, mode: &str) -> Result<()> {
+    if live_fallback {
+        bail!("--live-fallback is only supported in predictive Wordle mode, not {mode}");
+    }
+    Ok(())
+}
+
+fn predictive_cli_mode(live_fallback: bool) -> PredictiveSuggestionMode {
+    if live_fallback {
+        PredictiveSuggestionMode::Full
+    } else {
+        PredictiveSuggestionMode::FastDiskOnly
+    }
 }
 
 fn parse_solver_mode(raw: &str) -> Result<SolverMode> {
@@ -1488,7 +1535,8 @@ mod tests {
     use super::{
         Cli, enforce_sync_policy, find_project_root, format_absurdle_suggestion,
         format_predictive_suggestion, format_sync_summary, normalize_interactive_guess,
-        parse_solver_mode, predictive_warning_lines, reject_hard_mode_for_non_predictive,
+        parse_solver_mode, predictive_cli_mode, predictive_warning_lines,
+        reject_hard_mode_for_non_predictive, reject_live_fallback_for_non_predictive,
         try_append_observation,
     };
 
@@ -1547,7 +1595,7 @@ mod tests {
             exact_cost: Some(2.5),
         });
         assert!(formatted.contains("force_in_two=true"));
-        assert!(formatted.contains("exact_cost=2.50000"));
+        assert!(formatted.contains("candidate_pool_exact_cost=2.50000"));
     }
 
     #[test]
@@ -1575,6 +1623,24 @@ mod tests {
     fn reject_hard_mode_for_non_predictive_modes() {
         assert!(reject_hard_mode_for_non_predictive(false, "absurdle").is_ok());
         assert!(reject_hard_mode_for_non_predictive(true, "absurdle").is_err());
+    }
+
+    #[test]
+    fn reject_live_fallback_for_non_predictive_modes() {
+        assert!(reject_live_fallback_for_non_predictive(false, "absurdle").is_ok());
+        assert!(reject_live_fallback_for_non_predictive(true, "absurdle").is_err());
+    }
+
+    #[test]
+    fn predictive_cli_mode_requires_explicit_live_fallback() {
+        assert_eq!(
+            predictive_cli_mode(false),
+            maybe_wordle::predictive::PredictiveSuggestionMode::FastDiskOnly
+        );
+        assert_eq!(
+            predictive_cli_mode(true),
+            maybe_wordle::predictive::PredictiveSuggestionMode::Full
+        );
     }
 
     #[test]
@@ -1617,6 +1683,10 @@ mod tests {
                 promoted_word: None,
                 promotion_source: None,
                 artifact_state: PredictiveArtifactState::LiveSessionFallback,
+                model_version: "test".to_string(),
+                model_manifest_hash: "test".to_string(),
+                history_snapshot_date: None,
+                history_snapshot_hash: "test".to_string(),
             },
         );
         assert!(
@@ -1693,6 +1763,7 @@ mod tests {
         suggest.write_long_help(&mut suggest_help).expect("help");
         let suggest_rendered = String::from_utf8(suggest_help).expect("utf8");
         assert!(suggest_rendered.contains("Solver mode: predictive, absurdle, or formal-optimal"));
+        assert!(suggest_rendered.contains("Allow slower predictive live-session promotion"));
 
         let mut opener = Cli::command()
             .find_subcommand_mut("build-predictive-opener")

@@ -29,6 +29,10 @@ pub struct PredictiveSuggestResponse {
     pub promoted_word: Option<String>,
     pub promotion_source: Option<PredictivePromotionSource>,
     pub artifact_state: PredictiveArtifactState,
+    pub model_version: String,
+    pub model_manifest_hash: String,
+    pub history_snapshot_date: Option<NaiveDate>,
+    pub history_snapshot_hash: String,
 }
 
 impl PredictiveSuggestResponse {

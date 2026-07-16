@@ -1,18 +1,20 @@
 use std::{
     collections::{BTreeMap, HashSet},
+    error::Error,
+    fmt,
     fs::{self, File},
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
-use reqwest::blocking::Client;
+use chrono::{DateTime, NaiveDate, Utc};
+use reqwest::{StatusCode, blocking::Client, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 
-use crate::config::PriorConfig;
+use crate::{atomic_file::atomic_write, config::PriorConfig};
 
 pub const WORDLE_LAUNCH_DATE: &str = "2021-06-19";
 const NYT_WORDLE_BASE_URL: &str = "https://www.nytimes.com/svc/wordle/v2";
@@ -147,20 +149,48 @@ pub fn read_history_jsonl(path: &Path) -> Result<Vec<NytDailyEntry>> {
     Ok(entries)
 }
 
-pub fn write_history_jsonl(path: &Path, entries: &[NytDailyEntry]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+pub fn validate_history_continuity(entries: &[NytDailyEntry]) -> Result<()> {
+    for pair in entries.windows(2) {
+        let expected = pair[0]
+            .print_date
+            .checked_add_days(chrono::Days::new(1))
+            .ok_or_else(|| anyhow::anyhow!("history date overflow"))?;
+        if pair[1].print_date != expected {
+            bail!(
+                "NYT history is non-contiguous: expected {}, found {}; run sync-data to repair gaps or set allow_history_gaps = true for an explicit retrospective override",
+                expected,
+                pair[1].print_date
+            );
+        }
     }
-    let file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    for entry in entries {
-        serde_json::to_writer(&mut writer, entry).context("failed to serialize history entry")?;
-        writer.write_all(b"\n").context("failed to write newline")?;
-    }
-    writer.flush().context("failed to flush history file")?;
     Ok(())
+}
+
+pub fn write_history_jsonl(path: &Path, entries: &[NytDailyEntry]) -> Result<()> {
+    validate_history_continuity(entries)?;
+    let mut bytes = Vec::new();
+    for entry in entries {
+        serde_json::to_writer(&mut bytes, entry).context("failed to serialize history entry")?;
+        bytes.write_all(b"\n").context("failed to write newline")?;
+    }
+    let decoded = read_history_jsonl_bytes(&bytes)?;
+    validate_history_continuity(&decoded)?;
+    atomic_write(path, &bytes)
+}
+
+fn read_history_jsonl_bytes(bytes: &[u8]) -> Result<Vec<NytDailyEntry>> {
+    let mut entries = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let mut entry: NytDailyEntry =
+            serde_json::from_slice(line).context("failed to validate serialized history entry")?;
+        entry.solution = normalize_word(&entry.solution);
+        entries.push(entry);
+    }
+    entries.sort_by_key(|entry| entry.print_date);
+    Ok(entries)
 }
 
 pub fn sync_nyt_history(
@@ -183,7 +213,7 @@ fn sync_nyt_history_with_base_url(
     let launch_date =
         NaiveDate::parse_from_str(WORDLE_LAUNCH_DATE, "%Y-%m-%d").expect("launch date is valid");
     let last_existing = existing.last().map(|entry| entry.print_date);
-    let start_date = last_existing
+    let reverify_start = last_existing
         .map(|date| date - chrono::Days::new(config.sync_reverify_days.saturating_sub(1) as u64))
         .unwrap_or(launch_date)
         .max(launch_date);
@@ -206,8 +236,15 @@ fn sync_nyt_history_with_base_url(
     let mut failed_dates = Vec::new();
     let mut last_successful_date = None;
 
-    let mut current = start_date;
+    let mut current = launch_date;
     while current <= today {
+        let needs_fetch = !entries_by_date.contains_key(&current) || current >= reverify_start;
+        if !needs_fetch {
+            current = current
+                .checked_add_days(chrono::Days::new(1))
+                .expect("date increment stays in range");
+            continue;
+        }
         match fetch_nyt_entry_with_retry(
             &client,
             current,
@@ -246,15 +283,34 @@ fn sync_nyt_history_with_base_url(
     if entries.is_empty() {
         bail!("NYT history sync produced no entries");
     }
-    write_history_jsonl(&paths.raw_history, &entries)?;
+    let persisted_entries = if let Err(error) = validate_history_continuity(&entries) {
+        if paths.raw_history.exists() {
+            let existing = read_history_jsonl(&paths.raw_history)?;
+            validate_history_continuity(&existing).with_context(|| {
+                "sync could not repair every history gap and the existing archive is also non-contiguous"
+            })?;
+            existing
+        } else {
+            return Err(error).context("sync could not create a contiguous history archive");
+        }
+    } else {
+        write_history_jsonl(&paths.raw_history, &entries)?;
+        entries
+    };
 
     Ok(SyncSummary {
         fetched,
         reverified,
         changed,
-        total: entries.len(),
-        first_date: entries.first().expect("entries not empty").print_date,
-        last_date: entries.last().expect("entries not empty").print_date,
+        total: persisted_entries.len(),
+        first_date: persisted_entries
+            .first()
+            .expect("entries not empty")
+            .print_date,
+        last_date: persisted_entries
+            .last()
+            .expect("entries not empty")
+            .print_date,
         changed_dates,
         partial_sync: !failed_dates.is_empty(),
         failed_dates,
@@ -277,7 +333,11 @@ fn fetch_nyt_entry_with_retry(
                 if attempt >= retry_attempts || !is_retryable_fetch_error(&error) {
                     return Err(error);
                 }
-                let backoff = retry_backoff_millis.saturating_mul((attempt + 1) as u64);
+                let exponent = 1u64.checked_shl(attempt.min(16) as u32).unwrap_or(u64::MAX);
+                let exponential = retry_backoff_millis.saturating_mul(exponent).min(30_000);
+                let backoff = retry_after_for_error(&error)
+                    .map(|duration| duration.as_millis().min(60_000) as u64)
+                    .unwrap_or(exponential);
                 if backoff > 0 {
                     thread::sleep(Duration::from_millis(backoff));
                 }
@@ -288,6 +348,10 @@ fn fetch_nyt_entry_with_retry(
 }
 
 fn is_retryable_fetch_error(error: &anyhow::Error) -> bool {
+    if let Some(status_error) = error.downcast_ref::<HttpStatusError>() {
+        return status_error.status == StatusCode::TOO_MANY_REQUESTS
+            || status_error.status.is_server_error();
+    }
     let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() else {
         return false;
     };
@@ -303,14 +367,58 @@ fn is_retryable_fetch_error(error: &anyhow::Error) -> bool {
     }
 }
 
+fn retry_after_for_error(error: &anyhow::Error) -> Option<Duration> {
+    error
+        .downcast_ref::<HttpStatusError>()
+        .and_then(|status| status.retry_after)
+}
+
+#[derive(Debug)]
+struct HttpStatusError {
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    url: String,
+}
+
+impl fmt::Display for HttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "HTTP {} returned for {}", self.status, self.url)
+    }
+}
+
+impl Error for HttpStatusError {}
+
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    let seconds = (retry_at - Utc::now()).num_seconds().max(0) as u64;
+    Some(Duration::from_secs(seconds))
+}
+
 fn fetch_nyt_entry(client: &Client, date: NaiveDate, base_url: &str) -> Result<NytDailyEntry> {
     let url = format!("{base_url}/{}.json", date.format("%Y-%m-%d"));
-    let mut entry = client
+    let response = client
         .get(&url)
         .send()
-        .with_context(|| format!("failed to fetch {}", url))?
-        .error_for_status()
-        .with_context(|| format!("NYT returned error for {}", url))?
+        .with_context(|| format!("failed to fetch {}", url))?;
+    if !response.status().is_success() {
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after);
+        return Err(HttpStatusError {
+            status: response.status(),
+            retry_after,
+            url,
+        }
+        .into());
+    }
+    let mut entry = response
         .json::<NytDailyEntry>()
         .with_context(|| format!("failed to decode {}", url))?;
     entry.solution = normalize_word(&entry.solution);
@@ -348,13 +456,28 @@ fn read_request_path(stream: &mut std::net::TcpStream) -> Result<String> {
 
 #[cfg(test)]
 fn write_response(stream: &mut std::net::TcpStream, status: u16, body: &str) -> Result<()> {
+    write_response_with_headers(stream, status, &[], body)
+}
+
+#[cfg(test)]
+fn write_response_with_headers(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "OK",
     };
+    let extra_headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -415,7 +538,7 @@ mod date_format {
 mod tests {
     use super::{
         PriorConfig, ProjectPaths, make_test_entry, spawn_test_server,
-        sync_nyt_history_with_base_url, test_json_response,
+        sync_nyt_history_with_base_url, test_json_response, write_response_with_headers,
     };
     use chrono::NaiveDate;
     use std::{fs, path::PathBuf};
@@ -488,6 +611,112 @@ mod tests {
         assert_eq!(summary.total, 1);
         assert_eq!(summary.first_date, today);
         assert_eq!(summary.last_date, today);
+    }
+
+    #[test]
+    fn sync_retries_rate_limits_and_respects_retry_after() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let root = temp_project_root("retry-rate-limit");
+        let paths = ProjectPaths::new(&root);
+        let today = NaiveDate::from_ymd_opt(2021, 6, 19).expect("today");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let join = std::thread::spawn(move || {
+            for request in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("request");
+                if request == 0 {
+                    write_response_with_headers(&mut stream, 429, &[("Retry-After", "0")], "")
+                        .expect("429");
+                } else {
+                    write_response_with_headers(
+                        &mut stream,
+                        200,
+                        &[],
+                        &test_json_response(&make_test_entry(today, "cigar")),
+                    )
+                    .expect("200");
+                }
+            }
+        });
+        let config = PriorConfig {
+            sync_retry_attempts: 1,
+            sync_retry_backoff_millis: 10_000,
+            sync_reverify_days: 1,
+            ..PriorConfig::default()
+        };
+        let summary =
+            sync_nyt_history_with_base_url(&paths, &config, today, &format!("http://{addr}"))
+                .expect("rate-limit retry");
+        join.join().expect("server");
+        assert_eq!(summary.total, 1);
+        assert!(!summary.partial_sync);
+    }
+
+    #[test]
+    fn later_sync_repairs_a_transient_middle_date_gap() {
+        let root = temp_project_root("repair-gap");
+        let paths = ProjectPaths::new(&root);
+        paths.ensure_layout().expect("layout");
+        let first = NaiveDate::from_ymd_opt(2021, 6, 19).expect("first");
+        let middle = first
+            .checked_add_days(chrono::Days::new(1))
+            .expect("middle");
+        let last = middle.checked_add_days(chrono::Days::new(1)).expect("last");
+        super::write_history_jsonl(&paths.raw_history, &[make_test_entry(first, "cigar")])
+            .expect("seed");
+        let config = PriorConfig {
+            sync_retry_attempts: 0,
+            sync_retry_backoff_millis: 0,
+            sync_reverify_days: 1,
+            ..PriorConfig::default()
+        };
+
+        let (first_url, first_join) = spawn_test_server(3, move |path, _| {
+            let date = path
+                .rsplit('/')
+                .next()
+                .expect("segment")
+                .trim_end_matches(".json");
+            let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("date");
+            if date == middle {
+                (500, String::new())
+            } else {
+                (200, test_json_response(&make_test_entry(date, "cigar")))
+            }
+        });
+        let partial = sync_nyt_history_with_base_url(&paths, &config, last, &first_url)
+            .expect("partial sync");
+        first_join.join().expect("server");
+        assert!(partial.partial_sync);
+        assert_eq!(
+            super::read_history_jsonl(&paths.raw_history)
+                .expect("old")
+                .len(),
+            1
+        );
+
+        let (second_url, second_join) = spawn_test_server(3, move |path, _| {
+            let date = path
+                .rsplit('/')
+                .next()
+                .expect("segment")
+                .trim_end_matches(".json");
+            let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("date");
+            (200, test_json_response(&make_test_entry(date, "rebut")))
+        });
+        let repaired = sync_nyt_history_with_base_url(&paths, &config, last, &second_url)
+            .expect("repair sync");
+        second_join.join().expect("server");
+        assert!(!repaired.partial_sync);
+        let history = super::read_history_jsonl(&paths.raw_history).expect("history");
+        assert_eq!(history.len(), 3);
+        super::validate_history_continuity(&history).expect("contiguous");
     }
 
     #[test]

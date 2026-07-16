@@ -1,12 +1,10 @@
-use std::{
-    fs::{self, File},
-    io::{Read, Write},
-};
+use std::{fs::File, io::Read};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 use crate::{
+    atomic_file::atomic_write,
     model::AnswerRecord,
     scoring::{PATTERN_SPACE, score_guess},
 };
@@ -121,10 +119,6 @@ impl PatternTable {
     }
 
     fn persist(&self, path: &std::path::Path, guesses: &[String], answers: &[&str]) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
         let mut bytes = Vec::with_capacity(HEADER_SIZE + self.data.len());
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&(self.guess_count as u32).to_le_bytes());
@@ -133,11 +127,7 @@ impl PatternTable {
         bytes.extend_from_slice(&hash_word_list(answers.iter().copied()).to_le_bytes());
         bytes.extend_from_slice(&self.data);
 
-        let mut file =
-            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-        file.write_all(&bytes)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
+        atomic_write(path, &bytes)
     }
 }
 

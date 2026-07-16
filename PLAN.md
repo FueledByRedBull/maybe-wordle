@@ -1,5 +1,9 @@
 # Maybe Wordle Implementation Plan
 
+> Status: historical planning notes. The current user-facing behavior, commands, and artifact layout are documented in `README.md`; this file preserves the original implementation rationale and may describe phases that are already complete or superseded.
+>
+> The 2026-07-17 correctness and reproducibility implementation pass is recorded in `TODO.md`. It added contiguous-history enforcement and repair, atomic artifact persistence, leakage-free date support, full predictive manifests, explicit mixed-support recovery, rolling train/validation/test evaluation, independent formal verification, and removal of unsafe refinement pruning.
+
 ## Goal
 
 Build a Wordle solver that remains strong after the New York Times started reusing past answers in February 2026.

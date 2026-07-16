@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    fs::File,
-};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -9,8 +6,12 @@ use csv::Writer;
 use serde::Serialize;
 
 use crate::{
+    atomic_file::atomic_write,
     config::PriorConfig,
-    data::{NytDailyEntry, ProjectPaths, normalize_word, read_history_jsonl, read_word_list},
+    data::{
+        NytDailyEntry, ProjectPaths, normalize_word, read_history_jsonl, read_word_list,
+        validate_history_continuity,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +122,9 @@ pub fn load_model_with_variant(
         .with_context(|| format!("failed to load {}", paths.manual_additions.display()))?;
     let history = read_history_jsonl(&paths.raw_history)
         .with_context(|| format!("failed to load {}", paths.raw_history.display()))?;
+    if !config.allow_history_gaps {
+        validate_history_continuity(&history)?;
+    }
 
     let seed_lookup = seed_answers.iter().cloned().collect::<HashSet<_>>();
     let manual_keys = config
@@ -226,7 +230,7 @@ pub fn weight_snapshot_for_mode(
     let first_seen = seen_dates.first().copied();
     let last_seen = seen_dates.last().copied();
     let seen_count = seen_dates.len();
-    let eligible = record.in_seed || record.manual_entry || !record.history_dates.is_empty();
+    let eligible = record.in_seed || record.manual_entry || !seen_dates.is_empty();
 
     let (base_weight, recency_weight, final_weight) = match mode {
         WeightMode::Uniform => {
@@ -236,7 +240,7 @@ pub fn weight_snapshot_for_mode(
         WeightMode::CooldownOnly => {
             let base_weight = if record.in_seed || record.manual_entry {
                 config.base_seed_weight
-            } else if !record.history_dates.is_empty() {
+            } else if !seen_dates.is_empty() {
                 config.base_history_only_weight
             } else {
                 0.0
@@ -257,7 +261,7 @@ pub fn weight_snapshot_for_mode(
         WeightMode::Weighted => {
             let base_weight = if record.in_seed || record.manual_entry {
                 config.base_seed_weight
-            } else if !record.history_dates.is_empty() {
+            } else if !seen_dates.is_empty() {
                 config.base_history_only_weight
             } else {
                 0.0
@@ -342,18 +346,15 @@ fn build_modeled_rows(
 }
 
 fn write_csv<T: Serialize>(path: &std::path::Path, rows: &[T]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-    let mut writer = Writer::from_writer(file);
+    let mut writer = Writer::from_writer(Vec::new());
     for row in rows {
         writer.serialize(row).context("failed to write csv row")?;
     }
     writer.flush().context("failed to flush csv writer")?;
-    Ok(())
+    let bytes = writer
+        .into_inner()
+        .context("failed to finalize csv writer")?;
+    atomic_write(path, &bytes)
 }
 
 #[derive(Clone, Debug)]
@@ -397,7 +398,10 @@ mod tests {
 
     use crate::config::PriorConfig;
 
-    use super::{AnswerRecord, ModelVariant, load_model_with_variant, weight_snapshot};
+    use super::{
+        AnswerRecord, ModelVariant, WeightMode, load_model_with_variant, weight_snapshot,
+        weight_snapshot_for_mode,
+    };
 
     #[test]
     fn weight_snapshot_uses_cooldown_and_seed_defaults() {
@@ -418,6 +422,28 @@ mod tests {
         assert_eq!(snapshot.base_weight, config.base_seed_weight);
         assert!(snapshot.recency_weight > config.cooldown_floor);
         assert!(snapshot.final_weight > 0.0);
+    }
+
+    #[test]
+    fn future_history_only_answer_is_not_eligible_before_first_seen() {
+        let as_of = NaiveDate::from_ymd_opt(2024, 2, 1).expect("date");
+        let record = AnswerRecord {
+            word: "cigar".to_string(),
+            in_seed: false,
+            manual_entry: false,
+            manual_weight: 1.0,
+            history_dates: vec![NaiveDate::from_ymd_opt(2024, 3, 1).expect("future")],
+        };
+        for mode in [
+            WeightMode::Weighted,
+            WeightMode::Uniform,
+            WeightMode::CooldownOnly,
+        ] {
+            let snapshot = weight_snapshot_for_mode(&record, &PriorConfig::default(), as_of, mode);
+            assert_eq!(snapshot.seen_count, 0);
+            assert_eq!(snapshot.base_weight, 0.0);
+            assert_eq!(snapshot.final_weight, 0.0);
+        }
     }
 
     #[test]

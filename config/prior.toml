@@ -1,7 +1,8 @@
 base_seed_weight = 0.75
 base_history_only_weight = 0.50
 cooldown_days = 365
-cooldown_floor = 0.00
+cooldown_floor = 0.01
+allow_history_gaps = false
 midpoint_days = 1080.0
 logistic_k = 0.020
 exact_threshold = 64

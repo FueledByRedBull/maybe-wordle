@@ -12,8 +12,7 @@ impl Solver {
         let mut modeled_weights = vec![0.0; self.answers.len()];
         let mut recovery_weights = vec![0.0; self.answers.len()];
         let mut weights = vec![0.0; self.answers.len()];
-        let mut positive_survivors = Vec::new();
-        let mut recovery_survivors = Vec::new();
+        let mut supported_survivors = Vec::new();
         let mut modeled_total_weight = 0.0;
         let mut total_weight = 0.0;
 
@@ -21,41 +20,39 @@ impl Solver {
             let snapshot = weight_snapshot_for_mode(answer, &self.config, as_of, self.mode);
             let modeled_weight = snapshot.final_weight.max(0.0);
             if snapshot.base_weight > 0.0 {
+                supported_survivors.push(index);
                 recovery_weights[index] = snapshot.base_weight * snapshot.manual_weight;
                 modeled_weights[index] = modeled_weight;
                 if modeled_weight > 0.0 {
                     modeled_total_weight += modeled_weight;
                     total_weight += modeled_weight;
                     weights[index] = modeled_weight;
-                    positive_survivors.push(index);
-                } else {
-                    recovery_survivors.push(index);
                 }
             }
         }
 
         let (surviving, recovery_mode_used) = if modeled_total_weight > 0.0 {
-            (positive_survivors, None)
+            (supported_survivors, None)
         } else {
-            let support_count = recovery_survivors.len();
+            let support_count = supported_survivors.len();
             match self.config.recovery.mode {
                 RecoveryMode::Strict => {
-                    for index in &recovery_survivors {
+                    for index in &supported_survivors {
                         weights[*index] = 0.0;
                     }
                     total_weight = 0.0;
-                    (recovery_survivors, None)
+                    (supported_survivors, None)
                 }
                 mode => {
-                    for index in &recovery_survivors {
+                    for index in &supported_survivors {
                         weights[*index] =
                             recovery_policy.repair_weight(recovery_weights[*index], support_count);
                     }
-                    total_weight = recovery_survivors
+                    total_weight = supported_survivors
                         .iter()
                         .map(|index| weights[*index])
                         .sum::<f64>();
-                    (recovery_survivors, Some(mode))
+                    (supported_survivors, Some(mode))
                 }
             }
         };
@@ -197,6 +194,9 @@ impl Solver {
             )?
         };
 
+        let identity = self.predictive_book_identity(request.as_of);
+        let (history_snapshot_date, history_snapshot_hash) =
+            self.predictive_history_snapshot(request.as_of);
         Ok(PredictiveSuggestResponse {
             state: PredictiveStateSummary {
                 surviving: state.surviving.len(),
@@ -210,6 +210,10 @@ impl Solver {
             artifact_state: PredictiveArtifactState::from_promotion_source(
                 suggestions.promotion_source,
             ),
+            model_version: identity.policy_id,
+            model_manifest_hash: identity.model_manifest_hash,
+            history_snapshot_date,
+            history_snapshot_hash,
         })
     }
 

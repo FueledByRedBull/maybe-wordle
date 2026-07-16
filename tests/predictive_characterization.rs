@@ -122,8 +122,10 @@ fn fixture_paths(label: &str) -> ProjectPaths {
 fn predictive_api_uses_exact_date_opener_artifact_in_fast_mode() {
     let paths = fixture_paths("exact-artifact");
     write_standard_fixture(&paths);
-    let mut config = PriorConfig::default();
-    config.session_window_days = 1;
+    let config = PriorConfig {
+        session_window_days: 1,
+        ..PriorConfig::default()
+    };
     let solver = Solver::from_paths(&paths, &config).expect("solver");
     let as_of = NaiveDate::from_ymd_opt(2024, 1, 4).expect("date");
 
@@ -153,8 +155,10 @@ fn predictive_api_uses_exact_date_opener_artifact_in_fast_mode() {
 fn predictive_api_uses_recent_opener_artifact_when_exact_date_is_missing() {
     let paths = fixture_paths("recent-artifact");
     write_standard_fixture(&paths);
-    let mut config = PriorConfig::default();
-    config.session_window_days = 1;
+    let config = PriorConfig {
+        session_window_days: 1,
+        ..PriorConfig::default()
+    };
     let solver = Solver::from_paths(&paths, &config).expect("solver");
     let artifact_date = NaiveDate::from_ymd_opt(2024, 1, 4).expect("date");
     let request_date = NaiveDate::from_ymd_opt(2024, 1, 5).expect("date");
@@ -185,8 +189,10 @@ fn predictive_api_uses_recent_opener_artifact_when_exact_date_is_missing() {
 fn predictive_api_distinguishes_full_and_disk_only_session_fallbacks() {
     let paths = fixture_paths("session-fallback");
     write_standard_fixture(&paths);
-    let mut config = PriorConfig::default();
-    config.session_window_days = 1;
+    let config = PriorConfig {
+        session_window_days: 1,
+        ..PriorConfig::default()
+    };
     let solver = Solver::from_paths(&paths, &config).expect("solver");
     let as_of = NaiveDate::from_ymd_opt(2024, 1, 4).expect("date");
 
@@ -226,8 +232,11 @@ fn recovery_modes_are_explicit_in_predictive_api() {
     write_zero_mass_fixture(&paths);
     let as_of = NaiveDate::from_ymd_opt(2024, 1, 4).expect("date");
 
-    let mut epsilon_config = PriorConfig::default();
-    epsilon_config.session_window_days = 1;
+    let mut epsilon_config = PriorConfig {
+        session_window_days: 1,
+        cooldown_floor: 0.0,
+        ..PriorConfig::default()
+    };
     epsilon_config.recovery.mode = RecoveryMode::EpsilonRepair;
     let epsilon_solver = Solver::from_paths(&paths, &epsilon_config).expect("solver");
     let epsilon = epsilon_solver
@@ -245,8 +254,11 @@ fn recovery_modes_are_explicit_in_predictive_api() {
         Some(RecoveryMode::EpsilonRepair)
     );
 
-    let mut strict_config = PriorConfig::default();
-    strict_config.session_window_days = 1;
+    let mut strict_config = PriorConfig {
+        session_window_days: 1,
+        cooldown_floor: 0.0,
+        ..PriorConfig::default()
+    };
     strict_config.recovery.mode = RecoveryMode::Strict;
     let strict_solver = Solver::from_paths(&paths, &strict_config).expect("solver");
     let error = strict_solver

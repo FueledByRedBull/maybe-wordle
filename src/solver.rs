@@ -34,6 +34,7 @@ use crate::{
     small_state::SmallStateTable,
 };
 
+mod artifact_identity;
 mod books;
 mod eval;
 mod ranking;
@@ -179,6 +180,8 @@ pub struct BacktestStats {
     pub max_guesses: usize,
     pub failures: usize,
     pub coverage_gaps: usize,
+    pub average_guesses_ci95: (f64, f64),
+    pub failure_rate_ci95: (f64, f64),
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +247,8 @@ pub struct TunePriorSummary {
     pub search_window_end: NaiveDate,
     pub validation_window_start: NaiveDate,
     pub validation_window_end: NaiveDate,
+    pub test_window_start: NaiveDate,
+    pub test_window_end: NaiveDate,
     pub current: TuningEvaluation,
     pub best: TuningEvaluation,
     pub replacement_toml: String,
@@ -351,6 +356,8 @@ pub struct PredictiveReplyBuildSummary {
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 struct PredictiveBookIdentity {
+    manifest_version: u32,
+    model_manifest_hash: String,
     policy_id: String,
     mode: String,
     variant: String,
@@ -844,6 +851,7 @@ mod tests {
         data::NytDailyEntry,
         model::{AnswerRecord, ModelVariant, WeightMode},
         pattern_table::PatternTable,
+        predictive::RecoveryMode,
         scoring::{format_feedback_letters, score_guess},
         small_state::SmallStateTable,
     };
@@ -1162,6 +1170,90 @@ mod tests {
         assert!(state.total_weight > 0.0);
         assert!(state.weights[0] > 0.0);
         assert!(state.weights[0] < 0.001);
+    }
+
+    #[test]
+    fn mixed_support_feedback_can_recover_a_zero_mass_candidate() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 3, 10).expect("date");
+        let mut solver = test_solver(&["cigar", "rebut"]);
+        solver.mode = WeightMode::Weighted;
+        solver.config.cooldown_floor = 0.0;
+        solver.config.cooldown_days = 365;
+        solver.answers[0].history_dates = vec![as_of];
+
+        let initial = solver.initial_state(as_of);
+        assert_eq!(initial.surviving.len(), 2);
+        assert!(initial.modeled_weights[0] == 0.0);
+        assert!(initial.modeled_weights[1] > 0.0);
+
+        let mut repaired = initial.clone();
+        solver
+            .apply_feedback(&mut repaired, "cigar", score_guess("cigar", "cigar"))
+            .expect("epsilon repair");
+        assert_eq!(repaired.surviving, vec![0]);
+        assert_eq!(
+            repaired.recovery_mode_used,
+            Some(RecoveryMode::EpsilonRepair)
+        );
+        assert!(repaired.total_weight > 0.0);
+
+        solver.config.recovery.mode = RecoveryMode::UniformOverSupport;
+        let mut uniform = initial.clone();
+        solver
+            .apply_feedback(&mut uniform, "cigar", score_guess("cigar", "cigar"))
+            .expect("uniform repair");
+        assert_eq!(
+            uniform.recovery_mode_used,
+            Some(RecoveryMode::UniformOverSupport)
+        );
+
+        solver.config.recovery.mode = RecoveryMode::Strict;
+        let mut strict = initial;
+        assert!(
+            solver
+                .apply_feedback(&mut strict, "cigar", score_guess("cigar", "cigar"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn predictive_manifest_changes_for_same_count_inputs_and_history_mutations() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 3, 10).expect("date");
+        let base = test_solver(&["cigar", "rebut", "sissy"]);
+        let base_identity = base.predictive_book_identity(as_of);
+
+        let mut changed_guess = base.clone();
+        changed_guess.guesses[0] = "humph".to_string();
+        assert_ne!(
+            base_identity.model_manifest_hash,
+            changed_guess
+                .predictive_book_identity(as_of)
+                .model_manifest_hash
+        );
+
+        let mut changed_answer = base.clone();
+        changed_answer.answers[0].word = "humph".to_string();
+        assert_ne!(
+            base_identity.model_manifest_hash,
+            changed_answer
+                .predictive_book_identity(as_of)
+                .model_manifest_hash
+        );
+
+        let mut changed_history = base;
+        changed_history.history_dates.push(NytDailyEntry {
+            id: Some(99),
+            solution: "cigar".to_string(),
+            print_date: as_of,
+            days_since_launch: Some(99),
+            editor: Some("fixture".to_string()),
+        });
+        assert_ne!(
+            base_identity.model_manifest_hash,
+            changed_history
+                .predictive_book_identity(as_of)
+                .model_manifest_hash
+        );
     }
 
     #[test]

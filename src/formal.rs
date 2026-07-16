@@ -3,7 +3,7 @@ use std::{
     env,
     fs::{self, File},
     hash::{Hash, Hasher},
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -13,6 +13,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    atomic_file::atomic_write,
     data::{ProjectPaths, read_word_list},
     model::AnswerRecord,
     pattern_table::{PatternTable, hash_bytes, hash_word_list},
@@ -36,10 +37,8 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const OBJECTIVE_VERSION: u32 = 2;
 const STATE_FORMAT_VERSION: u32 = 2;
 const AUX_TABLE_VERSION: u32 = 2;
-const CERTIFICATE_FORMAT_VERSION: u32 = 3;
+const CERTIFICATE_FORMAT_VERSION: u32 = 4;
 const SMALL_STATE_LIMIT: usize = 12;
-const ROOT_REFINEMENT_LIMIT: usize = 256;
-const LOCAL_REFINEMENT_LIMIT: usize = 40;
 
 type AnswerId = u16;
 const INLINE_STATE_THRESHOLD: usize = 30;
@@ -403,7 +402,6 @@ struct HotTtEntry {
 #[derive(Clone, Debug)]
 struct IndependentExactSolver<'a> {
     model: &'a FormalModel,
-    seed_cache: Option<&'a HashMap<StateKey, StoredState>>,
     local_memo: HashMap<StateKey, StoredState>,
     scratch: PartitionScratch,
 }
@@ -485,10 +483,9 @@ fn compare_hot_tt_entry(left: &HotTtEntry, right: &HotTtEntry) -> std::cmp::Orde
 }
 
 impl<'a> IndependentExactSolver<'a> {
-    fn new(model: &'a FormalModel, seed_cache: Option<&'a HashMap<StateKey, StoredState>>) -> Self {
+    fn new(model: &'a FormalModel) -> Self {
         Self {
             model,
-            seed_cache,
             local_memo: HashMap::new(),
             scratch: PartitionScratch::default(),
         }
@@ -497,9 +494,6 @@ impl<'a> IndependentExactSolver<'a> {
     fn solve(&mut self, state: &StateKey) -> Result<StoredState> {
         if let Some(existing) = self.local_memo.get(state) {
             return Ok(existing.clone());
-        }
-        if let Some(existing) = self.seed_cache.and_then(|cache| cache.get(state)).cloned() {
-            return Ok(existing);
         }
         if state.count() == 1 {
             let stored = singleton_state_for_model(self.model, state)?;
@@ -1031,7 +1025,7 @@ impl FormalPolicyRuntime {
     }
 
     fn solve_state_independent(&self, state: &StateKey) -> Result<StoredState> {
-        IndependentExactSolver::new(&self.model, Some(&self.policy)).solve(state)
+        IndependentExactSolver::new(&self.model).solve(state)
     }
 
     fn build_guess_evaluation(
@@ -1315,7 +1309,7 @@ impl FormalPolicyBuilder {
     }
 
     fn solve_small_state_exact(&mut self, state: &StateKey) -> Result<StoredState> {
-        IndependentExactSolver::new(&self.model, Some(&self.memo)).solve(state)
+        IndependentExactSolver::new(&self.model).solve(state)
     }
 
     fn materialize_policy_reachable_states(&mut self, root: &StateKey) -> Result<()> {
@@ -1328,10 +1322,35 @@ impl FormalPolicyBuilder {
             self.maybe_report_progress("materialization");
             let stored = self.solve_state(&state)?;
             self.memo.insert(state.clone(), stored.clone());
-            self.certificate_states
-                .entry(state.clone())
-                .or_insert_with(|| trivial_certificate_state(&state, &stored));
             let buckets = self.partition_guess(&state, stored.best_guess)?;
+            if !self.certificate_states.contains_key(&state) {
+                let mut children = Vec::new();
+                for bucket in &buckets {
+                    if bucket.pattern == ALL_GREEN_PATTERN {
+                        continue;
+                    }
+                    let child = self.solve_state(&bucket.state)?;
+                    children.push(CertificateChild {
+                        pattern: bucket.pattern,
+                        state: bucket.state.clone(),
+                        objective: child.objective,
+                        mass: bucket.mass,
+                    });
+                }
+                self.certificate_states.insert(
+                    state.clone(),
+                    CertificateState {
+                        state: state.clone(),
+                        best_guess: stored.best_guess,
+                        best_objective: stored.objective.clone(),
+                        candidates: vec![CertificateCandidate {
+                            guess_index: stored.best_guess,
+                            objective: stored.objective.clone(),
+                            children,
+                        }],
+                    },
+                );
+            }
             for bucket in buckets {
                 if bucket.pattern != ALL_GREEN_PATTERN {
                     frontier.push(bucket.state);
@@ -1423,20 +1442,10 @@ impl FormalPolicyBuilder {
                     self.model.guesses[left.guess_index].cmp(&self.model.guesses[right.guess_index])
                 })
         });
-        let (pruned, pruned_count) = prune_refined_guesses(
-            &plans,
-            if state.count() == self.model.answers.len() {
-                ROOT_REFINEMENT_LIMIT
-            } else {
-                LOCAL_REFINEMENT_LIMIT
-            },
-        );
-        if state.count() == self.model.answers.len() {
-            self.root_refinement_pruned += pruned_count as u64;
-        } else {
-            self.local_refinement_pruned += pruned_count as u64;
-        }
-        Ok(pruned)
+        // Refinement pruning was intentionally removed. The previous subset direction could
+        // discard the more informative partition, which is unsafe for both expected cost and
+        // lexicographic worst-case/expected objectives.
+        Ok(plans)
     }
 
     fn partition_guess(
@@ -1767,29 +1776,19 @@ fn persist_policy(
     let artifacts = PolicyArtifactSet::for_model(paths, &model.manifest.model_id);
     fs::create_dir_all(&artifacts.model_dir)
         .with_context(|| format!("failed to create {}", artifacts.model_dir.display()))?;
-    serde_json::to_writer_pretty(
-        BufWriter::new(
-            File::create(&artifacts.manifest)
-                .with_context(|| format!("failed to create {}", artifacts.manifest.display()))?,
-        ),
-        &model.manifest,
-    )
-    .with_context(|| format!("failed to write {}", artifacts.manifest.display()))?;
-    serde_json::to_writer_pretty(
-        BufWriter::new(
-            File::create(&artifacts.metadata)
-                .with_context(|| format!("failed to create {}", artifacts.metadata.display()))?,
-        ),
-        metadata,
-    )
-    .with_context(|| format!("failed to write {}", artifacts.metadata.display()))?;
-    serde_json::to_writer_pretty(
-        BufWriter::new(File::create(&artifacts.small_state_table).with_context(|| {
-            format!("failed to create {}", artifacts.small_state_table.display())
-        })?),
-        &model.small_state_table,
-    )
-    .with_context(|| format!("failed to write {}", artifacts.small_state_table.display()))?;
+    atomic_write(
+        &artifacts.manifest,
+        &serde_json::to_vec_pretty(&model.manifest).context("serialize formal manifest")?,
+    )?;
+    atomic_write(
+        &artifacts.metadata,
+        &serde_json::to_vec_pretty(metadata).context("serialize proof metadata")?,
+    )?;
+    atomic_write(
+        &artifacts.small_state_table,
+        &serde_json::to_vec_pretty(&model.small_state_table)
+            .context("serialize small-state table")?,
+    )?;
     let mut certificate_entries = certificate_states.iter().collect::<Vec<_>>();
     certificate_entries.sort_by(|(left_key, _), (right_key, _)| {
         left_key
@@ -1846,14 +1845,10 @@ fn persist_policy(
             })
             .collect(),
     };
-    serde_json::to_writer_pretty(
-        BufWriter::new(
-            File::create(&artifacts.certificate)
-                .with_context(|| format!("failed to create {}", artifacts.certificate.display()))?,
-        ),
-        &certificate,
-    )
-    .with_context(|| format!("failed to write {}", artifacts.certificate.display()))?;
+    atomic_write(
+        &artifacts.certificate,
+        &serde_json::to_vec_pretty(&certificate).context("serialize proof certificate")?,
+    )?;
 
     write_values(&artifacts.values, model, &entries)?;
     write_policy(&artifacts.policy, model, &entries)?;
@@ -1865,9 +1860,7 @@ fn write_values(
     model: &FormalModel,
     entries: &[(&StateKey, &StoredState)],
 ) -> Result<()> {
-    let mut writer = BufWriter::new(
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
-    );
+    let mut writer = Vec::new();
     writer.write_all(VALUES_MAGIC)?;
     writer.write_all(&model.manifest.manifest_hash.to_le_bytes())?;
     writer.write_all(&(entries.len() as u64).to_le_bytes())?;
@@ -1878,10 +1871,7 @@ fn write_values(
         writer.write_all(&[stored.objective.worst_case_depth])?;
         writer.write_all(&stored.objective.expected_guesses.to_le_bytes())?;
     }
-    writer
-        .flush()
-        .with_context(|| format!("failed to flush {}", path.display()))?;
-    Ok(())
+    atomic_write(path, &writer)
 }
 
 fn write_policy(
@@ -1889,9 +1879,7 @@ fn write_policy(
     model: &FormalModel,
     entries: &[(&StateKey, &StoredState)],
 ) -> Result<()> {
-    let mut writer = BufWriter::new(
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
-    );
+    let mut writer = Vec::new();
     writer.write_all(POLICY_MAGIC)?;
     writer.write_all(&model.manifest.manifest_hash.to_le_bytes())?;
     writer.write_all(&(entries.len() as u64).to_le_bytes())?;
@@ -1901,10 +1889,7 @@ fn write_policy(
         state.write_tagged(&mut writer, model.answers.len())?;
         writer.write_all(&(stored.best_guess as u32).to_le_bytes())?;
     }
-    writer
-        .flush()
-        .with_context(|| format!("failed to flush {}", path.display()))?;
-    Ok(())
+    atomic_write(path, &writer)
 }
 
 fn read_values(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, PolicyObjective>> {
@@ -2037,11 +2022,25 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
             certificate.states.len()
         );
     }
+    if certificate.state_count != runtime.policy.len()
+        || runtime.ordered_states.len() != runtime.policy.len()
+    {
+        bail!(
+            "proof certificate does not cover the complete persisted policy: certificate={} policy={}",
+            certificate.state_count,
+            runtime.policy.len()
+        );
+    }
+    let mut covered_state_ids = vec![false; runtime.ordered_states.len()];
+    let mut independent = IndependentExactSolver::new(&runtime.model);
     for state in &certificate.states {
         let key = runtime
             .ordered_states
             .get(state.state_id as usize)
             .ok_or_else(|| anyhow!("certificate state id {} out of range", state.state_id))?;
+        if std::mem::replace(&mut covered_state_ids[state.state_id as usize], true) {
+            bail!("certificate repeats state id {}", state.state_id);
+        }
         if runtime.state_ids.get(key).copied() != Some(state.state_id) {
             bail!(
                 "runtime state row mapping mismatch for state {}",
@@ -2069,12 +2068,38 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
         }
         let mut saw_best = false;
         for candidate in &state.candidates {
+            if candidate.guess_index >= runtime.model.guesses.len() {
+                bail!("certificate guess index is out of range");
+            }
             if candidate.guess_index == state.best_guess
                 && same_objective(&candidate.objective, &state.best_objective)
             {
                 saw_best = true;
             }
             let mut seen_patterns = [false; PATTERN_SPACE];
+            let mut scratch = PartitionScratch::default();
+            let actual_buckets = partition_guess_with_scratch(
+                runtime.model.answers.len(),
+                key,
+                candidate.guess_index,
+                &runtime.model.pattern_table,
+                &runtime.model.prior,
+                &runtime.model.zobrist,
+                &mut scratch,
+            )?;
+            let actual_children = actual_buckets
+                .iter()
+                .filter(|bucket| bucket.pattern != ALL_GREEN_PATTERN)
+                .collect::<Vec<_>>();
+            if actual_children.len() != candidate.children.len() {
+                bail!(
+                    "certificate child coverage mismatch for state {} guess {}: expected {}, found {}",
+                    state.state_id,
+                    candidate.guess_index,
+                    actual_children.len(),
+                    candidate.children.len()
+                );
+            }
             let mut recomputed = PolicyObjective {
                 worst_case_depth: 1,
                 expected_guesses: 1.0,
@@ -2114,6 +2139,24 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
                         child.child_state_id
                     )
                 })?;
+                let actual = actual_children
+                    .iter()
+                    .find(|bucket| bucket.pattern == child.pattern)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "certificate pattern {} is not produced by state {} guess {}",
+                            child.pattern,
+                            state.state_id,
+                            candidate.guess_index
+                        )
+                    })?;
+                if actual.state != *child_key || (actual.mass - child.mass).abs() > 1e-12 {
+                    bail!(
+                        "certificate child state or mass mismatch for state {} pattern {}",
+                        state.state_id,
+                        child.pattern
+                    );
+                }
                 if !same_objective(&child_stored.objective, &child.objective) {
                     bail!("certificate child objective mismatch");
                 }
@@ -2148,6 +2191,16 @@ fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertific
                 state.state_id
             );
         }
+        let independently_solved = independent.solve(key)?;
+        if !same_decision(&independently_solved, stored) {
+            bail!(
+                "independent certificate verification failed for state {}",
+                state.state_id
+            );
+        }
+    }
+    if covered_state_ids.iter().any(|covered| !covered) {
+        bail!("proof certificate is missing one or more persisted policy states");
     }
     Ok(())
 }
@@ -2473,50 +2526,7 @@ fn singleton_state_for_model(model: &FormalModel, state: &StateKey) -> Result<St
     })
 }
 
-fn trivial_certificate_state(state: &StateKey, stored: &StoredState) -> CertificateState {
-    CertificateState {
-        state: state.clone(),
-        best_guess: stored.best_guess,
-        best_objective: stored.objective.clone(),
-        candidates: vec![CertificateCandidate {
-            guess_index: stored.best_guess,
-            objective: stored.objective.clone(),
-            children: Vec::new(),
-        }],
-    }
-}
-
-fn prune_refined_guesses(
-    plans: &[GuessQuickPlan],
-    threshold: usize,
-) -> (Vec<GuessQuickPlan>, usize) {
-    if plans.len() > threshold {
-        return (plans.to_vec(), 0);
-    }
-    let mut kept = Vec::with_capacity(plans.len());
-    let mut pruned = 0usize;
-    'candidate: for plan in plans {
-        for retained in &kept {
-            if plan_refined_by(plan, retained) {
-                pruned += 1;
-                continue 'candidate;
-            }
-        }
-        kept.push(plan.clone());
-    }
-    (kept, pruned)
-}
-
-fn plan_refined_by(candidate: &GuessQuickPlan, retained: &GuessQuickPlan) -> bool {
-    candidate.buckets.iter().all(|candidate_bucket| {
-        retained.buckets.iter().any(|retained_bucket| {
-            candidate_bucket.count <= retained_bucket.count
-                && candidate_bucket.state == retained_bucket.state
-                || state_is_subset_of(&candidate_bucket.state, &retained_bucket.state)
-        })
-    })
-}
-
+#[cfg(test)]
 fn state_is_subset_of(left: &StateKey, right: &StateKey) -> bool {
     if left.count() > right.count() {
         return false;
@@ -2886,6 +2896,66 @@ mod tests {
     }
 
     #[test]
+    fn certificate_verification_rejects_missing_or_tampered_structure() {
+        let root = std::env::temp_dir().join("maybe-wordle-formal-certificate-structure");
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = ProjectPaths::new(&root);
+        paths.ensure_layout().expect("layout");
+        let artifacts = PolicyArtifactSet::for_model(&paths, DEFAULT_FORMAL_MODEL_ID);
+        std::fs::create_dir_all(&artifacts.model_dir).expect("formal dir");
+        write_fixture(&paths.seed_guesses, "cigar\nrebut\nsissy\nhumph\n");
+        write_fixture(&paths.seed_answers, "cigar\nrebut\nsissy\n");
+        write_fixture(&artifacts.prior_spec, "kind = \"uniform\"\n");
+        build_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).expect("policy");
+        let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("load");
+        let certificate =
+            read_proof_certificate(&paths, DEFAULT_FORMAL_MODEL_ID).expect("certificate");
+        verify_certificate(&runtime, &certificate).expect("baseline certificate");
+
+        let mut missing = certificate.clone();
+        missing.states.pop();
+        assert!(verify_certificate(&runtime, &missing).is_err());
+
+        let state_with_child = certificate
+            .states
+            .iter()
+            .position(|state| {
+                state
+                    .candidates
+                    .iter()
+                    .any(|candidate| !candidate.children.is_empty())
+            })
+            .expect("child state");
+        let candidate_with_child = certificate.states[state_with_child]
+            .candidates
+            .iter()
+            .position(|candidate| !candidate.children.is_empty())
+            .expect("candidate");
+
+        let mut wrong_pattern = certificate.clone();
+        wrong_pattern.states[state_with_child].candidates[candidate_with_child].children[0]
+            .pattern = ALL_GREEN_PATTERN;
+        assert!(verify_certificate(&runtime, &wrong_pattern).is_err());
+
+        let mut wrong_child = certificate.clone();
+        let child =
+            &mut wrong_child.states[state_with_child].candidates[candidate_with_child].children[0];
+        child.child_state_id = ((child.child_state_id as usize + 1) % runtime.policy.len()) as u32;
+        assert!(verify_certificate(&runtime, &wrong_child).is_err());
+
+        let mut wrong_mass = certificate.clone();
+        wrong_mass.states[state_with_child].candidates[candidate_with_child].children[0].mass +=
+            0.125;
+        assert!(verify_certificate(&runtime, &wrong_mass).is_err());
+
+        let mut wrong_decision = certificate;
+        wrong_decision.states[0].best_guess =
+            (wrong_decision.states[0].best_guess + 1) % runtime.model.guesses.len();
+        assert!(verify_certificate(&runtime, &wrong_decision).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn hot_tt_comparator_evicts_shallow_states_before_deeper_ones() {
         let answer_count = 96;
         let zobrist = build_zobrist_tokens(answer_count);
@@ -2938,6 +3008,62 @@ mod tests {
             .expect("independent");
         assert!(same_decision(&exact, &independent));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn randomized_states_in_13_to_40_answer_universes_match_exhaustive_reference() {
+        let words = "cigar rebut sissy humph awake blush focal evade naval serve heath dwarf model karma stink grade quiet bench abate feign major death fresh crust stool colon abase marry react batty pride floss helix croak staff paper unfed whelp trawl outdo adobe";
+        let words = words.split_whitespace().collect::<Vec<_>>();
+        for answer_count in [13usize, 24, 40] {
+            let root =
+                std::env::temp_dir().join(format!("maybe-wordle-formal-randomized-{answer_count}"));
+            let _ = std::fs::remove_dir_all(&root);
+            let paths = ProjectPaths::new(&root);
+            paths.ensure_layout().expect("layout");
+            let artifacts = PolicyArtifactSet::for_model(&paths, DEFAULT_FORMAL_MODEL_ID);
+            std::fs::create_dir_all(&artifacts.model_dir).expect("formal dir");
+            write_fixture(&paths.seed_guesses, &format!("{}\n", words.join("\n")));
+            write_fixture(
+                &paths.seed_answers,
+                &format!("{}\n", words[..answer_count].join("\n")),
+            );
+            write_fixture(&artifacts.prior_spec, "kind = \"uniform\"\n");
+            let model = FormalModel::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("model");
+            let mut seed = answer_count as u64 * 0x9e37_79b9;
+            let mut indices = HashSet::new();
+            while indices.len() < 6 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                indices.insert((seed as usize) % answer_count);
+            }
+            let state = StateKey::from_indices_with_tokens(
+                answer_count,
+                indices.into_iter(),
+                &model.zobrist,
+            );
+            let started = Instant::now();
+            let mut builder = FormalPolicyBuilder {
+                model,
+                memo: HashMap::new(),
+                certificate_states: HashMap::new(),
+                hot_tt: HotTranspositionTable::new(1024 * 1024),
+                deduped_signatures: 0,
+                bound_hits: 0,
+                root_refinement_pruned: 0,
+                local_refinement_pruned: 0,
+                partition_calls: 0,
+                quick_plan_calls: 0,
+                started,
+                last_progress: started,
+            };
+            let built = builder.solve_state(&state).expect("builder");
+            let exhaustive = IndependentExactSolver::new(&builder.model)
+                .solve(&state)
+                .expect("exhaustive");
+            assert!(same_decision(&built, &exhaustive));
+            assert_eq!(builder.root_refinement_pruned, 0);
+            assert_eq!(builder.local_refinement_pruned, 0);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]

@@ -1,5 +1,11 @@
 /target
+/dist/
 /data/raw/*.jsonl
-/data/derived/*.bin
-/data/derived/*.csv
-/data/derived/*.md
+/data/derived/
+/data/formal/*/pattern_table.bin
+/data/formal/*/manifest.json
+/data/formal/*/state_values.bin
+/data/formal/*/policy_table.bin
+/data/formal/*/proof_metadata.json
+/data/formal/*/proof_certificate.json
+/data/formal/*/small_state_table.json

@@ -1,3 +1,4 @@
+mod atomic_file;
 pub mod config;
 pub mod data;
 pub mod formal;

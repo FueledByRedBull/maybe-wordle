@@ -87,6 +87,7 @@ struct WordleGuiApp {
     total_weight: f64,
     predictive_recovery_mode: Option<RecoveryMode>,
     predictive_artifact_state: PredictiveArtifactState,
+    predictive_model_metadata: String,
     top: usize,
     force_in_two_only: bool,
     hard_mode: bool,
@@ -115,6 +116,7 @@ enum WorkerPayload {
         state: PredictiveStateSummary,
         suggestions: Vec<Suggestion>,
         artifact_state: PredictiveArtifactState,
+        model_metadata: String,
     },
     Absurdle {
         state: SolveState,
@@ -157,6 +159,7 @@ impl WordleGuiApp {
             total_weight: 0.0,
             predictive_recovery_mode: None,
             predictive_artifact_state: PredictiveArtifactState::NoPredictiveArtifactAvailable,
+            predictive_model_metadata: String::new(),
             top: 10,
             force_in_two_only: false,
             hard_mode: false,
@@ -204,11 +207,13 @@ impl WordleGuiApp {
                     state,
                     suggestions,
                     artifact_state,
+                    model_metadata,
                 }) => {
                     self.surviving_count = state.surviving;
                     self.total_weight = state.effective_total_weight;
                     self.predictive_recovery_mode = state.recovery_mode_used;
                     self.predictive_artifact_state = artifact_state;
+                    self.predictive_model_metadata = model_metadata;
                     self.predictive_suggestions = suggestions;
                     self.absurdle_suggestions.clear();
                     self.formal_suggestions.clear();
@@ -464,6 +469,12 @@ impl eframe::App for WordleGuiApp {
                             RichText::new(predictive_banner_text(self.predictive_artifact_state))
                                 .color(Color32::from_rgb(92, 72, 54)),
                         );
+                        if !self.predictive_model_metadata.is_empty() {
+                            ui.label(
+                                RichText::new(&self.predictive_model_metadata)
+                                    .color(Color32::from_rgb(92, 72, 54)),
+                            );
+                        }
                         if let Some(message) = predictive_reply_book_text(
                             self.observations.len(),
                             self.predictive_artifact_state,
@@ -579,7 +590,7 @@ impl eframe::App for WordleGuiApp {
                                             ui.label("force_in_two");
                                         }
                                         if let Some(exact_cost) = suggestion.exact_cost {
-                                            ui.label(format!("exact {:.4}", exact_cost));
+                                            ui.label(format!("candidate-pool exact {:.4}", exact_cost));
                                         } else if let Some(lookahead_cost) = suggestion.lookahead_cost {
                                             ui.label(format!("lookahead {:.4}", lookahead_cost));
                                         }
@@ -681,10 +692,22 @@ fn spawn_worker(
                                 mode: PredictiveSuggestionMode::FastDiskOnly,
                             })?;
                         let artifact_state = response.artifact_state;
+                        let model_metadata = format!(
+                            "Heuristic predictive model {} · manifest {} · history {} ({}) · promoted from cache: {}",
+                            response.model_version,
+                            response.model_manifest_hash,
+                            response
+                                .history_snapshot_date
+                                .map(|date| date.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            response.history_snapshot_hash,
+                            response.promotion_source.is_some()
+                        );
                         Ok(WorkerPayload::Predictive {
                             state: response.state,
                             suggestions: response.suggestions,
                             artifact_state,
+                            model_metadata,
                         })
                     })();
                     result.map_err(|error| error.to_string())
@@ -749,6 +772,33 @@ fn decode_pattern(pattern: &u8) -> [u8; 5] {
         value /= 3;
     }
     decoded
+}
+
+fn predictive_banner_text(state: PredictiveArtifactState) -> &'static str {
+    state.banner_text()
+}
+
+fn predictive_compute_status(state: PredictiveArtifactState) -> String {
+    format!("Computing... {}", state.compute_text())
+}
+
+fn predictive_reply_book_text(
+    observation_count: usize,
+    state: PredictiveArtifactState,
+) -> Option<&'static str> {
+    match observation_count {
+        1 | 2 if state == PredictiveArtifactState::ExactDateArtifact => {
+            Some("Reply-book artifact is available for this branch.")
+        }
+        1 | 2 => Some(
+            "Reply-book artifact is missing for this date or branch; showing live ranking only.",
+        ),
+        _ => None,
+    }
+}
+
+fn formal_unavailable_text() -> &'static str {
+    "Formal artifacts missing; run build-optimal-policy first."
 }
 
 #[cfg(test)]
@@ -824,31 +874,4 @@ mod tests {
             "Formal artifacts missing; run build-optimal-policy first."
         );
     }
-}
-
-fn predictive_banner_text(state: PredictiveArtifactState) -> &'static str {
-    state.banner_text()
-}
-
-fn predictive_compute_status(state: PredictiveArtifactState) -> String {
-    format!("Computing... {}", state.compute_text())
-}
-
-fn predictive_reply_book_text(
-    observation_count: usize,
-    state: PredictiveArtifactState,
-) -> Option<&'static str> {
-    match observation_count {
-        1 | 2 if state == PredictiveArtifactState::ExactDateArtifact => {
-            Some("Reply-book artifact is available for this branch.")
-        }
-        1 | 2 => Some(
-            "Reply-book artifact is missing for this date or branch; showing live ranking only.",
-        ),
-        _ => None,
-    }
-}
-
-fn formal_unavailable_text() -> &'static str {
-    "Formal artifacts missing; run build-optimal-policy first."
 }
