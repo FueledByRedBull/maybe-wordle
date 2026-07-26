@@ -158,6 +158,12 @@ enum Command {
             help = "Allow slower predictive live-session promotion when disk artifacts are missing"
         )]
         live_fallback: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Return the fast proxy preview without lookahead or exact refinement"
+        )]
+        proxy_preview: bool,
         #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id when --mode formal-optimal is used")]
         model: String,
     },
@@ -834,6 +840,7 @@ fn run() -> Result<()> {
             mode,
             hard,
             live_fallback,
+            proxy_preview,
             model,
         } => match parse_solver_mode(&mode)? {
             SolverMode::Predictive => {
@@ -842,14 +849,19 @@ fn run() -> Result<()> {
                 warn_predictive_history_range(&paths, as_of)?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let predictive_mode = predictive_cli_mode(live_fallback);
-                let response = solver.suggest_predictive(PredictiveSuggestRequest {
+                let request = PredictiveSuggestRequest {
                     as_of,
                     observations: &observations,
                     top,
                     hard_mode: hard,
                     force_in_two_only: false,
                     mode: predictive_mode,
-                })?;
+                };
+                let response = if proxy_preview {
+                    solver.suggest_predictive_proxy_preview(request)?
+                } else {
+                    solver.suggest_predictive(request)?
+                };
                 for warning in
                     predictive_warning_lines(as_of, &observations, predictive_mode, &response)
                 {
@@ -878,6 +890,9 @@ fn run() -> Result<()> {
                 }
             }
             SolverMode::Absurdle => {
+                if proxy_preview {
+                    bail!("--proxy-preview is only supported in predictive mode");
+                }
                 reject_hard_mode_for_non_predictive(hard, "absurdle")?;
                 reject_live_fallback_for_non_predictive(live_fallback, "absurdle")?;
                 let observations = Solver::parse_observations(&guess, &feedback)?;
@@ -889,6 +904,9 @@ fn run() -> Result<()> {
                 }
             }
             SolverMode::FormalOptimal => {
+                if proxy_preview {
+                    bail!("--proxy-preview is only supported in predictive mode");
+                }
                 reject_hard_mode_for_non_predictive(hard, "formal-optimal")?;
                 reject_live_fallback_for_non_predictive(live_fallback, "formal-optimal")?;
                 let observations = parse_formal_observations(&guess, &feedback)?;

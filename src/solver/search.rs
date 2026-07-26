@@ -20,37 +20,36 @@ impl Solver {
         )
     }
 
-    pub(super) fn filtered_suggestion_batch_for_history(
+    pub(super) fn filtered_suggestion_batch_for_history_with_search_mode(
         &self,
         as_of: NaiveDate,
         observations: &[(String, u8)],
         top: usize,
-        mode: PredictiveSuggestionMode,
-        hard_mode: bool,
-        force_in_two_only: bool,
+        filters: PredictiveSuggestionFilters,
     ) -> Result<SuggestionBatch> {
         let state = self.apply_history(as_of, observations)?;
-        let limit = if hard_mode || force_in_two_only {
+        let limit = if filters.hard_mode || filters.force_in_two_only {
             self.guesses.len()
         } else {
             top
         };
-        let mut batch = self.suggestion_batch_internal(
+        let mut batch = self.suggestion_batch_internal_with_search_mode(
             &state,
             limit,
             Some(PredictiveContext {
                 as_of,
                 observations,
             }),
-            book_usage_for_mode(mode),
+            book_usage_for_mode(filters.mode),
+            filters.forced_search_mode,
         )?;
-        if hard_mode {
+        if filters.hard_mode {
             batch.suggestions.retain(|suggestion| {
                 self.hard_mode_violation(observations, &suggestion.word)
                     .is_none()
             });
         }
-        if force_in_two_only {
+        if filters.force_in_two_only {
             batch
                 .suggestions
                 .retain(|suggestion| suggestion.force_in_two);

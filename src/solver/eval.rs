@@ -2233,7 +2233,7 @@ impl Solver {
                 });
             }
         }
-        replies.sort_by(|left, right| left.feedback_pattern.cmp(&right.feedback_pattern));
+        replies.sort_by_key(|reply| reply.feedback_pattern);
         let artifact = PredictiveReplyBookArtifact {
             identity: self.predictive_book_identity(as_of),
             opener: opener_artifact.opener.clone(),

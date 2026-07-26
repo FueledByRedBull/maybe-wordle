@@ -222,18 +222,36 @@ impl Solver {
         &self,
         request: PredictiveSuggestRequest<'_>,
     ) -> Result<PredictiveSuggestResponse> {
+        self.suggest_predictive_with_search_mode(request, None)
+    }
+
+    pub fn suggest_predictive_proxy_preview(
+        &self,
+        request: PredictiveSuggestRequest<'_>,
+    ) -> Result<PredictiveSuggestResponse> {
+        self.suggest_predictive_with_search_mode(request, Some(PredictiveSearchMode::ProxyOnly))
+    }
+
+    fn suggest_predictive_with_search_mode(
+        &self,
+        request: PredictiveSuggestRequest<'_>,
+        forced_search_mode: Option<PredictiveSearchMode>,
+    ) -> Result<PredictiveSuggestResponse> {
         let state = self.apply_history(request.as_of, request.observations)?;
         let suggestions = if request.hard_mode || request.force_in_two_only {
-            self.filtered_suggestion_batch_for_history(
+            self.filtered_suggestion_batch_for_history_with_search_mode(
                 request.as_of,
                 request.observations,
                 request.top,
-                request.mode,
-                request.hard_mode,
-                request.force_in_two_only,
+                PredictiveSuggestionFilters {
+                    mode: request.mode,
+                    hard_mode: request.hard_mode,
+                    force_in_two_only: request.force_in_two_only,
+                    forced_search_mode,
+                },
             )?
         } else {
-            self.suggestion_batch_internal(
+            self.suggestion_batch_internal_with_search_mode(
                 &state,
                 request.top,
                 Some(PredictiveContext {
@@ -241,6 +259,7 @@ impl Solver {
                     observations: request.observations,
                 }),
                 book_usage_for_mode(request.mode),
+                forced_search_mode,
             )?
         };
 

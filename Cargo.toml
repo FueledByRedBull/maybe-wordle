@@ -2,6 +2,7 @@
 name = "maybe-wordle"
 version = "0.1.0"
 edition = "2024"
+default-run = "maybe-wordle"
 
 [dependencies]
 anyhow = "1.0"

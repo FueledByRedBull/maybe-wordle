@@ -1038,6 +1038,14 @@ enum PredictiveBookUsage {
     Full,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PredictiveSuggestionFilters {
+    mode: PredictiveSuggestionMode,
+    hard_mode: bool,
+    force_in_two_only: bool,
+    forced_search_mode: Option<PredictiveSearchMode>,
+}
+
 const EXACT_SUBSET_INLINE_CAPACITY: usize = 16;
 
 #[derive(Clone, Debug)]
@@ -1253,7 +1261,7 @@ mod tests {
         data::NytDailyEntry,
         model::{AnswerRecord, ModelVariant, WeightMode},
         pattern_table::PatternTable,
-        predictive::RecoveryMode,
+        predictive::{PredictiveSuggestRequest, PredictiveSuggestionMode, RecoveryMode},
         scoring::{ALL_GREEN_PATTERN, format_feedback_letters, score_guess},
         small_state::SmallStateTable,
     };
@@ -1384,6 +1392,35 @@ mod tests {
                 .exact_cost
                 .is_some()
         );
+    }
+
+    #[test]
+    fn proxy_preview_returns_immediately_rankable_results_without_exact_refinement() {
+        let mut solver = test_solver(&[
+            "cigar", "rebut", "sissy", "humph", "awake", "blush", "focal", "evade",
+        ]);
+        solver.config.exact_threshold = 8;
+        solver.config.exact_exhaustive_threshold = 2;
+        solver.config.exact_candidate_pool = 4;
+        let observations = Vec::new();
+        let request = PredictiveSuggestRequest {
+            as_of: NaiveDate::from_ymd_opt(2026, 1, 1).expect("date"),
+            observations: &observations,
+            top: 5,
+            hard_mode: false,
+            force_in_two_only: false,
+            mode: PredictiveSuggestionMode::LiveOnly,
+        };
+        let preview = solver
+            .suggest_predictive_proxy_preview(request)
+            .expect("proxy preview");
+
+        assert_eq!(preview.state.surviving, solver.answers.len());
+        assert!(!preview.suggestions.is_empty());
+        assert!(preview.suggestions.iter().all(
+            |suggestion| suggestion.exact_cost.is_none() && suggestion.lookahead_cost.is_none()
+        ));
+        assert!(preview.candidates.len() == solver.answers.len());
     }
 
     fn slow_exact_best_cost(
@@ -4059,7 +4096,7 @@ mod tests {
             );
             assert_eq!(
                 serial_outcome.guesses,
-                Some(serial_run.steps.len()).filter(|_| !serial_run.steps.is_empty())
+                (!serial_run.steps.is_empty()).then_some(serial_run.steps.len())
             );
         }
     }

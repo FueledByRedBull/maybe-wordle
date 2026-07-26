@@ -25,6 +25,12 @@ Cold-to-warm wall ratios were `1.070`, `1.025`, and `0.978`. Warm page faults pe
 - Pooled exact search is the most expensive measured regime, but remains below 200 ms on the replayable 15-answer state.
 - Allocation volume grows from about 7.2 MiB at the proxy root to 38.2 MiB in pooled exact. Reusing scratch vectors and candidate buffers is the clearest low-level opportunity, but solve-quality studies take priority because the current working-set envelope is modest and premature rewrites would add risk.
 
+## Interactive first-feedback diagnostic
+
+The reported GUI stall was reproduced with `OLATE` / `10001` on `2026-07-26`, leaving 53 survivors without a matching predictive artifact. A release CLI process took `61.901 s` to return the candidate-pool exact ranking. The new proxy-preview path returned the first useful ten-row ranking in `435.3 ms`, including process startup and model loading: about 142 times faster to visible results. The GUI keeps the exact computation in the background and replaces the labeled preview when refinement completes.
+
+This diagnostic is not part of the canonical allocator benchmark artifact and is not solve-quality evidence. It records the user-visible regression case and the latency of the progressive-rendering fix.
+
 ## Reproduction
 
 From the repository root in PowerShell:

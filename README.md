@@ -325,7 +325,7 @@ Backtests keep coverage gaps in all-game denominators and report both an explici
 
 The equations, domains, exact-versus-heuristic boundaries, coupling audit, and verification map are documented in [`docs/PREDICTIVE_MATH.md`](./docs/PREDICTIVE_MATH.md).
 
-The Rust GUI is a predictive-first analyst workspace with dedicated Play, Policy, Diagnostics, and secondary Formal panels. Heavy recomputes use two isolated workers sharing one replaceable pending slot: stale queued work is discarded, a newer generation can run while one obsolete request finishes, and stale responses cannot replace current state. Play includes keyboard feedback codes (`0/1/2` or `b/y/g`), Enter-to-apply, an accessible six-row board, compact history, sortable evidence, a suggestion inspector, and a filterable/exportable candidate list. Text scaling and a stacked layout keep the workflow usable in narrow windows. Diagnostics distinguishes exhaustive exact, candidate-pool exact, and proxy/lookahead allocation.
+The Rust GUI is a predictive-first analyst workspace with dedicated Play, Policy, Diagnostics, and secondary Formal panels. Heavy recomputes use two isolated workers sharing one replaceable pending slot: stale queued work is discarded, a newer generation can run while one obsolete request finishes, and stale responses cannot replace current state. After feedback is applied, the GUI first displays a fast proxy preview and then replaces it with the exact-refined ranking when that background search completes. Preview rows are explicitly labeled and do not weaken the final ranking. Play includes keyboard feedback codes (`0/1/2` or `b/y/g`), Enter-to-apply, an accessible six-row board, compact history, sortable evidence, a suggestion inspector, and a filterable/exportable candidate list. Board tiles use font-safe `A`, `P`, and `C` markers for absent, present, and correct feedback; the earlier Unicode marks rendered as empty squares with some Windows fonts. Text scaling and a stacked layout keep the workflow usable in narrow windows. Diagnostics distinguishes exhaustive exact, candidate-pool exact, and proxy/lookahead allocation.
 
 Missing derived data no longer prevents the window from opening. The setup surface offers explicit public-history sync, local build, retry, progress/error reporting, and cooperative cancellation at phase/request boundaries. Formal artifacts remain optional; their absence does not block predictive play.
 
@@ -351,7 +351,12 @@ CLI and GUI predictive mode are intentionally conservative:
 
 ## Running the preserved Windows executable
 
-The locally packaged release build is `dist/maybe-wordle.exe` (ignored by Git). Run it directly for the GUI or pass any CLI command, for example `dist/maybe-wordle.exe solve-interactive`. The executable expects to be run from this repository so it can find `config/` and `data/`. Rebuild it with `cargo build --release`, copy `target/release/maybe-wordle.exe` to `dist/`, then remove `target/` if you want a clean source tree.
+The locally packaged release builds are ignored by Git:
+
+- `dist/maybe-wordle.exe` is the normal double-clickable Windows GUI and does not open a console window.
+- `dist/maybe-wordle-cli.exe` preserves every command-line workflow, for example `dist/maybe-wordle-cli.exe solve-interactive`.
+
+Both executables locate the repository's `config/` and `data/` directories from the current directory or executable path. Rebuild them with `cargo build --release --bins`, copy `target/release/maybe-wordle-gui.exe` to `dist/maybe-wordle.exe` and `target/release/maybe-wordle.exe` to `dist/maybe-wordle-cli.exe`, then remove `target/` if you want a clean source tree.
 
 ## Repo map
 

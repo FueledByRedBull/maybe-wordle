@@ -1217,7 +1217,7 @@ impl FormalPolicyBuilder {
                 .filter(|bucket| bucket.pattern != ALL_GREEN_PATTERN)
                 .cloned()
                 .collect::<Vec<_>>();
-            unresolved.sort_unstable_by(|left, right| right.count.cmp(&left.count));
+            unresolved.sort_unstable_by_key(|bucket| std::cmp::Reverse(bucket.count));
             for bucket in unresolved {
                 let probability = bucket.mass / total_mass;
                 remaining_lower -=
@@ -3175,11 +3175,7 @@ mod tests {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                 indices.insert((seed as usize) % answer_count);
             }
-            let state = StateKey::from_indices_with_tokens(
-                answer_count,
-                indices.into_iter(),
-                &model.zobrist,
-            );
+            let state = StateKey::from_indices_with_tokens(answer_count, indices, &model.zobrist);
             let started = Instant::now();
             let mut builder = FormalPolicyBuilder {
                 model,

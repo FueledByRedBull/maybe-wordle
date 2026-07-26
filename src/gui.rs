@@ -444,6 +444,7 @@ struct WordleGuiApp {
 #[derive(Default)]
 struct LatestWorkerQueue {
     pending: Option<WorkerRequest>,
+    latest_generation: u64,
     shutdown: bool,
 }
 
@@ -460,6 +461,7 @@ impl LatestWorkerDispatcher {
         if queue.shutdown {
             anyhow::bail!("suggestion workers have stopped");
         }
+        queue.latest_generation = request.generation;
         queue.pending = Some(request);
         ready.notify_one();
         Ok(())
@@ -509,6 +511,7 @@ enum WorkerPayload {
 #[derive(Clone, Debug)]
 struct WorkerResponse {
     generation: u64,
+    complete: bool,
     payload: std::result::Result<WorkerPayload, String>,
 }
 
@@ -620,7 +623,7 @@ impl WordleGuiApp {
             if !worker_response_is_current(self.latest_generation, response.generation) {
                 continue;
             }
-            self.computing = false;
+            self.computing = !response.complete;
             match response.payload {
                 Ok(WorkerPayload::Predictive {
                     state,
@@ -645,7 +648,12 @@ impl WordleGuiApp {
                     self.absurdle_suggestions.clear();
                     self.formal_suggestions.clear();
                     self.formal_explanation = None;
-                    self.status.clear();
+                    self.status = if response.complete {
+                        String::new()
+                    } else {
+                        "Fast proxy preview shown; refining the exact ranking in the background."
+                            .to_string()
+                    };
                 }
                 Ok(WorkerPayload::Absurdle { state, suggestions }) => {
                     self.surviving_count = state.surviving.len();
@@ -1689,15 +1697,54 @@ fn spawn_worker(
                         }
                         queue.pending.take().expect("pending request")
                     };
+                    let should_preview = request.mode == GuiSolverMode::Predictive
+                        && !request.observations.is_empty();
+                    if should_preview {
+                        let preview = compute_worker_payload(
+                            &predictive_solver,
+                            formal_solver.as_ref(),
+                            &request,
+                            true,
+                        )
+                        .map_err(|error| error.to_string());
+                        let preview_failed = preview.is_err();
+                        if response_sender
+                            .send(WorkerResponse {
+                                generation: request.generation,
+                                complete: preview_failed,
+                                payload: preview,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if preview_failed {
+                            continue;
+                        }
+                        let superseded = {
+                            let (lock, _) = &*shared;
+                            match lock.lock() {
+                                Ok(queue) => {
+                                    queue.shutdown || queue.latest_generation > request.generation
+                                }
+                                Err(_) => return,
+                            }
+                        };
+                        if superseded {
+                            continue;
+                        }
+                    }
                     let payload = compute_worker_payload(
                         &predictive_solver,
                         formal_solver.as_ref(),
                         &request,
+                        false,
                     )
                     .map_err(|error| error.to_string());
                     if response_sender
                         .send(WorkerResponse {
                             generation: request.generation,
+                            complete: true,
                             payload,
                         })
                         .is_err()
@@ -1716,19 +1763,25 @@ fn compute_worker_payload(
     predictive_solver: &Solver,
     formal_solver: Option<&FormalPolicyRuntime>,
     request: &WorkerRequest,
+    proxy_preview: bool,
 ) -> Result<WorkerPayload> {
     match request.mode {
         GuiSolverMode::Predictive => {
             let date = NaiveDate::parse_from_str(&request.date_text, "%Y-%m-%d")
                 .with_context(|| format!("invalid date: {}", request.date_text))?;
-            let response = predictive_solver.suggest_predictive(PredictiveSuggestRequest {
+            let request = PredictiveSuggestRequest {
                 as_of: date,
                 observations: &request.observations,
                 top: request.top,
                 hard_mode: request.hard_mode,
                 force_in_two_only: request.force_in_two_only,
                 mode: PredictiveSuggestionMode::FastDiskOnly,
-            })?;
+            };
+            let response = if proxy_preview {
+                predictive_solver.suggest_predictive_proxy_preview(request)?
+            } else {
+                predictive_solver.suggest_predictive(request)?
+            };
             let artifact_state = response.artifact_state;
             let model_metadata = format!(
                 "Predictive model: {}\nConfig identity: {}\nHistory snapshot: {} ({})\nCached promotion: {}",
@@ -1858,11 +1911,11 @@ fn workspace_visuals() -> egui::Visuals {
     visuals.faint_bg_color = Color32::from_rgb(238, 231, 221);
     visuals.extreme_bg_color = Color32::from_rgb(255, 252, 247);
     visuals.selection.bg_fill = Color32::from_rgb(46, 112, 82);
-    visuals.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, ink);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, ink);
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, ink);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, ink);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, ink);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, ink);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5_f32, ink);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, ink);
     visuals
 }
 
@@ -2034,6 +2087,12 @@ fn show_game_board(
     current_guess: &str,
     current_feedback: [u8; 5],
 ) {
+    ui.label(
+        RichText::new("Tile markers: A absent / P present / C correct")
+            .small()
+            .color(Color32::from_rgb(92, 72, 54)),
+    );
+    ui.add_space(4.0);
     for row in 0..6 {
         ui.horizontal(|ui| {
             let (letters, feedback, applied) = if let Some((guess, pattern)) = observations.get(row)
@@ -2127,9 +2186,9 @@ fn feedback_accessible_label(value: u8) -> &'static str {
 
 fn feedback_marker(value: u8) -> &'static str {
     match value {
-        0 => "×",
-        1 => "●",
-        _ => "✓",
+        0 => "A",
+        1 => "P",
+        _ => "C",
     }
 }
 
@@ -2186,9 +2245,10 @@ mod tests {
 
     use super::{
         BoardAction, BoardDraft, GuiSolverMode, GuiSurfaceState, LatestWorkerDispatcher,
-        LatestWorkerQueue, WorkerRequest, feedback_accessible_label, formal_unavailable_text,
-        gui_surface_state, is_compact_layout, predictive_banner_text, predictive_compute_status,
-        predictive_reply_book_text, reduce_board_draft, worker_response_is_current,
+        LatestWorkerQueue, WorkerRequest, feedback_accessible_label, feedback_marker,
+        formal_unavailable_text, gui_surface_state, is_compact_layout, predictive_banner_text,
+        predictive_compute_status, predictive_reply_book_text, reduce_board_draft,
+        worker_response_is_current,
     };
 
     #[test]
@@ -2209,6 +2269,10 @@ mod tests {
         );
         assert_eq!(coded.feedback, [0, 1, 2, 2, 0]);
         assert_eq!(feedback_accessible_label(2), "Correct");
+        assert_eq!(
+            [feedback_marker(0), feedback_marker(1), feedback_marker(2)],
+            ["A", "P", "C"]
+        );
         assert_eq!(reduce_board_draft(&coded, BoardAction::Reset), initial);
     }
 
@@ -2234,6 +2298,7 @@ mod tests {
             queue.pending.as_ref().map(|request| request.generation),
             Some(5)
         );
+        assert_eq!(queue.latest_generation, 5);
     }
 
     #[test]
