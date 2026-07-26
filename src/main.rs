@@ -1949,7 +1949,9 @@ fn run() -> Result<()> {
             } else {
                 let existing = std::fs::read_to_string(&markdown_output)
                     .with_context(|| format!("failed to read {}", markdown_output.display()))?;
-                if existing != generated || updated_readme != readme_text {
+                if canonical_newlines(&existing) != canonical_newlines(&generated)
+                    || canonical_newlines(&updated_readme) != canonical_newlines(&readme_text)
+                {
                     bail!("rolling evidence documentation is stale; rerun with --update");
                 }
                 println!("rolling evidence documentation is current");
@@ -2035,6 +2037,10 @@ fn replace_generated_rolling_evidence(readme: &str, generated: &str) -> Result<S
     updated.push_str(generated.trim_end());
     updated.push_str(&readme[end..]);
     Ok(updated)
+}
+
+fn canonical_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
 }
 
 fn warn_predictive_history_range(paths: &ProjectPaths, as_of: NaiveDate) -> Result<()> {
@@ -2322,12 +2328,24 @@ mod tests {
     use maybe_wordle::solver::AbsurdleSuggestion;
 
     use super::{
-        Cli, enforce_sync_policy, find_project_root, format_absurdle_suggestion,
-        format_predictive_suggestion, format_sync_summary, normalize_interactive_guess,
-        parse_solver_mode, parse_study_stage, parse_study_strategy, predictive_cli_mode,
-        predictive_warning_lines, reject_hard_mode_for_non_predictive,
+        Cli, canonical_newlines, enforce_sync_policy, find_project_root,
+        format_absurdle_suggestion, format_predictive_suggestion, format_sync_summary,
+        normalize_interactive_guess, parse_solver_mode, parse_study_stage, parse_study_strategy,
+        predictive_cli_mode, predictive_warning_lines, reject_hard_mode_for_non_predictive,
         reject_live_fallback_for_non_predictive, try_append_observation,
     };
+
+    #[test]
+    fn documentation_verification_ignores_platform_line_endings() {
+        assert_eq!(
+            canonical_newlines("alpha\r\nbeta\r\n"),
+            canonical_newlines("alpha\nbeta\n")
+        );
+        assert_ne!(
+            canonical_newlines("alpha\r\nbeta\r\n"),
+            canonical_newlines("alpha\ngamma\n")
+        );
+    }
 
     #[test]
     fn try_append_observation_rejects_invalid_feedback_without_mutation() {
