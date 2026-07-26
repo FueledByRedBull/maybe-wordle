@@ -1,0 +1,657 @@
+{
+  "schema_version": 1,
+  "identity_format": "sha256-length-delimited-v1",
+  "freeze_fingerprint": "sha256-v1:15cb4c86c7548dbcdf94624a8a80b93009a8ebbdcc57d228617977765d4a543a",
+  "input_fingerprint": "sha256-v1:bfb8611d7834008d1a3ddcd2d7c8fd1244be74a29ef560716809bbf2b8ea46b8",
+  "config_fingerprint": "sha256-v1:180376188618b1ffa1f082e6d0df44680e5eb84a14d078f2c436ab9af2e5840f",
+  "evaluation_plan": {
+    "history": {
+      "start": "2021-06-19",
+      "end": "2026-07-17"
+    },
+    "development": {
+      "start": "2021-06-19",
+      "end": "2026-06-17"
+    },
+    "sealed_test": {
+      "start": "2026-06-18",
+      "end": "2026-07-17"
+    },
+    "folds": [
+      {
+        "index": 0,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-06-22"
+        },
+        "validation": {
+          "start": "2025-06-23",
+          "end": "2025-07-22"
+        }
+      },
+      {
+        "index": 1,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-07-22"
+        },
+        "validation": {
+          "start": "2025-07-23",
+          "end": "2025-08-21"
+        }
+      },
+      {
+        "index": 2,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-08-21"
+        },
+        "validation": {
+          "start": "2025-08-22",
+          "end": "2025-09-20"
+        }
+      },
+      {
+        "index": 3,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-09-20"
+        },
+        "validation": {
+          "start": "2025-09-21",
+          "end": "2025-10-20"
+        }
+      },
+      {
+        "index": 4,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-10-20"
+        },
+        "validation": {
+          "start": "2025-10-21",
+          "end": "2025-11-19"
+        }
+      },
+      {
+        "index": 5,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-11-19"
+        },
+        "validation": {
+          "start": "2025-11-20",
+          "end": "2025-12-19"
+        }
+      },
+      {
+        "index": 6,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-12-19"
+        },
+        "validation": {
+          "start": "2025-12-20",
+          "end": "2026-01-18"
+        }
+      },
+      {
+        "index": 7,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-01-18"
+        },
+        "validation": {
+          "start": "2026-01-19",
+          "end": "2026-02-17"
+        }
+      },
+      {
+        "index": 8,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-02-17"
+        },
+        "validation": {
+          "start": "2026-02-18",
+          "end": "2026-03-19"
+        }
+      },
+      {
+        "index": 9,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-03-19"
+        },
+        "validation": {
+          "start": "2026-03-20",
+          "end": "2026-04-18"
+        }
+      },
+      {
+        "index": 10,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-04-18"
+        },
+        "validation": {
+          "start": "2026-04-19",
+          "end": "2026-05-18"
+        }
+      },
+      {
+        "index": 11,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-05-18"
+        },
+        "validation": {
+          "start": "2026-05-19",
+          "end": "2026-06-17"
+        }
+      }
+    ],
+    "config": {
+      "minimum_training_days": 365,
+      "validation_days": 30,
+      "step_days": 30,
+      "sealed_test_days": 30,
+      "maximum_folds": 12
+    }
+  },
+  "evaluation_artifact_policy": "artifact_free",
+  "sealed_test_evaluated": true,
+  "evaluated_once": true,
+  "metrics": {
+    "scheduled_games": 30,
+    "modeled_games": 30,
+    "solved_games": 30,
+    "unsolved_games": 0,
+    "coverage_gaps": 0,
+    "coverage_rate": 1.0,
+    "solve_rate": 1.0,
+    "conditional_mean_guesses": 3.3,
+    "conditional_mean_guesses_ci95": {
+      "lower": 3.1333333333333333,
+      "upper": 3.466666666666667
+    },
+    "failure_penalty_guesses": 7.0,
+    "all_game_penalized_mean_guesses": 3.3,
+    "all_game_penalized_mean_guesses_ci95": {
+      "lower": 3.1333333333333333,
+      "upper": 3.466666666666667
+    },
+    "median_guesses": 3.0,
+    "p90_guesses": 4,
+    "p95_guesses": 5,
+    "max_guesses": 5,
+    "solved_in_guess_counts": [
+      0,
+      2,
+      19,
+      7,
+      2,
+      0
+    ],
+    "coverage_rate_ci95": {
+      "lower": 0.8864866068260312,
+      "upper": 0.9999999999999999
+    },
+    "solve_rate_ci95": {
+      "lower": 0.8864866068260312,
+      "upper": 0.9999999999999999
+    },
+    "bootstrap": {
+      "resamples": 2000,
+      "block_length": 7,
+      "seed": 21769571400961093
+    }
+  },
+  "prior_evidence": {
+    "measured_games": 27,
+    "top_1_recall": 0.0,
+    "top_1_recall_ci95": {
+      "lower": 0.0,
+      "upper": 0.12455502974186705
+    },
+    "top_3_recall": 0.0,
+    "top_3_recall_ci95": {
+      "lower": 0.0,
+      "upper": 0.12455502974186705
+    },
+    "top_5_recall": 0.0,
+    "top_5_recall_ci95": {
+      "lower": 0.0,
+      "upper": 0.12455502974186705
+    },
+    "calibration_bins": 10,
+    "expected_calibration_error": 0.0014305457231946223,
+    "expected_calibration_error_ci95": {
+      "lower": 0.0014294256402580736,
+      "upper": 0.00143170744495219
+    },
+    "bootstrap": {
+      "resamples": 2000,
+      "block_length": 7,
+      "seed": 21769571400961093
+    }
+  },
+  "execution": {
+    "total_steps": 99,
+    "proxy_steps": 32,
+    "lookahead_steps": 15,
+    "escalated_exact_steps": 0,
+    "exact_steps": 52,
+    "danger_escalated_steps": 0,
+    "strict_recovery_steps": 0,
+    "uniform_recovery_steps": 6,
+    "epsilon_repair_steps": 0,
+    "dormant_fallback_steps": 29,
+    "exact_date_opener_artifact_hits": 0,
+    "recent_opener_artifact_hits": 0,
+    "reply_book_hits": 0,
+    "session_fallback_hits": 0
+  },
+  "games": [
+    {
+      "target": "entry",
+      "outcome": {
+        "date": "2026-06-18",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "suint",
+        "entry"
+      ]
+    },
+    {
+      "target": "emoji",
+      "outcome": {
+        "date": "2026-06-19",
+        "status": "solved",
+        "guesses": 5
+      },
+      "path": [
+        "olate",
+        "rowns",
+        "epoch",
+        "ebook",
+        "emoji"
+      ]
+    },
+    {
+      "target": "drake",
+      "outcome": {
+        "date": "2026-06-20",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "grosz",
+        "drake"
+      ]
+    },
+    {
+      "target": "alibi",
+      "outcome": {
+        "date": "2026-06-21",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "iliac",
+        "alibi"
+      ]
+    },
+    {
+      "target": "ovate",
+      "outcome": {
+        "date": "2026-06-22",
+        "status": "solved",
+        "guesses": 2
+      },
+      "path": [
+        "olate",
+        "ovate"
+      ]
+    },
+    {
+      "target": "curry",
+      "outcome": {
+        "date": "2026-06-23",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "misch",
+        "curry"
+      ]
+    },
+    {
+      "target": "queer",
+      "outcome": {
+        "date": "2026-06-24",
+        "status": "solved",
+        "guesses": 4
+      },
+      "path": [
+        "olate",
+        "seder",
+        "freer",
+        "queer"
+      ]
+    },
+    {
+      "target": "unity",
+      "outcome": {
+        "date": "2026-06-25",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "brins",
+        "unity"
+      ]
+    },
+    {
+      "target": "acute",
+      "outcome": {
+        "date": "2026-06-26",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "caste",
+        "acute"
+      ]
+    },
+    {
+      "target": "scoop",
+      "outcome": {
+        "date": "2026-06-27",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "croon",
+        "scoop"
+      ]
+    },
+    {
+      "target": "emcee",
+      "outcome": {
+        "date": "2026-06-28",
+        "status": "solved",
+        "guesses": 4
+      },
+      "path": [
+        "olate",
+        "scind",
+        "creme",
+        "emcee"
+      ]
+    },
+    {
+      "target": "crude",
+      "outcome": {
+        "date": "2026-06-29",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "scind",
+        "crude"
+      ]
+    },
+    {
+      "target": "puppy",
+      "outcome": {
+        "date": "2026-06-30",
+        "status": "solved",
+        "guesses": 4
+      },
+      "path": [
+        "olate",
+        "misch",
+        "pudgy",
+        "puppy"
+      ]
+    },
+    {
+      "target": "demur",
+      "outcome": {
+        "date": "2026-07-01",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "seder",
+        "demur"
+      ]
+    },
+    {
+      "target": "maven",
+      "outcome": {
+        "date": "2026-07-02",
+        "status": "solved",
+        "guesses": 5
+      },
+      "path": [
+        "olate",
+        "sagar",
+        "nymph",
+        "maneb",
+        "maven"
+      ]
+    },
+    {
+      "target": "baton",
+      "outcome": {
+        "date": "2026-07-03",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "tango",
+        "baton"
+      ]
+    },
+    {
+      "target": "pizza",
+      "outcome": {
+        "date": "2026-07-04",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "panir",
+        "pizza"
+      ]
+    },
+    {
+      "target": "swami",
+      "outcome": {
+        "date": "2026-07-05",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "chirp",
+        "swami"
+      ]
+    },
+    {
+      "target": "toddy",
+      "outcome": {
+        "date": "2026-07-06",
+        "status": "solved",
+        "guesses": 4
+      },
+      "path": [
+        "olate",
+        "prism",
+        "thong",
+        "toddy"
+      ]
+    },
+    {
+      "target": "sling",
+      "outcome": {
+        "date": "2026-07-07",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "spiky",
+        "sling"
+      ]
+    },
+    {
+      "target": "demon",
+      "outcome": {
+        "date": "2026-07-08",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "rowns",
+        "demon"
+      ]
+    },
+    {
+      "target": "amend",
+      "outcome": {
+        "date": "2026-07-09",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "sagar",
+        "amend"
+      ]
+    },
+    {
+      "target": "canal",
+      "outcome": {
+        "date": "2026-07-10",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "vadas",
+        "canal"
+      ]
+    },
+    {
+      "target": "avian",
+      "outcome": {
+        "date": "2026-07-11",
+        "status": "solved",
+        "guesses": 4
+      },
+      "path": [
+        "olate",
+        "panir",
+        "china",
+        "avian"
+      ]
+    },
+    {
+      "target": "clack",
+      "outcome": {
+        "date": "2026-07-12",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "crins",
+        "clack"
+      ]
+    },
+    {
+      "target": "stout",
+      "outcome": {
+        "date": "2026-07-13",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "trist",
+        "stout"
+      ]
+    },
+    {
+      "target": "steak",
+      "outcome": {
+        "date": "2026-07-14",
+        "status": "solved",
+        "guesses": 3
+      },
+      "path": [
+        "olate",
+        "theek",
+        "steak"
+      ]
+    },
+    {
+      "target": "pshaw",
+      "outcome": {
+        "date": "2026-07-15",
+        "status": "solved",
+        "guesses": 4
+      },
+      "path": [
+        "olate",
+        "panir",
+        "hykes",
+        "pshaw"
+      ]
+    },
+    {
+      "target": "butte",
+      "outcome": {
+        "date": "2026-07-16",
+        "status": "solved",
+        "guesses": 2
+      },
+      "path": [
+        "olate",
+        "butte"
+      ]
+    },
+    {
+      "target": "legal",
+      "outcome": {
+        "date": "2026-07-17",
+        "status": "solved",
+        "guesses": 4
+      },
+      "path": [
+        "olate",
+        "paler",
+        "fecal",
+        "legal"
+      ]
+    }
+  ],
+  "latency_p95_ms": 38.4962
+}

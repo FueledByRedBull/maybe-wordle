@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use csv::Writer;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     atomic_file::atomic_write,
@@ -14,7 +14,8 @@ use crate::{
     },
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WeightMode {
     Weighted,
     Uniform,
@@ -31,7 +32,8 @@ impl WeightMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelVariant {
     SeedOnly,
     SeedPlusHistory,
@@ -59,6 +61,7 @@ pub struct AnswerRecord {
 pub struct ModelData {
     pub guesses: Vec<String>,
     pub answers: Vec<AnswerRecord>,
+    pub primary_answer_count: usize,
     pub history: Vec<NytDailyEntry>,
     pub variant: ModelVariant,
 }
@@ -101,6 +104,7 @@ pub struct WeightSnapshot {
 pub struct BuildSummary {
     pub guess_count: usize,
     pub answer_count: usize,
+    pub fallback_answer_count: usize,
     pub historical_answers: usize,
     pub history_rows: usize,
 }
@@ -173,15 +177,33 @@ pub fn load_model_with_variant(
         .chain(extra_words)
         .collect::<Vec<_>>();
 
-    let answers = ordered_words
+    let mut answers = ordered_words
         .into_iter()
         .filter_map(|word| builders.remove(&word))
         .map(|builder| builder.finish(config))
         .collect::<Vec<_>>();
+    let primary_answer_count = answers.len();
+    let answer_lookup = answers
+        .iter()
+        .map(|answer| answer.word.as_str())
+        .collect::<HashSet<_>>();
+    let fallback_words = guesses
+        .iter()
+        .filter(|word| !answer_lookup.contains(word.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    answers.extend(fallback_words.into_iter().map(|word| AnswerRecord {
+        word,
+        in_seed: false,
+        manual_entry: false,
+        manual_weight: 1.0,
+        history_dates: Vec::new(),
+    }));
 
     Ok(ModelData {
         guesses,
         answers,
+        primary_answer_count,
         history,
         variant,
     })
@@ -193,18 +215,21 @@ pub fn build_model_artifacts(
     as_of: NaiveDate,
 ) -> Result<BuildSummary> {
     let model = load_model(paths, config)?;
-    let history_rows = build_history_rows(&model.answers, as_of);
-    let modeled_rows = build_modeled_rows(&model.answers, config, as_of);
+    let primary_answers = &model.answers[..model.primary_answer_count];
+    let history_rows = build_history_rows(primary_answers, as_of);
+    let modeled_rows = build_modeled_rows(primary_answers, config, as_of);
 
     write_csv(&paths.derived_answer_history, &history_rows)?;
     write_csv(&paths.derived_modeled_answers, &modeled_rows)?;
 
     Ok(BuildSummary {
         guess_count: model.guesses.len(),
-        answer_count: model.answers.len(),
+        answer_count: model.primary_answer_count,
+        fallback_answer_count: model.answers.len() - model.primary_answer_count,
         historical_answers: model
             .answers
             .iter()
+            .take(model.primary_answer_count)
             .filter(|answer| !answer.history_dates.is_empty())
             .count(),
         history_rows: model.history.len(),
@@ -468,7 +493,10 @@ mod tests {
         let full =
             load_model_with_variant(&paths, &config, ModelVariant::SeedPlusHistory).expect("model");
 
-        assert_eq!(seed_only.answers.len(), 1);
+        assert_eq!(seed_only.primary_answer_count, 1);
+        assert_eq!(seed_only.answers.len(), 2);
+        assert_eq!(seed_only.answers[1].word, "rebut");
+        assert_eq!(full.primary_answer_count, 2);
         assert_eq!(full.answers.len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }

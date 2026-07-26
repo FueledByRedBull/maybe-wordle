@@ -4,6 +4,9 @@ use chrono::NaiveDate;
 use maybe_wordle::{
     config::PriorConfig,
     data::{NytDailyEntry, ProjectPaths, write_history_jsonl},
+    experiments::{
+        StudyFoldSelection, StudySearchStrategy, StudySpec, StudyStage, StudyState, TrialStatus,
+    },
     formal::{
         DEFAULT_EXPECTED_ONLY_MODEL_ID, DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime,
         FormalVerificationMode, build_optimal_policy, verify_optimal_policy_with_mode,
@@ -182,10 +185,42 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
                 )
                 .expect("report");
             assert!(report.latency_p95_ms >= 0.0);
+            assert_eq!(report.backtest.canonical.scheduled_games, 4);
+            assert_eq!(
+                report.backtest.canonical.solved_games
+                    + report.backtest.canonical.unsolved_games
+                    + report.backtest.canonical.coverage_gaps,
+                report.backtest.canonical.scheduled_games
+            );
+            assert!(
+                report.backtest.canonical.all_game_penalized_mean_guesses
+                    >= report.backtest.canonical.conditional_mean_guesses
+            );
         }
     }
 
     let summary = Solver::tune_prior(&paths, &config).expect("tune");
+    assert_eq!(summary.evaluation_plan.folds.len(), 1);
+    assert_eq!(
+        summary
+            .evaluation_plan
+            .folds
+            .last()
+            .expect("fold")
+            .validation
+            .end,
+        summary.evaluation_plan.development.end
+    );
+    assert!(summary.evaluation_plan.development.end < summary.evaluation_plan.sealed_test.start);
+    let sealed_live_config_error = Solver::evaluate_live_config(
+        &paths,
+        &config,
+        NaiveDate::from_ymd_opt(2024, 1, 4).expect("date"),
+        NaiveDate::from_ymd_opt(2024, 1, 4).expect("date"),
+        5,
+    )
+    .expect_err("live-config evaluation must not reach the sealed test");
+    assert!(format!("{sealed_live_config_error:#}").contains("reaches the sealed test"));
     assert!(
         summary
             .replacement_toml
@@ -196,6 +231,226 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
     let hard_cases = solver.hard_case_report(5).expect("hard cases");
     assert!(!hard_cases.cases.is_empty());
     assert!(summary.current.hard_case_failures <= hard_cases.cases.len());
+
+    let study_path = root.join("study-state.json");
+    let cancellation_path = root.join("pause-study");
+    write_fixture(&cancellation_path, "pause\n");
+    let study_spec = StudySpec {
+        name: "toy-calibration".to_string(),
+        stage: StudyStage::Calibration,
+        seed: 17,
+        trial_count: 7,
+        parallelism: 2,
+        strategy: StudySearchStrategy::Random,
+        maximum_validation_folds: 1,
+        initial_validation_folds: 1,
+        reduction_factor: 2,
+        fold_selection: StudyFoldSelection::NestedTimeSpread,
+        maximum_trial_seconds: 60,
+        maximum_memory_mb: 4_096,
+    };
+    let paused = Solver::run_predictive_study(
+        &paths,
+        &config,
+        study_spec.clone(),
+        &study_path,
+        5,
+        Some(&cancellation_path),
+    )
+    .expect("paused study");
+    assert_eq!(paused.completed_trials, 0);
+    let paused_state = StudyState::load(&study_path).expect("paused state");
+    assert!(
+        paused_state
+            .trials
+            .iter()
+            .all(|trial| trial.status == TrialStatus::Pending)
+    );
+    std::fs::remove_file(&cancellation_path).expect("remove cancellation file");
+    let resumed = Solver::run_predictive_study(
+        &paths,
+        &config,
+        study_spec,
+        &study_path,
+        5,
+        Some(&cancellation_path),
+    )
+    .expect("resumed study");
+    assert_eq!(resumed.completed_trials, 7);
+    let resumed_state = StudyState::load(&study_path).expect("resumed state");
+    assert!(resumed_state.trials.iter().all(|trial| {
+        trial.status == TrialStatus::Complete
+            && trial
+                .measurement
+                .as_ref()
+                .is_some_and(|measurement| measurement.validation_fold_indices == vec![0])
+            && trial.pareto_rank.is_some()
+    }));
+
+    let proxy_study_path = root.join("proxy-study-state.json");
+    let proxy_summary = Solver::run_predictive_study(
+        &paths,
+        &config,
+        StudySpec {
+            name: "toy-proxy-ranker".to_string(),
+            stage: StudyStage::ProxyRanker,
+            seed: 23,
+            trial_count: 2,
+            parallelism: 2,
+            strategy: StudySearchStrategy::LowDiscrepancy,
+            maximum_validation_folds: 1,
+            initial_validation_folds: 1,
+            reduction_factor: 2,
+            fold_selection: StudyFoldSelection::NestedTimeSpread,
+            maximum_trial_seconds: 60,
+            maximum_memory_mb: 4_096,
+        },
+        &proxy_study_path,
+        5,
+        None,
+    )
+    .expect("proxy-ranker study");
+    assert_eq!(proxy_summary.completed_trials, 2);
+    assert!(
+        proxy_summary
+            .best_measurement
+            .as_ref()
+            .is_some_and(|measurement| measurement.solve_metrics_recorded)
+    );
+    let proxy_state = StudyState::load(&proxy_study_path).expect("proxy state");
+    assert!(proxy_state.trials.iter().all(|trial| {
+        trial.candidate.parameters.keys().all(|name| {
+            name.starts_with("proxy_weights.")
+                || name == "proxy_small_state_lower_bound_threshold"
+                || name == "ambiguous_mass_threshold"
+        })
+    }));
+    let book_study = Solver::run_predictive_study(
+        &paths,
+        &config,
+        StudySpec {
+            name: "toy-book-policy".to_string(),
+            stage: StudyStage::BookPolicy,
+            seed: 29,
+            trial_count: 6,
+            parallelism: 1,
+            strategy: StudySearchStrategy::Grid,
+            maximum_validation_folds: 1,
+            initial_validation_folds: 1,
+            reduction_factor: 2,
+            fold_selection: StudyFoldSelection::NestedTimeSpread,
+            maximum_trial_seconds: 60,
+            maximum_memory_mb: 4_096,
+        },
+        &root.join("book-study-state.json"),
+        5,
+        None,
+    )
+    .expect("cutoff-safe book study");
+    assert_eq!(book_study.completed_trials, 6);
+    assert_eq!(book_study.failed_trials, 0);
+    let oversized_fold_study = Solver::run_predictive_study(
+        &paths,
+        &config,
+        StudySpec {
+            name: "oversized-fold-budget".to_string(),
+            stage: StudyStage::Calibration,
+            seed: 30,
+            trial_count: 2,
+            parallelism: 1,
+            strategy: StudySearchStrategy::Grid,
+            maximum_validation_folds: 2,
+            initial_validation_folds: 1,
+            reduction_factor: 2,
+            fold_selection: StudyFoldSelection::NestedTimeSpread,
+            maximum_trial_seconds: 60,
+            maximum_memory_mb: 4_096,
+        },
+        &root.join("oversized-study-state.json"),
+        5,
+        None,
+    )
+    .expect_err("fold budget must fit the plan");
+    assert!(format!("{oversized_fold_study:#}").contains("plan contains only 1"));
+    let memory_limited_path = root.join("memory-limited-study-state.json");
+    let memory_limited = Solver::run_predictive_study(
+        &paths,
+        &config,
+        StudySpec {
+            name: "memory-limited".to_string(),
+            stage: StudyStage::Calibration,
+            seed: 30,
+            trial_count: 7,
+            parallelism: 1,
+            strategy: StudySearchStrategy::Grid,
+            maximum_validation_folds: 1,
+            initial_validation_folds: 1,
+            reduction_factor: 2,
+            fold_selection: StudyFoldSelection::NestedTimeSpread,
+            maximum_trial_seconds: 60,
+            maximum_memory_mb: 1,
+        },
+        &memory_limited_path,
+        5,
+        None,
+    )
+    .expect("memory-limited study records a failed trial");
+    assert_eq!(memory_limited.failed_trials, 7);
+    assert!(
+        StudyState::load(&memory_limited_path)
+            .expect("memory-limited state")
+            .trials
+            .iter()
+            .any(|trial| trial
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("peak working set")))
+    );
+
+    let model_based_path = root.join("model-based-study-state.json");
+    let model_based_spec = StudySpec {
+        name: "toy-model-based".to_string(),
+        stage: StudyStage::Calibration,
+        seed: 31,
+        trial_count: 7,
+        parallelism: 4,
+        strategy: StudySearchStrategy::ModelBased,
+        maximum_validation_folds: 1,
+        initial_validation_folds: 1,
+        reduction_factor: 2,
+        fold_selection: StudyFoldSelection::NestedTimeSpread,
+        maximum_trial_seconds: 60,
+        maximum_memory_mb: 4_096,
+    };
+    let model_based = Solver::run_predictive_study(
+        &paths,
+        &config,
+        model_based_spec.clone(),
+        &model_based_path,
+        5,
+        None,
+    )
+    .expect("model-based study");
+    assert_eq!(model_based.requested_parallelism, 4);
+    assert_eq!(model_based.effective_parallelism, 1);
+    assert_eq!(model_based.completed_trials, 7);
+    let first_model_state = StudyState::load(&model_based_path).expect("model state");
+    let resumed_model_based = Solver::run_predictive_study(
+        &paths,
+        &config,
+        model_based_spec,
+        &model_based_path,
+        5,
+        None,
+    )
+    .expect("resume model-based study");
+    assert_eq!(resumed_model_based.completed_trials, 7);
+    assert_eq!(
+        StudyState::load(&model_based_path)
+            .expect("resumed model state")
+            .trials,
+        first_model_state.trials
+    );
 
     let ablations = Solver::predictive_ablation_report(
         &paths,

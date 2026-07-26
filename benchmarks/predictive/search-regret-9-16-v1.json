@@ -1,0 +1,569 @@
+{
+  "schema_version": 1,
+  "identity_format": "sha256-length-delimited-v1",
+  "input_fingerprint": "sha256-v1:965e7cbaaf6fe44b801c6e1f9bc7e6f50be420418c6129138d5b8344559c9526",
+  "config_fingerprint": "sha256-v1:abc88aa1f541f82bbd86d8eadb22f304b67fda6510259e024f69d1047b0b1984",
+  "code_revision": "790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e",
+  "code_dirty": true,
+  "evaluation_from": "2026-04-19",
+  "evaluation_to": "2026-07-17",
+  "state_path_policy": "forced_proxy_without_artifacts",
+  "minimum_survivors": 9,
+  "maximum_survivors": 16,
+  "maximum_states": 24,
+  "maximum_seconds": 900,
+  "historical_games": 90,
+  "scanned_games": 48,
+  "available_states": 14,
+  "sampled_states": 14,
+  "generation_elapsed_ms": 35198,
+  "production": {
+    "states": 14,
+    "exact_matches": 14,
+    "positive_regret_states": 0,
+    "mean_regret": 0.0,
+    "maximum_regret": 0.0
+  },
+  "proxy": {
+    "states": 14,
+    "exact_matches": 8,
+    "positive_regret_states": 6,
+    "mean_regret": 0.34095221724094327,
+    "maximum_regret": 0.8991797382165512
+  },
+  "lookahead": {
+    "states": 14,
+    "exact_matches": 11,
+    "positive_regret_states": 3,
+    "mean_regret": 0.00015422136263449588,
+    "maximum_regret": 0.0017242962414814045
+  },
+  "states": [
+    {
+      "date": "2026-04-19",
+      "target": "stand",
+      "turn": 3,
+      "surviving_answers": 15,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbgyb"
+        },
+        {
+          "guess": "embar",
+          "feedback": "bbbyb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "giant",
+      "optimal_exact_cost": 1.8679978321608237,
+      "production": {
+        "word": "giant",
+        "exact_cost": 1.8679978321608237,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "giant",
+        "exact_cost": 1.8679978321608237,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "giant",
+        "exact_cost": 1.8679978321608237,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-04-26",
+      "target": "gloss",
+      "turn": 3,
+      "surviving_answers": 14,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "ygbbb"
+        },
+        {
+          "guess": "clock",
+          "feedback": "bggbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "fados",
+      "optimal_exact_cost": 2.1008350068746533,
+      "production": {
+        "word": "doofs",
+        "exact_cost": 2.1008350068746533,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "alaap",
+        "exact_cost": 3.0000147450912045,
+        "regret": 0.8991797382165512,
+        "matches_optimum": false
+      },
+      "lookahead": {
+        "word": "bufos",
+        "exact_cost": 2.1009891984437123,
+        "regret": 0.00015419156905904785,
+        "matches_optimum": false
+      }
+    },
+    {
+      "date": "2026-05-07",
+      "target": "budge",
+      "turn": 3,
+      "surviving_answers": 10,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbbbg"
+        },
+        {
+          "guess": "pirns",
+          "feedback": "bbbbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "fudge",
+      "optimal_exact_cost": 2.1353948133450955,
+      "production": {
+        "word": "fudge",
+        "exact_cost": 2.1353948133450955,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "fudge",
+        "exact_cost": 2.1353948133450955,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "bedew",
+        "exact_cost": 2.135675424611438,
+        "regret": 0.0002806112663424898,
+        "matches_optimum": false
+      }
+    },
+    {
+      "date": "2026-05-09",
+      "target": "satin",
+      "turn": 5,
+      "surviving_answers": 13,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbyyb"
+        },
+        {
+          "guess": "babel",
+          "feedback": "bgbbb"
+        },
+        {
+          "guess": "javel",
+          "feedback": "bgbbb"
+        },
+        {
+          "guess": "mazet",
+          "feedback": "bgbby"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "cowry",
+      "optimal_exact_cost": 2.00422623199068,
+      "production": {
+        "word": "cowry",
+        "exact_cost": 2.00422623199068,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "cowry",
+        "exact_cost": 2.00422623199068,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "cowry",
+        "exact_cost": 2.00422623199068,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-05-21",
+      "target": "agree",
+      "turn": 5,
+      "surviving_answers": 15,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbybg"
+        },
+        {
+          "guess": "ethal",
+          "feedback": "ybbyb"
+        },
+        {
+          "guess": "bewdy",
+          "feedback": "bybbb"
+        },
+        {
+          "guess": "effed",
+          "feedback": "ybbgb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "agree",
+      "optimal_exact_cost": 1.1256704999075657,
+      "production": {
+        "word": "agree",
+        "exact_cost": 1.1256704999075657,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "agree",
+        "exact_cost": 1.1256704999075657,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "agree",
+        "exact_cost": 1.1256704999075657,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-05",
+      "target": "nobly",
+      "turn": 3,
+      "surviving_answers": 14,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "yybbb"
+        },
+        {
+          "guess": "jokey",
+          "feedback": "bgbbg"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "lolog",
+      "optimal_exact_cost": 2.1252368630228022,
+      "production": {
+        "word": "lolog",
+        "exact_cost": 2.1252368630228022,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "aarti",
+        "exact_cost": 3.004615180343114,
+        "regret": 0.8793783173203118,
+        "matches_optimum": false
+      },
+      "lookahead": {
+        "word": "lolog",
+        "exact_cost": 2.1252368630228022,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-11",
+      "target": "testy",
+      "turn": 2,
+      "surviving_answers": 12,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbbgy"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "tipsy",
+      "optimal_exact_cost": 2.0030022386134476,
+      "production": {
+        "word": "tipsy",
+        "exact_cost": 2.0030022386134476,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "tipsy",
+        "exact_cost": 2.0030022386134476,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "tipsy",
+        "exact_cost": 2.0030022386134476,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-12",
+      "target": "break",
+      "turn": 3,
+      "surviving_answers": 9,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbyby"
+        },
+        {
+          "guess": "apgar",
+          "feedback": "bbbgy"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "break",
+      "optimal_exact_cost": 1.7562854574932678,
+      "production": {
+        "word": "break",
+        "exact_cost": 1.7562854574932678,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "break",
+        "exact_cost": 1.7562854574932678,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "break",
+        "exact_cost": 1.7562854574932678,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-20",
+      "target": "drake",
+      "turn": 4,
+      "surviving_answers": 13,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbgbg"
+        },
+        {
+          "guess": "inane",
+          "feedback": "bbgbg"
+        },
+        {
+          "guess": "frame",
+          "feedback": "bggbg"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "brock",
+      "optimal_exact_cost": 2.2881406178258685,
+      "production": {
+        "word": "aback",
+        "exact_cost": 2.2881406178258685,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "aback",
+        "exact_cost": 2.2881406178258685,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "cezve",
+        "exact_cost": 2.28986491406735,
+        "regret": 0.0017242962414814045,
+        "matches_optimum": false
+      }
+    },
+    {
+      "date": "2026-06-24",
+      "target": "queer",
+      "turn": 3,
+      "surviving_answers": 14,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbbby"
+        },
+        {
+          "guess": "dries",
+          "feedback": "bybgb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "venue",
+      "optimal_exact_cost": 2.0094862500724004,
+      "production": {
+        "word": "venue",
+        "exact_cost": 2.0094862500724004,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "aarti",
+        "exact_cost": 2.6852181748987887,
+        "regret": 0.6757319248263882,
+        "matches_optimum": false
+      },
+      "lookahead": {
+        "word": "venue",
+        "exact_cost": 2.0094862500724004,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-26",
+      "target": "acute",
+      "turn": 2,
+      "surviving_answers": 10,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbygg"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "scowp",
+      "optimal_exact_cost": 2.005536895691952,
+      "production": {
+        "word": "scowp",
+        "exact_cost": 2.005536895691952,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "scowp",
+        "exact_cost": 2.005536895691952,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "scowp",
+        "exact_cost": 2.005536895691952,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-03",
+      "target": "baton",
+      "turn": 2,
+      "surviving_answers": 16,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "ybyyb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "porno",
+      "optimal_exact_cost": 2.0144851329686824,
+      "production": {
+        "word": "porno",
+        "exact_cost": 2.0144851329686824,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "hushy",
+        "exact_cost": 2.76996107695568,
+        "regret": 0.7554759439869976,
+        "matches_optimum": false
+      },
+      "lookahead": {
+        "word": "porno",
+        "exact_cost": 2.0144851329686824,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-07",
+      "target": "sling",
+      "turn": 3,
+      "surviving_answers": 14,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bgbbb"
+        },
+        {
+          "guess": "addio",
+          "feedback": "bbbyb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "conks",
+      "optimal_exact_cost": 2.001412527302839,
+      "production": {
+        "word": "conks",
+        "exact_cost": 2.001412527302839,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "adyta",
+        "exact_cost": 2.726039584209357,
+        "regret": 0.7246270569065181,
+        "matches_optimum": false
+      },
+      "lookahead": {
+        "word": "conks",
+        "exact_cost": 2.001412527302839,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-17",
+      "target": "legal",
+      "turn": 3,
+      "surviving_answers": 14,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "byyby"
+        },
+        {
+          "guess": "haulm",
+          "feedback": "bybyb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "grind",
+      "optimal_exact_cost": 2.0065140076212633,
+      "production": {
+        "word": "grind",
+        "exact_cost": 2.0065140076212633,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "baals",
+        "exact_cost": 2.845452067737703,
+        "regret": 0.8389380601164396,
+        "matches_optimum": false
+      },
+      "lookahead": {
+        "word": "grind",
+        "exact_cost": 2.0065140076212633,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    }
+  ]
+}

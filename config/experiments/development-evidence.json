@@ -1,0 +1,100 @@
+{
+  "format_version": 1,
+  "name": "development-evidence-baselines",
+  "profiles": [
+    {
+      "id": "previous_release_790ec2d",
+      "description": "Immutable config snapshot from repository release commit 790ec2d",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disk_only",
+      "base_config_path": "config/baselines/previous-release-790ec2d.toml"
+    },
+    {
+      "id": "uniform_entropy",
+      "description": "Uniform date-supported prior with entropy-only ranking",
+      "weight_mode": "uniform",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "proxy_only" },
+        "second_guess_coverage_max_survivors": { "type": "integer", "value": 0 },
+        "proxy_small_state_lower_bound_threshold": { "type": "integer", "value": 0 },
+        "proxy_weights.entropy_w": { "type": "float", "value": 1.0 },
+        "proxy_weights.bucket_mass_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.bucket_size_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.ambiguous_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.proxy_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.solve_prob_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.posterior_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.smoothness_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.gray_reuse_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.large_bucket_count_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.dangerous_mass_count_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.large_bucket_mass_w": { "type": "float", "value": 0.0 }
+      }
+    },
+    {
+      "id": "cooldown_entropy",
+      "description": "Cooldown-only prior with entropy-only ranking",
+      "weight_mode": "cooldown_only",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "proxy_only" },
+        "second_guess_coverage_max_survivors": { "type": "integer", "value": 0 },
+        "proxy_small_state_lower_bound_threshold": { "type": "integer", "value": 0 },
+        "proxy_weights.entropy_w": { "type": "float", "value": 1.0 },
+        "proxy_weights.bucket_mass_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.bucket_size_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.ambiguous_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.proxy_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.solve_prob_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.posterior_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.smoothness_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.gray_reuse_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.large_bucket_count_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.dangerous_mass_count_w": { "type": "float", "value": 0.0 },
+        "proxy_weights.large_bucket_mass_w": { "type": "float", "value": 0.0 }
+      }
+    },
+    {
+      "id": "weighted_proxy_only",
+      "description": "Weighted prior and proxy ranking without lookahead, exact escalation, or books",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "proxy_only" },
+        "second_guess_coverage_max_survivors": { "type": "integer", "value": 0 },
+        "proxy_small_state_lower_bound_threshold": { "type": "integer", "value": 0 }
+      }
+    },
+    {
+      "id": "weighted_proxy_exact_endgame",
+      "description": "Weighted proxy ranking with exact search only inside the configured endgame threshold",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "proxy_with_exact_endgame" },
+        "second_guess_coverage_max_survivors": { "type": "integer", "value": 0 },
+        "proxy_small_state_lower_bound_threshold": { "type": "integer", "value": 0 }
+      }
+    },
+    {
+      "id": "weighted_staged_no_artifacts",
+      "description": "Weighted prior with staged lookahead/exact search and no predictive books",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled"
+    },
+    {
+      "id": "selected_default_disk_artifacts",
+      "description": "Current default with valid date-matched disk artifacts when available",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disk_only"
+    }
+  ]
+}

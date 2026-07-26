@@ -1,0 +1,69 @@
+{
+  "format_version": 1,
+  "name": "predictive-ablation-matrix",
+  "profiles": [
+    {
+      "id": "uniform_baseline",
+      "description": "Uniform-weight baseline with valid disk artifacts when available",
+      "weight_mode": "uniform",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disk_only"
+    },
+    {
+      "id": "uniform_wide_pools",
+      "description": "Uniform-weight wide-pool ablation with valid disk artifacts when available",
+      "weight_mode": "uniform",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disk_only",
+      "parameters": {
+        "lookahead_candidate_pool": { "type": "integer", "value": 96 },
+        "medium_state_lookahead_candidate_pool": { "type": "integer", "value": 128 },
+        "lookahead_reply_pool": { "type": "integer", "value": 48 },
+        "medium_state_lookahead_reply_pool": { "type": "integer", "value": 64 },
+        "exact_candidate_pool": { "type": "integer", "value": 160 }
+      }
+    },
+    {
+      "id": "cooldown_baseline",
+      "description": "Cooldown-only baseline with valid disk artifacts when available",
+      "weight_mode": "cooldown_only",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disk_only"
+    },
+    {
+      "id": "cooldown_wide_pools",
+      "description": "Cooldown-only wide-pool ablation with valid disk artifacts when available",
+      "weight_mode": "cooldown_only",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disk_only",
+      "parameters": {
+        "lookahead_candidate_pool": { "type": "integer", "value": 96 },
+        "medium_state_lookahead_candidate_pool": { "type": "integer", "value": 128 },
+        "lookahead_reply_pool": { "type": "integer", "value": 48 },
+        "medium_state_lookahead_reply_pool": { "type": "integer", "value": 64 },
+        "exact_candidate_pool": { "type": "integer", "value": 160 }
+      }
+    },
+    {
+      "id": "weighted_baseline",
+      "description": "Weighted baseline with valid disk artifacts when available",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disk_only"
+    },
+    {
+      "id": "weighted_wide_pools",
+      "description": "Weighted wide-pool ablation with valid disk artifacts when available",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disk_only",
+      "parameters": {
+        "lookahead_candidate_pool": { "type": "integer", "value": 96 },
+        "medium_state_lookahead_candidate_pool": { "type": "integer", "value": 128 },
+        "lookahead_reply_pool": { "type": "integer", "value": 48 },
+        "medium_state_lookahead_reply_pool": { "type": "integer", "value": 64 },
+        "exact_candidate_pool": { "type": "integer", "value": 160 }
+      }
+    }
+  ]
+}

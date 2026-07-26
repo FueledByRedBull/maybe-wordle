@@ -13,10 +13,17 @@ impl Solver {
         let mut recovery_weights = vec![0.0; self.answers.len()];
         let mut weights = vec![0.0; self.answers.len()];
         let mut supported_survivors = Vec::new();
+        let mut fallback_surviving =
+            (self.primary_answer_count..self.answers.len()).collect::<Vec<_>>();
         let mut modeled_total_weight = 0.0;
         let mut total_weight = 0.0;
 
-        for (index, answer) in self.answers.iter().enumerate() {
+        for (index, answer) in self
+            .answers
+            .iter()
+            .take(self.primary_answer_count)
+            .enumerate()
+        {
             let snapshot = weight_snapshot_for_mode(answer, &self.config, as_of, self.mode);
             let modeled_weight = snapshot.final_weight.max(0.0);
             if snapshot.base_weight > 0.0 {
@@ -28,7 +35,20 @@ impl Solver {
                     total_weight += modeled_weight;
                     weights[index] = modeled_weight;
                 }
+            } else {
+                fallback_surviving.push(index);
+                recovery_weights[index] = 1.0;
             }
+        }
+        let fallback_weight = if fallback_surviving.is_empty() {
+            0.0
+        } else {
+            let prior_mass = self.config.fallback_prior_mass.clamp(0.0, 0.999_999);
+            modeled_total_weight * (prior_mass / (1.0 - prior_mass))
+                / fallback_surviving.len() as f64
+        };
+        for index in &fallback_surviving {
+            recovery_weights[*index] = fallback_weight;
         }
 
         let (surviving, recovery_mode_used) = if modeled_total_weight > 0.0 {
@@ -59,6 +79,8 @@ impl Solver {
 
         SolveState {
             surviving,
+            fallback_surviving,
+            fallback_active: false,
             modeled_weights,
             recovery_weights,
             weights,
@@ -82,7 +104,9 @@ impl Solver {
 
     pub fn absurdle_initial_state(&self) -> SolveState {
         SolveState {
-            surviving: (0..self.answers.len()).collect(),
+            surviving: (0..self.primary_answer_count).collect(),
+            fallback_surviving: Vec::new(),
+            fallback_active: false,
             modeled_weights: vec![1.0; self.answers.len()],
             recovery_weights: vec![1.0; self.answers.len()],
             weights: vec![1.0; self.answers.len()],
@@ -108,18 +132,44 @@ impl Solver {
             .ok_or_else(|| anyhow!("unknown guess: {}", guess))?;
         state
             .surviving
-            .retain(|answer_index| self.pattern_table.get(guess_index, *answer_index) == pattern);
+            .retain(|answer_index| self.answer_pattern(guess_index, *answer_index) == pattern);
+        state
+            .fallback_surviving
+            .retain(|answer_index| self.answer_pattern(guess_index, *answer_index) == pattern);
+        if state.surviving.is_empty() && !state.fallback_surviving.is_empty() {
+            state.surviving = std::mem::take(&mut state.fallback_surviving);
+            state.fallback_active = true;
+        } else if self.config.fallback_activation_threshold > 0
+            && state.surviving.len() <= self.config.fallback_activation_threshold
+            && !state.fallback_surviving.is_empty()
+        {
+            state
+                .surviving
+                .extend(std::mem::take(&mut state.fallback_surviving));
+            state.surviving.sort_unstable();
+            state.fallback_active = true;
+        }
         state.modeled_total_weight = state
             .surviving
             .iter()
             .map(|index| state.modeled_weights[*index])
             .sum::<f64>();
-        if state.modeled_total_weight > 0.0 && state.recovery_mode_used.is_none() {
+        if state.modeled_total_weight > 0.0 {
             for index in &state.surviving {
-                state.weights[*index] = state.modeled_weights[*index];
+                state.weights[*index] = if state.modeled_weights[*index] > 0.0 {
+                    state.modeled_weights[*index]
+                } else if state.fallback_active {
+                    state.recovery_weights[*index]
+                } else {
+                    0.0
+                };
             }
             state.recovery_mode_used = None;
-            state.total_weight = state.modeled_total_weight;
+            state.total_weight = state
+                .surviving
+                .iter()
+                .map(|index| state.weights[*index])
+                .sum::<f64>();
         } else {
             state.recovery_mode_used = match self.config.recovery.mode {
                 RecoveryMode::Strict => {
@@ -197,6 +247,26 @@ impl Solver {
         let identity = self.predictive_book_identity(request.as_of);
         let (history_snapshot_date, history_snapshot_hash) =
             self.predictive_history_snapshot(request.as_of);
+        let mut candidates = state
+            .surviving
+            .iter()
+            .map(|index| PredictiveCandidateSummary {
+                word: self.answers[*index].word.clone(),
+                probability: if state.total_weight > 0.0 {
+                    state.weights[*index] / state.total_weight
+                } else {
+                    0.0
+                },
+                modeled_weight: state.modeled_weights[*index],
+                fallback_support: state.modeled_weights[*index] <= 0.0,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .probability
+                .total_cmp(&left.probability)
+                .then_with(|| left.word.cmp(&right.word))
+        });
         Ok(PredictiveSuggestResponse {
             state: PredictiveStateSummary {
                 surviving: state.surviving.len(),
@@ -205,6 +275,7 @@ impl Solver {
                 recovery_mode_used: state.recovery_mode_used,
             },
             suggestions: suggestions.suggestions,
+            candidates,
             promoted_word: suggestions.promoted_word,
             promotion_source: suggestions.promotion_source,
             artifact_state: PredictiveArtifactState::from_promotion_source(

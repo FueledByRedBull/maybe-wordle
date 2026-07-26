@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "identity_format": "sha256-length-delimited-v1",
+  "scope": "release suggestion-kernel profile; no sealed-test evaluation",
+  "build_command": "cargo bench --bench performance_profile",
+  "platform": "windows-x86_64",
+  "cpu": "AMD64 Family 25 Model 97 Stepping 2, AuthenticAMD",
+  "code_revision": "790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e",
+  "code_dirty": true,
+  "executable_fingerprint": "sha256-v1:1eb49992adf2afb8b3fcbacedbfa6b530c163f278a0d0f69c51077b51687ffda",
+  "inputs": [
+    {
+      "path": "config/prior.toml",
+      "bytes": 2855,
+      "fingerprint": "sha256-v1:0c5238b341beeb8b36bd61bdeaa1e10f73611930045ae952e5139b773d11cfbe"
+    },
+    {
+      "path": "data/raw/nyt_daily_answers.jsonl",
+      "bytes": 190856,
+      "fingerprint": "sha256-v1:c1409059e22b6a16ac588cbb0f5ff82dc460eb5b61f2b825639c27b991239727"
+    },
+    {
+      "path": "data/seed/valid_guesses.txt",
+      "bytes": 89131,
+      "fingerprint": "sha256-v1:97ca0ae74c149ea8d61f72a685fc75517b9bdc25835ecc00320481908f33ec3b"
+    },
+    {
+      "path": "data/seed/candidate_answers.txt",
+      "bytes": 13892,
+      "fingerprint": "sha256-v1:464596a550a4e13e2e575f421aabd6966881910c6a6b3fba7abf68ced740b7a0"
+    },
+    {
+      "path": "data/seed/reference_candidate_answers.txt",
+      "bytes": 16163,
+      "fingerprint": "sha256-v1:517caf1b32b60b690bedb15f0d6a155280ee1695c11b4ebdcf0b554c0e2c8a3f"
+    },
+    {
+      "path": "data/seed/manual_additions.txt",
+      "bytes": 153,
+      "fingerprint": "sha256-v1:228a10ca63f99c970c37163f336320bf62b22428024cd2c38624c5f1c2c8dd3c"
+    },
+    {
+      "path": "data/derived/pattern_table.bin",
+      "bytes": 35028170,
+      "fingerprint": "sha256-v1:78da1942901efd169c7dcc791b07bab3c2a8c7d9aa71aaa6105a09cecedc6fe8"
+    }
+  ],
+  "workloads": [
+    {
+      "id": "proxy-root",
+      "description": "Proxy-only ranking on the full modeled posterior.",
+      "as_of": "2026-07-17",
+      "observations": [],
+      "surviving_answers": 2358,
+      "detected_regime": "proxy",
+      "config_fingerprint": "sha256-v1:c94a2332d447049d6f948b5c96db0acb557d4603a329eadb8a61787ebdd60780",
+      "cold": {
+        "runs": 1,
+        "wall_ms_per_call": 39.298300000000005,
+        "process_cpu_ms_per_call": 687.5,
+        "process_cycles_per_call": 2097048660.0,
+        "allocation_calls_per_call": 18311.0,
+        "allocated_bytes_per_call": 7560173.0,
+        "page_faults_per_call": 2813.0,
+        "current_working_set_bytes": 49016832,
+        "peak_working_set_bytes": 77320192
+      },
+      "warm": {
+        "runs": 12,
+        "wall_ms_per_call": 36.72431666666667,
+        "process_cpu_ms_per_call": 467.4479166666667,
+        "process_cycles_per_call": 2077375965.0,
+        "allocation_calls_per_call": 18377.25,
+        "allocated_bytes_per_call": 7502792.75,
+        "page_faults_per_call": 1641.0833333333333,
+        "current_working_set_bytes": 52207616,
+        "peak_working_set_bytes": 77320192
+      },
+      "cold_to_warm_wall_ratio": 1.0700893458875342
+    },
+    {
+      "id": "bounded-lookahead-15",
+      "description": "Bounded lookahead on a replayable 15-answer posterior.",
+      "as_of": "2026-04-18",
+      "observations": [
+        "olate:bbgyb",
+        "embar:bbbyb"
+      ],
+      "surviving_answers": 15,
+      "detected_regime": "lookahead",
+      "config_fingerprint": "sha256-v1:90c8c049069088b66f39064eb319e59131edfb78c9bafef879b13e20ed0dc917",
+      "cold": {
+        "runs": 1,
+        "wall_ms_per_call": 96.5338,
+        "process_cpu_ms_per_call": 93.75,
+        "process_cycles_per_call": 492843120.0,
+        "allocation_calls_per_call": 24487.0,
+        "allocated_bytes_per_call": 29123021.0,
+        "page_faults_per_call": 3856.0,
+        "current_working_set_bytes": 52891648,
+        "peak_working_set_bytes": 85438464
+      },
+      "warm": {
+        "runs": 12,
+        "wall_ms_per_call": 94.15263333333333,
+        "process_cpu_ms_per_call": 108.07291666666667,
+        "process_cycles_per_call": 466473490.0,
+        "allocation_calls_per_call": 22959.166666666668,
+        "allocated_bytes_per_call": 28751757.5,
+        "page_faults_per_call": 3711.5833333333335,
+        "current_working_set_bytes": 53817344,
+        "peak_working_set_bytes": 85438464
+      },
+      "cold_to_warm_wall_ratio": 1.0252904946188441
+    },
+    {
+      "id": "pooled-exact-15",
+      "description": "Production pooled-exact search on the same 15-answer posterior.",
+      "as_of": "2026-04-18",
+      "observations": [
+        "olate:bbgyb",
+        "embar:bbbyb"
+      ],
+      "surviving_answers": 15,
+      "detected_regime": "exact",
+      "config_fingerprint": "sha256-v1:ac7a3a468e8a23c472019f42f5e18de0431ec21c435e8b1eba4e6a29d2d737f9",
+      "cold": {
+        "runs": 1,
+        "wall_ms_per_call": 184.9974,
+        "process_cpu_ms_per_call": 187.5,
+        "process_cycles_per_call": 854245140.0,
+        "allocation_calls_per_call": 23546.0,
+        "allocated_bytes_per_call": 40048772.0,
+        "page_faults_per_call": 4537.0,
+        "current_working_set_bytes": 53809152,
+        "peak_working_set_bytes": 87060480
+      },
+      "warm": {
+        "runs": 3,
+        "wall_ms_per_call": 189.1725333333333,
+        "process_cpu_ms_per_call": 270.83333333333337,
+        "process_cycles_per_call": 863803220.0,
+        "allocation_calls_per_call": 23346.333333333332,
+        "allocated_bytes_per_call": 40000253.0,
+        "page_faults_per_call": 4659.0,
+        "current_working_set_bytes": 53993472,
+        "peak_working_set_bytes": 87060480
+      },
+      "cold_to_warm_wall_ratio": 0.9779294950500216
+    }
+  ],
+  "limitations": [
+    "Allocation counts use a System-allocator wrapper in this dedicated benchmark executable; relaxed atomic counters add measurement overhead.",
+    "Process CPU time and cycle counts include Rayon worker threads and are process-wide.",
+    "Cold/warm ratios and page faults characterize application/data-cache behavior; hardware L1/L2/LLC miss counters were unavailable in the installed Windows profiling toolchain.",
+    "Peak working set is the process lifetime high-water mark and cannot be reset between workloads, so later workloads inherit earlier setup memory."
+  ]
+}

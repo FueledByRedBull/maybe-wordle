@@ -46,6 +46,22 @@ impl Solver {
         Ok((artifact.identity == self.predictive_book_identity(as_of)).then_some(artifact))
     }
 
+    pub(super) fn load_recent_predictive_reply_book(
+        &self,
+        as_of: NaiveDate,
+        max_age_days: u64,
+    ) -> Result<Option<PredictiveReplyBookArtifact>> {
+        for age_days in 1..=max_age_days {
+            let Some(candidate_date) = as_of.checked_sub_days(Days::new(age_days)) else {
+                break;
+            };
+            if let Some(artifact) = self.load_predictive_reply_book(candidate_date)? {
+                return Ok(Some(artifact));
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) fn session_root_guess(&self, as_of: NaiveDate) -> Result<Option<String>> {
         let identity = self.predictive_book_identity(as_of);
         if let Some(cached) = self
@@ -67,7 +83,7 @@ impl Solver {
     }
 
     pub(super) fn evaluate_session_opener(&self, as_of: NaiveDate) -> Result<Option<String>> {
-        let offline = self.offline_book_solver();
+        let offline = self.offline_book_solver()?;
         let (window_start, _, targets) = offline.recent_history_targets_for_books(as_of)?;
         let holdout = offline.previous_history_targets_for_books(window_start)?;
         if targets.is_empty() {
@@ -162,7 +178,7 @@ impl Solver {
         opener: &str,
         pattern: u8,
     ) -> Result<Option<String>> {
-        let offline = self.offline_book_solver();
+        let offline = self.offline_book_solver()?;
         let (_, _, targets) = offline.recent_history_targets_for_books(as_of)?;
         let scoped_targets = targets
             .into_iter()
@@ -189,7 +205,7 @@ impl Solver {
         reply: &str,
         reply_pattern: u8,
     ) -> Result<Option<String>> {
-        let offline = self.offline_book_solver();
+        let offline = self.offline_book_solver()?;
         let (_, _, targets) = offline.recent_history_targets_for_books(as_of)?;
         let scoped_targets = targets
             .into_iter()
@@ -315,7 +331,7 @@ impl Solver {
                 .or_else(|| {
                     self.load_recent_predictive_opener_artifact(
                         as_of,
-                        OPENER_ARTIFACT_FRESHNESS_DAYS,
+                        self.config.session_artifact_freshness_days as u64,
                     )
                     .ok()
                     .flatten()
@@ -337,6 +353,14 @@ impl Solver {
                 .load_predictive_reply_book(as_of)
                 .ok()
                 .flatten()
+                .or_else(|| {
+                    self.load_recent_predictive_reply_book(
+                        as_of,
+                        self.config.session_artifact_freshness_days as u64,
+                    )
+                    .ok()
+                    .flatten()
+                })
                 .filter(|artifact| artifact.opener == guess.as_str())
                 .and_then(|artifact| {
                     artifact
@@ -365,6 +389,14 @@ impl Solver {
                 .load_predictive_reply_book(as_of)
                 .ok()
                 .flatten()
+                .or_else(|| {
+                    self.load_recent_predictive_reply_book(
+                        as_of,
+                        self.config.session_artifact_freshness_days as u64,
+                    )
+                    .ok()
+                    .flatten()
+                })
                 .filter(|artifact| artifact.opener == opener.as_str())
                 .and_then(|artifact| {
                     artifact

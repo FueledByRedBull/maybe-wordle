@@ -1,0 +1,102 @@
+{
+  "format_version": 1,
+  "identity_format": "sha256-length-delimited-v1",
+  "input_fingerprint": "sha256-v1:ab967dbfee3a03f88bde9784418ebd4e6938660770f5aaf6a2f2441138fdfb7d",
+  "operating_system": "windows",
+  "architecture": "x86_64",
+  "logical_cpus": 16,
+  "answer_counts": [
+    3,
+    4,
+    5,
+    6,
+    8,
+    10,
+    12
+  ],
+  "guess_limit": 14855,
+  "maximum_seconds": 1800,
+  "maximum_memory_mb": 4096,
+  "maximum_disk_mb": 4096,
+  "full_model_projection": {
+    "target_answer_count": 2358,
+    "method": "least-squares linear fit of log10(metric) against pinned answer count",
+    "source_points": 5,
+    "projected_log10_seconds": 766.4430662907304,
+    "projected_log10_certificate_bytes": 830.3707979967719
+  },
+  "points": [
+    {
+      "answer_count": 3,
+      "guess_count": 14855,
+      "policy_states": 3,
+      "certificate_states": 7,
+      "build_millis": 279,
+      "verify_millis": 262,
+      "states_per_second": 25.089605734767023,
+      "certificate_bytes": 46215566,
+      "artifact_bytes": 46262088,
+      "scale_checkpoint_bytes": 1255,
+      "process_peak_working_set_bytes": 270245888,
+      "manifest_hash": "sha256-v1:bbf5e2f649999ce4fe5117ed491b00370c0a0605d13b8405d8a2c63574f26496"
+    },
+    {
+      "answer_count": 4,
+      "guess_count": 14855,
+      "policy_states": 4,
+      "certificate_states": 15,
+      "build_millis": 592,
+      "verify_millis": 632,
+      "states_per_second": 25.33783783783784,
+      "certificate_bytes": 126239761,
+      "artifact_bytes": 126301168,
+      "scale_checkpoint_bytes": 1742,
+      "process_peak_working_set_bytes": 367955968,
+      "manifest_hash": "sha256-v1:464ae92bcfb36eb7cf007d8607635814e4124d656af6b73494202388397a2d3b"
+    },
+    {
+      "answer_count": 5,
+      "guess_count": 14855,
+      "policy_states": 5,
+      "certificate_states": 26,
+      "build_millis": 1105,
+      "verify_millis": 1369,
+      "states_per_second": 23.529411764705884,
+      "certificate_bytes": 255916651,
+      "artifact_bytes": 255992970,
+      "scale_checkpoint_bytes": 2258,
+      "process_peak_working_set_bytes": 529969152,
+      "manifest_hash": "sha256-v1:fc06e275c2d9e24169893fac19a41fafed2e29e0beb020a8671d072e82214b04"
+    },
+    {
+      "answer_count": 6,
+      "guess_count": 14855,
+      "policy_states": 6,
+      "certificate_states": 49,
+      "build_millis": 2625,
+      "verify_millis": 3319,
+      "states_per_second": 18.666666666666668,
+      "certificate_bytes": 578692721,
+      "artifact_bytes": 578783938,
+      "scale_checkpoint_bytes": 2749,
+      "process_peak_working_set_bytes": 1396404224,
+      "manifest_hash": "sha256-v1:aab191fbf9331bce4ce494caa058684dc28cf282bc698719fdcee34084a34ef3"
+    },
+    {
+      "answer_count": 8,
+      "guess_count": 14855,
+      "policy_states": 9,
+      "certificate_states": 193,
+      "build_millis": 11795,
+      "verify_millis": 15059,
+      "states_per_second": 16.362865621025858,
+      "certificate_bytes": 2739921165,
+      "artifact_bytes": 2740042203,
+      "scale_checkpoint_bytes": 3284,
+      "process_peak_working_set_bytes": 5025992704,
+      "manifest_hash": "sha256-v1:44e966f4b6e22bc2809897d727fa6ac1dad2e49999895b1bf47746d2b156cf5c"
+    }
+  ],
+  "completed": false,
+  "stopped_reason": "memory budget exhausted before 10 answers"
+}

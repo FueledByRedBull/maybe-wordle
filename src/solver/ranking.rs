@@ -5,7 +5,7 @@ impl Solver {
         &self,
         subset: &[usize],
         weights: &[f64],
-        small_state_table: &SmallStateTable,
+        _small_state_table: &SmallStateTable,
     ) -> Vec<GuessMetrics> {
         let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
         let mut posterior_answer_probability = vec![0.0; self.guesses.len()];
@@ -28,7 +28,6 @@ impl Solver {
                         subset,
                         weights,
                         total_weight,
-                        small_state_table,
                         posterior_answer_probability: posterior_answer_probability[guess_index],
                     },
                 )
@@ -45,7 +44,7 @@ impl Solver {
         let mut counts = [0usize; PATTERN_SPACE];
         let mut touched_patterns = Vec::new();
         for answer_index in subset {
-            let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
+            let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
             if counts[pattern] == 0 {
                 touched_patterns.push(pattern as u8);
             }
@@ -96,17 +95,17 @@ impl Solver {
             subset,
             weights,
             total_weight,
-            small_state_table,
             posterior_answer_probability,
         } = context;
         scratch.reset();
         for answer_index in subset {
-            let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
+            let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
             if scratch.counts[pattern] == 0 {
                 scratch.touched_patterns.push(pattern as u8);
             }
             let weight = weights[*answer_index];
             scratch.masses[pattern] += weight;
+            scratch.largest_weights[pattern] = scratch.largest_weights[pattern].max(weight);
             scratch.counts[pattern] += 1;
             if weight > 0.0 {
                 scratch.weighted_log_sums[pattern] += weight * weight.log2();
@@ -144,9 +143,11 @@ impl Solver {
             if pattern == ALL_GREEN_PATTERN {
                 solve_probability = probability;
             } else {
-                non_green_bucket_count += 1;
-                non_green_mass += probability;
-                non_green_mass_square_sum += probability * probability;
+                if probability > 0.0 {
+                    non_green_bucket_count += 1;
+                    non_green_mass += probability;
+                    non_green_mass_square_sum += probability * probability;
+                }
                 worst_non_green_bucket_size =
                     worst_non_green_bucket_size.max(scratch.counts[index]);
                 largest_non_green_bucket_mass = largest_non_green_bucket_mass.max(probability);
@@ -159,7 +160,7 @@ impl Solver {
                 }
                 if scratch.counts[index] > 1 {
                     force_in_two = false;
-                    if probability >= 0.10 {
+                    if probability >= self.config.ambiguous_mass_threshold {
                         high_mass_ambiguous_bucket_count += 1;
                     }
                 }
@@ -168,8 +169,8 @@ impl Solver {
                 0.0
             } else if scratch.counts[index] == 1 {
                 1.0
-            } else if scratch.counts[index] <= self.config.exact_exhaustive_threshold {
-                small_state_table.lower_bound(scratch.counts[index])
+            } else if scratch.counts[index] <= self.config.proxy_small_state_lower_bound_threshold {
+                weighted_proxy_child_floor(mass, scratch.largest_weights[index])
             } else {
                 let expected_remaining_floor =
                     (scratch.counts[index] as f64 / PATTERN_SPACE as f64).max(1.0);
@@ -188,7 +189,6 @@ impl Solver {
             non_green_mass_square_sum,
             non_green_bucket_count,
         );
-        proxy_cost += 0.25 * smoothness_penalty;
         let entropy = if total_weight > 0.0 {
             total_weight.log2() - (sum_mass_log_mass / total_weight)
         } else {
@@ -231,6 +231,13 @@ impl Solver {
             posterior_answer_probability,
         }
     }
+}
+
+pub(super) fn weighted_proxy_child_floor(total_mass: f64, largest_mass: f64) -> f64 {
+    if total_mass <= 0.0 {
+        return 0.0;
+    }
+    1.0 + ((total_mass - largest_mass) / total_mass)
 }
 
 pub(super) fn compare_force_in_two(left: bool, right: bool) -> std::cmp::Ordering {
@@ -297,30 +304,19 @@ pub(super) fn has_repeated_letters(word: &str) -> bool {
     false
 }
 
-pub(super) fn aggressive_early_exact_config(config: &PriorConfig) -> PriorConfig {
-    let mut aggressive = config.clone();
-    aggressive.exact_threshold = aggressive.exact_threshold.max(80);
-    aggressive.exact_exhaustive_threshold = aggressive.exact_exhaustive_threshold.max(16);
-    aggressive.exact_candidate_pool = aggressive.exact_candidate_pool.max(160);
-    aggressive.lookahead_threshold = aggressive.lookahead_threshold.max(192);
-    aggressive.medium_state_lookahead_threshold =
-        aggressive.medium_state_lookahead_threshold.max(96);
-    aggressive.lookahead_candidate_pool = aggressive.lookahead_candidate_pool.max(48);
-    aggressive.medium_state_lookahead_candidate_pool =
-        aggressive.medium_state_lookahead_candidate_pool.max(64);
-    aggressive.lookahead_reply_pool = aggressive.lookahead_reply_pool.max(24);
-    aggressive.medium_state_lookahead_reply_pool =
-        aggressive.medium_state_lookahead_reply_pool.max(24);
-    aggressive.lookahead_root_force_in_two_scan =
-        aggressive.lookahead_root_force_in_two_scan.max(96);
-    aggressive.medium_state_force_in_two_scan = aggressive.medium_state_force_in_two_scan.max(160);
-    aggressive.danger_lookahead_threshold = aggressive.danger_lookahead_threshold.min(0.52);
-    aggressive.danger_exact_threshold = aggressive.danger_exact_threshold.min(0.64);
-    aggressive.danger_reply_pool_bonus = aggressive.danger_reply_pool_bonus.max(10);
-    aggressive.danger_exact_root_pool = aggressive.danger_exact_root_pool.max(48);
-    aggressive.danger_exact_survivor_cap = aggressive.danger_exact_survivor_cap.max(224);
-    aggressive.large_state_split_threshold = aggressive.large_state_split_threshold.min(48);
-    aggressive
+pub(super) fn aggressive_early_exact_config(config: &PriorConfig) -> Result<PriorConfig> {
+    apply_embedded_profile(
+        config,
+        include_str!("../../config/profiles/aggressive-three-guess.json"),
+    )
+}
+
+pub(super) fn apply_embedded_profile(config: &PriorConfig, source: &str) -> Result<PriorConfig> {
+    let profile = PredictiveConfigProfile::parse_json(source)?;
+    profile.apply(
+        &predictive_parameter_registry(&PriorConfig::default()),
+        config,
+    )
 }
 
 pub(super) fn better_targeted_run(
@@ -450,20 +446,6 @@ pub(super) fn proxy_row_score_from_weights(
         - (weights.large_bucket_count_w * row.large_non_green_bucket_count as f64)
         - (weights.dangerous_mass_count_w * row.dangerous_mass_bucket_count as f64)
         - (weights.large_bucket_mass_w * row.non_green_mass_in_large_buckets)
-}
-
-pub(super) fn flatten_weighted_config(config: &PriorConfig, keep_factor: f64) -> PriorConfig {
-    let mut flattened = config.clone();
-    let blend = |value: f64| 1.0 + ((value - 1.0) * keep_factor);
-    flattened.base_seed_weight = blend(flattened.base_seed_weight).max(0.01);
-    flattened.base_history_only_weight = blend(flattened.base_history_only_weight).max(0.01);
-    flattened.cooldown_floor = blend(flattened.cooldown_floor).clamp(0.0, 1.0);
-    flattened.manual_weights = flattened
-        .manual_weights
-        .into_iter()
-        .map(|(word, weight)| (word, blend(weight).max(0.01)))
-        .collect();
-    flattened
 }
 
 pub(super) fn compare_guess_metrics(
@@ -700,4 +682,16 @@ pub(super) fn compare_exact_costs(
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => compare_suggestions_for_state(left, right, split_first),
     }
+}
+
+pub(super) fn compare_final_turn(left: &Suggestion, right: &Suggestion) -> std::cmp::Ordering {
+    right
+        .solve_probability
+        .total_cmp(&left.solve_probability)
+        .then_with(|| {
+            right
+                .posterior_answer_probability
+                .total_cmp(&left.posterior_answer_probability)
+        })
+        .then_with(|| left.word.cmp(&right.word))
 }

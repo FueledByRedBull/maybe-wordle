@@ -5,12 +5,13 @@ use rayon::prelude::*;
 
 use crate::{
     atomic_file::atomic_write,
+    identity::CanonicalSha256,
     model::AnswerRecord,
     scoring::{PATTERN_SPACE, score_guess},
 };
 
-const MAGIC: &[u8; 8] = b"MWORDPT1";
-const HEADER_SIZE: usize = 8 + 4 + 4 + 8 + 8;
+const MAGIC: &[u8; 8] = b"MWORDPT2";
+const HEADER_SIZE: usize = 8 + 4 + 4 + 32 + 32;
 
 #[derive(Clone, Debug)]
 pub struct PatternTable {
@@ -92,8 +93,8 @@ impl PatternTable {
             u32::from_le_bytes(bytes[8..12].try_into().expect("slice length")) as usize;
         let answer_count =
             u32::from_le_bytes(bytes[12..16].try_into().expect("slice length")) as usize;
-        let guess_hash = u64::from_le_bytes(bytes[16..24].try_into().expect("slice length"));
-        let answer_hash = u64::from_le_bytes(bytes[24..32].try_into().expect("slice length"));
+        let guess_hash: [u8; 32] = bytes[16..48].try_into().expect("slice length");
+        let answer_hash: [u8; 32] = bytes[48..80].try_into().expect("slice length");
 
         if guess_count != guesses.len()
             || answer_count != answers.len()
@@ -123,27 +124,18 @@ impl PatternTable {
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&(self.guess_count as u32).to_le_bytes());
         bytes.extend_from_slice(&(self.answer_count as u32).to_le_bytes());
-        bytes.extend_from_slice(&hash_word_list(guesses.iter().map(String::as_str)).to_le_bytes());
-        bytes.extend_from_slice(&hash_word_list(answers.iter().copied()).to_le_bytes());
+        bytes.extend_from_slice(&hash_word_list(guesses.iter().map(String::as_str)));
+        bytes.extend_from_slice(&hash_word_list(answers.iter().copied()));
         bytes.extend_from_slice(&self.data);
 
         atomic_write(path, &bytes)
     }
 }
 
-pub fn hash_word_list<'a>(words: impl IntoIterator<Item = &'a str>) -> u64 {
-    let mut hash = 1469598103934665603u64;
+pub fn hash_word_list<'a>(words: impl IntoIterator<Item = &'a str>) -> [u8; 32] {
+    let mut hash = CanonicalSha256::new("maybe-wordle-word-list-v2");
     for word in words {
-        hash = hash_bytes(hash, word.as_bytes());
-        hash = hash_bytes(hash, b"\n");
+        hash.field(word.as_bytes());
     }
-    hash
-}
-
-pub fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(1099511628211);
-    }
-    hash
+    hash.finish()
 }

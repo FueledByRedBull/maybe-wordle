@@ -66,6 +66,17 @@ impl Solver {
         context: Option<PredictiveContext<'_>>,
         book_usage: PredictiveBookUsage,
     ) -> Result<SuggestionBatch> {
+        self.suggestion_batch_internal_with_search_mode(state, top, context, book_usage, None)
+    }
+
+    pub(super) fn suggestion_batch_internal_with_search_mode(
+        &self,
+        state: &SolveState,
+        top: usize,
+        context: Option<PredictiveContext<'_>>,
+        book_usage: PredictiveBookUsage,
+        forced_search_mode: Option<PredictiveSearchMode>,
+    ) -> Result<SuggestionBatch> {
         if state.surviving.is_empty() {
             bail!("cannot score guesses with an empty state");
         }
@@ -73,10 +84,11 @@ impl Solver {
             bail!("cannot score guesses when no positive answer mass remains");
         }
         let split_first = state.surviving.len() > self.config.large_state_split_threshold;
-        let medium_second_guess = context
-            .as_ref()
-            .is_some_and(|context| context.observations.len() == 1)
-            && self.is_medium_state_lookahead(state.surviving.len());
+        let use_second_guess_coverage = should_use_second_guess_coverage(
+            &self.config,
+            state.surviving.len(),
+            context.map_or(0, |context| context.observations.len()),
+        );
         let known_absent_mask = context
             .as_ref()
             .map(|context| known_absent_letter_mask(context.observations))
@@ -99,7 +111,7 @@ impl Solver {
         metrics.sort_by(|left, right| {
             compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
         });
-        let three_solve_coverage = if medium_second_guess {
+        let three_solve_coverage = if use_second_guess_coverage {
             Some(self.medium_second_guess_coverage(&state.surviving, &state.weights, &metrics)?)
         } else {
             None
@@ -116,7 +128,9 @@ impl Solver {
             });
         }
         let assessment = self.assess_state_danger(state, &metrics);
-        let search_mode = predictive_search_mode(&self.config, state.surviving.len(), assessment);
+        let search_mode = forced_search_mode.unwrap_or_else(|| {
+            predictive_search_mode(&self.config, state.surviving.len(), assessment)
+        });
         let mut suggestions = metrics
             .into_iter()
             .map(|metric| Suggestion {
@@ -138,6 +152,14 @@ impl Solver {
                 exact_cost: None,
             })
             .collect::<Vec<_>>();
+        suggestions
+            .retain(|suggestion| suggestion.worst_non_green_bucket_size < state.surviving.len());
+        if suggestions.is_empty() {
+            bail!(
+                "no predictive guess makes progress on a state with {} survivors",
+                state.surviving.len()
+            );
+        }
         let lookahead_pool_base = self.lookahead_candidate_pool_for_state(state.surviving.len());
         let lookahead_pool = self.expanded_pool_size(
             &suggestions,
@@ -259,6 +281,12 @@ impl Solver {
                     });
                 }
                 ExactSuggestionMode::Pooled => {
+                    for suggestion in &mut suggestions {
+                        suggestion.exact_cost = self
+                            .guess_index
+                            .get(&suggestion.word)
+                            .and_then(|guess_index| exact_costs[*guess_index]);
+                    }
                     suggestions.sort_by(|left, right| {
                         let left_cost = self
                             .guess_index
@@ -346,6 +374,12 @@ impl Solver {
             });
         }
 
+        if context
+            .is_some_and(|context| should_use_final_turn_objective(context.observations.len()))
+        {
+            suggestions.sort_by(compare_final_turn);
+        }
+
         let mut promoted_word = None;
         let mut promotion_source = None;
         if book_usage != PredictiveBookUsage::None
@@ -408,9 +442,9 @@ impl Solver {
             (kth_score - top).abs()
         };
         let expanded = if gap < self.config.pool_tight_gap_threshold {
-            base.saturating_mul(5) / 2
+            scaled_pool_size(base, self.config.pool_tight_expansion_multiplier)
         } else if gap < self.config.pool_medium_gap_threshold {
-            base.saturating_mul(3) / 2
+            scaled_pool_size(base, self.config.pool_medium_expansion_multiplier)
         } else {
             base
         };
@@ -443,7 +477,10 @@ impl Solver {
             }
         };
 
-        for suggestion in suggestions.iter().take(pool / 2) {
+        for suggestion in suggestions.iter().take(fractional_pool_take(
+            pool,
+            self.config.exact_pool_primary_fraction,
+        )) {
             let guess_index = self
                 .guess_index
                 .get(&suggestion.word)
@@ -459,7 +496,10 @@ impl Solver {
                 .total_cmp(&left.entropy)
                 .then_with(|| left.word.cmp(&right.word))
         });
-        for suggestion in by_entropy.into_iter().take(pool / 4) {
+        for suggestion in by_entropy.into_iter().take(fractional_pool_take(
+            pool,
+            self.config.exact_pool_entropy_fraction,
+        )) {
             let guess_index = self
                 .guess_index
                 .get(&suggestion.word)
@@ -474,7 +514,10 @@ impl Solver {
                 .cmp(&right.worst_non_green_bucket_size)
                 .then_with(|| compare_suggestions(left, right))
         });
-        for suggestion in by_worst_bucket.into_iter().take(pool / 6) {
+        for suggestion in by_worst_bucket.into_iter().take(fractional_pool_take(
+            pool,
+            self.config.exact_pool_worst_bucket_fraction,
+        )) {
             let guess_index = self
                 .guess_index
                 .get(&suggestion.word)
@@ -489,7 +532,10 @@ impl Solver {
                 .total_cmp(&right.largest_non_green_bucket_mass)
                 .then_with(|| compare_suggestions(left, right))
         });
-        for suggestion in by_mass_reducer.into_iter().take(pool / 6) {
+        for suggestion in by_mass_reducer.into_iter().take(fractional_pool_take(
+            pool,
+            self.config.exact_pool_mass_reducer_fraction,
+        )) {
             let guess_index = self
                 .guess_index
                 .get(&suggestion.word)
@@ -505,7 +551,10 @@ impl Solver {
                 .total_cmp(&left.solve_probability)
                 .then_with(|| left.word.cmp(&right.word))
         });
-        for suggestion in by_solve_prob.into_iter().take(pool / 8) {
+        for suggestion in by_solve_prob.into_iter().take(fractional_pool_take(
+            pool,
+            self.config.exact_pool_solve_probability_fraction,
+        )) {
             let guess_index = self
                 .guess_index
                 .get(&suggestion.word)
@@ -524,7 +573,10 @@ impl Solver {
                 .total_cmp(&left.posterior_answer_probability)
                 .then_with(|| left.word.cmp(&right.word))
         });
-        for suggestion in by_posterior.into_iter().take(pool / 8) {
+        for suggestion in by_posterior.into_iter().take(fractional_pool_take(
+            pool,
+            self.config.exact_pool_posterior_fraction,
+        )) {
             let guess_index = self
                 .guess_index
                 .get(&suggestion.word)
@@ -605,16 +657,13 @@ impl Solver {
             exact_scratch,
             lookahead_memo,
         } = context;
-        let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
-        if total_weight <= 0.0 {
-            bail!("cannot evaluate lookahead on a zero-mass subset");
-        }
+        let (total_weight, _) = validated_subset_mass(subset, weights)?;
 
         let mut ordered_patterns = [0u8; PATTERN_SPACE];
         let ordered_len = {
             let frame = exact_scratch.frame_mut(0);
             for answer_index in subset {
-                let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
+                let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
                 if frame.child_subsets[pattern].is_empty() {
                     frame.touched_patterns.push(pattern as u8);
                 }
@@ -631,12 +680,11 @@ impl Solver {
         let mut large_bucket_count = 0usize;
         let mut dangerous_mass_bucket_count = 0usize;
         let mut non_green_mass_in_large_buckets = 0.0_f64;
-        let mut high_mass_ambiguous_bucket_count = 0usize;
         for pattern in ordered_patterns[..ordered_len].iter().copied() {
             let mass = exact_scratch.frames[0].masses[pattern as usize];
             let probability = mass / total_weight;
             let child_len = exact_scratch.frames[0].child_subsets[pattern as usize].len();
-            let child_value = if pattern == ALL_GREEN_PATTERN {
+            let child_value = if mass == 0.0 || pattern == ALL_GREEN_PATTERN {
                 0.0
             } else {
                 let child_subset =
@@ -666,9 +714,6 @@ impl Solver {
                 }
                 if probability >= self.config.trap_mass_threshold {
                     dangerous_mass_bucket_count += 1;
-                    if child_len > 1 {
-                        high_mass_ambiguous_bucket_count += 1;
-                    }
                 }
             }
         }
@@ -678,7 +723,6 @@ impl Solver {
                 large_bucket_count,
                 dangerous_mass_bucket_count,
                 non_green_mass_in_large_buckets,
-                high_mass_ambiguous_bucket_count,
             ))
     }
 
@@ -716,7 +760,7 @@ impl Solver {
         metrics.sort_by(|left, right| {
             compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
         });
-        let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
+        let (total_weight, _) = validated_subset_mass(subset, weights)?;
         let assessment = self.assess_subset_danger(subset, weights, total_weight, &metrics);
         let reply_pool = self.lookahead_reply_pool_for_state(subset.len()).max(1)
             + if expanded || assessment.dangerous_lookahead {
@@ -757,7 +801,10 @@ impl Solver {
             .into_iter()
             .map(|metric| metric.proxy_cost + self.lookahead_reply_penalty(&metric, subset.len()))
             .fold(f64::INFINITY, f64::min);
-        let child_value = 1.0 + best_reply;
+        // `proxy_cost` already includes the reply guess (`1 + E[child]`).
+        // Adding another unit here would count that reply twice and make the
+        // heuristic branch discontinuous with the exact branch above.
+        let child_value = best_reply;
         lookahead_memo.insert(key, child_value);
         Ok(child_value)
     }
@@ -768,30 +815,21 @@ impl Solver {
         large_bucket_count: usize,
         dangerous_mass_bucket_count: usize,
         non_green_mass_in_large_buckets: f64,
-        high_mass_ambiguous_bucket_count: usize,
     ) -> f64 {
-        let compounded_large_mass = non_green_mass_in_large_buckets
-            * (1.0
-                + (large_bucket_count as f64 * 0.25)
-                + (dangerous_mass_bucket_count as f64 * 0.35));
-        (self.config.lookahead_trap_penalty
-            * (worst_branch_mass + (high_mass_ambiguous_bucket_count as f64 / 4.0).min(1.0)))
-            + (self.config.lookahead_large_bucket_penalty
-                * (large_bucket_count as f64 + (high_mass_ambiguous_bucket_count as f64 * 0.5)))
-            + (self.config.lookahead_dangerous_mass_penalty
-                * (dangerous_mass_bucket_count as f64 + high_mass_ambiguous_bucket_count as f64))
-            + (self.config.lookahead_large_bucket_mass_penalty * compounded_large_mass)
+        (self.config.lookahead_trap_penalty * worst_branch_mass)
+            + (self.config.lookahead_large_bucket_penalty * large_bucket_count as f64)
+            + (self.config.lookahead_dangerous_mass_penalty * dangerous_mass_bucket_count as f64)
+            + (self.config.lookahead_large_bucket_mass_penalty * non_green_mass_in_large_buckets)
     }
 
     pub(super) fn lookahead_reply_penalty(&self, metric: &GuessMetrics, subset_len: usize) -> f64 {
         let bucket_ratio = metric.worst_non_green_bucket_size as f64 / subset_len.max(1) as f64;
         self.aggregate_lookahead_trap_penalty(
-            bucket_ratio + metric.largest_non_green_bucket_mass,
+            metric.largest_non_green_bucket_mass,
             metric.large_non_green_bucket_count,
             metric.dangerous_mass_bucket_count,
             metric.non_green_mass_in_large_buckets,
-            metric.high_mass_ambiguous_bucket_count,
-        )
+        ) + (self.config.lookahead_worst_bucket_ratio_penalty * bucket_ratio)
     }
 
     pub(super) fn collect_lookahead_candidates(
@@ -937,12 +975,12 @@ impl Solver {
             return Ok(1.0);
         }
 
-        let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
+        let (total_weight, _) = validated_subset_mass(subset, weights)?;
         let mut ordered_patterns = [0u8; PATTERN_SPACE];
         let ordered_len = {
             let frame = scratch.frame_mut(depth);
             for answer_index in subset {
-                let pattern = self.pattern_table.get(guess_index, *answer_index) as usize;
+                let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
                 if frame.child_subsets[pattern].is_empty() {
                     frame.touched_patterns.push(pattern as u8);
                 }
@@ -960,6 +998,9 @@ impl Solver {
         let mut cost = 1.0;
         for pattern in ordered_patterns[..ordered_len].iter().copied() {
             let mass = scratch.frames[depth].masses[pattern as usize];
+            if mass == 0.0 {
+                continue;
+            }
             let branch_probability = mass / total_weight;
             let child_cost = if pattern == ALL_GREEN_PATTERN {
                 0.0
@@ -1019,7 +1060,7 @@ impl Solver {
                 self.top_guess_indexes_for_subset(subset, weights, self.config.exact_candidate_pool)
             }
         };
-        let lower_bound = small_state_table.lower_bound(subset.len());
+        let lower_bound = weighted_exact_lower_bound(subset, weights)?;
         for answer_index in subset {
             debug_assert!(u16::try_from(*answer_index).is_ok());
         }
@@ -1117,6 +1158,44 @@ impl Solver {
     }
 }
 
+pub(super) fn scaled_pool_size(base: usize, multiplier: f64) -> usize {
+    ((base as f64) * multiplier).floor() as usize
+}
+
+pub(super) fn fractional_pool_take(pool: usize, fraction: f64) -> usize {
+    ((pool as f64) * fraction).floor() as usize
+}
+
+pub(super) fn weighted_exact_lower_bound(subset: &[usize], weights: &[f64]) -> Result<f64> {
+    if subset.is_empty() {
+        return Ok(0.0);
+    }
+    let (total_weight, largest_weight) = validated_subset_mass(subset, weights)?;
+    // A guess can solve at most one distinct answer. Every other outcome needs at
+    // least one additional guess, so 1 + P(not solved immediately) is admissible
+    // for arbitrary non-uniform predictive masses.
+    Ok(1.0 + ((total_weight - largest_weight) / total_weight))
+}
+
+fn validated_subset_mass(subset: &[usize], weights: &[f64]) -> Result<(f64, f64)> {
+    let mut total_weight = 0.0;
+    let mut largest_weight = 0.0_f64;
+    for answer_index in subset {
+        let weight = weights.get(*answer_index).copied().ok_or_else(|| {
+            anyhow!("predictive-search answer index {answer_index} is out of range")
+        })?;
+        if !weight.is_finite() || weight < 0.0 {
+            bail!("predictive-search weights must be finite and non-negative");
+        }
+        total_weight += weight;
+        largest_weight = largest_weight.max(weight);
+    }
+    if !total_weight.is_finite() || total_weight <= 0.0 {
+        bail!("cannot evaluate predictive search on a zero-mass subset");
+    }
+    Ok((total_weight, largest_weight))
+}
+
 pub(super) fn exact_suggestion_mode(
     config: &PriorConfig,
     surviving_answers: usize,
@@ -1135,6 +1214,20 @@ pub(super) fn exact_suggestion_mode(
     }
 }
 
+pub(super) fn should_use_second_guess_coverage(
+    config: &PriorConfig,
+    surviving_answers: usize,
+    observation_count: usize,
+) -> bool {
+    observation_count == 1
+        && surviving_answers >= config.second_guess_coverage_min_survivors
+        && surviving_answers <= config.second_guess_coverage_max_survivors
+}
+
+pub(super) fn should_use_final_turn_objective(observation_count: usize) -> bool {
+    observation_count >= 5
+}
+
 pub(super) fn book_usage_for_mode(mode: PredictiveSuggestionMode) -> PredictiveBookUsage {
     match mode {
         PredictiveSuggestionMode::LiveOnly => PredictiveBookUsage::None,
@@ -1148,6 +1241,15 @@ pub(super) fn predictive_search_mode(
     surviving_answers: usize,
     assessment: StateDangerAssessment,
 ) -> PredictiveSearchMode {
+    match config.search_policy_mode {
+        crate::config::SearchPolicyMode::ProxyOnly => return PredictiveSearchMode::ProxyOnly,
+        crate::config::SearchPolicyMode::ProxyWithExactEndgame => {
+            return exact_suggestion_mode(config, surviving_answers)
+                .map(PredictiveSearchMode::Exact)
+                .unwrap_or(PredictiveSearchMode::ProxyOnly);
+        }
+        crate::config::SearchPolicyMode::Staged => {}
+    }
     if let Some(mode) = exact_suggestion_mode(config, surviving_answers) {
         PredictiveSearchMode::Exact(mode)
     } else if surviving_answers <= config.danger_exact_survivor_cap

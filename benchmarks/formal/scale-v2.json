@@ -1,0 +1,102 @@
+{
+  "format_version": 2,
+  "identity_format": "sha256-length-delimited-v1",
+  "input_fingerprint": "sha256-v1:61e99d06c5ea53a11811a8fd93d89083fb30087b1b7207bb878070fa958bb8e8",
+  "operating_system": "windows",
+  "architecture": "x86_64",
+  "logical_cpus": 16,
+  "answer_counts": [
+    3,
+    4,
+    5,
+    6,
+    8,
+    10,
+    12
+  ],
+  "guess_limit": 14855,
+  "maximum_seconds": 1800,
+  "maximum_memory_mb": 4096,
+  "maximum_disk_mb": 4096,
+  "full_model_projection": {
+    "target_answer_count": 2358,
+    "method": "least-squares linear fit of log10(metric) against pinned answer count",
+    "source_points": 5,
+    "projected_log10_seconds": 727.9193495594293,
+    "projected_log10_certificate_bytes": 830.2732284476526
+  },
+  "points": [
+    {
+      "answer_count": 3,
+      "guess_count": 14855,
+      "policy_states": 3,
+      "certificate_states": 7,
+      "build_millis": 235,
+      "verify_millis": 173,
+      "states_per_second": 29.787234042553195,
+      "certificate_bytes": 18893096,
+      "artifact_bytes": 18939618,
+      "scale_checkpoint_bytes": 1255,
+      "process_peak_working_set_bytes": 231006208,
+      "manifest_hash": "sha256-v1:8f88829364b86c6b71510b9b9fd7e1d0a7370c749f89e2e555b103feb0af2a79"
+    },
+    {
+      "answer_count": 4,
+      "guess_count": 14855,
+      "policy_states": 4,
+      "certificate_states": 15,
+      "build_millis": 475,
+      "verify_millis": 406,
+      "states_per_second": 31.578947368421055,
+      "certificate_bytes": 44264165,
+      "artifact_bytes": 44325572,
+      "scale_checkpoint_bytes": 1741,
+      "process_peak_working_set_bytes": 274526208,
+      "manifest_hash": "sha256-v1:cfb4ac68c513200ff946bf05312ace4e0b6bdf425165860c62884d97dec39ca9"
+    },
+    {
+      "answer_count": 5,
+      "guess_count": 14855,
+      "policy_states": 5,
+      "certificate_states": 26,
+      "build_millis": 817,
+      "verify_millis": 777,
+      "states_per_second": 31.82374541003672,
+      "certificate_bytes": 84783252,
+      "artifact_bytes": 84859571,
+      "scale_checkpoint_bytes": 2252,
+      "process_peak_working_set_bytes": 352673792,
+      "manifest_hash": "sha256-v1:061e505febd30afa3e6b4837282efcbaea17171064eb0b79b5af209d4d1f9162"
+    },
+    {
+      "answer_count": 6,
+      "guess_count": 14855,
+      "policy_states": 6,
+      "certificate_states": 49,
+      "build_millis": 1837,
+      "verify_millis": 1527,
+      "states_per_second": 26.673924877517692,
+      "certificate_bytes": 193331335,
+      "artifact_bytes": 193422552,
+      "scale_checkpoint_bytes": 2742,
+      "process_peak_working_set_bytes": 514617344,
+      "manifest_hash": "sha256-v1:57152e3b0f3a21bed48b5457e83d4b0e2e76f6df59ed24870d4bcbc6b670b03f"
+    },
+    {
+      "answer_count": 8,
+      "guess_count": 14855,
+      "policy_states": 9,
+      "certificate_states": 193,
+      "build_millis": 8333,
+      "verify_millis": 7432,
+      "states_per_second": 23.160926437057483,
+      "certificate_bytes": 1096420648,
+      "artifact_bytes": 1096541686,
+      "scale_checkpoint_bytes": 3325,
+      "process_peak_working_set_bytes": 2597732352,
+      "manifest_hash": "sha256-v1:aa1498259ee2db6d5985749666552a219bf7a54b0058b1317f84eb9d71aba63f"
+    }
+  ],
+  "completed": false,
+  "stopped_reason": "projected next-point peak memory (12505.6 MiB) exceeds the memory budget with safety margin"
+}

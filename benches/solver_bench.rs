@@ -7,7 +7,7 @@ use std::{
 use chrono::NaiveDate;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use maybe_wordle::{
-    config::PriorConfig,
+    config::{PriorConfig, SearchPolicyMode},
     data::ProjectPaths,
     formal::{
         DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, FormalVerificationMode, build_optimal_policy,
@@ -47,8 +47,7 @@ fn bench_predictive_proxy_only(c: &mut Criterion) {
     let fixture = predictive_fixture();
     let paths = ProjectPaths::new(&fixture.root);
     let config = PriorConfig {
-        exact_threshold: 0,
-        lookahead_threshold: 0,
+        search_policy_mode: SearchPolicyMode::ProxyOnly,
         ..PriorConfig::default()
     };
     let solver = Solver::from_paths(&paths, &config).expect("solver");
@@ -66,6 +65,7 @@ fn bench_predictive_lookahead(c: &mut Criterion) {
         exact_threshold: 8,
         exact_exhaustive_threshold: 6,
         lookahead_threshold: 16,
+        medium_state_lookahead_threshold: 12,
         lookahead_candidate_pool: 8,
         lookahead_reply_pool: 4,
         ..PriorConfig::default()
@@ -84,7 +84,8 @@ fn bench_predictive_danger_escalated_exact(c: &mut Criterion) {
     let config = PriorConfig {
         exact_threshold: 4,
         exact_exhaustive_threshold: 2,
-        lookahead_threshold: 4,
+        lookahead_threshold: 8,
+        medium_state_lookahead_threshold: 6,
         danger_lookahead_threshold: 0.0,
         danger_exact_threshold: 0.0,
         danger_exact_root_pool: 10,

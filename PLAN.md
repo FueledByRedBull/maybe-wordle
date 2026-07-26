@@ -2,7 +2,31 @@
 
 > Status: historical planning notes. The current user-facing behavior, commands, and artifact layout are documented in `README.md`; this file preserves the original implementation rationale and may describe phases that are already complete or superseded.
 >
-> The 2026-07-17 correctness and reproducibility implementation pass is recorded in `TODO.md`. It added contiguous-history enforcement and repair, atomic artifact persistence, leakage-free date support, full predictive manifests, explicit mixed-support recovery, rolling train/validation/test evaluation, independent formal verification, and removal of unsafe refinement pruning.
+> 2026-07-26 release checkpoint: `selected-predictive-v20` is frozen and shipped in `config/prior.toml`. It solved all 360 development games at `3.1778` guesses versus `3.3000` and two failures for the previous default; paired delta `-0.1222`, interval `[-0.1722, -0.0722]`, W/T/L `69/265/26`. The once-only sealed evaluation solved `30/30` at `3.3000`, interval `[3.1333, 3.4667]`, with no gaps or failures. This is evidence of an improvement, not a flat-three result. Further tuning requires a new future holdout.
+>
+> Final correctness checkpoint: study format v16 serializes finalist latency after parallel fold scoring and all solver/study/GUI Rayon entry points use explicitly sized 8 MiB stacks. Long benchmark-evidence runs now emit flushed per-profile/per-game progress and ETA. Debug `cargo test --all-targets` skips release profiling instead of spending time on meaningless unoptimized timings or overwriting the release artifact. Formal certificate v7 has explicit per-candidate witnesses, independent partition/objective verification, third-reference cross-checks, and mutation coverage. The scale-v2 benchmark stopped at the declared resource boundary and shows that a full 2,358-answer formal proof is infeasible with the current algorithm.
+>
+> The 2026-07-17/18 correctness and reproducibility work is represented by the current worktree and generated development evidence. `TODO.md` contains only unfinished work. The mathematical contract is `docs/PREDICTIVE_MATH.md`.
+>
+> Last pre-v14 development guard (sealed test untouched): the staged default solved 358/360 games at 3.3028 and the threshold-4 recovery candidate solved 360/360 at 3.2194. Study v14 removed double-counted proxy/lookahead features and made danger algebra explicit; v15 then exposed pool composition/expansion and reply bucket-ratio terms. Those values are historical screening evidence until the new rolling comparison completes. See `benchmarks/predictive/rolling-prior-recovery-threshold4-lookahead-audit-20260719-v2.json`; do not treat it as current promotion evidence.
+>
+> 2026-07-19 predictive checkpoint: the pre-v14 comparison established threshold 4 as the last leading candidate, but the v14 recurrence and v15 parameterization audits supersede that promotion status. Atomic source-aware per-fold checkpoints recover evaluation across process boundaries, and indexed parallel per-date evaluation reproduced serial results while reducing recorded default fold time from 73.96 to 13.39 minutes (5.53x). The final-turn policy maximizes immediate solve probability after five observations instead of optimizing an unlimited future horizon. `study-run --base-config` supports explicit staged handoff. No sealed-test dates were evaluated.
+>
+> Central-study v15 checkpoint, superseded by the v16 latency protocol: SHA-256 config/registry/data/code/evaluation provenance, typed parameter cohorts, parallelism, nested time-spread fold selection, wall-clock/fold/peak-working-set budgets, deterministic grid/low-discrepancy/random/local-refinement/TPE strategies, resumable checkpoints, successive halving, hard constraints, and Pareto ranks were centralized in Rust. Registry format v6 maps every serialized config leaf and assigns all 79 tunable knobs exactly once across prior, recovery, proxy, search, and book cohorts. The audit exposed and fixed an inert coverage-pool clamp, an ignored reply-book pool, hard-coded production limits and exact-pool quotas, double-charged proxy/lookahead terms, fixed pool expansion, and hidden danger-feature definitions. The format-v8 five-strategy/five-seed calibration record remains at `benchmarks/predictive/study-strategy-comparison-v8.json`.
+>
+> Legacy import checkpoint: `scripts/import_optuna_archive.py` archived all 33 completed trials from three historical Optuna databases into `benchmarks/predictive/legacy-optuna-archive.json`, with source SHA-256 and six unfinished trials explicitly ignored. These records are diagnostic/non-promotable because their old scalar objective lacks current provenance and guarded evaluation.
+>
+> Matrix centralization checkpoint: generated-development baselines and predictive ablations now come from format-v1 JSON matrices under `config/experiments/`. Their typed overlays, weight/model modes, and artifact policies are registry/config validated; the diagnostic application path permits exact-zero float ablations but no other out-of-range values. Regeneration matched the previous effective configs and all deterministic results.
+>
+> Diagnostic centralization checkpoint: format-v1 `config/experiments/diagnostic-suite.json` now owns the three-guess rescue profile and root/reply search sizes, default four-guess opener tournament, hard-case selection sizes/cutoffs, book forced-search depth, and latency sample budgets. Schema tests reject zero budgets, invalid Hamming distances, duplicate/invalid openers, and unsupported versions. These diagnostics do not nominate configs; the common typed study runner remains the only promotable optimizer.
+>
+> Math/sealing audit checkpoint: every development evaluation entry point derives its cutoff from one canonical rolling plan, including `evaluate-live-config`. Predictive exact recursion uses the admissible `1 + (1 - max posterior mass)` bound, skips zero-probability branches safely, and validates finite non-negative masses. Concentration counts only positive-mass probability buckets while retaining zero-mass candidates for structural coverage diagnostics. The 2026-07-19 continuation also removed a double-counted lookahead reply and made the small-state proxy weight-aware; a fresh rolling comparison is required before configuration freeze.
+>
+> 2026-07-26 tractable-search checkpoint: the versioned `search-regret` diagnostic now replays deterministic artifact-free proxy paths and compares production, proxy, and bounded-lookahead choices with exhaustive Bellman search on identical 3–16-answer posteriors. The first wider run exposed a proxy guess that made no progress; predictive ranking now filters such guesses universally. After the guard, lookahead matched exhaustive cost on 27/30 states and had combined mean regret about `0.000072`, while proxy-only ranking had combined mean regret about `0.159111`. The evidence supports retaining bounded lookahead pending rolling ablations; it is not sealed-test solve evidence.
+>
+> 2026-07-26 release-profile checkpoint: a dedicated System-allocator benchmark records wall time, process CPU/cycles, allocation calls/bytes, current/peak working set, page faults, and cold/warm behavior for proxy-root, bounded-lookahead, and pooled-exact workloads. The final selected-config run measured warm wall times of 36.724 ms, 94.153 ms, and 189.173 ms; lifetime peak working set was 83.0 MiB. Hardware cache-miss counters were unavailable, so only cold/warm and page-fault behavior is claimed. The measured allocation volume identifies a future speed opportunity, but no low-level rewrite is justified before solve-quality studies.
+>
+> Final evidence-matrix probe: the new progress/ETA logging showed profile 1 of 7 still computing after more than four minutes at roughly 13 busy cores. Even equal profile cost projected beyond the user-declared 20-minute release ceiling, and later exact profiles are slower, so the run was stopped without publishing a partial artifact. The verified 12-fold rolling and once-only sealed artifacts remain the release evidence.
 
 ## Goal
 
@@ -15,17 +39,9 @@ The solver should:
 - backtest itself against historical NYT answers
 - make its assumptions explicit so "optimal" always means "optimal for the model we chose", not "perfectly predicts the editor"
 
-## Product Decision
+## Historical product decision
 
-Version 1 should be a Rust CLI, not a GUI.
-
-Why:
-
-- the hard part is the data model, solver core, and backtesting
-- a GUI adds surface area before the scoring model is validated
-- a CLI makes it easy to benchmark, regression-test, and later expose the same engine to `egui`, Tauri, web, or Python
-
-GUI work is Phase 5, after the solver is correct and fast.
+The original plan deliberately started with a Rust CLI so data, scoring, backtesting, and performance could be validated first. That milestone is complete. The current product includes an `eframe`/`egui` desktop workspace and treats predictive GUI use as the primary workflow; formal mode is secondary. The predictive-first redesign, missing-data setup/recovery surface, replaceable dual-worker queue, responsive layouts, diagnostics, keyboard workflow, and native usability pass are complete.
 
 ## What Changes From The Original Draft
 
@@ -520,13 +536,6 @@ Primary and supporting sources used for this plan:
 - Solver theory and exact-search structure: [Bertsimas and Paskov, An Exact and Interpretable Solution to Wordle](https://auction-upload-files.s3.amazonaws.com/Wordle_Paper_Final.pdf)
 - Complexity and optimal-play baseline: [Lokshtanov and Subercaseaux, IJCAI 2022](https://www.ijcai.org/proceedings/2022/783)
 
-## Immediate Next Step
+## Historical next step (completed)
 
-Implement Phase 0 first.
-
-If you want me to continue, the next concrete task should be:
-
-1. scaffold the Rust project
-2. add the data sync command for the NYT endpoint
-3. vendor the pinned guess and candidate-answer lists
-4. write the feedback-scoring tests before any solver optimization
+The original Phase 0 scaffold, NYT sync, pinned seed lists, and feedback fixtures are implemented. Current work follows the forward-only roadmap in `TODO.md`; this file remains the design-history record rather than an active task list.

@@ -5,6 +5,14 @@ use crate::solver::Suggestion;
 use super::state::PredictiveArtifactState;
 use super::{PredictivePromotionSource, PredictiveStateSummary};
 
+#[derive(Clone, Debug)]
+pub struct PredictiveCandidateSummary {
+    pub word: String,
+    pub probability: f64,
+    pub modeled_weight: f64,
+    pub fallback_support: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PredictiveSuggestionMode {
     LiveOnly,
@@ -26,6 +34,7 @@ pub struct PredictiveSuggestRequest<'a> {
 pub struct PredictiveSuggestResponse {
     pub state: PredictiveStateSummary,
     pub suggestions: Vec<Suggestion>,
+    pub candidates: Vec<PredictiveCandidateSummary>,
     pub promoted_word: Option<String>,
     pub promotion_source: Option<PredictivePromotionSource>,
     pub artifact_state: PredictiveArtifactState,

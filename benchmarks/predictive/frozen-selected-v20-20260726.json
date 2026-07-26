@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "identity_format": "sha256-length-delimited-v1",
+  "input_fingerprint": "sha256-v1:bfb8611d7834008d1a3ddcd2d7c8fd1244be74a29ef560716809bbf2b8ea46b8",
+  "freeze_fingerprint": "sha256-v1:15cb4c86c7548dbcdf94624a8a80b93009a8ebbdcc57d228617977765d4a543a",
+  "evaluation_plan": {
+    "history": {
+      "start": "2021-06-19",
+      "end": "2026-07-17"
+    },
+    "development": {
+      "start": "2021-06-19",
+      "end": "2026-06-17"
+    },
+    "sealed_test": {
+      "start": "2026-06-18",
+      "end": "2026-07-17"
+    },
+    "folds": [
+      {
+        "index": 0,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-06-22"
+        },
+        "validation": {
+          "start": "2025-06-23",
+          "end": "2025-07-22"
+        }
+      },
+      {
+        "index": 1,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-07-22"
+        },
+        "validation": {
+          "start": "2025-07-23",
+          "end": "2025-08-21"
+        }
+      },
+      {
+        "index": 2,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-08-21"
+        },
+        "validation": {
+          "start": "2025-08-22",
+          "end": "2025-09-20"
+        }
+      },
+      {
+        "index": 3,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-09-20"
+        },
+        "validation": {
+          "start": "2025-09-21",
+          "end": "2025-10-20"
+        }
+      },
+      {
+        "index": 4,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-10-20"
+        },
+        "validation": {
+          "start": "2025-10-21",
+          "end": "2025-11-19"
+        }
+      },
+      {
+        "index": 5,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-11-19"
+        },
+        "validation": {
+          "start": "2025-11-20",
+          "end": "2025-12-19"
+        }
+      },
+      {
+        "index": 6,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-12-19"
+        },
+        "validation": {
+          "start": "2025-12-20",
+          "end": "2026-01-18"
+        }
+      },
+      {
+        "index": 7,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-01-18"
+        },
+        "validation": {
+          "start": "2026-01-19",
+          "end": "2026-02-17"
+        }
+      },
+      {
+        "index": 8,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-02-17"
+        },
+        "validation": {
+          "start": "2026-02-18",
+          "end": "2026-03-19"
+        }
+      },
+      {
+        "index": 9,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-03-19"
+        },
+        "validation": {
+          "start": "2026-03-20",
+          "end": "2026-04-18"
+        }
+      },
+      {
+        "index": 10,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-04-18"
+        },
+        "validation": {
+          "start": "2026-04-19",
+          "end": "2026-05-18"
+        }
+      },
+      {
+        "index": 11,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-05-18"
+        },
+        "validation": {
+          "start": "2026-05-19",
+          "end": "2026-06-17"
+        }
+      }
+    ],
+    "config": {
+      "minimum_training_days": 365,
+      "validation_days": 30,
+      "step_days": 30,
+      "sealed_test_days": 30,
+      "maximum_folds": 12
+    }
+  },
+  "config_toml": "base_seed_weight = 0.75\nbase_history_only_weight = 0.5\ncooldown_days = 365\ncooldown_floor = 0.01\nmidpoint_days = 1680.0\nlogistic_k = 0.030542173853450913\nfallback_prior_mass = 0.06644939273961506\nfallback_activation_threshold = 4\nsearch_policy_mode = \"staged\"\nexact_threshold = 64\nexact_exhaustive_threshold = 12\nexact_candidate_pool = 96\nsession_opener_pool = 32\nsession_opener_holdout_shortlist = 4\nsession_reply_pool = 20\nsession_window_days = 30\nsession_artifact_freshness_days = 14\nlookahead_threshold = 160\nmedium_state_lookahead_threshold = 80\nsecond_guess_coverage_min_survivors = 65\nsecond_guess_coverage_max_survivors = 80\nsecond_guess_coverage_pool = 24\nsecond_guess_coverage_child_cap = 24\nlookahead_candidate_pool = 24\nmedium_state_lookahead_candidate_pool = 48\nlookahead_reply_pool = 12\nmedium_state_lookahead_reply_pool = 20\nlookahead_root_force_in_two_scan = 64\nmedium_state_force_in_two_scan = 160\nlarge_state_split_threshold = 50\npool_tight_gap_threshold = 0.05\npool_medium_gap_threshold = 0.15\npool_tight_expansion_multiplier = 2.5\npool_medium_expansion_multiplier = 1.5\npool_diversity_stride = 4\nexact_pool_primary_fraction = 0.5\nexact_pool_entropy_fraction = 0.25\nexact_pool_worst_bucket_fraction = 0.16666666666666666\nexact_pool_mass_reducer_fraction = 0.16666666666666666\nexact_pool_solve_probability_fraction = 0.125\nexact_pool_posterior_fraction = 0.125\nambiguous_mass_threshold = 0.1\ndanger_top_concentration_w = 0.3\ndanger_bucket_mass_w = 0.25\ndanger_bucket_ratio_w = 0.2\ndanger_ambiguous_w = 0.15\ndanger_disagreement_w = 0.1\ndanger_posterior_window = 3\ndanger_candidate_window = 3\ndanger_mass_disagreement_threshold = 0.1\ndanger_size_disagreement_threshold = 2\ndanger_ambiguity_saturation_count = 4\ndanger_lookahead_threshold = 0.58\ndanger_exact_threshold = 0.72\ndanger_reply_pool_bonus = 8\ndanger_exact_root_pool = 24\ndanger_exact_survivor_cap = 192\nlookahead_trap_penalty = 0.35\nlookahead_worst_bucket_ratio_penalty = 0.35\nlookahead_large_bucket_penalty = 0.12\nlookahead_dangerous_mass_penalty = 0.08\nlookahead_large_bucket_mass_penalty = 0.1\ntrap_size_threshold = 6\ntrap_mass_threshold = 0.15\nsync_reverify_days = 3\nsync_request_timeout_seconds = 10\nsync_retry_attempts = 3\nsync_retry_backoff_millis = 500\nallow_history_gaps = false\nproxy_small_state_lower_bound_threshold = 12\n\n[proxy_weights]\nentropy_w = 0.14634824837897314\nbucket_mass_w = 2.1\nbucket_size_w = 0.12\nambiguous_w = 0.75\nproxy_w = 1.0\nsolve_prob_w = 0.1\nposterior_w = 0.05\nsmoothness_w = 0.45\ngray_reuse_w = 0.08\nlarge_bucket_count_w = 0.1782\ndangerous_mass_count_w = 0.22\nlarge_bucket_mass_w = 0.4\n\n[recovery]\nmode = \"uniform_over_support\"\nepsilon_scale = 0.00000850780812210975\n\n[manual_weights]\n",
+  "config_fingerprint": "sha256-v1:180376188618b1ffa1f082e6d0df44680e5eb84a14d078f2c436ab9af2e5840f",
+  "candidate_label": "selected-predictive-v20",
+  "development_comparison_fingerprint": "sha256-v1:97dd8a947d069a33ca19b6f8f178a5fee362b1e712f1fbeff2dfd53caecb0cab",
+  "development_metrics": {
+    "scheduled_games": 360,
+    "modeled_games": 360,
+    "solved_games": 360,
+    "unsolved_games": 0,
+    "coverage_gaps": 0,
+    "coverage_rate": 1.0,
+    "solve_rate": 1.0,
+    "conditional_mean_guesses": 3.1777777777777776,
+    "conditional_mean_guesses_ci95": {
+      "lower": 3.1055555555555556,
+      "upper": 3.2555555555555555
+    },
+    "failure_penalty_guesses": 7.0,
+    "all_game_penalized_mean_guesses": 3.1777777777777776,
+    "all_game_penalized_mean_guesses_ci95": {
+      "lower": 3.1055555555555556,
+      "upper": 3.2555555555555555
+    },
+    "median_guesses": 3.0,
+    "p90_guesses": 4,
+    "p95_guesses": 4,
+    "max_guesses": 6,
+    "solved_in_guess_counts": [
+      0,
+      33,
+      241,
+      76,
+      9,
+      1
+    ],
+    "coverage_rate_ci95": {
+      "lower": 0.9894419431113064,
+      "upper": 1.0
+    },
+    "solve_rate_ci95": {
+      "lower": 0.9894419431113064,
+      "upper": 1.0
+    },
+    "bootstrap": {
+      "resamples": 2000,
+      "block_length": 7,
+      "seed": 21769571400961093
+    }
+  },
+  "development_paired_difference": {
+    "candidate_minus_baseline": -0.12222222222222222,
+    "ci95": {
+      "lower": -0.17222222222222222,
+      "upper": -0.07222222222222222
+    },
+    "candidate_wins": 69,
+    "ties": 265,
+    "baseline_wins": 26
+  },
+  "evaluation_artifact_policy": "artifact_free",
+  "sealed_test_evaluated": false
+}

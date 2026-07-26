@@ -1,0 +1,35 @@
+{
+  "format_version": 1,
+  "name": "predictive-diagnostic-suite",
+  "three_guess_rescue": {
+    "profile": "aggressive-three-guess",
+    "root_candidate_limit": 1,
+    "reply_candidate_limit": 4
+  },
+  "default_four_guess_openers": [
+    "olate",
+    "aiery",
+    "reais",
+    "crane",
+    "slate",
+    "trace",
+    "audio",
+    "tarse"
+  ],
+  "hard_cases": {
+    "target_count": 5,
+    "top_posterior_scan": 96,
+    "minimum_trap_neighbors": 2,
+    "low_prior_splitter_scan": 128,
+    "maximum_cluster_hamming_distance": 1
+  },
+  "latency": {
+    "evidence_runs": 5,
+    "evaluation_runs": 3,
+    "study_runs": 3,
+    "top_suggestions": 10
+  },
+  "book_build": {
+    "forced_suggestion_top": 5
+  }
+}

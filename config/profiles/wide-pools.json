@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "name": "wide-pools",
+  "description": "Registry-valid ablation profile with wider root and medium lookahead/reply pools plus a wider exact shortlist.",
+  "parameters": {
+    "lookahead_candidate_pool": { "type": "integer", "value": 96 },
+    "medium_state_lookahead_candidate_pool": { "type": "integer", "value": 128 },
+    "lookahead_reply_pool": { "type": "integer", "value": 48 },
+    "medium_state_lookahead_reply_pool": { "type": "integer", "value": 64 },
+    "exact_candidate_pool": { "type": "integer", "value": 160 }
+  }
+}

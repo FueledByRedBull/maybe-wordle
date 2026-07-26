@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "study_format_version": 5,
+  "scope": "rolling-development calibration strategy diagnostic; not solve-quality or sealed-test evidence",
+  "sealed_test_evaluated": false,
+  "history_snapshot_start": "2021-06-19",
+  "history_snapshot_end": "2026-07-17",
+  "development_cutoff": "2026-06-17",
+  "code_revision": "790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e",
+  "code_dirty": true,
+  "common_budget": {
+    "trials": 16,
+    "jobs": 4,
+    "maximum_validation_folds": 12,
+    "initial_validation_folds": 3,
+    "reduction_factor": 3,
+    "maximum_trial_seconds": 300,
+    "scheduled_games_for_finalists": 360,
+    "measured_prior_games_for_finalists": 337
+  },
+  "command_template": "cargo run --quiet -- study-run --name <name> --stage calibration --strategy <strategy> --trials 16 --jobs 4 --seed <seed> --maximum-validation-folds 12 --initial-validation-folds 3 --reduction-factor 3 --maximum-trial-seconds 300 --state target/studies/<name>.json --top 5",
+  "equal_seed_results": [
+    {
+      "strategy": "grid",
+      "seed": 20260315,
+      "best_candidate": 0,
+      "coverage_gaps": 23,
+      "failures": 0,
+      "average_log_loss": 7.170541631311011,
+      "average_brier_score": 0.9991875633953302,
+      "aggregate_trial_elapsed_ms": 8657,
+      "best_parameters": {}
+    },
+    {
+      "strategy": "low_discrepancy",
+      "seed": 20260315,
+      "best_candidate": 2,
+      "coverage_gaps": 23,
+      "failures": 0,
+      "average_log_loss": 7.1700259013676835,
+      "average_brier_score": 0.9991874261760741,
+      "aggregate_trial_elapsed_ms": 7409,
+      "best_parameters": {
+        "base_history_only_weight": 0.046415888336127795
+      }
+    },
+    {
+      "strategy": "random",
+      "seed": 20260315,
+      "best_candidate": 14,
+      "coverage_gaps": 23,
+      "failures": 0,
+      "average_log_loss": 6.776257904281577,
+      "average_brier_score": 0.9987671072475133,
+      "aggregate_trial_elapsed_ms": 7447,
+      "best_parameters": {
+        "base_history_only_weight": 0.3546565644874061,
+        "midpoint_days": 1530.0
+      }
+    },
+    {
+      "strategy": "local_refinement",
+      "seed": 20260315,
+      "best_candidate": 15,
+      "coverage_gaps": 23,
+      "failures": 0,
+      "average_log_loss": 7.052973619478039,
+      "average_brier_score": 0.9990747636940186,
+      "aggregate_trial_elapsed_ms": 7698,
+      "best_parameters": {
+        "midpoint_days": 1230.0
+      }
+    }
+  ],
+  "random_seed_results": [
+    {
+      "seed": 20260315,
+      "average_log_loss": 6.776257904281577,
+      "average_brier_score": 0.9987671072475133
+    },
+    {
+      "seed": 20260316,
+      "average_log_loss": 7.170098985128464,
+      "average_brier_score": 0.9991874344913773
+    },
+    {
+      "seed": 20260317,
+      "average_log_loss": 7.170164872426984,
+      "average_brier_score": 0.9991874451413743
+    },
+    {
+      "seed": 20260318,
+      "average_log_loss": 7.170541631311011,
+      "average_brier_score": 0.9991875633953302
+    },
+    {
+      "seed": 20260319,
+      "average_log_loss": 7.17033872298904,
+      "average_brier_score": 0.9991874875843383
+    }
+  ],
+  "interpretation": "Random search found the strongest calibration candidate at the shared seed, but adjacent seeds clustered near the baseline. Use multiple deterministic global seeds, promote only hard-constraint-safe finalists, then refine locally. This calibration diagnostic neither measures mean guesses nor authorizes a default-config or sealed-test promotion."
+}

@@ -1,0 +1,731 @@
+{
+  "format_version": 12,
+  "spec": {
+    "name": "proxy-core-threshold4-lookahead-audit-20260719",
+    "stage": "proxy_core",
+    "seed": 20260719,
+    "trial_count": 14,
+    "parallelism": 14,
+    "strategy": "low_discrepancy",
+    "maximum_validation_folds": 12,
+    "initial_validation_folds": 3,
+    "reduction_factor": 2,
+    "fold_selection": "nested_time_spread",
+    "maximum_trial_seconds": 7200,
+    "maximum_memory_mb": 4096
+  },
+  "evaluation_plan": {
+    "history": {
+      "start": "2021-06-19",
+      "end": "2026-07-17"
+    },
+    "development": {
+      "start": "2021-06-19",
+      "end": "2026-06-17"
+    },
+    "sealed_test": {
+      "start": "2026-06-18",
+      "end": "2026-07-17"
+    },
+    "folds": [
+      {
+        "index": 0,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-06-22"
+        },
+        "validation": {
+          "start": "2025-06-23",
+          "end": "2025-07-22"
+        }
+      },
+      {
+        "index": 1,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-07-22"
+        },
+        "validation": {
+          "start": "2025-07-23",
+          "end": "2025-08-21"
+        }
+      },
+      {
+        "index": 2,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-08-21"
+        },
+        "validation": {
+          "start": "2025-08-22",
+          "end": "2025-09-20"
+        }
+      },
+      {
+        "index": 3,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-09-20"
+        },
+        "validation": {
+          "start": "2025-09-21",
+          "end": "2025-10-20"
+        }
+      },
+      {
+        "index": 4,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-10-20"
+        },
+        "validation": {
+          "start": "2025-10-21",
+          "end": "2025-11-19"
+        }
+      },
+      {
+        "index": 5,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-11-19"
+        },
+        "validation": {
+          "start": "2025-11-20",
+          "end": "2025-12-19"
+        }
+      },
+      {
+        "index": 6,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2025-12-19"
+        },
+        "validation": {
+          "start": "2025-12-20",
+          "end": "2026-01-18"
+        }
+      },
+      {
+        "index": 7,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-01-18"
+        },
+        "validation": {
+          "start": "2026-01-19",
+          "end": "2026-02-17"
+        }
+      },
+      {
+        "index": 8,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-02-17"
+        },
+        "validation": {
+          "start": "2026-02-18",
+          "end": "2026-03-19"
+        }
+      },
+      {
+        "index": 9,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-03-19"
+        },
+        "validation": {
+          "start": "2026-03-20",
+          "end": "2026-04-18"
+        }
+      },
+      {
+        "index": 10,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-04-18"
+        },
+        "validation": {
+          "start": "2026-04-19",
+          "end": "2026-05-18"
+        }
+      },
+      {
+        "index": 11,
+        "training": {
+          "start": "2021-06-19",
+          "end": "2026-05-18"
+        },
+        "validation": {
+          "start": "2026-05-19",
+          "end": "2026-06-17"
+        }
+      }
+    ],
+    "config": {
+      "minimum_training_days": 365,
+      "validation_days": 30,
+      "step_days": 30,
+      "sealed_test_days": 30,
+      "maximum_folds": 12
+    }
+  },
+  "provenance": {
+    "identity_format": "fnv64-length-delimited-v1; pending-sha256",
+    "base_config_toml": "base_seed_weight = 0.75\nbase_history_only_weight = 0.5\ncooldown_days = 365\ncooldown_floor = 0.01\nmidpoint_days = 1680.0\nlogistic_k = 0.05431251890142089\nfallback_prior_mass = 0.06644939273961506\nfallback_activation_threshold = 4\nsearch_policy_mode = \"staged\"\nexact_threshold = 64\nexact_exhaustive_threshold = 12\nexact_candidate_pool = 96\nsession_opener_pool = 32\nsession_reply_pool = 20\nsession_window_days = 30\nlookahead_threshold = 160\nmedium_state_lookahead_threshold = 80\nsecond_guess_coverage_min_survivors = 65\nsecond_guess_coverage_max_survivors = 80\nsecond_guess_coverage_pool = 24\nlookahead_candidate_pool = 24\nmedium_state_lookahead_candidate_pool = 48\nlookahead_reply_pool = 12\nmedium_state_lookahead_reply_pool = 20\nlookahead_root_force_in_two_scan = 64\nmedium_state_force_in_two_scan = 160\nlarge_state_split_threshold = 50\npool_tight_gap_threshold = 0.05\npool_medium_gap_threshold = 0.15\npool_diversity_stride = 4\ndanger_lookahead_threshold = 0.58\ndanger_exact_threshold = 0.72\ndanger_reply_pool_bonus = 8\ndanger_exact_root_pool = 24\ndanger_exact_survivor_cap = 192\nlookahead_trap_penalty = 0.35\nlookahead_large_bucket_penalty = 0.12\nlookahead_dangerous_mass_penalty = 0.08\nlookahead_large_bucket_mass_penalty = 0.1\ntrap_size_threshold = 6\ntrap_mass_threshold = 0.15\nsync_reverify_days = 3\nsync_request_timeout_seconds = 10\nsync_retry_attempts = 3\nsync_retry_backoff_millis = 500\nallow_history_gaps = false\nproxy_small_state_lower_bound_threshold = 12\n\n[proxy_weights]\nentropy_w = 0.3375\nbucket_mass_w = 2.1\nbucket_size_w = 0.12\nambiguous_w = 0.75\nproxy_w = 1.0\nsolve_prob_w = 0.1\nposterior_w = 0.05\nsmoothness_w = 0.45\ngray_reuse_w = 0.08\nlarge_bucket_count_w = 0.1782\ndangerous_mass_count_w = 0.22\nlarge_bucket_mass_w = 0.4\n\n[recovery]\nmode = \"uniform_over_support\"\nepsilon_scale = 0.00000850780812210975\n\n[manual_weights]\n",
+    "registry_format_version": 2,
+    "registry_fingerprint": "fnv64-v1:6393ba6884ed3c25",
+    "input_fingerprint": "fnv64-v1:d9562f5da037e299",
+    "code_revision": "790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e",
+    "code_dirty": true,
+    "history_snapshot_start": "2021-06-19",
+    "history_snapshot_end": "2026-07-17",
+    "development_cutoff": "2026-06-17",
+    "top_suggestions": 5
+  },
+  "sealed_test_evaluated": false,
+  "trials": [
+    {
+      "candidate": {
+        "number": 0,
+        "seed": 5595823793800774456,
+        "parameters": {}
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":5595823793800774456,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 918246,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 1,
+        "seed": 1658073925373846519,
+        "parameters": {
+          "proxy_weights.entropy_w": {
+            "type": "float",
+            "value": 0.14634824837897314
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":1658073925373846519,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.entropy_w\":\"float:3fc2bb8a164eaa62\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 916620,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 2,
+        "seed": 530473249301004060,
+        "parameters": {
+          "proxy_weights.bucket_mass_w": {
+            "type": "float",
+            "value": 0.9106113232469438
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":530473249301004060,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.bucket_mass_w\":\"float:3fed23ba5b96d025\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 928821,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 3,
+        "seed": 4360090686845316138,
+        "parameters": {
+          "proxy_weights.bucket_size_w": {
+            "type": "float",
+            "value": 0.04640368783791388
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":4360090686845316138,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.bucket_size_w\":\"float:3fa7c239635af2b9\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1,
+          5
+        ],
+        "scheduled_games": 60,
+        "solve_metrics_recorded": true,
+        "solved_games": 60,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 54,
+        "penalized_guess_sum": 203.0,
+        "solved_guess_sum": 203.0,
+        "log_loss_sum": 359.8164610993569,
+        "brier_score_sum": 53.9294175143997,
+        "all_game_penalized_mean_guesses": 3.3833333333333333,
+        "conditional_mean_guesses": 3.3833333333333333,
+        "average_log_loss": 6.663267798136239,
+        "average_brier_score": 0.9986929169333278,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 1346315,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 4,
+        "seed": 7365512333837612133,
+        "parameters": {
+          "proxy_weights.ambiguous_w": {
+            "type": "float",
+            "value": 0.26595230854359037
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":7365512333837612133,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.ambiguous_w\":\"float:3fd1055cd4df6313\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 909725,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 5,
+        "seed": 15572776590440019004,
+        "parameters": {
+          "proxy_weights.proxy_w": {
+            "type": "float",
+            "value": 0.44950144656904323
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":15572776590440019004,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.proxy_w\":\"float:3fdcc4a1b72132e7\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 930216,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 6,
+        "seed": 16238224193786786429,
+        "parameters": {
+          "proxy_weights.solve_prob_w": {
+            "type": "float",
+            "value": 0.038669739864928276
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":16238224193786786429,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.solve_prob_w\":\"float:3fa3cc8528211f9f\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 914612,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 7,
+        "seed": 5832448156643353774,
+        "parameters": {
+          "proxy_weights.posterior_w": {
+            "type": "float",
+            "value": 0.019334869932464128
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":5832448156643353774,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.posterior_w\":\"float:3f93cc8528211f9d\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 918189,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 8,
+        "seed": 6086489473256709665,
+        "parameters": {
+          "proxy_weights.smoothness_w": {
+            "type": "float",
+            "value": 0.15957138512615424
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":6086489473256709665,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.smoothness_w\":\"float:3fc46cd5cc3f43b1\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 926867,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 9,
+        "seed": 11779156955956947289,
+        "parameters": {
+          "proxy_weights.gray_reuse_w": {
+            "type": "float",
+            "value": 0.030935791891942597
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":11779156955956947289,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.gray_reuse_w\":\"float:3f9fada1d9ce98f9\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 923173,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 10,
+        "seed": 1658073925373846519,
+        "parameters": {
+          "proxy_weights.entropy_w": {
+            "type": "float",
+            "value": 0.282842712474619
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":1658073925373846519,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.entropy_w\":\"float:3fd21a1851ff630a\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 918626,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 11,
+        "seed": 530473249301004060,
+        "parameters": {
+          "proxy_weights.bucket_mass_w": {
+            "type": "float",
+            "value": 0.09283177667225556
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":530473249301004060,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.bucket_mass_w\":\"float:3fb7c3d2c4d63ff4\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 931196,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 12,
+        "seed": 4360090686845316138,
+        "parameters": {
+          "proxy_weights.bucket_size_w": {
+            "type": "float",
+            "value": 0.004573050519273263
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":4360090686845316138,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.bucket_size_w\":\"float:3f72bb30e6c59185\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1,
+          5
+        ],
+        "scheduled_games": 60,
+        "solve_metrics_recorded": true,
+        "solved_games": 60,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 54,
+        "penalized_guess_sum": 212.0,
+        "solved_guess_sum": 212.0,
+        "log_loss_sum": 359.8164610993569,
+        "brier_score_sum": 53.9294175143997,
+        "all_game_penalized_mean_guesses": 3.533333333333333,
+        "conditional_mean_guesses": 3.533333333333333,
+        "average_log_loss": 6.663267798136239,
+        "average_brier_score": 0.9986929169333278,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 1054472,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    },
+    {
+      "candidate": {
+        "number": 13,
+        "seed": 7365512333837612133,
+        "parameters": {
+          "proxy_weights.ambiguous_w": {
+            "type": "float",
+            "value": 0.00327024280452292
+          }
+        }
+      },
+      "identity": "{\"format_version\":12,\"study\":\"proxy-core-threshold4-lookahead-audit-20260719\",\"stage\":\"proxy_core\",\"study_seed\":20260719,\"trial_seed\":7365512333837612133,\"maximum_validation_folds\":12,\"initial_validation_folds\":3,\"reduction_factor\":2,\"maximum_trial_seconds\":7200,\"maximum_memory_mb\":4096,\"parallelism\":14,\"strategy\":\"low_discrepancy\",\"provenance\":\"{\\\"identity_format\\\":\\\"fnv64-length-delimited-v1; pending-sha256\\\",\\\"base_config_toml\\\":\\\"base_seed_weight = 0.75\\\\nbase_history_only_weight = 0.5\\\\ncooldown_days = 365\\\\ncooldown_floor = 0.01\\\\nmidpoint_days = 1680.0\\\\nlogistic_k = 0.05431251890142089\\\\nfallback_prior_mass = 0.06644939273961506\\\\nfallback_activation_threshold = 4\\\\nsearch_policy_mode = \\\\\\\"staged\\\\\\\"\\\\nexact_threshold = 64\\\\nexact_exhaustive_threshold = 12\\\\nexact_candidate_pool = 96\\\\nsession_opener_pool = 32\\\\nsession_reply_pool = 20\\\\nsession_window_days = 30\\\\nlookahead_threshold = 160\\\\nmedium_state_lookahead_threshold = 80\\\\nsecond_guess_coverage_min_survivors = 65\\\\nsecond_guess_coverage_max_survivors = 80\\\\nsecond_guess_coverage_pool = 24\\\\nlookahead_candidate_pool = 24\\\\nmedium_state_lookahead_candidate_pool = 48\\\\nlookahead_reply_pool = 12\\\\nmedium_state_lookahead_reply_pool = 20\\\\nlookahead_root_force_in_two_scan = 64\\\\nmedium_state_force_in_two_scan = 160\\\\nlarge_state_split_threshold = 50\\\\npool_tight_gap_threshold = 0.05\\\\npool_medium_gap_threshold = 0.15\\\\npool_diversity_stride = 4\\\\ndanger_lookahead_threshold = 0.58\\\\ndanger_exact_threshold = 0.72\\\\ndanger_reply_pool_bonus = 8\\\\ndanger_exact_root_pool = 24\\\\ndanger_exact_survivor_cap = 192\\\\nlookahead_trap_penalty = 0.35\\\\nlookahead_large_bucket_penalty = 0.12\\\\nlookahead_dangerous_mass_penalty = 0.08\\\\nlookahead_large_bucket_mass_penalty = 0.1\\\\ntrap_size_threshold = 6\\\\ntrap_mass_threshold = 0.15\\\\nsync_reverify_days = 3\\\\nsync_request_timeout_seconds = 10\\\\nsync_retry_attempts = 3\\\\nsync_retry_backoff_millis = 500\\\\nallow_history_gaps = false\\\\nproxy_small_state_lower_bound_threshold = 12\\\\n\\\\n[proxy_weights]\\\\nentropy_w = 0.3375\\\\nbucket_mass_w = 2.1\\\\nbucket_size_w = 0.12\\\\nambiguous_w = 0.75\\\\nproxy_w = 1.0\\\\nsolve_prob_w = 0.1\\\\nposterior_w = 0.05\\\\nsmoothness_w = 0.45\\\\ngray_reuse_w = 0.08\\\\nlarge_bucket_count_w = 0.1782\\\\ndangerous_mass_count_w = 0.22\\\\nlarge_bucket_mass_w = 0.4\\\\n\\\\n[recovery]\\\\nmode = \\\\\\\"uniform_over_support\\\\\\\"\\\\nepsilon_scale = 0.00000850780812210975\\\\n\\\\n[manual_weights]\\\\n\\\",\\\"registry_format_version\\\":2,\\\"registry_fingerprint\\\":\\\"fnv64-v1:6393ba6884ed3c25\\\",\\\"input_fingerprint\\\":\\\"fnv64-v1:d9562f5da037e299\\\",\\\"code_revision\\\":\\\"790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e\\\",\\\"code_dirty\\\":true,\\\"history_snapshot_start\\\":\\\"2021-06-19\\\",\\\"history_snapshot_end\\\":\\\"2026-07-17\\\",\\\"development_cutoff\\\":\\\"2026-06-17\\\",\\\"top_suggestions\\\":5}\",\"parameters\":{\"proxy_weights.ambiguous_w\":\"float:3f6aca323ca728f0\"}}",
+      "status": "running",
+      "measurement": {
+        "validation_fold_indices": [
+          1
+        ],
+        "scheduled_games": 30,
+        "solve_metrics_recorded": true,
+        "solved_games": 30,
+        "coverage_gaps": 0,
+        "failures": 0,
+        "measured_prior_games": 26,
+        "penalized_guess_sum": 98.0,
+        "solved_guess_sum": 98.0,
+        "log_loss_sum": 175.17608696577187,
+        "brier_score_sum": 25.96863083856347,
+        "all_game_penalized_mean_guesses": 3.2666666666666666,
+        "conditional_mean_guesses": 3.2666666666666666,
+        "average_log_loss": 6.737541806375841,
+        "average_brier_score": 0.9987934937909027,
+        "latency_p95_ms": null,
+        "peak_memory_bytes": 761864192
+      },
+      "reason": null,
+      "elapsed_ms": 901655,
+      "pareto_rank": null,
+      "hard_constraint_violations": []
+    }
+  ]
+}

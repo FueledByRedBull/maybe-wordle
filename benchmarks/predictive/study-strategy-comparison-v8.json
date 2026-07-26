@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "study_format_version": 8,
+  "scope": "rolling-development prior-calibration strategy diagnostic; not solve-quality or sealed-test evidence",
+  "sealed_test_evaluated": false,
+  "history_snapshot_start": "2021-06-19",
+  "history_snapshot_end": "2026-07-17",
+  "development_cutoff": "2026-06-17",
+  "code_revision": "790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e",
+  "code_dirty": true,
+  "common_budget": {
+    "trials": 8,
+    "requested_jobs": 4,
+    "maximum_validation_folds": 12,
+    "initial_validation_folds": 12,
+    "reduction_factor": 3,
+    "maximum_trial_seconds": 300,
+    "candidate_fold_evaluations": 96,
+    "scheduled_games_per_candidate": 360,
+    "measured_prior_games_per_candidate": 337
+  },
+  "command_template": "cargo run --quiet -- study-run --name <name> --stage calibration --strategy <strategy> --trials 8 --jobs 4 --seed <seed> --maximum-validation-folds 12 --initial-validation-folds 12 --reduction-factor 3 --maximum-trial-seconds 300 --state target/studies/<name>.json --top 5",
+  "equal_seed_results": [
+    {
+      "strategy": "grid",
+      "seed": 20260315,
+      "effective_parallelism": 4,
+      "best_candidate": 2,
+      "coverage_gaps": 23,
+      "failures": 0,
+      "average_log_loss": 7.169984476020721,
+      "average_brier_score": 0.9991874230973008,
+      "aggregate_trial_elapsed_ms": 5125
+    },
+    {
+      "strategy": "low_discrepancy",
+      "seed": 20260315,
+      "effective_parallelism": 4,
+      "best_candidate": 2,
+      "coverage_gaps": 23,
+      "failures": 0,
+      "average_log_loss": 7.1700259013676835,
+      "average_brier_score": 0.9991874261760741,
+      "aggregate_trial_elapsed_ms": 4990
+    },
+    {
+      "strategy": "random",
+      "seed": 20260315,
+      "effective_parallelism": 4,
+      "best_candidate": 2,
+      "coverage_gaps": 23,
+      "failures": 0,
+      "average_log_loss": 7.166966916746764,
+      "average_brier_score": 0.9991444428378163,
+      "aggregate_trial_elapsed_ms": 5144
+    },
+    {
+      "strategy": "local_refinement",
+      "seed": 20260315,
+      "effective_parallelism": 4,
+      "best_candidate": 6,
+      "coverage_gaps": 23,
+      "failures": 0,
+      "average_log_loss": 7.168935354958973,
+      "average_brier_score": 0.9991739007372595,
+      "aggregate_trial_elapsed_ms": 5126
+    },
+    {
+      "strategy": "model_based",
+      "seed": 20260315,
+      "effective_parallelism": 1,
+      "best_candidate": 6,
+      "coverage_gaps": 23,
+      "failures": 0,
+      "average_log_loss": 7.063525808923776,
+      "average_brier_score": 0.9989477480225075,
+      "aggregate_trial_elapsed_ms": 4642,
+      "tpe_candidate": 7,
+      "tpe_candidate_log_loss": 7.170520636271784,
+      "tpe_candidate_brier": 0.9991875541135489
+    }
+  ],
+  "model_based_seed_results": [
+    {
+      "seed": 20260315,
+      "best_candidate": 6,
+      "best_log_loss": 7.063525808923776,
+      "best_brier": 0.9989477480225075,
+      "tpe_candidate_log_loss": 7.170520636271784
+    },
+    {
+      "seed": 20260316,
+      "best_candidate": 7,
+      "best_log_loss": 6.769679115203385,
+      "best_brier": 0.998696935837952,
+      "tpe_candidate_log_loss": 6.769679115203385
+    },
+    {
+      "seed": 20260317,
+      "best_candidate": 3,
+      "best_log_loss": 7.092322230643005,
+      "best_brier": 0.9990532910084692,
+      "tpe_candidate_log_loss": 7.170663636193157
+    },
+    {
+      "seed": 20260318,
+      "best_candidate": 7,
+      "best_log_loss": 7.1213883647654015,
+      "best_brier": 0.999003513138741,
+      "tpe_candidate_log_loss": 7.1213883647654015
+    },
+    {
+      "seed": 20260319,
+      "best_candidate": 7,
+      "best_log_loss": 6.6958664023944765,
+      "best_brier": 0.9986863538093017,
+      "tpe_candidate_log_loss": 6.6958664023944765
+    }
+  ],
+  "interpretation": "At equal candidate-fold budget, the model-based portfolio won the shared seed and its five-seed median best log loss was 7.063526 (range 6.695866 to 7.121388). The TPE suggestion won three of five seeds but did not always beat its deterministic global startup pool. Model-based execution is sequential by design; static strategies retain parallel successive halving. These calibration results nominate candidates for guarded rolling solve evaluation and do not authorize a default-config or sealed-test promotion."
+}

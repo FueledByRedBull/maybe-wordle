@@ -2,16 +2,24 @@ use std::{
     env,
     io::{self, Write},
     path::{Path, PathBuf},
+    thread,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use maybe_wordle::{
+    SOLVER_THREAD_STACK_BYTES,
+    atomic_file::atomic_write,
     config::PriorConfig,
     data::{ProjectPaths, SyncSummary, sync_nyt_history},
+    experiments::{
+        DateRange, RollingOriginConfig, StudyFoldSelection, StudySearchStrategy, StudySpec,
+        StudyStage, build_rolling_origin_plan, predictive_parameter_registry,
+    },
     formal::{
-        DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, FormalVerificationMode, build_optimal_policy,
+        DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, FormalScaleRequest, FormalVerificationMode,
+        benchmark_formal_scale, build_optimal_policy,
         parse_observations as parse_formal_observations, verify_optimal_policy_with_mode,
     },
     gui::run_gui,
@@ -19,7 +27,7 @@ use maybe_wordle::{
     model::{ModelVariant, WeightMode},
     predictive::{PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode},
     seed::{MergeStrategy, add_manual_addition, merge_seed_lists, reconcile_seed_lists},
-    solver::{AbsurdleSuggestion, Solver},
+    solver::{AbsurdleSuggestion, EvidenceResourceBudget, SearchRegretRequest, Solver},
 };
 
 #[derive(Parser, Debug)]
@@ -58,6 +66,36 @@ enum Command {
             help = "Use the slower oracle verifier instead of certificate mode"
         )]
         oracle: bool,
+    },
+    #[command(
+        about = "Run or resume a resource-bounded formal scale projection on pinned prefixes"
+    )]
+    FormalScale {
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "3,4,5,6,8,10,12",
+            help = "Strictly increasing pinned answer counts, comma separated; capped at 16"
+        )]
+        answer_counts: Vec<usize>,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Pinned guess-prefix size, including every selected answer; 0 uses the complete pinned guess list"
+        )]
+        guess_limit: usize,
+        #[arg(long, default_value_t = 1800)]
+        maximum_seconds: u64,
+        #[arg(long, default_value_t = 4096)]
+        maximum_memory_mb: u64,
+        #[arg(long, default_value_t = 4096)]
+        maximum_disk_mb: u64,
+        #[arg(
+            long,
+            default_value = "benchmarks/formal/scale-v2.json",
+            help = "Atomic resumable machine-readable scale report"
+        )]
+        output: PathBuf,
     },
     #[command(about = "Open the desktop GUI")]
     Gui,
@@ -179,6 +217,8 @@ enum Command {
     },
     #[command(about = "Backtest the predictive solver across a synced NYT date range")]
     Backtest {
+        #[arg(long, help = "Optional alternate prior TOML config")]
+        config: Option<PathBuf>,
         #[arg(
             long,
             help = "Backtest start date in YYYY-MM-DD; defaults to earliest synced date"
@@ -332,20 +372,132 @@ enum Command {
         )]
         top: usize,
     },
+    #[command(about = "Print the canonical rolling-origin and sealed-test evaluation plan as JSON")]
+    EvaluationPlan {
+        #[arg(long, default_value_t = 365)]
+        minimum_training_days: u64,
+        #[arg(long, default_value_t = 30)]
+        validation_days: u64,
+        #[arg(long, default_value_t = 30)]
+        step_days: u64,
+        #[arg(long, default_value_t = 30)]
+        sealed_test_days: u64,
+        #[arg(long, default_value_t = 12)]
+        maximum_folds: usize,
+    },
+    #[command(about = "Print the complete predictive parameter registry as JSON")]
+    ParameterRegistry,
+    #[command(about = "Run or resume a deterministic rolling-origin predictive study")]
+    StudyRun {
+        #[arg(long, help = "Stable study name recorded in trial identities")]
+        name: String,
+        #[arg(
+            long,
+            help = "Optional TOML base config; defaults to config/prior.toml"
+        )]
+        base_config: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "calibration",
+            help = "Study stage or typed cohort; use proxy-ranker/solve-policy for aggregate compatibility or proxy-core, proxy-risk, proxy-small-state, search-routing, search-exact, search-coverage, search-lookahead, search-pool, search-danger, and search-penalty for coherent studies"
+        )]
+        stage: String,
+        #[arg(
+            long,
+            default_value_t = 16,
+            help = "Total deterministic candidates including the baseline"
+        )]
+        trials: usize,
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Maximum concurrent candidate evaluations"
+        )]
+        jobs: usize,
+        #[arg(long, default_value_t = 20260315, help = "Deterministic study seed")]
+        seed: u64,
+        #[arg(
+            long,
+            default_value = "low-discrepancy",
+            help = "Candidate strategy: grid, low-discrepancy, random, local-refinement, or model-based"
+        )]
+        strategy: String,
+        #[arg(
+            long,
+            default_value_t = 12,
+            help = "Maximum chronological validation folds evaluated per candidate"
+        )]
+        maximum_validation_folds: usize,
+        #[arg(
+            long,
+            default_value_t = 3,
+            help = "Validation folds in the first successive-halving rung"
+        )]
+        initial_validation_folds: usize,
+        #[arg(
+            long,
+            default_value_t = 3,
+            help = "Successive-halving reduction factor between fidelity rungs"
+        )]
+        reduction_factor: usize,
+        #[arg(
+            long,
+            default_value_t = 7200,
+            help = "Candidate wall-clock budget in seconds, checked between games/folds"
+        )]
+        maximum_trial_seconds: u64,
+        #[arg(
+            long,
+            default_value_t = 4096,
+            help = "Hard process peak-working-set budget in MiB"
+        )]
+        maximum_memory_mb: u64,
+        #[arg(long, help = "Resumable JSON study-state path")]
+        state: PathBuf,
+        #[arg(
+            long,
+            help = "Pause cooperatively between games/folds while this file exists"
+        )]
+        cancel_file: Option<PathBuf>,
+        #[arg(long, help = "Optional TOML path for the current best config")]
+        output_config: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "Top suggestions retained during solve evaluation"
+        )]
+        top: usize,
+    },
     #[command(about = "Search for a better predictive prior policy and print a replacement TOML")]
     TunePrior,
-    #[command(about = "Fit proxy weights from synced history and print a replacement TOML")]
-    FitProxyWeights {
+    #[command(
+        about = "Tune registered proxy-ranker weights through the common rolling study runner"
+    )]
+    FitProxyWeights,
+    #[command(
+        about = "Measure production, proxy, and bounded-lookahead regret against exhaustive search"
+    )]
+    SearchRegret {
+        #[arg(long, help = "Optional alternate prior TOML config")]
+        config: Option<PathBuf>,
+        #[arg(long, help = "Historical audit start date in YYYY-MM-DD")]
+        from: String,
+        #[arg(long, help = "Historical audit end date in YYYY-MM-DD")]
+        to: String,
+        #[arg(long, default_value_t = 3)]
+        minimum_survivors: usize,
+        #[arg(long, default_value_t = 6)]
+        maximum_survivors: usize,
+        #[arg(long, default_value_t = 16)]
+        maximum_states: usize,
         #[arg(
             long,
-            help = "Training start date in YYYY-MM-DD; defaults near the last year of synced history"
+            default_value_t = 1800,
+            help = "Hard wall-clock budget in seconds, checked between games and states"
         )]
-        from: Option<String>,
-        #[arg(
-            long,
-            help = "Training end date in YYYY-MM-DD; defaults to the latest synced date"
-        )]
-        to: Option<String>,
+        maximum_seconds: u64,
+        #[arg(long, help = "Versioned JSON report output path")]
+        output: PathBuf,
     },
     #[command(about = "Benchmark predictive, Absurdle, or formal-optimal suggestion latency")]
     Benchmark {
@@ -364,6 +516,107 @@ enum Command {
         #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id when --mode formal-optimal is used")]
         model: String,
     },
+    #[command(about = "Generate versioned predictive development evidence as JSON and Markdown")]
+    BenchmarkEvidence {
+        #[arg(long, help = "Development evaluation start date in YYYY-MM-DD")]
+        from: String,
+        #[arg(long, help = "Development evaluation end date in YYYY-MM-DD")]
+        to: String,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        #[arg(
+            long,
+            default_value_t = 3600,
+            help = "Hard evidence-generation wall-clock budget in seconds"
+        )]
+        maximum_seconds: u64,
+        #[arg(
+            long,
+            default_value_t = 4096,
+            help = "Hard process peak-working-set budget in MiB"
+        )]
+        maximum_memory_mb: u64,
+        #[arg(long, help = "Versioned JSON evidence output path")]
+        output: PathBuf,
+        #[arg(long, help = "Generated README fragment output path")]
+        markdown_output: PathBuf,
+    },
+    #[command(about = "Update or verify README evidence from a versioned benchmark artifact")]
+    BenchmarkEvidenceDocs {
+        #[arg(long, help = "Versioned predictive evidence JSON path")]
+        evidence: PathBuf,
+        #[arg(long, default_value = "docs/generated/predictive-evidence.md")]
+        markdown_output: PathBuf,
+        #[arg(long, default_value = "README.md")]
+        readme: PathBuf,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Atomically update both documentation files instead of checking them"
+        )]
+        update: bool,
+    },
+    #[command(
+        about = "Compare a candidate config with the default over every rolling development fold"
+    )]
+    RollingCompare {
+        #[arg(
+            long,
+            help = "Optional baseline TOML config; defaults to config/prior.toml"
+        )]
+        baseline_config: Option<PathBuf>,
+        #[arg(long, default_value = "current_default")]
+        baseline_label: String,
+        #[arg(long, help = "Candidate TOML config path")]
+        candidate_config: PathBuf,
+        #[arg(long, default_value = "candidate")]
+        candidate_label: String,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        #[arg(long, help = "Versioned rolling comparison JSON output")]
+        output: PathBuf,
+        #[arg(
+            long,
+            help = "Optional prior rolling-comparison JSON whose matching default baseline can be reused"
+        )]
+        baseline_artifact: Option<PathBuf>,
+    },
+    #[command(
+        about = "Freeze an eligible 12-fold development winner without opening the sealed test"
+    )]
+    FreezeCandidate {
+        #[arg(long, help = "Complete candidate TOML config to freeze")]
+        config: PathBuf,
+        #[arg(
+            long,
+            help = "Current rolling-comparison JSON proving eligibility against its parent"
+        )]
+        comparison: PathBuf,
+        #[arg(long, default_value = "benchmarks/predictive/frozen-candidate-v1.json")]
+        output: PathBuf,
+    },
+    #[command(about = "Evaluate one frozen candidate on the sealed test exactly once")]
+    EvaluateSealed {
+        #[arg(long, default_value = "benchmarks/predictive/frozen-candidate-v1.json")]
+        frozen: PathBuf,
+        #[arg(long, default_value = "benchmarks/predictive/sealed-test-v1.json")]
+        output: PathBuf,
+    },
+    #[command(about = "Update or verify rolling-comparison README evidence")]
+    RollingEvidenceDocs {
+        #[arg(
+            long,
+            required = true,
+            help = "Rolling comparison JSON; repeat for each candidate"
+        )]
+        comparison: Vec<PathBuf>,
+        #[arg(long, default_value = "docs/generated/rolling-evidence.md")]
+        markdown_output: PathBuf,
+        #[arg(long, default_value = "README.md")]
+        readme: PathBuf,
+        #[arg(long, default_value_t = false)]
+        update: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -374,18 +627,39 @@ enum SolverMode {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    let result = configure_global_solver_pool().and_then(|()| {
+        if env::args_os().count() == 1 {
+            resolve_project_root().and_then(run_gui)
+        } else {
+            run_cli_on_sized_stack()
+        }
+    });
+    if let Err(error) = result {
         eprintln!("{error:#}");
         std::process::exit(1);
     }
 }
 
+fn configure_global_solver_pool() -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(SOLVER_THREAD_STACK_BYTES)
+        .build_global()
+        .context("failed to configure the global solver worker pool")
+}
+
+fn run_cli_on_sized_stack() -> Result<()> {
+    thread::Builder::new()
+        .name("maybe-wordle-cli".to_string())
+        .stack_size(SOLVER_THREAD_STACK_BYTES)
+        .spawn(run)
+        .context("failed to start CLI worker")?
+        .join()
+        .map_err(|_| anyhow!("CLI worker panicked"))?
+}
+
 fn run() -> Result<()> {
     let args = env::args_os().collect::<Vec<_>>();
     let root = resolve_project_root()?;
-    if args.len() == 1 {
-        return run_gui(root);
-    }
     let cli = Cli::parse_from(args);
     let paths = ProjectPaths::new(root);
     paths.ensure_layout()?;
@@ -431,9 +705,10 @@ fn run() -> Result<()> {
         Command::BuildModel => {
             let summary = build_model_artifacts(&paths, &config, Solver::today())?;
             println!(
-                "built model with {} guesses, {} modeled answers, {} historical answers across {} daily rows",
+                "built model with {} guesses, {} primary answers, {} dormant fallback answers, {} historical answers across {} daily rows",
                 summary.guess_count,
                 summary.answer_count,
+                summary.fallback_answer_count,
                 summary.historical_answers,
                 summary.history_rows
             );
@@ -464,7 +739,7 @@ fn run() -> Result<()> {
                 },
             )?;
             println!(
-                "model={} manifest={} mode={} verified_cached_states={} verified_small_states={} verified_medium_states={}",
+                "model={} manifest={} mode={} status={} certificate_format={} verified_cached_states={} verified_small_states={} verified_medium_states={}",
                 summary.model_id,
                 summary.manifest_hash,
                 if summary.mode == FormalVerificationMode::Oracle {
@@ -472,9 +747,52 @@ fn run() -> Result<()> {
                 } else {
                     "certificate"
                 },
+                if summary.mode == FormalVerificationMode::Certificate {
+                    "proved_for_exact_manifest"
+                } else {
+                    "oracle_cross_check_only"
+                },
+                summary.certificate_format_version,
                 summary.verified_cached_states,
                 summary.verified_small_states,
                 summary.verified_medium_states
+            );
+        }
+        Command::FormalScale {
+            answer_counts,
+            guess_limit,
+            maximum_seconds,
+            maximum_memory_mb,
+            maximum_disk_mb,
+            output,
+        } => {
+            let report = benchmark_formal_scale(
+                &paths,
+                &FormalScaleRequest {
+                    answer_counts,
+                    guess_limit,
+                    maximum_seconds,
+                    maximum_memory_mb,
+                    maximum_disk_mb,
+                    output: output.clone(),
+                },
+            )?;
+            println!(
+                "formal_scale_points={} completed={} stopped_reason={} projected_full_log10_seconds={} projected_full_log10_certificate_bytes={} output={}",
+                report.points.len(),
+                report.completed,
+                report.stopped_reason.as_deref().unwrap_or("none"),
+                report
+                    .full_model_projection
+                    .projected_log10_seconds
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                report
+                    .full_model_projection
+                    .projected_log10_certificate_bytes
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                output.display()
             );
         }
         Command::Gui => {
@@ -806,13 +1124,19 @@ fn run() -> Result<()> {
             }
         }
         Command::Backtest {
+            config: backtest_config,
             from,
             to,
             top,
             detailed,
             failures_only,
         } => {
-            let solver = Solver::from_paths(&paths, &config)?;
+            let backtest_config = backtest_config
+                .as_deref()
+                .map(PriorConfig::load)
+                .transpose()?
+                .unwrap_or_else(|| config.clone());
+            let solver = Solver::from_paths(&paths, &backtest_config)?;
             let (default_from, default_to) = Solver::latest_history_range(&paths)?
                 .ok_or_else(|| anyhow!("run sync-data before backtesting"))?;
             let from = parse_date(from.as_deref())?.unwrap_or(default_from);
@@ -822,19 +1146,33 @@ fn run() -> Result<()> {
             }
             let report = solver.backtest_detailed(from, to, top)?;
             let stats = &report.summary;
+            let canonical = &stats.canonical;
             println!(
-                "games={} coverage={} average_guesses={:.4} average_guesses_ci95={:.4}..{:.4} p95={} max={} failures={} failure_rate_ci95={:.6}..{:.6} coverage_gaps={}",
-                stats.games,
-                stats.games.saturating_sub(stats.coverage_gaps),
-                stats.average_guesses,
-                stats.average_guesses_ci95.0,
-                stats.average_guesses_ci95.1,
-                stats.p95_guesses,
-                stats.max_guesses,
-                stats.failures,
-                stats.failure_rate_ci95.0,
-                stats.failure_rate_ci95.1,
-                stats.coverage_gaps
+                "scheduled_games={} modeled_games={} solved_games={} unsolved_games={} coverage_gaps={} coverage_rate={:.6} solve_rate={:.6} conditional_mean_guesses={:.4} conditional_mean_guesses_ci95={:.4}..{:.4} all_game_penalized_mean_guesses={:.4} all_game_penalized_mean_guesses_ci95={:.4}..{:.4} failure_penalty_guesses={:.1} median={:.2} p90={} p95={} max={} solved_distribution={}",
+                canonical.scheduled_games,
+                canonical.modeled_games,
+                canonical.solved_games,
+                canonical.unsolved_games,
+                canonical.coverage_gaps,
+                canonical.coverage_rate,
+                canonical.solve_rate,
+                canonical.conditional_mean_guesses,
+                canonical.conditional_mean_guesses_ci95.lower,
+                canonical.conditional_mean_guesses_ci95.upper,
+                canonical.all_game_penalized_mean_guesses,
+                canonical.all_game_penalized_mean_guesses_ci95.lower,
+                canonical.all_game_penalized_mean_guesses_ci95.upper,
+                canonical.failure_penalty_guesses,
+                canonical.median_guesses,
+                canonical.p90_guesses,
+                canonical.p95_guesses,
+                canonical.max_guesses,
+                canonical
+                    .solved_in_guess_counts
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             if detailed {
                 for run in report.runs.iter().filter(|run| {
@@ -1119,10 +1457,88 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::EvaluationPlan {
+            minimum_training_days,
+            validation_days,
+            step_days,
+            sealed_test_days,
+            maximum_folds,
+        } => {
+            let (history_start, history_end) = Solver::latest_history_range(&paths)?
+                .ok_or_else(|| anyhow!("run sync-data before evaluation-plan"))?;
+            let plan = build_rolling_origin_plan(
+                DateRange::new(history_start, history_end)?,
+                RollingOriginConfig {
+                    minimum_training_days,
+                    validation_days,
+                    step_days,
+                    sealed_test_days,
+                    maximum_folds,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        Command::ParameterRegistry => {
+            let registry = predictive_parameter_registry(&config);
+            registry.validate()?;
+            println!("{}", serde_json::to_string_pretty(&registry)?);
+        }
+        Command::StudyRun {
+            name,
+            base_config,
+            stage,
+            trials,
+            jobs,
+            seed,
+            strategy,
+            maximum_validation_folds,
+            initial_validation_folds,
+            reduction_factor,
+            maximum_trial_seconds,
+            maximum_memory_mb,
+            state,
+            cancel_file,
+            output_config,
+            top,
+        } => {
+            let study_base_config = base_config
+                .as_deref()
+                .map(PriorConfig::load)
+                .transpose()?
+                .unwrap_or_else(|| config.clone());
+            let summary = Solver::run_predictive_study(
+                &paths,
+                &study_base_config,
+                StudySpec {
+                    name,
+                    stage: parse_study_stage(&stage)?,
+                    seed,
+                    trial_count: trials,
+                    parallelism: jobs,
+                    strategy: parse_study_strategy(&strategy)?,
+                    maximum_validation_folds,
+                    initial_validation_folds,
+                    reduction_factor,
+                    fold_selection: StudyFoldSelection::NestedTimeSpread,
+                    maximum_trial_seconds,
+                    maximum_memory_mb,
+                },
+                &state,
+                top,
+                cancel_file.as_deref(),
+            )?;
+            if let (Some(path), Some(best_config)) =
+                (output_config.as_deref(), summary.best_config.as_ref())
+            {
+                best_config.save(path)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         Command::TunePrior => {
             let summary = Solver::tune_prior(&paths, &config)?;
             println!(
-                "train_window={}..{} validation_window={}..{} untouched_test_window={}..{} current_avg_guesses={:.4} current_failures={} current_coverage_gaps={} current_log_loss={:.6} current_target_rank={:.2} current_latency_p95_ms={:.3} current_hard_case_avg_guesses={:.4} current_hard_case_failures={} current_regime_mix=proxy:{:.1}%/lookahead:{:.1}%/escalated_exact:{:.1}%/exact:{:.1}%",
+                "rolling_folds={} train_span={}..{} validation_span={}..{} sealed_test_window={}..{} sealed_test_evaluated=false current_conditional_mean_guesses={:.4} current_all_game_penalized_mean_guesses={:.4} current_failures={} current_coverage_gaps={} current_log_loss={:.6} current_target_rank={:.2} current_latency_p95_ms={:.3} current_hard_case_avg_guesses={:.4} current_hard_case_failures={} current_regime_mix=proxy:{:.1}%/lookahead:{:.1}%/escalated_exact:{:.1}%/exact:{:.1}%",
+                summary.evaluation_plan.folds.len(),
                 summary.search_window_start,
                 summary.search_window_end,
                 summary.validation_window_start,
@@ -1130,6 +1546,7 @@ fn run() -> Result<()> {
                 summary.test_window_start,
                 summary.test_window_end,
                 summary.current.average_guesses,
+                summary.current.all_game_penalized_mean_guesses,
                 summary.current.failures,
                 summary.current.coverage_gaps,
                 summary.current.average_log_loss,
@@ -1143,8 +1560,9 @@ fn run() -> Result<()> {
                 summary.current.exact_step_pct * 100.0
             );
             println!(
-                "best_avg_guesses={:.4} best_failures={} best_coverage_gaps={} best_log_loss={:.6} best_target_rank={:.2} best_latency_p95_ms={:.3} best_hard_case_avg_guesses={:.4} best_hard_case_failures={} best_regime_mix=proxy:{:.1}%/lookahead:{:.1}%/escalated_exact:{:.1}%/exact:{:.1}%",
+                "best_conditional_mean_guesses={:.4} best_all_game_penalized_mean_guesses={:.4} best_failures={} best_coverage_gaps={} best_log_loss={:.6} best_target_rank={:.2} best_latency_p95_ms={:.3} best_hard_case_avg_guesses={:.4} best_hard_case_failures={} best_regime_mix=proxy:{:.1}%/lookahead:{:.1}%/escalated_exact:{:.1}%/exact:{:.1}%",
                 summary.best.average_guesses,
+                summary.best.all_game_penalized_mean_guesses,
                 summary.best.failures,
                 summary.best.coverage_gaps,
                 summary.best.average_log_loss,
@@ -1159,27 +1577,82 @@ fn run() -> Result<()> {
             );
             println!("{}", summary.replacement_toml.trim_end());
         }
-        Command::FitProxyWeights { from, to } => {
-            let (history_start, history_end) = Solver::latest_history_range(&paths)?
-                .ok_or_else(|| anyhow!("run sync-data before fitting proxy weights"))?;
-            let default_from = history_end
-                .checked_sub_days(chrono::Days::new(364))
-                .map_or(history_start, |date| date.max(history_start));
-            let from = parse_date(from.as_deref())?.unwrap_or(default_from);
-            let to = parse_date(to.as_deref())?.unwrap_or(history_end);
-            if from > to {
-                bail!("--from cannot be after --to");
-            }
-            let solver = Solver::from_paths(&paths, &config)?;
-            let summary = solver.fit_proxy_weights(from, to)?;
+        Command::FitProxyWeights => {
+            let maximum_validation_folds = Solver::latest_history_range(&paths)?
+                .map(|(start, end)| DateRange::new(start, end))
+                .transpose()?
+                .map_or(1, |history| {
+                    build_rolling_origin_plan(history, RollingOriginConfig::default())
+                        .map_or(1, |plan| plan.folds.len())
+                });
+            let summary = Solver::run_predictive_study(
+                &paths,
+                &config,
+                StudySpec {
+                    name: "fit-proxy-weights".to_string(),
+                    stage: StudyStage::ProxyRanker,
+                    seed: 20_260_315,
+                    trial_count: 24,
+                    parallelism: std::thread::available_parallelism()
+                        .map_or(1, usize::from)
+                        .min(4),
+                    strategy: StudySearchStrategy::LowDiscrepancy,
+                    maximum_validation_folds,
+                    initial_validation_folds: maximum_validation_folds.min(3),
+                    reduction_factor: 3,
+                    fold_selection: StudyFoldSelection::NestedTimeSpread,
+                    maximum_trial_seconds: 7_200,
+                    maximum_memory_mb: 4_096,
+                },
+                &paths.root.join("target/studies/fit-proxy-weights-v16.json"),
+                5,
+                None,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::SearchRegret {
+            config: audit_config,
+            from,
+            to,
+            minimum_survivors,
+            maximum_survivors,
+            maximum_states,
+            maximum_seconds,
+            output,
+        } => {
+            let audit_config = audit_config
+                .as_deref()
+                .map(PriorConfig::load)
+                .transpose()?
+                .unwrap_or_else(|| config.clone());
+            let from = parse_date(Some(&from))?
+                .ok_or_else(|| anyhow!("--from is required for search-regret"))?;
+            let to = parse_date(Some(&to))?
+                .ok_or_else(|| anyhow!("--to is required for search-regret"))?;
+            let solver = Solver::from_paths(&paths, &audit_config)?;
+            let report = solver.search_regret_report(
+                &paths,
+                SearchRegretRequest {
+                    from,
+                    to,
+                    minimum_survivors,
+                    maximum_survivors,
+                    maximum_states,
+                    maximum_seconds,
+                },
+            )?;
+            let encoded = serde_json::to_vec_pretty(&report)
+                .context("failed to encode search-regret JSON")?;
+            atomic_write(&output, &encoded)?;
             println!(
-                "rows={} states={} train_avg={:.4} validation_avg={:.4}",
-                summary.row_count,
-                summary.state_count,
-                summary.training_average_guesses,
-                summary.validation_average_guesses
+                "search_regret={} states={} available={} production_mean={:.6} proxy_mean={:.6} lookahead_mean={:.6}",
+                output.display(),
+                report.sampled_states,
+                report.available_states,
+                report.production.mean_regret,
+                report.proxy.mean_regret,
+                report.lookahead.mean_regret,
             );
-            println!("{}", summary.replacement_toml.trim_end());
         }
         Command::Benchmark { runs, mode, model } => {
             if runs == 0 {
@@ -1242,6 +1715,228 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::BenchmarkEvidence {
+            from,
+            to,
+            top,
+            maximum_seconds,
+            maximum_memory_mb,
+            output,
+            markdown_output,
+        } => {
+            let from = NaiveDate::parse_from_str(&from, "%Y-%m-%d")
+                .with_context(|| format!("invalid --from date: {from}"))?;
+            let to = NaiveDate::parse_from_str(&to, "%Y-%m-%d")
+                .with_context(|| format!("invalid --to date: {to}"))?;
+            let artifact = Solver::build_development_evidence_with_budget(
+                &paths,
+                &config,
+                from,
+                to,
+                top,
+                EvidenceResourceBudget {
+                    maximum_seconds,
+                    maximum_memory_mb,
+                },
+            )?;
+            atomic_write(
+                &output,
+                &serde_json::to_vec_pretty(&artifact)
+                    .context("failed to serialize predictive evidence")?,
+            )?;
+            let markdown = Solver::render_development_evidence_markdown(&artifact)?;
+            atomic_write(&markdown_output, markdown.as_bytes())?;
+            println!(
+                "evidence_json={} evidence_markdown={} baselines={} sealed_test_evaluated=false",
+                output.display(),
+                markdown_output.display(),
+                artifact.baselines.len()
+            );
+        }
+        Command::BenchmarkEvidenceDocs {
+            evidence,
+            markdown_output,
+            readme,
+            update,
+        } => {
+            let bytes = std::fs::read(&evidence)
+                .with_context(|| format!("failed to read {}", evidence.display()))?;
+            let artifact: maybe_wordle::solver::PredictiveEvidenceArtifact =
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("failed to parse {}", evidence.display()))?;
+            let generated = Solver::render_development_evidence_markdown(&artifact)?;
+            let readme_text = std::fs::read_to_string(&readme)
+                .with_context(|| format!("failed to read {}", readme.display()))?;
+            let updated_readme = replace_generated_evidence(&readme_text, &generated)?;
+            if update {
+                atomic_write(&markdown_output, generated.as_bytes())?;
+                atomic_write(&readme, updated_readme.as_bytes())?;
+                println!(
+                    "updated_markdown={} updated_readme={}",
+                    markdown_output.display(),
+                    readme.display()
+                );
+            } else {
+                let existing_markdown = std::fs::read_to_string(&markdown_output)
+                    .with_context(|| format!("failed to read {}", markdown_output.display()))?;
+                if existing_markdown != generated {
+                    bail!(
+                        "generated evidence fragment is stale: run benchmark-evidence-docs --evidence {} --update",
+                        evidence.display()
+                    );
+                }
+                if updated_readme != readme_text {
+                    bail!(
+                        "README evidence fragment is stale: run benchmark-evidence-docs --evidence {} --update",
+                        evidence.display()
+                    );
+                }
+                println!("predictive evidence documentation is current");
+            }
+        }
+        Command::RollingCompare {
+            baseline_config,
+            baseline_label,
+            candidate_config,
+            candidate_label,
+            top,
+            output,
+            baseline_artifact,
+        } => {
+            let rolling_baseline = baseline_config
+                .as_deref()
+                .map(PriorConfig::load)
+                .transpose()?
+                .unwrap_or_else(|| config.clone());
+            let candidate = PriorConfig::load(&candidate_config)?;
+            let reusable = baseline_artifact
+                .as_deref()
+                .map(|path| {
+                    let bytes = std::fs::read(path)
+                        .with_context(|| format!("failed to read {}", path.display()))?;
+                    serde_json::from_slice::<maybe_wordle::solver::RollingComparisonArtifact>(
+                        &bytes,
+                    )
+                    .with_context(|| format!("failed to parse {}", path.display()))
+                })
+                .transpose()?;
+            let artifact = Solver::build_rolling_config_comparison(
+                &paths,
+                &rolling_baseline,
+                &baseline_label,
+                &candidate,
+                &candidate_label,
+                top,
+                reusable.as_ref(),
+            )?;
+            atomic_write(
+                &output,
+                &serde_json::to_vec_pretty(&artifact)
+                    .context("failed to serialize rolling comparison")?,
+            )?;
+            println!(
+                "rolling_folds={} baseline_all_game_mean={:.4} candidate_all_game_mean={:.4} delta={:+.4} ci95={:+.4}..{:+.4} wins={} ties={} losses={} sealed_test_evaluated=false output={}",
+                artifact.evaluation_plan.folds.len(),
+                artifact.baseline.aggregate.all_game_penalized_mean_guesses,
+                artifact.candidate.aggregate.all_game_penalized_mean_guesses,
+                artifact.candidate_minus_baseline.candidate_minus_baseline,
+                artifact.candidate_minus_baseline.ci95.lower,
+                artifact.candidate_minus_baseline.ci95.upper,
+                artifact.candidate_minus_baseline.candidate_wins,
+                artifact.candidate_minus_baseline.ties,
+                artifact.candidate_minus_baseline.baseline_wins,
+                output.display()
+            );
+        }
+        Command::FreezeCandidate {
+            config,
+            comparison,
+            output,
+        } => {
+            let frozen = Solver::freeze_predictive_candidate(&paths, &config, &comparison)?;
+            let output = if output.is_absolute() {
+                output
+            } else {
+                paths.root.join(output)
+            };
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            atomic_write(
+                &output,
+                &serde_json::to_vec_pretty(&frozen)
+                    .context("failed to serialize frozen candidate")?,
+            )?;
+            println!(
+                "candidate={} freeze={} development_all_game_mean={:.4} development_failures={} sealed_test_evaluated=false output={}",
+                frozen.candidate_label,
+                frozen.freeze_fingerprint,
+                frozen.development_metrics.all_game_penalized_mean_guesses,
+                frozen.development_metrics.unsolved_games
+                    + frozen.development_metrics.coverage_gaps,
+                output.display()
+            );
+        }
+        Command::EvaluateSealed { frozen, output } => {
+            let bytes = std::fs::read(&frozen)
+                .with_context(|| format!("failed to read {}", frozen.display()))?;
+            let frozen: maybe_wordle::solver::FrozenPredictiveCandidate =
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("failed to parse {}", frozen.display()))?;
+            let report =
+                Solver::evaluate_frozen_candidate_on_sealed_test(&paths, &frozen, &output)?;
+            println!(
+                "sealed_games={} solved={} failures={} coverage_gaps={} all_game_mean={:.4} ci95={:.4}..{:.4} latency_p95_ms={:.3} evaluated_once=true output={}",
+                report.metrics.scheduled_games,
+                report.metrics.solved_games,
+                report.metrics.unsolved_games,
+                report.metrics.coverage_gaps,
+                report.metrics.all_game_penalized_mean_guesses,
+                report.metrics.all_game_penalized_mean_guesses_ci95.lower,
+                report.metrics.all_game_penalized_mean_guesses_ci95.upper,
+                report.latency_p95_ms,
+                output.display()
+            );
+        }
+        Command::RollingEvidenceDocs {
+            comparison,
+            markdown_output,
+            readme,
+            update,
+        } => {
+            let comparisons = comparison
+                .iter()
+                .map(|path| {
+                    let bytes = std::fs::read(path)
+                        .with_context(|| format!("failed to read {}", path.display()))?;
+                    serde_json::from_slice::<maybe_wordle::solver::RollingComparisonArtifact>(
+                        &bytes,
+                    )
+                    .with_context(|| format!("failed to parse {}", path.display()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let generated = Solver::render_rolling_comparison_markdown(&comparisons)?;
+            let readme_text = std::fs::read_to_string(&readme)
+                .with_context(|| format!("failed to read {}", readme.display()))?;
+            let updated_readme = replace_generated_rolling_evidence(&readme_text, &generated)?;
+            if update {
+                atomic_write(&markdown_output, generated.as_bytes())?;
+                atomic_write(&readme, updated_readme.as_bytes())?;
+                println!(
+                    "updated_markdown={} updated_readme={}",
+                    markdown_output.display(),
+                    readme.display()
+                );
+            } else {
+                let existing = std::fs::read_to_string(&markdown_output)
+                    .with_context(|| format!("failed to read {}", markdown_output.display()))?;
+                if existing != generated || updated_readme != readme_text {
+                    bail!("rolling evidence documentation is stale; rerun with --update");
+                }
+                println!("rolling evidence documentation is current");
+            }
+        }
     }
 
     Ok(())
@@ -1286,6 +1981,42 @@ fn parse_date(raw: Option<&str>) -> Result<Option<NaiveDate>> {
             .with_context(|| format!("invalid date: {value}"))
     })
     .transpose()
+}
+
+fn replace_generated_evidence(readme: &str, generated: &str) -> Result<String> {
+    const START: &str = "<!-- BEGIN GENERATED PREDICTIVE EVIDENCE -->";
+    const END: &str = "<!-- END GENERATED PREDICTIVE EVIDENCE -->";
+    let start = readme
+        .find(START)
+        .ok_or_else(|| anyhow!("README is missing the generated evidence start marker"))?;
+    let end_start = readme[start..]
+        .find(END)
+        .map(|offset| start + offset)
+        .ok_or_else(|| anyhow!("README is missing the generated evidence end marker"))?;
+    let end = end_start + END.len();
+    let mut updated = String::with_capacity(readme.len() + generated.len());
+    updated.push_str(&readme[..start]);
+    updated.push_str(generated.trim_end());
+    updated.push_str(&readme[end..]);
+    Ok(updated)
+}
+
+fn replace_generated_rolling_evidence(readme: &str, generated: &str) -> Result<String> {
+    const START: &str = "<!-- BEGIN GENERATED ROLLING EVIDENCE -->";
+    const END: &str = "<!-- END GENERATED ROLLING EVIDENCE -->";
+    let start = readme
+        .find(START)
+        .ok_or_else(|| anyhow!("README is missing the generated rolling evidence start marker"))?;
+    let end_start = readme[start..]
+        .find(END)
+        .map(|offset| start + offset)
+        .ok_or_else(|| anyhow!("README is missing the generated rolling evidence end marker"))?;
+    let end = end_start + END.len();
+    let mut updated = String::with_capacity(readme.len() + generated.len());
+    updated.push_str(&readme[..start]);
+    updated.push_str(generated.trim_end());
+    updated.push_str(&readme[end..]);
+    Ok(updated)
 }
 
 fn warn_predictive_history_range(paths: &ProjectPaths, as_of: NaiveDate) -> Result<()> {
@@ -1471,6 +2202,45 @@ fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy> {
     }
 }
 
+fn parse_study_stage(raw: &str) -> Result<StudyStage> {
+    match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "calibration" | "prior" => Ok(StudyStage::Calibration),
+        "coverage-recovery" | "recovery" => Ok(StudyStage::CoverageRecovery),
+        "proxy-core" => Ok(StudyStage::ProxyCore),
+        "proxy-risk" => Ok(StudyStage::ProxyRisk),
+        "proxy-small-state" => Ok(StudyStage::ProxySmallState),
+        "proxy-ranker" | "proxy" => Ok(StudyStage::ProxyRanker),
+        "search-routing" => Ok(StudyStage::SearchRouting),
+        "search-exact" => Ok(StudyStage::SearchExact),
+        "search-coverage" => Ok(StudyStage::SearchCoverage),
+        "search-lookahead" => Ok(StudyStage::SearchLookahead),
+        "search-pool" => Ok(StudyStage::SearchPool),
+        "search-danger" => Ok(StudyStage::SearchDanger),
+        "search-penalty" => Ok(StudyStage::SearchPenalty),
+        "solve-policy" | "solve" => Ok(StudyStage::SolvePolicy),
+        "book-policy" | "book" => Ok(StudyStage::BookPolicy),
+        "joint" | "all" => Ok(StudyStage::Joint),
+        _ => bail!(
+            "study stage must be one of: calibration, coverage-recovery, proxy-core, proxy-risk, proxy-small-state, proxy-ranker, search-routing, search-exact, search-coverage, search-lookahead, search-pool, search-danger, search-penalty, solve-policy, book-policy, joint"
+        ),
+    }
+}
+
+fn parse_study_strategy(raw: &str) -> Result<StudySearchStrategy> {
+    match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "grid" => Ok(StudySearchStrategy::Grid),
+        "low-discrepancy" | "quasi-random" => Ok(StudySearchStrategy::LowDiscrepancy),
+        "random" => Ok(StudySearchStrategy::Random),
+        "local-refinement" | "local" => Ok(StudySearchStrategy::LocalRefinement),
+        "model-based" | "model_based" | "tpe" => Ok(StudySearchStrategy::ModelBased),
+        _ => {
+            bail!(
+                "study strategy must be one of: grid, low-discrepancy, random, local-refinement, model-based"
+            )
+        }
+    }
+}
+
 fn reject_hard_mode_for_non_predictive(hard: bool, mode: &str) -> Result<()> {
     if hard {
         bail!("--hard is only supported in predictive Wordle mode, not {mode}");
@@ -1529,15 +2299,16 @@ mod tests {
     use chrono::NaiveDate;
     use clap::CommandFactory;
     use maybe_wordle::data::SyncSummary;
+    use maybe_wordle::experiments::StudySearchStrategy;
     use maybe_wordle::predictive::{PredictiveArtifactState, PredictiveSuggestResponse};
     use maybe_wordle::solver::AbsurdleSuggestion;
 
     use super::{
         Cli, enforce_sync_policy, find_project_root, format_absurdle_suggestion,
         format_predictive_suggestion, format_sync_summary, normalize_interactive_guess,
-        parse_solver_mode, predictive_cli_mode, predictive_warning_lines,
-        reject_hard_mode_for_non_predictive, reject_live_fallback_for_non_predictive,
-        try_append_observation,
+        parse_solver_mode, parse_study_stage, parse_study_strategy, predictive_cli_mode,
+        predictive_warning_lines, reject_hard_mode_for_non_predictive,
+        reject_live_fallback_for_non_predictive, try_append_observation,
     };
 
     #[test]
@@ -1620,6 +2391,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_study_strategy_accepts_documented_aliases_and_rejects_unknown_values() {
+        assert_eq!(
+            parse_study_strategy("low_discrepancy").expect("low discrepancy"),
+            StudySearchStrategy::LowDiscrepancy
+        );
+        assert_eq!(
+            parse_study_strategy("quasi-random").expect("quasi-random"),
+            StudySearchStrategy::LowDiscrepancy
+        );
+        assert_eq!(
+            parse_study_strategy("local").expect("local"),
+            StudySearchStrategy::LocalRefinement
+        );
+        assert_eq!(
+            parse_study_strategy("tpe").expect("tpe"),
+            StudySearchStrategy::ModelBased
+        );
+    }
+
+    #[test]
+    fn parse_study_stage_accepts_proxy_ranker_aliases() {
+        assert_eq!(
+            parse_study_stage("proxy-ranker").expect("proxy ranker"),
+            maybe_wordle::experiments::StudyStage::ProxyRanker
+        );
+        assert_eq!(
+            parse_study_stage("proxy").expect("proxy alias"),
+            maybe_wordle::experiments::StudyStage::ProxyRanker
+        );
+    }
+
+    #[test]
+    fn parse_study_stage_accepts_typed_cohort_aliases() {
+        assert_eq!(
+            parse_study_stage("proxy_small_state").expect("proxy small state"),
+            maybe_wordle::experiments::StudyStage::ProxySmallState
+        );
+        assert_eq!(
+            parse_study_stage("search-exact").expect("search exact"),
+            maybe_wordle::experiments::StudyStage::SearchExact
+        );
+        assert_eq!(
+            parse_study_stage("search_penalty").expect("search penalty"),
+            maybe_wordle::experiments::StudyStage::SearchPenalty
+        );
+    }
+
+    #[test]
     fn reject_hard_mode_for_non_predictive_modes() {
         assert!(reject_hard_mode_for_non_predictive(false, "absurdle").is_ok());
         assert!(reject_hard_mode_for_non_predictive(true, "absurdle").is_err());
@@ -1680,6 +2499,7 @@ mod tests {
                     recovery_mode_used: None,
                 },
                 suggestions: Vec::new(),
+                candidates: Vec::new(),
                 promoted_word: None,
                 promotion_source: None,
                 artifact_state: PredictiveArtifactState::LiveSessionFallback,
@@ -1775,5 +2595,21 @@ mod tests {
         assert!(
             opener_rendered.contains("Answer-weight model: weighted, uniform, or cooldown_only")
         );
+
+        let mut study = Cli::command()
+            .find_subcommand_mut("study-run")
+            .expect("study help")
+            .clone();
+        let mut study_help = Vec::new();
+        study.write_long_help(&mut study_help).expect("help");
+        let study_rendered = String::from_utf8(study_help).expect("utf8");
+        assert!(
+            study_rendered
+                .contains("grid, low-discrepancy, random, local-refinement, or model-based")
+        );
+        assert!(study_rendered.contains("first successive-halving rung"));
+        assert!(study_rendered.contains("Pause cooperatively"));
+        assert!(study_rendered.contains("peak-working-set budget"));
+        assert!(study_rendered.contains("Optional TOML base config"));
     }
 }

@@ -15,10 +15,19 @@ use serde::{Deserialize, Serialize};
 use crate::{
     atomic_file::atomic_write,
     data::{ProjectPaths, read_word_list},
+    identity::{CanonicalSha256, digest_bytes_tagged, tag},
     model::AnswerRecord,
-    pattern_table::{PatternTable, hash_bytes, hash_word_list},
+    pattern_table::{PatternTable, hash_word_list},
     scoring::{ALL_GREEN_PATTERN, PATTERN_SPACE, format_feedback_letters, parse_feedback},
     small_state::{SMALL_STATE_TABLE_VERSION, SmallStateTable},
+};
+
+mod scale;
+mod verifier;
+
+pub use scale::{
+    FormalScalePoint, FormalScaleProjection, FormalScaleReport, FormalScaleRequest,
+    benchmark_formal_scale,
 };
 
 pub const DEFAULT_FORMAL_MODEL_ID: &str = "formal-v1";
@@ -31,13 +40,14 @@ const METADATA_NAME: &str = "proof_metadata.json";
 const CERTIFICATE_NAME: &str = "proof_certificate.json";
 const SMALL_STATE_TABLE_NAME: &str = "small_state_table.json";
 const FORMAL_PATTERN_TABLE_NAME: &str = "pattern_table.bin";
-const POLICY_MAGIC: &[u8; 8] = b"MWORDPV1";
-const VALUES_MAGIC: &[u8; 8] = b"MWORDVV1";
+const POLICY_MAGIC: &[u8; 8] = b"MWORDPV2";
+const VALUES_MAGIC: &[u8; 8] = b"MWORDVV2";
+const TAGGED_DIGEST_LENGTH: usize = 74;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const OBJECTIVE_VERSION: u32 = 2;
 const STATE_FORMAT_VERSION: u32 = 2;
-const AUX_TABLE_VERSION: u32 = 2;
-const CERTIFICATE_FORMAT_VERSION: u32 = 4;
+const AUX_TABLE_VERSION: u32 = 4;
+const CERTIFICATE_FORMAT_VERSION: u32 = 7;
 const SMALL_STATE_LIMIT: usize = 12;
 
 type AnswerId = u16;
@@ -68,32 +78,10 @@ pub enum FormalVerificationMode {
     Oracle,
 }
 
-#[derive(Clone, Debug)]
-struct CertificateState {
-    state: StateKey,
-    best_guess: usize,
-    best_objective: PolicyObjective,
-    candidates: Vec<CertificateCandidate>,
-}
-
-#[derive(Clone, Debug)]
-struct CertificateCandidate {
-    guess_index: usize,
-    objective: PolicyObjective,
-    children: Vec<CertificateChild>,
-}
-
-#[derive(Clone, Debug)]
-struct CertificateChild {
-    pattern: u8,
-    state: StateKey,
-    objective: PolicyObjective,
-    mass: f64,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedCertificateState {
     state_id: u32,
+    answer_indices: Vec<AnswerId>,
     best_guess: usize,
     best_objective: PolicyObjective,
     candidates: Vec<PersistedCertificateCandidate>,
@@ -102,8 +90,22 @@ struct PersistedCertificateState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedCertificateCandidate {
     guess_index: usize,
-    objective: PolicyObjective,
-    children: Vec<PersistedCertificateChild>,
+    witness: PersistedCandidateWitness,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistedCandidateWitness {
+    NonProgress {
+        pattern: u8,
+    },
+    Equivalent {
+        representative_guess: usize,
+    },
+    Exact {
+        objective: PolicyObjective,
+        children: Vec<PersistedCertificateChild>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,15 +125,15 @@ pub struct FormalManifest {
     pub normal_mode_only: bool,
     pub guess_count: usize,
     pub answer_count: usize,
-    pub guess_hash: u64,
-    pub answer_hash: u64,
-    pub prior_hash: u64,
+    pub guess_hash: String,
+    pub answer_hash: String,
+    pub prior_hash: String,
     pub state_format_version: u32,
     pub aux_table_version: u32,
     pub certificate_format_version: u32,
     pub small_state_table_version: u32,
-    pub small_state_table_hash: u64,
-    pub manifest_hash: u64,
+    pub small_state_table_hash: String,
+    pub manifest_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,7 +152,7 @@ pub struct FormalSuggestion {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProofMetadata {
     pub model_id: String,
-    pub manifest_hash: u64,
+    pub manifest_hash: String,
     pub solved_states: usize,
     pub deduped_signatures: u64,
     pub bound_hits: u64,
@@ -163,7 +165,7 @@ pub struct ProofMetadata {
 #[derive(Clone, Debug)]
 pub struct BuildOptimalSummary {
     pub model_id: String,
-    pub manifest_hash: u64,
+    pub manifest_hash: String,
     pub solved_states: usize,
     pub deduped_signatures: u64,
     pub bound_hits: u64,
@@ -177,31 +179,35 @@ pub struct BuildOptimalSummary {
 #[derive(Clone, Debug)]
 pub struct VerifySummary {
     pub mode: FormalVerificationMode,
+    pub certificate_format_version: u32,
+    pub certificate_state_count: usize,
     pub verified_cached_states: usize,
     pub verified_small_states: usize,
     pub verified_medium_states: usize,
     pub model_id: String,
-    pub manifest_hash: u64,
+    pub manifest_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProofCertificate {
     pub model_id: String,
-    pub manifest_hash: u64,
+    pub manifest_hash: String,
     pub objective_id: String,
     pub objective_version: u32,
     pub state_format_version: u32,
     pub aux_table_version: u32,
     pub certificate_format_version: u32,
-    pub small_state_table_hash: u64,
+    pub small_state_table_hash: String,
+    pub policy_state_count: usize,
     pub state_count: usize,
+    pub root_state_id: u32,
     states: Vec<PersistedCertificateState>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FormalStateExplanation {
     pub model_id: String,
-    pub manifest_hash: u64,
+    pub manifest_hash: String,
     pub surviving_answers: usize,
     pub best_guess: String,
     pub objective: PolicyObjective,
@@ -336,7 +342,6 @@ struct StoredState {
 struct FormalPolicyBuilder {
     model: FormalModel,
     memo: HashMap<StateKey, StoredState>,
-    certificate_states: HashMap<StateKey, CertificateState>,
     hot_tt: HotTranspositionTable,
     deduped_signatures: u64,
     bound_hits: u64,
@@ -566,7 +571,6 @@ pub fn build_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<Buil
     let mut builder = FormalPolicyBuilder {
         model,
         memo: HashMap::new(),
-        certificate_states: HashMap::new(),
         hot_tt: HotTranspositionTable::new(HOT_TT_BYTES),
         deduped_signatures: 0,
         bound_hits: 0,
@@ -589,7 +593,7 @@ pub fn build_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<Buil
     let build_millis = started.elapsed().as_millis();
     let metadata = ProofMetadata {
         model_id: builder.model.manifest.model_id.clone(),
-        manifest_hash: builder.model.manifest.manifest_hash,
+        manifest_hash: builder.model.manifest.manifest_hash.clone(),
         solved_states: builder.memo.len(),
         deduped_signatures: builder.deduped_signatures,
         bound_hits: builder.bound_hits,
@@ -598,16 +602,10 @@ pub fn build_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<Buil
         build_millis,
         root_objective: root_state.objective.clone(),
     };
-    persist_policy(
-        &builder.model,
-        &builder.memo,
-        &builder.certificate_states,
-        &metadata,
-        paths,
-    )?;
+    persist_policy(&builder.model, &builder.memo, &metadata, paths)?;
     Ok(BuildOptimalSummary {
         model_id: builder.model.manifest.model_id.clone(),
-        manifest_hash: builder.model.manifest.manifest_hash,
+        manifest_hash: builder.model.manifest.manifest_hash.clone(),
         solved_states: builder.memo.len(),
         deduped_signatures: builder.deduped_signatures,
         bound_hits: builder.bound_hits,
@@ -655,7 +653,7 @@ pub fn verify_optimal_policy_with_mode(
     let mut cached_states = 0usize;
     if mode == FormalVerificationMode::Certificate {
         verify_certificate(&runtime, &certificate)?;
-        cached_states = certificate.state_count;
+        cached_states = runtime.policy.len();
     }
     let mut small_states = 0usize;
     let mut medium_states = 0usize;
@@ -696,6 +694,8 @@ pub fn verify_optimal_policy_with_mode(
 
     Ok(VerifySummary {
         mode,
+        certificate_format_version: certificate.certificate_format_version,
+        certificate_state_count: certificate.state_count,
         verified_cached_states: cached_states,
         verified_small_states: small_states,
         verified_medium_states: medium_states,
@@ -741,30 +741,28 @@ impl FormalModel {
             std::str::from_utf8(&raw_prior).context("formal prior spec must be valid UTF-8")?,
         )
         .with_context(|| format!("failed to parse {}", artifacts.prior_spec.display()))?;
-        let guess_hash = hash_word_list(guesses.iter().map(String::as_str));
-        let answer_hash = hash_word_list(answers.iter().map(String::as_str));
-        let prior_hash = hash_bytes(1469598103934665603, &raw_prior);
+        let guess_hash = tag(&hash_word_list(guesses.iter().map(String::as_str)));
+        let answer_hash = tag(&hash_word_list(answers.iter().map(String::as_str)));
+        let prior_hash = digest_bytes_tagged("maybe-wordle-formal-prior-v2", &raw_prior);
         let objective_spec = objective_spec_for_model(model_id);
-        let (small_state_table, small_state_table_bytes) = if artifacts.small_state_table.exists() {
+        let canonical_small_state_table = SmallStateTable::build(SMALL_STATE_LIMIT);
+        if artifacts.small_state_table.exists() {
             let raw = fs::read(&artifacts.small_state_table).with_context(|| {
                 format!("failed to read {}", artifacts.small_state_table.display())
             })?;
-            let table = serde_json::from_slice(&raw).with_context(|| {
+            let persisted: SmallStateTable = serde_json::from_slice(&raw).with_context(|| {
                 format!("failed to parse {}", artifacts.small_state_table.display())
             })?;
-            (table, raw)
-        } else {
-            let table = SmallStateTable::build(SMALL_STATE_LIMIT);
-            let raw = serde_json::to_vec_pretty(&table).context("small-state table serialize")?;
-            (table, raw)
-        };
-        let small_state_table_hash = hash_bytes(1469598103934665603, &small_state_table_bytes);
+            validate_small_state_table(&persisted, &canonical_small_state_table)?;
+        }
+        let small_state_table = canonical_small_state_table;
+        let small_state_table_hash = hash_small_state_table(&small_state_table);
         let manifest_hash = combine_hashes(
-            guess_hash,
-            answer_hash,
-            prior_hash,
+            &guess_hash,
+            &answer_hash,
+            &prior_hash,
             objective_spec,
-            small_state_table_hash,
+            &small_state_table_hash,
         );
         let manifest = FormalManifest {
             model_id: model_id.to_string(),
@@ -826,7 +824,13 @@ impl FormalPolicyRuntime {
             File::open(&artifacts.manifest)
                 .with_context(|| format!("failed to open {}", artifacts.manifest.display()))?,
         ))
-        .with_context(|| format!("failed to parse {}", artifacts.manifest.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to parse {}; rebuild formal artifacts to migrate to {}",
+                artifacts.manifest.display(),
+                crate::identity::IDENTITY_FORMAT
+            )
+        })?;
         if manifest.manifest_hash != model.manifest.manifest_hash {
             bail!(
                 "formal artifacts are stale for {}: expected manifest {}, found {}",
@@ -941,7 +945,7 @@ impl FormalPolicyRuntime {
         let tied_moves = ranked.into_iter().take(top).collect::<Vec<_>>();
         Ok(FormalStateExplanation {
             model_id: self.model.manifest.model_id.clone(),
-            manifest_hash: self.model.manifest.manifest_hash,
+            manifest_hash: self.model.manifest.manifest_hash.clone(),
             surviving_answers: state.count(),
             best_guess: self.model.guesses[best.guess_index].clone(),
             objective: best.objective.clone(),
@@ -1170,7 +1174,6 @@ impl FormalPolicyBuilder {
         }
         let total_mass = self.state_mass(state);
         let mut best: Option<StoredState> = None;
-        let mut best_certificate: Option<CertificateState> = None;
         for plan in quick_plans {
             let effective_upper = best
                 .as_ref()
@@ -1182,12 +1185,8 @@ impl FormalPolicyBuilder {
                 self.bound_hits += 1;
                 continue;
             }
-            let expected_lower_bound = guess_expected_lower_bound(
-                &plan.buckets,
-                total_mass,
-                PATTERN_SPACE as f64,
-                &self.model.small_state_table,
-            );
+            let expected_lower_bound =
+                guess_expected_lower_bound(&plan.buckets, total_mass, PATTERN_SPACE as f64);
             let lower_objective = PolicyObjective {
                 worst_case_depth: plan.lower_bound,
                 expected_guesses: expected_lower_bound,
@@ -1200,18 +1199,13 @@ impl FormalPolicyBuilder {
                 self.bound_hits += 1;
                 continue;
             }
-            let mut children = Vec::new();
             let mut remaining_lower = plan
                 .buckets
                 .iter()
                 .filter(|bucket| bucket.pattern != ALL_GREEN_PATTERN)
                 .map(|bucket| {
                     (bucket.mass / total_mass)
-                        * child_expected_lower_bound(
-                            bucket,
-                            PATTERN_SPACE as f64,
-                            &self.model.small_state_table,
-                        )
+                        * child_expected_lower_bound(bucket, PATTERN_SPACE as f64)
                 })
                 .sum::<f64>();
             let mut worst_case = 1u8;
@@ -1226,12 +1220,8 @@ impl FormalPolicyBuilder {
             unresolved.sort_unstable_by(|left, right| right.count.cmp(&left.count));
             for bucket in unresolved {
                 let probability = bucket.mass / total_mass;
-                remaining_lower -= probability
-                    * child_expected_lower_bound(
-                        &bucket,
-                        PATTERN_SPACE as f64,
-                        &self.model.small_state_table,
-                    );
+                remaining_lower -=
+                    probability * child_expected_lower_bound(&bucket, PATTERN_SPACE as f64);
                 let child_upper = PolicyObjective {
                     worst_case_depth: effective_upper.worst_case_depth.saturating_sub(1),
                     expected_guesses: f64::INFINITY,
@@ -1255,12 +1245,6 @@ impl FormalPolicyBuilder {
                     self.bound_hits += 1;
                     break;
                 }
-                children.push(CertificateChild {
-                    pattern: bucket.pattern,
-                    state: bucket.state.clone(),
-                    objective: child.objective.clone(),
-                    mass: bucket.mass,
-                });
             }
             if !valid {
                 continue;
@@ -1272,11 +1256,6 @@ impl FormalPolicyBuilder {
                 },
                 best_guess: plan.guess_index,
             };
-            let certificate = CertificateCandidate {
-                guess_index: plan.guess_index,
-                objective: candidate.objective.clone(),
-                children,
-            };
             if best.as_ref().is_none_or(|current| {
                 compare_stored_with_kind(
                     &candidate,
@@ -1286,20 +1265,11 @@ impl FormalPolicyBuilder {
                 )
                 .is_lt()
             }) {
-                best_certificate = Some(CertificateState {
-                    state: state.clone(),
-                    best_guess: plan.guess_index,
-                    best_objective: candidate.objective.clone(),
-                    candidates: vec![certificate],
-                });
                 best = Some(candidate);
-            } else if let Some(existing) = &mut best_certificate {
-                existing.candidates.push(certificate);
             }
         }
-        if let (Some(stored), Some(certificate)) = (best, best_certificate) {
+        if let Some(stored) = best {
             self.hot_tt.insert(state.clone(), stored.clone());
-            self.certificate_states.insert(state.clone(), certificate);
             return Ok(
                 objective_le(&stored.objective, upper, self.model.objective_spec.kind)
                     .then_some(stored),
@@ -1323,34 +1293,6 @@ impl FormalPolicyBuilder {
             let stored = self.solve_state(&state)?;
             self.memo.insert(state.clone(), stored.clone());
             let buckets = self.partition_guess(&state, stored.best_guess)?;
-            if !self.certificate_states.contains_key(&state) {
-                let mut children = Vec::new();
-                for bucket in &buckets {
-                    if bucket.pattern == ALL_GREEN_PATTERN {
-                        continue;
-                    }
-                    let child = self.solve_state(&bucket.state)?;
-                    children.push(CertificateChild {
-                        pattern: bucket.pattern,
-                        state: bucket.state.clone(),
-                        objective: child.objective,
-                        mass: bucket.mass,
-                    });
-                }
-                self.certificate_states.insert(
-                    state.clone(),
-                    CertificateState {
-                        state: state.clone(),
-                        best_guess: stored.best_guess,
-                        best_objective: stored.objective.clone(),
-                        candidates: vec![CertificateCandidate {
-                            guess_index: stored.best_guess,
-                            objective: stored.objective.clone(),
-                            children,
-                        }],
-                    },
-                );
-            }
             for bucket in buckets {
                 if bucket.pattern != ALL_GREEN_PATTERN {
                     frontier.push(bucket.state);
@@ -1753,11 +1695,19 @@ fn build_prior(answers: &[String], prior_spec: FormalPriorSpec) -> Result<Vec<f6
         FormalPriorSpec::Uniform => vec![1.0; answers.len()],
         FormalPriorSpec::Explicit { weights } => answers
             .iter()
-            .map(|answer| weights.get(answer).copied().unwrap_or(0.0))
-            .collect::<Vec<_>>(),
+            .map(|answer| {
+                let weight = weights.get(answer).copied().ok_or_else(|| {
+                    anyhow!("formal prior is missing a positive weight for answer {answer}")
+                })?;
+                if !weight.is_finite() || weight <= 0.0 {
+                    bail!("formal prior weight for {answer} must be finite and positive");
+                }
+                Ok(weight)
+            })
+            .collect::<Result<Vec<_>>>()?,
     };
     let total = weights.iter().sum::<f64>();
-    if total <= 0.0 {
+    if !total.is_finite() || total <= 0.0 {
         bail!("formal prior must assign positive total probability mass");
     }
     for weight in &mut weights {
@@ -1769,7 +1719,6 @@ fn build_prior(answers: &[String], prior_spec: FormalPriorSpec) -> Result<Vec<f6
 fn persist_policy(
     model: &FormalModel,
     memo: &HashMap<StateKey, StoredState>,
-    certificate_states: &HashMap<StateKey, CertificateState>,
     metadata: &ProofMetadata,
     paths: &ProjectPaths,
 ) -> Result<()> {
@@ -1789,13 +1738,6 @@ fn persist_policy(
         &serde_json::to_vec_pretty(&model.small_state_table)
             .context("serialize small-state table")?,
     )?;
-    let mut certificate_entries = certificate_states.iter().collect::<Vec<_>>();
-    certificate_entries.sort_by(|(left_key, _), (right_key, _)| {
-        left_key
-            .state_hash()
-            .cmp(&right_key.state_hash())
-            .then_with(|| left_key.cmp_storage(right_key, model.answers.len()))
-    });
     let mut entries = memo.iter().collect::<Vec<_>>();
     entries.sort_by(|(left_key, _), (right_key, _)| {
         left_key
@@ -1803,48 +1745,7 @@ fn persist_policy(
             .cmp(&right_key.state_hash())
             .then_with(|| left_key.cmp_storage(right_key, model.answers.len()))
     });
-    let state_ids = entries
-        .iter()
-        .enumerate()
-        .map(|(index, (state, _))| ((*state).clone(), index as u32))
-        .collect::<HashMap<_, _>>();
-    let certificate = ProofCertificate {
-        model_id: model.manifest.model_id.clone(),
-        manifest_hash: model.manifest.manifest_hash,
-        objective_id: model.manifest.objective_id.clone(),
-        objective_version: model.manifest.objective_version,
-        state_format_version: model.manifest.state_format_version,
-        aux_table_version: model.manifest.aux_table_version,
-        certificate_format_version: model.manifest.certificate_format_version,
-        small_state_table_hash: model.manifest.small_state_table_hash,
-        state_count: memo.len(),
-        states: certificate_entries
-            .into_iter()
-            .map(|(_, state)| PersistedCertificateState {
-                state_id: state_ids[&state.state],
-                best_guess: state.best_guess,
-                best_objective: state.best_objective.clone(),
-                candidates: state
-                    .candidates
-                    .iter()
-                    .map(|candidate| PersistedCertificateCandidate {
-                        guess_index: candidate.guess_index,
-                        objective: candidate.objective.clone(),
-                        children: candidate
-                            .children
-                            .iter()
-                            .map(|child| PersistedCertificateChild {
-                                pattern: child.pattern,
-                                child_state_id: state_ids[&child.state],
-                                objective: child.objective.clone(),
-                                mass: child.mass,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-    };
+    let certificate = build_exhaustive_proof_certificate(model, memo)?;
     atomic_write(
         &artifacts.certificate,
         &serde_json::to_vec_pretty(&certificate).context("serialize proof certificate")?,
@@ -1855,6 +1756,153 @@ fn persist_policy(
     Ok(())
 }
 
+fn build_exhaustive_proof_certificate(
+    model: &FormalModel,
+    policy: &HashMap<StateKey, StoredState>,
+) -> Result<ProofCertificate> {
+    let root = StateKey::full(model.answers.len(), &model.zobrist);
+    let mut exhaustive = IndependentExactSolver::new(model);
+    let _ = exhaustive.solve(&root)?;
+    let mut proof_entries = exhaustive.local_memo.iter().collect::<Vec<_>>();
+    proof_entries.sort_by(|(left_key, _), (right_key, _)| {
+        left_key
+            .count()
+            .cmp(&right_key.count())
+            .then_with(|| left_key.state_hash().cmp(&right_key.state_hash()))
+            .then_with(|| left_key.cmp_storage(right_key, model.answers.len()))
+    });
+    let state_ids = proof_entries
+        .iter()
+        .enumerate()
+        .map(|(index, (state, _))| ((*state).clone(), index as u32))
+        .collect::<HashMap<_, _>>();
+    for (state, stored) in policy {
+        let independently_solved = exhaustive.local_memo.get(state).ok_or_else(|| {
+            anyhow!(
+                "persisted policy state {} is absent from the exhaustive proof closure",
+                state.state_hash()
+            )
+        })?;
+        if !same_decision(stored, independently_solved) {
+            bail!(
+                "persisted policy state {} disagrees with the exhaustive proof closure",
+                state.state_hash()
+            );
+        }
+    }
+
+    let mut scratch = PartitionScratch::default();
+    let mut states = Vec::with_capacity(proof_entries.len());
+    for (state_id, (state, stored)) in proof_entries.iter().enumerate() {
+        let total_mass = state_total_mass(state, &model.prior);
+        let mut candidates = Vec::with_capacity(model.guesses.len());
+        let mut signature_map: HashMap<PartitionFingerprint, Vec<usize>> = HashMap::new();
+        let mut representative_guesses = Vec::new();
+        let mut representative_buckets: Vec<Vec<PartitionBucket>> = Vec::new();
+        for guess_index in 0..model.guesses.len() {
+            let buckets = partition_guess_with_scratch(
+                model.answers.len(),
+                state,
+                guess_index,
+                &model.pattern_table,
+                &model.prior,
+                &model.zobrist,
+                &mut scratch,
+            )?;
+            let signature = partition_fingerprint_from_buckets(&buckets);
+            let equivalent = signature_map.get(&signature).and_then(|indexes| {
+                indexes
+                    .iter()
+                    .copied()
+                    .find(|index| same_bucket_partition(&representative_buckets[*index], &buckets))
+            });
+            let witness = if let Some(representative_index) = equivalent {
+                PersistedCandidateWitness::Equivalent {
+                    representative_guess: representative_guesses[representative_index],
+                }
+            } else if let Some(bucket) = buckets
+                .iter()
+                .find(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.state == **state)
+            {
+                PersistedCandidateWitness::NonProgress {
+                    pattern: bucket.pattern,
+                }
+            } else {
+                let mut objective = PolicyObjective {
+                    worst_case_depth: 1,
+                    expected_guesses: 1.0,
+                };
+                let mut children = Vec::new();
+                for bucket in buckets
+                    .iter()
+                    .filter(|bucket| bucket.pattern != ALL_GREEN_PATTERN)
+                {
+                    let child = exhaustive.local_memo.get(&bucket.state).ok_or_else(|| {
+                        anyhow!(
+                            "exact proof closure is missing child state {}",
+                            bucket.state.state_hash()
+                        )
+                    })?;
+                    objective.worst_case_depth = objective
+                        .worst_case_depth
+                        .max(1 + child.objective.worst_case_depth);
+                    objective.expected_guesses +=
+                        (bucket.mass / total_mass) * child.objective.expected_guesses;
+                    children.push(PersistedCertificateChild {
+                        pattern: bucket.pattern,
+                        child_state_id: state_ids[&bucket.state],
+                        objective: child.objective.clone(),
+                        mass: bucket.mass,
+                    });
+                }
+                PersistedCandidateWitness::Exact {
+                    objective,
+                    children,
+                }
+            };
+            if equivalent.is_none() {
+                let representative_index = representative_buckets.len();
+                signature_map
+                    .entry(signature)
+                    .or_default()
+                    .push(representative_index);
+                representative_guesses.push(guess_index);
+                representative_buckets.push(buckets);
+            }
+            candidates.push(PersistedCertificateCandidate {
+                guess_index,
+                witness,
+            });
+        }
+        states.push(PersistedCertificateState {
+            state_id: state_id as u32,
+            answer_indices: state
+                .indices()
+                .into_iter()
+                .map(|index| index as AnswerId)
+                .collect(),
+            best_guess: stored.best_guess,
+            best_objective: stored.objective.clone(),
+            candidates,
+        });
+    }
+
+    Ok(ProofCertificate {
+        model_id: model.manifest.model_id.clone(),
+        manifest_hash: model.manifest.manifest_hash.clone(),
+        objective_id: model.manifest.objective_id.clone(),
+        objective_version: model.manifest.objective_version,
+        state_format_version: model.manifest.state_format_version,
+        aux_table_version: model.manifest.aux_table_version,
+        certificate_format_version: model.manifest.certificate_format_version,
+        small_state_table_hash: model.manifest.small_state_table_hash.clone(),
+        policy_state_count: policy.len(),
+        state_count: states.len(),
+        root_state_id: state_ids[&root],
+        states,
+    })
+}
+
 fn write_values(
     path: &Path,
     model: &FormalModel,
@@ -1862,7 +1910,7 @@ fn write_values(
 ) -> Result<()> {
     let mut writer = Vec::new();
     writer.write_all(VALUES_MAGIC)?;
-    writer.write_all(&model.manifest.manifest_hash.to_le_bytes())?;
+    writer.write_all(model.manifest.manifest_hash.as_bytes())?;
     writer.write_all(&(entries.len() as u64).to_le_bytes())?;
     writer.write_all(&(model.answers.len().div_ceil(64) as u32).to_le_bytes())?;
     for (state, stored) in entries {
@@ -1881,7 +1929,7 @@ fn write_policy(
 ) -> Result<()> {
     let mut writer = Vec::new();
     writer.write_all(POLICY_MAGIC)?;
-    writer.write_all(&model.manifest.manifest_hash.to_le_bytes())?;
+    writer.write_all(model.manifest.manifest_hash.as_bytes())?;
     writer.write_all(&(entries.len() as u64).to_le_bytes())?;
     writer.write_all(&(model.answers.len().div_ceil(64) as u32).to_le_bytes())?;
     for (state, stored) in entries {
@@ -1899,9 +1947,12 @@ fn read_values(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, Pol
     let mut header = [0u8; 8];
     reader.read_exact(&mut header)?;
     if &header != VALUES_MAGIC {
-        bail!("invalid values file magic: {}", path.display());
+        bail!(
+            "unsupported values artifact format: {}; rebuild formal artifacts",
+            path.display()
+        );
     }
-    let manifest_hash = read_u64(&mut reader)?;
+    let manifest_hash = read_tagged_digest(&mut reader)?;
     if manifest_hash != model.manifest.manifest_hash {
         bail!("stale values file: {}", path.display());
     }
@@ -1937,9 +1988,12 @@ fn read_policy(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, usi
     let mut header = [0u8; 8];
     reader.read_exact(&mut header)?;
     if &header != POLICY_MAGIC {
-        bail!("invalid policy file magic: {}", path.display());
+        bail!(
+            "unsupported policy artifact format: {}; rebuild formal artifacts",
+            path.display()
+        );
     }
-    let manifest_hash = read_u64(&mut reader)?;
+    let manifest_hash = read_tagged_digest(&mut reader)?;
     if manifest_hash != model.manifest.manifest_hash {
         bail!("stale policy file: {}", path.display());
     }
@@ -1973,6 +2027,16 @@ fn read_state_words(reader: &mut impl Read, word_count: usize) -> Result<Vec<u64
         words.push(read_u64(reader)?);
     }
     Ok(words)
+}
+
+fn read_tagged_digest(reader: &mut impl Read) -> Result<String> {
+    let mut bytes = [0u8; TAGGED_DIGEST_LENGTH];
+    reader.read_exact(&mut bytes)?;
+    let digest = std::str::from_utf8(&bytes).context("artifact digest must be UTF-8")?;
+    if !crate::identity::is_tagged_digest(digest) {
+        bail!("artifact uses an unsupported identity format; rebuild formal artifacts");
+    }
+    Ok(digest.to_string())
 }
 
 fn read_u8(reader: &mut impl Read) -> Result<u8> {
@@ -2011,219 +2075,68 @@ fn read_proof_certificate(paths: &ProjectPaths, model_id: &str) -> Result<ProofC
         File::open(&artifacts.certificate)
             .with_context(|| format!("failed to open {}", artifacts.certificate.display()))?,
     ))
-    .with_context(|| format!("failed to parse {}", artifacts.certificate.display()))
+    .with_context(|| {
+        format!(
+            "failed to parse {}; rebuild formal artifacts to migrate to {}",
+            artifacts.certificate.display(),
+            crate::identity::IDENTITY_FORMAT
+        )
+    })
 }
 
 fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertificate) -> Result<()> {
-    if certificate.states.len() != certificate.state_count {
-        bail!(
-            "proof certificate state count mismatch: header={} payload={}",
-            certificate.state_count,
-            certificate.states.len()
-        );
-    }
-    if certificate.state_count != runtime.policy.len()
-        || runtime.ordered_states.len() != runtime.policy.len()
-    {
-        bail!(
-            "proof certificate does not cover the complete persisted policy: certificate={} policy={}",
-            certificate.state_count,
-            runtime.policy.len()
-        );
-    }
-    let mut covered_state_ids = vec![false; runtime.ordered_states.len()];
-    let mut independent = IndependentExactSolver::new(&runtime.model);
-    for state in &certificate.states {
-        let key = runtime
-            .ordered_states
-            .get(state.state_id as usize)
-            .ok_or_else(|| anyhow!("certificate state id {} out of range", state.state_id))?;
-        if std::mem::replace(&mut covered_state_ids[state.state_id as usize], true) {
-            bail!("certificate repeats state id {}", state.state_id);
-        }
-        if runtime.state_ids.get(key).copied() != Some(state.state_id) {
-            bail!(
-                "runtime state row mapping mismatch for state {}",
-                state.state_id
-            );
-        }
-        let stored = runtime
-            .policy
-            .get(key)
-            .ok_or_else(|| anyhow!("certificate references unknown state {}", state.state_id))?;
-        if stored.best_guess != state.best_guess
-            || !same_objective(&stored.objective, &state.best_objective)
-        {
-            bail!(
-                "certificate best decision mismatch for state {}",
-                state.state_id
-            );
-        }
-        let total_mass = state_total_mass(key, &runtime.model.prior);
-        if total_mass <= 0.0 {
-            bail!(
-                "certificate state {} has non-positive total mass",
-                state.state_id
-            );
-        }
-        let mut saw_best = false;
-        for candidate in &state.candidates {
-            if candidate.guess_index >= runtime.model.guesses.len() {
-                bail!("certificate guess index is out of range");
-            }
-            if candidate.guess_index == state.best_guess
-                && same_objective(&candidate.objective, &state.best_objective)
-            {
-                saw_best = true;
-            }
-            let mut seen_patterns = [false; PATTERN_SPACE];
-            let mut scratch = PartitionScratch::default();
-            let actual_buckets = partition_guess_with_scratch(
-                runtime.model.answers.len(),
-                key,
-                candidate.guess_index,
-                &runtime.model.pattern_table,
-                &runtime.model.prior,
-                &runtime.model.zobrist,
-                &mut scratch,
-            )?;
-            let actual_children = actual_buckets
-                .iter()
-                .filter(|bucket| bucket.pattern != ALL_GREEN_PATTERN)
-                .collect::<Vec<_>>();
-            if actual_children.len() != candidate.children.len() {
-                bail!(
-                    "certificate child coverage mismatch for state {} guess {}: expected {}, found {}",
-                    state.state_id,
-                    candidate.guess_index,
-                    actual_children.len(),
-                    candidate.children.len()
-                );
-            }
-            let mut recomputed = PolicyObjective {
-                worst_case_depth: 1,
-                expected_guesses: 1.0,
-            };
-            let should_rederive = !candidate.children.is_empty() || key.count() == 1;
-            for child in &candidate.children {
-                if child.pattern == ALL_GREEN_PATTERN {
-                    bail!(
-                        "certificate child unexpectedly uses all-green pattern for state {}",
-                        state.state_id
-                    );
-                }
-                let pattern_index = child.pattern as usize;
-                if seen_patterns[pattern_index] {
-                    bail!(
-                        "certificate has duplicate child pattern {} for state {}",
-                        child.pattern,
-                        state.state_id
-                    );
-                }
-                seen_patterns[pattern_index] = true;
-                let child_key = runtime
-                    .ordered_states
-                    .get(child.child_state_id as usize)
-                    .ok_or_else(|| {
-                        anyhow!("certificate child id {} out of range", child.child_state_id)
-                    })?;
-                if runtime.state_ids.get(child_key).copied() != Some(child.child_state_id) {
-                    bail!(
-                        "runtime child row mapping mismatch for state {}",
-                        child.child_state_id
-                    );
-                }
-                let child_stored = runtime.policy.get(child_key).ok_or_else(|| {
-                    anyhow!(
-                        "certificate references unknown child state {}",
-                        child.child_state_id
-                    )
-                })?;
-                let actual = actual_children
-                    .iter()
-                    .find(|bucket| bucket.pattern == child.pattern)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "certificate pattern {} is not produced by state {} guess {}",
-                            child.pattern,
-                            state.state_id,
-                            candidate.guess_index
-                        )
-                    })?;
-                if actual.state != *child_key || (actual.mass - child.mass).abs() > 1e-12 {
-                    bail!(
-                        "certificate child state or mass mismatch for state {} pattern {}",
-                        state.state_id,
-                        child.pattern
-                    );
-                }
-                if !same_objective(&child_stored.objective, &child.objective) {
-                    bail!("certificate child objective mismatch");
-                }
-                recomputed.worst_case_depth = recomputed
-                    .worst_case_depth
-                    .max(1 + child.objective.worst_case_depth);
-                recomputed.expected_guesses +=
-                    (child.mass / total_mass) * child.objective.expected_guesses;
-            }
-            if should_rederive && !same_objective(&recomputed, &candidate.objective) {
-                bail!(
-                    "certificate candidate objective mismatch for state {}",
-                    state.state_id
-                );
-            }
-            if compare_objective_with_kind(
-                &candidate.objective,
-                &state.best_objective,
-                runtime.model.objective_spec.kind,
-            )
-            .is_lt()
-            {
-                bail!(
-                    "certificate contains candidate better than best for state {}",
-                    state.state_id
-                );
-            }
-        }
-        if !saw_best {
-            bail!(
-                "certificate is missing the winning candidate for state {}",
-                state.state_id
-            );
-        }
-        let independently_solved = independent.solve(key)?;
-        if !same_decision(&independently_solved, stored) {
-            bail!(
-                "independent certificate verification failed for state {}",
-                state.state_id
-            );
-        }
-    }
-    if covered_state_ids.iter().any(|covered| !covered) {
-        bail!("proof certificate is missing one or more persisted policy states");
-    }
-    Ok(())
+    verifier::verify_certificate_witnesses(runtime, certificate)
 }
 
 fn combine_hashes(
-    left: u64,
-    middle: u64,
-    right: u64,
+    left: &str,
+    middle: &str,
+    right: &str,
     objective_spec: FormalObjectiveSpec,
-    small_state_table_hash: u64,
-) -> u64 {
-    let mut hash = 1469598103934665603u64;
-    hash = hash_bytes(hash, &left.to_le_bytes());
-    hash = hash_bytes(hash, &middle.to_le_bytes());
-    hash = hash_bytes(hash, &right.to_le_bytes());
-    hash = hash_bytes(hash, objective_spec.id.as_bytes());
-    hash = hash_bytes(hash, &objective_spec.version.to_le_bytes());
-    hash = hash_bytes(hash, &STATE_FORMAT_VERSION.to_le_bytes());
-    hash = hash_bytes(hash, &AUX_TABLE_VERSION.to_le_bytes());
-    hash = hash_bytes(hash, &CERTIFICATE_FORMAT_VERSION.to_le_bytes());
-    hash = hash_bytes(hash, &SMALL_STATE_TABLE_VERSION.to_le_bytes());
-    hash = hash_bytes(hash, &small_state_table_hash.to_le_bytes());
-    hash
+    small_state_table_hash: &str,
+) -> String {
+    let mut hash = CanonicalSha256::new("maybe-wordle-formal-manifest-v2");
+    hash.field(left.as_bytes())
+        .field(middle.as_bytes())
+        .field(right.as_bytes())
+        .field(objective_spec.id.as_bytes())
+        .field(&objective_spec.version.to_le_bytes())
+        .field(&STATE_FORMAT_VERSION.to_le_bytes())
+        .field(&AUX_TABLE_VERSION.to_le_bytes())
+        .field(&CERTIFICATE_FORMAT_VERSION.to_le_bytes())
+        .field(&SMALL_STATE_TABLE_VERSION.to_le_bytes())
+        .field(small_state_table_hash.as_bytes());
+    hash.finish_tagged()
+}
+
+fn hash_small_state_table(table: &SmallStateTable) -> String {
+    let mut hash = CanonicalSha256::new("maybe-wordle-small-state-table-v2");
+    hash.field(&table.version.to_le_bytes())
+        .field(&(table.max_size as u64).to_le_bytes())
+        .field(&(table.expected_lower_bound_by_size.len() as u64).to_le_bytes());
+    for value in &table.expected_lower_bound_by_size {
+        hash.field(&value.to_bits().to_le_bytes());
+    }
+    hash.finish_tagged()
+}
+
+fn validate_small_state_table(
+    persisted: &SmallStateTable,
+    canonical: &SmallStateTable,
+) -> Result<()> {
+    if persisted.version != canonical.version
+        || persisted.max_size != canonical.max_size
+        || persisted.expected_lower_bound_by_size.len()
+            != canonical.expected_lower_bound_by_size.len()
+        || persisted
+            .expected_lower_bound_by_size
+            .iter()
+            .zip(&canonical.expected_lower_bound_by_size)
+            .any(|(left, right)| (left - right).abs() > 1e-12)
+    {
+        bail!("formal small-state table is stale or invalid; rebuild formal artifacts");
+    }
+    Ok(())
 }
 
 fn depth_lower_bound(count: usize) -> u8 {
@@ -2243,30 +2156,23 @@ fn guess_expected_lower_bound(
     buckets: &[PartitionBucket],
     total_mass: f64,
     pattern_space: f64,
-    small_state_table: &SmallStateTable,
 ) -> f64 {
     let mut lower_bound = 1.0;
     for bucket in buckets {
         if bucket.pattern == ALL_GREEN_PATTERN {
             continue;
         }
-        let child_floor = child_expected_lower_bound(bucket, pattern_space, small_state_table);
+        let child_floor = child_expected_lower_bound(bucket, pattern_space);
         lower_bound += (bucket.mass / total_mass) * child_floor;
     }
     lower_bound
 }
 
-fn child_expected_lower_bound(
-    bucket: &PartitionBucket,
-    pattern_space: f64,
-    small_state_table: &SmallStateTable,
-) -> f64 {
+fn child_expected_lower_bound(bucket: &PartitionBucket, pattern_space: f64) -> f64 {
     if bucket.count <= 1 {
         return 1.0;
     }
-    let table_floor = small_state_table.lower_bound(bucket.count);
-    let entropy_floor = (bucket.entropy_bits / pattern_space.log2()).max(1.0);
-    table_floor.max(entropy_floor)
+    (bucket.entropy_bits / pattern_space.log2()).max(1.0)
 }
 
 fn partition_guess_with_scratch(
@@ -2719,6 +2625,49 @@ mod tests {
     }
 
     #[test]
+    fn formal_expected_bound_does_not_apply_uniform_count_floor_to_skewed_mass() {
+        let probabilities = [0.59_f64, 0.40, 0.01];
+        let entropy_bits = probabilities
+            .iter()
+            .map(|probability| -probability * probability.log2())
+            .sum::<f64>();
+        let bucket = PartitionBucket {
+            pattern: 0,
+            state: StateKey::from_indices(3, 0..3),
+            mass: 1.0,
+            count: 3,
+            entropy_bits,
+        };
+        assert!(SmallStateTable::build(3).lower_bound(3) > 1.0);
+        assert_eq!(
+            child_expected_lower_bound(&bucket, PATTERN_SPACE as f64),
+            1.0
+        );
+    }
+
+    #[test]
+    fn explicit_formal_prior_requires_every_answer_to_have_positive_finite_mass() {
+        let answers = vec!["cigar".to_string(), "rebut".to_string()];
+        let missing = build_prior(
+            &answers,
+            FormalPriorSpec::Explicit {
+                weights: HashMap::from([("cigar".to_string(), 1.0)]),
+            },
+        )
+        .expect_err("missing formal mass must fail");
+        assert!(missing.to_string().contains("missing a positive weight"));
+
+        let negative = build_prior(
+            &answers,
+            FormalPriorSpec::Explicit {
+                weights: HashMap::from([("cigar".to_string(), 1.0), ("rebut".to_string(), -0.1)]),
+            },
+        )
+        .expect_err("negative formal mass must fail");
+        assert!(negative.to_string().contains("finite and positive"));
+    }
+
+    #[test]
     fn reproducible_manifest_hash_uses_same_inputs() {
         let root = std::env::temp_dir().join("maybe-wordle-formal-manifest");
         let _ = std::fs::remove_dir_all(&root);
@@ -2733,6 +2682,20 @@ mod tests {
         let left = FormalModel::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("model");
         let right = FormalModel::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("model");
         assert_eq!(left.manifest.manifest_hash, right.manifest.manifest_hash);
+        atomic_write(
+            &artifacts.small_state_table,
+            &serde_json::to_vec_pretty(&left.small_state_table).expect("table"),
+        )
+        .expect("persist table");
+        let reloaded = FormalModel::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("reloaded");
+        assert_eq!(left.manifest.guess_hash, reloaded.manifest.guess_hash);
+        assert_eq!(left.manifest.answer_hash, reloaded.manifest.answer_hash);
+        assert_eq!(left.manifest.prior_hash, reloaded.manifest.prior_hash);
+        assert_eq!(
+            left.manifest.small_state_table_hash,
+            reloaded.manifest.small_state_table_hash
+        );
+        assert_eq!(left.manifest.manifest_hash, reloaded.manifest.manifest_hash);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2879,7 +2842,10 @@ mod tests {
         paths.ensure_layout().expect("layout");
         let artifacts = PolicyArtifactSet::for_model(&paths, DEFAULT_FORMAL_MODEL_ID);
         std::fs::create_dir_all(&artifacts.model_dir).expect("formal dir");
-        write_fixture(&paths.seed_guesses, "cigar\nrebut\nsissy\nhumph\n");
+        write_fixture(
+            &paths.seed_guesses,
+            "cigar\nrebut\nsissy\nhumph\nzzzzz\nxxxxx\n",
+        );
         write_fixture(&paths.seed_answers, "cigar\nrebut\nsissy\n");
         write_fixture(&artifacts.prior_spec, "kind = \"uniform\"\n");
 
@@ -2887,9 +2853,17 @@ mod tests {
         let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("load");
         let mut certificate =
             read_proof_certificate(&paths, DEFAULT_FORMAL_MODEL_ID).expect("certificate");
-        certificate.states[0].candidates[0]
-            .objective
-            .expected_guesses += 0.25;
+        let exact = certificate
+            .states
+            .iter_mut()
+            .flat_map(|state| &mut state.candidates)
+            .find_map(|candidate| match &mut candidate.witness {
+                PersistedCandidateWitness::Exact { objective, .. } => Some(objective),
+                PersistedCandidateWitness::NonProgress { .. }
+                | PersistedCandidateWitness::Equivalent { .. } => None,
+            })
+            .expect("exact candidate");
+        exact.expected_guesses += 0.25;
 
         assert!(verify_certificate(&runtime, &certificate).is_err());
         let _ = std::fs::remove_dir_all(&root);
@@ -2903,7 +2877,10 @@ mod tests {
         paths.ensure_layout().expect("layout");
         let artifacts = PolicyArtifactSet::for_model(&paths, DEFAULT_FORMAL_MODEL_ID);
         std::fs::create_dir_all(&artifacts.model_dir).expect("formal dir");
-        write_fixture(&paths.seed_guesses, "cigar\nrebut\nsissy\nhumph\n");
+        write_fixture(
+            &paths.seed_guesses,
+            "cigar\nrebut\nsissy\nhumph\nzzzzz\nxxxxx\n",
+        );
         write_fixture(&paths.seed_answers, "cigar\nrebut\nsissy\n");
         write_fixture(&artifacts.prior_spec, "kind = \"uniform\"\n");
         build_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).expect("policy");
@@ -2920,33 +2897,130 @@ mod tests {
             .states
             .iter()
             .position(|state| {
-                state
-                    .candidates
-                    .iter()
-                    .any(|candidate| !candidate.children.is_empty())
+                state.candidates.iter().any(|candidate| {
+                    matches!(
+                        &candidate.witness,
+                        PersistedCandidateWitness::Exact { children, .. }
+                            if !children.is_empty()
+                    )
+                })
             })
             .expect("child state");
         let candidate_with_child = certificate.states[state_with_child]
             .candidates
             .iter()
-            .position(|candidate| !candidate.children.is_empty())
+            .position(|candidate| {
+                matches!(
+                    &candidate.witness,
+                    PersistedCandidateWitness::Exact { children, .. } if !children.is_empty()
+                )
+            })
             .expect("candidate");
 
         let mut wrong_pattern = certificate.clone();
-        wrong_pattern.states[state_with_child].candidates[candidate_with_child].children[0]
-            .pattern = ALL_GREEN_PATTERN;
+        let PersistedCandidateWitness::Exact { children, .. } =
+            &mut wrong_pattern.states[state_with_child].candidates[candidate_with_child].witness
+        else {
+            unreachable!("selected exact candidate")
+        };
+        children[0].pattern = ALL_GREEN_PATTERN;
         assert!(verify_certificate(&runtime, &wrong_pattern).is_err());
 
         let mut wrong_child = certificate.clone();
-        let child =
-            &mut wrong_child.states[state_with_child].candidates[candidate_with_child].children[0];
-        child.child_state_id = ((child.child_state_id as usize + 1) % runtime.policy.len()) as u32;
+        let PersistedCandidateWitness::Exact { children, .. } =
+            &mut wrong_child.states[state_with_child].candidates[candidate_with_child].witness
+        else {
+            unreachable!("selected exact candidate")
+        };
+        children[0].child_state_id =
+            ((children[0].child_state_id as usize + 1) % certificate.state_count) as u32;
         assert!(verify_certificate(&runtime, &wrong_child).is_err());
 
         let mut wrong_mass = certificate.clone();
-        wrong_mass.states[state_with_child].candidates[candidate_with_child].children[0].mass +=
-            0.125;
+        let PersistedCandidateWitness::Exact { children, .. } =
+            &mut wrong_mass.states[state_with_child].candidates[candidate_with_child].witness
+        else {
+            unreachable!("selected exact candidate")
+        };
+        children[0].mass += 0.125;
         assert!(verify_certificate(&runtime, &wrong_mass).is_err());
+
+        let mut wrong_child_objective = certificate.clone();
+        let PersistedCandidateWitness::Exact { children, .. } =
+            &mut wrong_child_objective.states[state_with_child].candidates[candidate_with_child]
+                .witness
+        else {
+            unreachable!("selected exact candidate")
+        };
+        children[0].objective.expected_guesses += 0.25;
+        assert!(verify_certificate(&runtime, &wrong_child_objective).is_err());
+
+        let mut missing_candidate = certificate.clone();
+        missing_candidate.states[state_with_child].candidates.pop();
+        assert!(verify_certificate(&runtime, &missing_candidate).is_err());
+
+        let mut duplicate_guess = certificate.clone();
+        duplicate_guess.states[state_with_child].candidates[1].guess_index =
+            duplicate_guess.states[state_with_child].candidates[0].guess_index;
+        assert!(verify_certificate(&runtime, &duplicate_guess).is_err());
+
+        let non_progress = certificate
+            .states
+            .iter()
+            .enumerate()
+            .find_map(|(state_index, state)| {
+                state
+                    .candidates
+                    .iter()
+                    .position(|candidate| {
+                        matches!(
+                            candidate.witness,
+                            PersistedCandidateWitness::NonProgress { .. }
+                        )
+                    })
+                    .map(|candidate_index| (state_index, candidate_index))
+            })
+            .expect("non-progress witness");
+        let mut wrong_witness_type = certificate.clone();
+        wrong_witness_type.states[non_progress.0].candidates[non_progress.1].witness =
+            PersistedCandidateWitness::Exact {
+                objective: PolicyObjective {
+                    worst_case_depth: 1,
+                    expected_guesses: 1.0,
+                },
+                children: Vec::new(),
+            };
+        assert!(verify_certificate(&runtime, &wrong_witness_type).is_err());
+
+        let equivalent = certificate
+            .states
+            .iter()
+            .enumerate()
+            .find_map(|(state_index, state)| {
+                state
+                    .candidates
+                    .iter()
+                    .position(|candidate| {
+                        matches!(
+                            candidate.witness,
+                            PersistedCandidateWitness::Equivalent { .. }
+                        )
+                    })
+                    .map(|candidate_index| (state_index, candidate_index))
+            })
+            .expect("equivalent witness");
+        let mut wrong_equivalent = certificate.clone();
+        let candidate = &mut wrong_equivalent.states[equivalent.0].candidates[equivalent.1];
+        candidate.witness = PersistedCandidateWitness::Equivalent {
+            representative_guess: candidate.guess_index,
+        };
+        assert!(verify_certificate(&runtime, &wrong_equivalent).is_err());
+
+        let mut wrong_state = certificate.clone();
+        wrong_state.states[state_with_child]
+            .answer_indices
+            .reverse();
+        assert!(verify_certificate(&runtime, &wrong_state).is_err());
 
         let mut wrong_decision = certificate;
         wrong_decision.states[0].best_guess =
@@ -3011,6 +3085,72 @@ mod tests {
     }
 
     #[test]
+    fn skewed_explicit_prior_builds_and_matches_independent_solver() {
+        let root = std::env::temp_dir().join("maybe-wordle-formal-skewed-prior");
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = ProjectPaths::new(&root);
+        paths.ensure_layout().expect("layout");
+        let artifacts = PolicyArtifactSet::for_model(&paths, DEFAULT_FORMAL_MODEL_ID);
+        std::fs::create_dir_all(&artifacts.model_dir).expect("formal dir");
+        write_fixture(&paths.seed_guesses, "cigar\nrebut\nsissy\nhumph\n");
+        write_fixture(&paths.seed_answers, "cigar\nrebut\nsissy\n");
+        write_fixture(
+            &artifacts.prior_spec,
+            "kind = \"explicit\"\n[weights]\ncigar = 0.40\nrebut = 0.59\nsissy = 0.01\n",
+        );
+
+        build_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).expect("policy");
+        let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("load");
+        let root_state = runtime.initial_state();
+        let exact = runtime.evaluate_state_exact(&root_state).expect("exact");
+        let independent = runtime
+            .solve_state_independent(&root_state)
+            .expect("independent");
+        assert!(same_decision(&exact, &independent));
+        let certificate =
+            read_proof_certificate(&paths, DEFAULT_FORMAL_MODEL_ID).expect("certificate");
+        verify_certificate(&runtime, &certificate).expect("verify skewed certificate");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn independently_verified_certificates_match_two_solvers_on_tractable_prefixes() {
+        let words = [
+            "cigar", "rebut", "sissy", "humph", "awake", "blush", "focal", "evade",
+        ];
+        for answer_count in 3..=7 {
+            let root = std::env::temp_dir().join(format!(
+                "maybe-wordle-formal-three-way-prefix-{answer_count}"
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let paths = ProjectPaths::new(&root);
+            paths.ensure_layout().expect("layout");
+            let artifacts = PolicyArtifactSet::for_model(&paths, DEFAULT_FORMAL_MODEL_ID);
+            std::fs::create_dir_all(&artifacts.model_dir).expect("formal dir");
+            write_fixture(&paths.seed_guesses, &format!("{}\n", words.join("\n")));
+            write_fixture(
+                &paths.seed_answers,
+                &format!("{}\n", words[..answer_count].join("\n")),
+            );
+            write_fixture(&artifacts.prior_spec, "kind = \"uniform\"\n");
+
+            build_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).expect("builder");
+            let runtime =
+                FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("runtime");
+            let certificate =
+                read_proof_certificate(&paths, DEFAULT_FORMAL_MODEL_ID).expect("certificate");
+            verify_certificate(&runtime, &certificate).expect("witness verifier");
+            let root_state = runtime.initial_state();
+            let policy = runtime.policy.get(&root_state).expect("root policy");
+            let slow = IndependentExactSolver::new(&runtime.model)
+                .solve(&root_state)
+                .expect("slow reference");
+            assert!(same_decision(policy, &slow));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
     fn randomized_states_in_13_to_40_answer_universes_match_exhaustive_reference() {
         let words = "cigar rebut sissy humph awake blush focal evade naval serve heath dwarf model karma stink grade quiet bench abate feign major death fresh crust stool colon abase marry react batty pride floss helix croak staff paper unfed whelp trawl outdo adobe";
         let words = words.split_whitespace().collect::<Vec<_>>();
@@ -3044,7 +3184,6 @@ mod tests {
             let mut builder = FormalPolicyBuilder {
                 model,
                 memo: HashMap::new(),
-                certificate_states: HashMap::new(),
                 hot_tt: HotTranspositionTable::new(1024 * 1024),
                 deduped_signatures: 0,
                 bound_hits: 0,

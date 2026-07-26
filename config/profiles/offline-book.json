@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "name": "offline-book",
+  "description": "High-budget deterministic search profile used only while generating predictive opener and reply artifacts.",
+  "parameters": {
+    "medium_state_lookahead_threshold": { "type": "integer", "value": 96 },
+    "lookahead_candidate_pool": { "type": "integer", "value": 128 },
+    "medium_state_lookahead_candidate_pool": { "type": "integer", "value": 160 },
+    "lookahead_reply_pool": { "type": "integer", "value": 50 },
+    "medium_state_lookahead_reply_pool": { "type": "integer", "value": 64 },
+    "medium_state_force_in_two_scan": { "type": "integer", "value": 192 },
+    "exact_candidate_pool": { "type": "integer", "value": 160 },
+    "lookahead_threshold": { "type": "integer", "value": 224 },
+    "danger_exact_root_pool": { "type": "integer", "value": 32 },
+    "large_state_split_threshold": { "type": "integer", "value": 50 }
+  }
+}

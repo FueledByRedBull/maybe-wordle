@@ -10,4 +10,7 @@ pub use policy::{PredictivePolicy, PriorPolicy, ProxyPolicy, SearchPolicy};
 pub use recovery::{RecoveryMode, RecoveryPolicy};
 pub use search::PredictiveRegime;
 pub use state::{PredictiveArtifactState, PredictiveStateSummary};
-pub use types::{PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode};
+pub use types::{
+    PredictiveCandidateSummary, PredictiveSuggestRequest, PredictiveSuggestResponse,
+    PredictiveSuggestionMode,
+};

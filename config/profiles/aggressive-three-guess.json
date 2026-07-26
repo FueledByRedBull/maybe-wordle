@@ -1,0 +1,24 @@
+{
+  "format_version": 1,
+  "name": "aggressive-three-guess",
+  "description": "Diagnostic profile for testing whether more early lookahead and exact search converts four-guess paths.",
+  "parameters": {
+    "exact_threshold": { "type": "integer", "value": 80 },
+    "exact_exhaustive_threshold": { "type": "integer", "value": 16 },
+    "exact_candidate_pool": { "type": "integer", "value": 160 },
+    "lookahead_threshold": { "type": "integer", "value": 192 },
+    "medium_state_lookahead_threshold": { "type": "integer", "value": 96 },
+    "lookahead_candidate_pool": { "type": "integer", "value": 48 },
+    "medium_state_lookahead_candidate_pool": { "type": "integer", "value": 64 },
+    "lookahead_reply_pool": { "type": "integer", "value": 24 },
+    "medium_state_lookahead_reply_pool": { "type": "integer", "value": 24 },
+    "lookahead_root_force_in_two_scan": { "type": "integer", "value": 96 },
+    "medium_state_force_in_two_scan": { "type": "integer", "value": 160 },
+    "danger_lookahead_threshold": { "type": "float", "value": 0.52 },
+    "danger_exact_threshold": { "type": "float", "value": 0.64 },
+    "danger_reply_pool_bonus": { "type": "integer", "value": 10 },
+    "danger_exact_root_pool": { "type": "integer", "value": 48 },
+    "danger_exact_survivor_cap": { "type": "integer", "value": 224 },
+    "large_state_split_threshold": { "type": "integer", "value": 48 }
+  }
+}

@@ -1,0 +1,651 @@
+{
+  "schema_version": 1,
+  "identity_format": "sha256-length-delimited-v1",
+  "input_fingerprint": "sha256-v1:965e7cbaaf6fe44b801c6e1f9bc7e6f50be420418c6129138d5b8344559c9526",
+  "config_fingerprint": "sha256-v1:abc88aa1f541f82bbd86d8eadb22f304b67fda6510259e024f69d1047b0b1984",
+  "code_revision": "790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e",
+  "code_dirty": true,
+  "evaluation_from": "2026-06-18",
+  "evaluation_to": "2026-07-17",
+  "state_path_policy": "forced_proxy_without_artifacts",
+  "minimum_survivors": 3,
+  "maximum_survivors": 8,
+  "maximum_states": 16,
+  "maximum_seconds": 900,
+  "historical_games": 30,
+  "scanned_games": 30,
+  "available_states": 19,
+  "sampled_states": 16,
+  "generation_elapsed_ms": 2981,
+  "production": {
+    "states": 16,
+    "exact_matches": 16,
+    "positive_regret_states": 0,
+    "mean_regret": 0.0,
+    "maximum_regret": 0.0
+  },
+  "proxy": {
+    "states": 16,
+    "exact_matches": 16,
+    "positive_regret_states": 0,
+    "mean_regret": 2.7755575615628914e-17,
+    "maximum_regret": 4.440892098500626e-16
+  },
+  "lookahead": {
+    "states": 16,
+    "exact_matches": 16,
+    "positive_regret_states": 0,
+    "mean_regret": 2.7755575615628914e-17,
+    "maximum_regret": 4.440892098500626e-16
+  },
+  "states": [
+    {
+      "date": "2026-06-18",
+      "target": "entry",
+      "turn": 3,
+      "surviving_answers": 8,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbbyy"
+        },
+        {
+          "guess": "reist",
+          "feedback": "yybby"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "truer",
+      "optimal_exact_cost": 1.7611371104828444,
+      "production": {
+        "word": "truer",
+        "exact_cost": 1.7611371104828444,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "truer",
+        "exact_cost": 1.7611371104828444,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "truer",
+        "exact_cost": 1.7611371104828444,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-19",
+      "target": "emoji",
+      "turn": 3,
+      "surviving_answers": 5,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "ybbby"
+        },
+        {
+          "guess": "yonks",
+          "feedback": "bybbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "error",
+      "optimal_exact_cost": 1.6571012017454756,
+      "production": {
+        "word": "error",
+        "exact_cost": 1.6571012017454756,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "error",
+        "exact_cost": 1.6571012017454756,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "error",
+        "exact_cost": 1.6571012017454756,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-21",
+      "target": "alibi",
+      "turn": 2,
+      "surviving_answers": 6,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bgybb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "alibi",
+      "optimal_exact_cost": 1.9994705024509702,
+      "production": {
+        "word": "alibi",
+        "exact_cost": 1.9994705024509702,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "iliac",
+        "exact_cost": 1.9994705024509707,
+        "regret": 4.440892098500626e-16,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "iliac",
+        "exact_cost": 1.9994705024509707,
+        "regret": 4.440892098500626e-16,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-23",
+      "target": "curry",
+      "turn": 3,
+      "surviving_answers": 3,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbbbb"
+        },
+        {
+          "guess": "crisp",
+          "feedback": "gybbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "churn",
+      "optimal_exact_cost": 1.6666666666666665,
+      "production": {
+        "word": "churn",
+        "exact_cost": 1.6666666666666665,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "churn",
+        "exact_cost": 1.6666666666666665,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "churn",
+        "exact_cost": 1.6666666666666665,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-24",
+      "target": "queer",
+      "turn": 5,
+      "surviving_answers": 3,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbbby"
+        },
+        {
+          "guess": "dries",
+          "feedback": "bybgb"
+        },
+        {
+          "guess": "aarti",
+          "feedback": "bbybb"
+        },
+        {
+          "guess": "renew",
+          "feedback": "yybgb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "queer",
+      "optimal_exact_cost": 1.0423761091373944,
+      "production": {
+        "word": "queer",
+        "exact_cost": 1.0423761091373944,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "queer",
+        "exact_cost": 1.0423761091373944,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "queer",
+        "exact_cost": 1.0423761091373944,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-06-28",
+      "target": "emcee",
+      "turn": 3,
+      "surviving_answers": 5,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbbbg"
+        },
+        {
+          "guess": "pring",
+          "feedback": "bbbbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "emcee",
+      "optimal_exact_cost": 1.526172195163002,
+      "production": {
+        "word": "emcee",
+        "exact_cost": 1.526172195163002,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "emcee",
+        "exact_cost": 1.526172195163002,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "emcee",
+        "exact_cost": 1.526172195163002,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-01",
+      "target": "demur",
+      "turn": 3,
+      "surviving_answers": 3,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbbby"
+        },
+        {
+          "guess": "dries",
+          "feedback": "gybyb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "derby",
+      "optimal_exact_cost": 1.5024935465785436,
+      "production": {
+        "word": "derby",
+        "exact_cost": 1.5024935465785436,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "derby",
+        "exact_cost": 1.5024935465785436,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "derby",
+        "exact_cost": 1.5024935465785436,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-02",
+      "target": "maven",
+      "turn": 3,
+      "surviving_answers": 6,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbyby"
+        },
+        {
+          "guess": "apgar",
+          "feedback": "ybbbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "mecca",
+      "optimal_exact_cost": 1.515319159484998,
+      "production": {
+        "word": "mecca",
+        "exact_cost": 1.515319159484998,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "mecca",
+        "exact_cost": 1.515319159484998,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "mecca",
+        "exact_cost": 1.515319159484998,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-04",
+      "target": "pizza",
+      "turn": 3,
+      "surviving_answers": 6,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbybb"
+        },
+        {
+          "guess": "carny",
+          "feedback": "bybbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "aphid",
+      "optimal_exact_cost": 1.7047561171619066,
+      "production": {
+        "word": "aphid",
+        "exact_cost": 1.7047561171619066,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "aphid",
+        "exact_cost": 1.7047561171619066,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "aphid",
+        "exact_cost": 1.7047561171619066,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-05",
+      "target": "swami",
+      "turn": 3,
+      "surviving_answers": 4,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbgbb"
+        },
+        {
+          "guess": "churn",
+          "feedback": "bbbbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "swami",
+      "optimal_exact_cost": 1.0314743926304948,
+      "production": {
+        "word": "swami",
+        "exact_cost": 1.0314743926304948,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "swami",
+        "exact_cost": 1.0314743926304948,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "swami",
+        "exact_cost": 1.0314743926304948,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-07",
+      "target": "sling",
+      "turn": 5,
+      "surviving_answers": 3,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bgbbb"
+        },
+        {
+          "guess": "addio",
+          "feedback": "bbbyb"
+        },
+        {
+          "guess": "adyta",
+          "feedback": "bbbbb"
+        },
+        {
+          "guess": "flick",
+          "feedback": "bggbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "sling",
+      "optimal_exact_cost": 1.024130925887083,
+      "production": {
+        "word": "sling",
+        "exact_cost": 1.024130925887083,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "sling",
+        "exact_cost": 1.024130925887083,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "sling",
+        "exact_cost": 1.024130925887083,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-08",
+      "target": "demon",
+      "turn": 3,
+      "surviving_answers": 3,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "ybbby"
+        },
+        {
+          "guess": "conky",
+          "feedback": "byybb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "demon",
+      "optimal_exact_cost": 1.5024973052901336,
+      "production": {
+        "word": "demon",
+        "exact_cost": 1.5024973052901336,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "demon",
+        "exact_cost": 1.5024973052901336,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "demon",
+        "exact_cost": 1.5024973052901336,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "amend",
+      "turn": 3,
+      "surviving_answers": 5,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbyby"
+        },
+        {
+          "guess": "apgar",
+          "feedback": "gbbbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "askew",
+      "optimal_exact_cost": 1.6722088293455066,
+      "production": {
+        "word": "askew",
+        "exact_cost": 1.6722088293455066,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "askew",
+        "exact_cost": 1.6722088293455066,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "askew",
+        "exact_cost": 1.6722088293455066,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-11",
+      "target": "avian",
+      "turn": 3,
+      "surviving_answers": 4,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbybb"
+        },
+        {
+          "guess": "carny",
+          "feedback": "bybyb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "avian",
+      "optimal_exact_cost": 1.5256114017180042,
+      "production": {
+        "word": "avian",
+        "exact_cost": 1.5256114017180042,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "avian",
+        "exact_cost": 1.5256114017180042,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "avian",
+        "exact_cost": 1.5256114017180042,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-14",
+      "target": "steak",
+      "turn": 4,
+      "surviving_answers": 5,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbyyy"
+        },
+        {
+          "guess": "flexi",
+          "feedback": "bbgbb"
+        },
+        {
+          "guess": "tread",
+          "feedback": "ybggb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "steak",
+      "optimal_exact_cost": 1.6678630866068858,
+      "production": {
+        "word": "steak",
+        "exact_cost": 1.6678630866068858,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "steak",
+        "exact_cost": 1.6678630866068858,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "steak",
+        "exact_cost": 1.6678630866068858,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    },
+    {
+      "date": "2026-07-16",
+      "target": "butte",
+      "turn": 3,
+      "surviving_answers": 3,
+      "observations": [
+        {
+          "guess": "olate",
+          "feedback": "bbbgg"
+        },
+        {
+          "guess": "tuism",
+          "feedback": "ygbbb"
+        }
+      ],
+      "production_regime": "exact",
+      "optimal_word": "butte",
+      "optimal_exact_cost": 1.0161089118719926,
+      "production": {
+        "word": "butte",
+        "exact_cost": 1.0161089118719926,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "proxy": {
+        "word": "butte",
+        "exact_cost": 1.0161089118719926,
+        "regret": 0.0,
+        "matches_optimum": true
+      },
+      "lookahead": {
+        "word": "butte",
+        "exact_cost": 1.0161089118719926,
+        "regret": 0.0,
+        "matches_optimum": true
+      }
+    }
+  ]
+}

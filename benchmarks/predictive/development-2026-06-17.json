@@ -1,0 +1,3463 @@
+{
+  "schema_version": 2,
+  "scope": "rolling-development-diagnostic; not sealed-test evidence",
+  "sealed_test_evaluated": false,
+  "evaluation_from": "2026-05-19",
+  "evaluation_to": "2026-06-17",
+  "history_snapshot_start": "2021-06-19",
+  "history_snapshot_end": "2026-07-17",
+  "code_revision": "790ec2dde5849aabc653c5ae4d5b7ae3c7ef323e",
+  "code_dirty": true,
+  "platform": "windows-x86_64",
+  "cpu": "AMD64 Family 25 Model 97 Stepping 2, AuthenticAMD",
+  "release_command": "cargo run --release -- benchmark-evidence --from 2026-05-19 --to 2026-06-17 --output <json> --markdown-output <md>",
+  "config_toml": "base_seed_weight = 0.75\nbase_history_only_weight = 0.5\ncooldown_days = 365\ncooldown_floor = 0.01\nmidpoint_days = 1080.0\nlogistic_k = 0.02\nfallback_prior_mass = 0.05\nfallback_activation_threshold = 1\nsearch_policy_mode = \"staged\"\nexact_threshold = 64\nexact_exhaustive_threshold = 12\nexact_candidate_pool = 96\nsession_opener_pool = 32\nsession_reply_pool = 20\nsession_window_days = 30\nlookahead_threshold = 160\nmedium_state_lookahead_threshold = 80\nsecond_guess_coverage_min_survivors = 65\nsecond_guess_coverage_max_survivors = 80\nsecond_guess_coverage_pool = 24\nlookahead_candidate_pool = 24\nmedium_state_lookahead_candidate_pool = 48\nlookahead_reply_pool = 12\nmedium_state_lookahead_reply_pool = 20\nlookahead_root_force_in_two_scan = 64\nmedium_state_force_in_two_scan = 160\nlarge_state_split_threshold = 50\npool_tight_gap_threshold = 0.05\npool_medium_gap_threshold = 0.15\npool_diversity_stride = 4\ndanger_lookahead_threshold = 0.58\ndanger_exact_threshold = 0.72\ndanger_reply_pool_bonus = 8\ndanger_exact_root_pool = 24\ndanger_exact_survivor_cap = 192\nlookahead_trap_penalty = 0.35\nlookahead_large_bucket_penalty = 0.12\nlookahead_dangerous_mass_penalty = 0.08\nlookahead_large_bucket_mass_penalty = 0.1\ntrap_size_threshold = 6\ntrap_mass_threshold = 0.15\nsync_reverify_days = 3\nsync_request_timeout_seconds = 10\nsync_retry_attempts = 3\nsync_retry_backoff_millis = 500\nallow_history_gaps = false\nproxy_small_state_lower_bound_threshold = 12\n\n[proxy_weights]\nentropy_w = 0.3375\nbucket_mass_w = 2.1\nbucket_size_w = 0.12\nambiguous_w = 0.75\nproxy_w = 1.0\nsolve_prob_w = 0.1\nposterior_w = 0.05\nsmoothness_w = 0.45\ngray_reuse_w = 0.08\nlarge_bucket_count_w = 0.1782\ndangerous_mass_count_w = 0.22\nlarge_bucket_mass_w = 0.4\n\n[recovery]\nmode = \"epsilon_repair\"\nepsilon_scale = 0.000001\n\n[manual_weights]\n",
+  "historical_diagnostic": {
+    "date_range": "historical 30-game diagnostic before dormant-support repair",
+    "scheduled_games": 30,
+    "modeled_games": 27,
+    "coverage_gaps": 3,
+    "conditional_mean_guesses": 3.2222,
+    "average_log_loss": 7.327027,
+    "average_brier_score": 0.999241,
+    "interpretation": "Attribution baseline only: its guess mean excluded three coverage gaps and is not comparable to an all-game score"
+  },
+  "baselines": [
+    {
+      "id": "uniform_entropy",
+      "description": "Uniform date-supported prior with entropy-only ranking",
+      "artifacts": "disabled",
+      "effective_config_toml": "base_seed_weight = 0.75\nbase_history_only_weight = 0.5\ncooldown_days = 365\ncooldown_floor = 0.01\nmidpoint_days = 1080.0\nlogistic_k = 0.02\nfallback_prior_mass = 0.05\nfallback_activation_threshold = 1\nsearch_policy_mode = \"proxy_only\"\nexact_threshold = 64\nexact_exhaustive_threshold = 12\nexact_candidate_pool = 96\nsession_opener_pool = 32\nsession_reply_pool = 20\nsession_window_days = 30\nlookahead_threshold = 160\nmedium_state_lookahead_threshold = 80\nsecond_guess_coverage_min_survivors = 65\nsecond_guess_coverage_max_survivors = 0\nsecond_guess_coverage_pool = 24\nlookahead_candidate_pool = 24\nmedium_state_lookahead_candidate_pool = 48\nlookahead_reply_pool = 12\nmedium_state_lookahead_reply_pool = 20\nlookahead_root_force_in_two_scan = 64\nmedium_state_force_in_two_scan = 160\nlarge_state_split_threshold = 50\npool_tight_gap_threshold = 0.05\npool_medium_gap_threshold = 0.15\npool_diversity_stride = 4\ndanger_lookahead_threshold = 0.58\ndanger_exact_threshold = 0.72\ndanger_reply_pool_bonus = 8\ndanger_exact_root_pool = 24\ndanger_exact_survivor_cap = 192\nlookahead_trap_penalty = 0.35\nlookahead_large_bucket_penalty = 0.12\nlookahead_dangerous_mass_penalty = 0.08\nlookahead_large_bucket_mass_penalty = 0.1\ntrap_size_threshold = 6\ntrap_mass_threshold = 0.15\nsync_reverify_days = 3\nsync_request_timeout_seconds = 10\nsync_retry_attempts = 3\nsync_retry_backoff_millis = 500\nallow_history_gaps = false\nproxy_small_state_lower_bound_threshold = 0\n\n[proxy_weights]\nentropy_w = 1.0\nbucket_mass_w = 0.0\nbucket_size_w = 0.0\nambiguous_w = 0.0\nproxy_w = 0.0\nsolve_prob_w = 0.0\nposterior_w = 0.0\nsmoothness_w = 0.0\ngray_reuse_w = 0.0\nlarge_bucket_count_w = 0.0\ndangerous_mass_count_w = 0.0\nlarge_bucket_mass_w = 0.0\n\n[recovery]\nmode = \"epsilon_repair\"\nepsilon_scale = 0.000001\n\n[manual_weights]\n",
+      "paired_vs_selected_default": {
+        "candidate_minus_baseline": 0.06666666666666667,
+        "ci95": {
+          "lower": -0.1,
+          "upper": 0.26666666666666666
+        },
+        "candidate_wins": 4,
+        "ties": 22,
+        "baseline_wins": 4
+      },
+      "result": {
+        "config_id": "proxy_only-et64-ee12-cp96-lt160-lc24-lr12-ls50",
+        "mode": "uniform",
+        "variant": "seed_plus_history",
+        "backtest": {
+          "canonical": {
+            "scheduled_games": 30,
+            "modeled_games": 30,
+            "solved_games": 30,
+            "unsolved_games": 0,
+            "coverage_gaps": 0,
+            "coverage_rate": 1.0,
+            "solve_rate": 1.0,
+            "conditional_mean_guesses": 3.533333333333333,
+            "conditional_mean_guesses_ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.7666666666666666
+            },
+            "failure_penalty_guesses": 7.0,
+            "all_game_penalized_mean_guesses": 3.533333333333333,
+            "all_game_penalized_mean_guesses_ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.7666666666666666
+            },
+            "median_guesses": 3.0,
+            "p90_guesses": 4,
+            "p95_guesses": 5,
+            "max_guesses": 5,
+            "solved_in_guess_counts": [
+              0,
+              1,
+              15,
+              11,
+              3,
+              0
+            ],
+            "coverage_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "solve_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "bootstrap": {
+              "resamples": 2000,
+              "block_length": 7,
+              "seed": 21769571400961093
+            }
+          },
+          "games": 30,
+          "average_guesses": 3.533333333333333,
+          "p95_guesses": 5,
+          "max_guesses": 5,
+          "failures": 0,
+          "coverage_gaps": 0,
+          "average_guesses_ci95": [
+            3.3333333333333335,
+            3.7666666666666666
+          ],
+          "failure_rate_ci95": [
+            1.1102230246251565e-16,
+            0.1135133931739688
+          ]
+        },
+        "average_log_loss": 7.764164197220422,
+        "average_brier": 0.9995753155679963,
+        "average_target_probability": 0.00042468443194266365,
+        "average_target_rank": 1114.103448275862,
+        "prior_evidence": {
+          "measured_games": 29,
+          "top_1_recall": 0.0,
+          "top_1_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_3_recall": 0.0,
+          "top_3_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_5_recall": 0.0,
+          "top_5_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "calibration_bins": 10,
+          "expected_calibration_error": 0.00042468443194266365,
+          "expected_calibration_error_ci95": {
+            "lower": 0.0004246284501061571,
+            "upper": 0.0004247528541872825
+          },
+          "bootstrap": {
+            "resamples": 2000,
+            "block_length": 7,
+            "seed": 21769571400961093
+          }
+        },
+        "execution": {
+          "total_steps": 106,
+          "proxy_steps": 106,
+          "lookahead_steps": 0,
+          "escalated_exact_steps": 0,
+          "exact_steps": 0,
+          "danger_escalated_steps": 0,
+          "strict_recovery_steps": 0,
+          "uniform_recovery_steps": 0,
+          "epsilon_repair_steps": 2,
+          "dormant_fallback_steps": 16,
+          "exact_date_opener_artifact_hits": 0,
+          "recent_opener_artifact_hits": 0,
+          "reply_book_hits": 0,
+          "session_fallback_hits": 0
+        },
+        "failure_penalty_sensitivity": [
+          {
+            "penalty_guesses": 6.0,
+            "all_game_mean_guesses": 3.533333333333333,
+            "ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.7666666666666666
+            }
+          },
+          {
+            "penalty_guesses": 7.0,
+            "all_game_mean_guesses": 3.533333333333333,
+            "ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.7666666666666666
+            }
+          },
+          {
+            "penalty_guesses": 8.0,
+            "all_game_mean_guesses": 3.533333333333333,
+            "ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.7666666666666666
+            }
+          }
+        ],
+        "latency_p95_ms": 31.528399999999998,
+        "session_fallback_cold_ms": 0.0,
+        "session_fallback_warm_ms": 0.0,
+        "proxy_step_pct": 1.0,
+        "lookahead_step_pct": 0.0,
+        "escalated_exact_step_pct": 0.0,
+        "exact_step_pct": 0.0,
+        "average_lookahead_pool_ratio": 1.0,
+        "average_exact_pool_ratio": 1.0,
+        "games": [
+          {
+            "target": "dusty",
+            "outcome": {
+              "date": "2026-05-19",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "stout",
+              "dusty"
+            ]
+          },
+          {
+            "target": "wreck",
+            "outcome": {
+              "date": "2026-05-20",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "flied",
+              "every",
+              "wreck"
+            ]
+          },
+          {
+            "target": "agree",
+            "outcome": {
+              "date": "2026-05-21",
+              "status": "solved",
+              "guesses": 2
+            },
+            "path": [
+              "tarse",
+              "agree"
+            ]
+          },
+          {
+            "target": "vocal",
+            "outcome": {
+              "date": "2026-05-22",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "focal",
+              "local",
+              "vocal"
+            ]
+          },
+          {
+            "target": "chuck",
+            "outcome": {
+              "date": "2026-05-23",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "chuck"
+            ]
+          },
+          {
+            "target": "niece",
+            "outcome": {
+              "date": "2026-05-24",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "dinlo",
+              "niche",
+              "niece"
+            ]
+          },
+          {
+            "target": "visit",
+            "outcome": {
+              "date": "2026-05-25",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "stout",
+              "visit"
+            ]
+          },
+          {
+            "target": "couch",
+            "outcome": {
+              "date": "2026-05-26",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "couch"
+            ]
+          },
+          {
+            "target": "stuff",
+            "outcome": {
+              "date": "2026-05-27",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "stout",
+              "study",
+              "stuff"
+            ]
+          },
+          {
+            "target": "divot",
+            "outcome": {
+              "date": "2026-05-28",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "tarse",
+              "hoing",
+              "pilot",
+              "dicot",
+              "divot"
+            ]
+          },
+          {
+            "target": "clang",
+            "outcome": {
+              "date": "2026-05-29",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "clang"
+            ]
+          },
+          {
+            "target": "smile",
+            "outcome": {
+              "date": "2026-05-30",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "tarse",
+              "snipe",
+              "seize",
+              "slice",
+              "smile"
+            ]
+          },
+          {
+            "target": "etude",
+            "outcome": {
+              "date": "2026-05-31",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "quite",
+              "etude"
+            ]
+          },
+          {
+            "target": "chili",
+            "outcome": {
+              "date": "2026-06-01",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "child",
+              "chili"
+            ]
+          },
+          {
+            "target": "basis",
+            "outcome": {
+              "date": "2026-06-02",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "salon",
+              "basic",
+              "basis"
+            ]
+          },
+          {
+            "target": "notch",
+            "outcome": {
+              "date": "2026-06-03",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "hoing",
+              "month",
+              "notch"
+            ]
+          },
+          {
+            "target": "alloy",
+            "outcome": {
+              "date": "2026-06-04",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "aglow",
+              "alloy"
+            ]
+          },
+          {
+            "target": "nobly",
+            "outcome": {
+              "date": "2026-06-05",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "nobly"
+            ]
+          },
+          {
+            "target": "morph",
+            "outcome": {
+              "date": "2026-06-06",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "curly",
+              "forgo",
+              "morph"
+            ]
+          },
+          {
+            "target": "thumb",
+            "outcome": {
+              "date": "2026-06-07",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "tonic",
+              "thumb"
+            ]
+          },
+          {
+            "target": "mafia",
+            "outcome": {
+              "date": "2026-06-08",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "mincy",
+              "mafia"
+            ]
+          },
+          {
+            "target": "wharf",
+            "outcome": {
+              "date": "2026-06-09",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "brond",
+              "chair",
+              "wharf"
+            ]
+          },
+          {
+            "target": "align",
+            "outcome": {
+              "date": "2026-06-10",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "align"
+            ]
+          },
+          {
+            "target": "testy",
+            "outcome": {
+              "date": "2026-06-11",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "lenes",
+              "testy"
+            ]
+          },
+          {
+            "target": "break",
+            "outcome": {
+              "date": "2026-06-12",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "clear",
+              "break"
+            ]
+          },
+          {
+            "target": "quell",
+            "outcome": {
+              "date": "2026-06-13",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "dinlo",
+              "belly",
+              "quell"
+            ]
+          },
+          {
+            "target": "sepia",
+            "outcome": {
+              "date": "2026-06-14",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "sedan",
+              "sepia"
+            ]
+          },
+          {
+            "target": "broil",
+            "outcome": {
+              "date": "2026-06-15",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "coign",
+              "broil"
+            ]
+          },
+          {
+            "target": "amaze",
+            "outcome": {
+              "date": "2026-06-16",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "angle",
+              "abode",
+              "amaze"
+            ]
+          },
+          {
+            "target": "token",
+            "outcome": {
+              "date": "2026-06-17",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "totem",
+              "token"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "cooldown_entropy",
+      "description": "Cooldown-only prior with entropy-only ranking",
+      "artifacts": "disabled",
+      "effective_config_toml": "base_seed_weight = 0.75\nbase_history_only_weight = 0.5\ncooldown_days = 365\ncooldown_floor = 0.01\nmidpoint_days = 1080.0\nlogistic_k = 0.02\nfallback_prior_mass = 0.05\nfallback_activation_threshold = 1\nsearch_policy_mode = \"proxy_only\"\nexact_threshold = 64\nexact_exhaustive_threshold = 12\nexact_candidate_pool = 96\nsession_opener_pool = 32\nsession_reply_pool = 20\nsession_window_days = 30\nlookahead_threshold = 160\nmedium_state_lookahead_threshold = 80\nsecond_guess_coverage_min_survivors = 65\nsecond_guess_coverage_max_survivors = 0\nsecond_guess_coverage_pool = 24\nlookahead_candidate_pool = 24\nmedium_state_lookahead_candidate_pool = 48\nlookahead_reply_pool = 12\nmedium_state_lookahead_reply_pool = 20\nlookahead_root_force_in_two_scan = 64\nmedium_state_force_in_two_scan = 160\nlarge_state_split_threshold = 50\npool_tight_gap_threshold = 0.05\npool_medium_gap_threshold = 0.15\npool_diversity_stride = 4\ndanger_lookahead_threshold = 0.58\ndanger_exact_threshold = 0.72\ndanger_reply_pool_bonus = 8\ndanger_exact_root_pool = 24\ndanger_exact_survivor_cap = 192\nlookahead_trap_penalty = 0.35\nlookahead_large_bucket_penalty = 0.12\nlookahead_dangerous_mass_penalty = 0.08\nlookahead_large_bucket_mass_penalty = 0.1\ntrap_size_threshold = 6\ntrap_mass_threshold = 0.15\nsync_reverify_days = 3\nsync_request_timeout_seconds = 10\nsync_retry_attempts = 3\nsync_retry_backoff_millis = 500\nallow_history_gaps = false\nproxy_small_state_lower_bound_threshold = 0\n\n[proxy_weights]\nentropy_w = 1.0\nbucket_mass_w = 0.0\nbucket_size_w = 0.0\nambiguous_w = 0.0\nproxy_w = 0.0\nsolve_prob_w = 0.0\nposterior_w = 0.0\nsmoothness_w = 0.0\ngray_reuse_w = 0.0\nlarge_bucket_count_w = 0.0\ndangerous_mass_count_w = 0.0\nlarge_bucket_mass_w = 0.0\n\n[recovery]\nmode = \"epsilon_repair\"\nepsilon_scale = 0.000001\n\n[manual_weights]\n",
+      "paired_vs_selected_default": {
+        "candidate_minus_baseline": 0.16666666666666666,
+        "ci95": {
+          "lower": -0.1,
+          "upper": 0.43333333333333335
+        },
+        "candidate_wins": 5,
+        "ties": 18,
+        "baseline_wins": 7
+      },
+      "result": {
+        "config_id": "proxy_only-et64-ee12-cp96-lt160-lc24-lr12-ls50",
+        "mode": "cooldown_only",
+        "variant": "seed_plus_history",
+        "backtest": {
+          "canonical": {
+            "scheduled_games": 30,
+            "modeled_games": 30,
+            "solved_games": 30,
+            "unsolved_games": 0,
+            "coverage_gaps": 0,
+            "coverage_rate": 1.0,
+            "solve_rate": 1.0,
+            "conditional_mean_guesses": 3.6333333333333333,
+            "conditional_mean_guesses_ci95": {
+              "lower": 3.3,
+              "upper": 3.966666666666667
+            },
+            "failure_penalty_guesses": 7.0,
+            "all_game_penalized_mean_guesses": 3.6333333333333333,
+            "all_game_penalized_mean_guesses_ci95": {
+              "lower": 3.3,
+              "upper": 3.966666666666667
+            },
+            "median_guesses": 3.0,
+            "p90_guesses": 5,
+            "p95_guesses": 5,
+            "max_guesses": 5,
+            "solved_in_guess_counts": [
+              0,
+              1,
+              15,
+              8,
+              6,
+              0
+            ],
+            "coverage_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "solve_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "bootstrap": {
+              "resamples": 2000,
+              "block_length": 7,
+              "seed": 21769571400961093
+            }
+          },
+          "games": 30,
+          "average_guesses": 3.6333333333333333,
+          "p95_guesses": 5,
+          "max_guesses": 5,
+          "failures": 0,
+          "coverage_gaps": 0,
+          "average_guesses_ci95": [
+            3.3,
+            3.966666666666667
+          ],
+          "failure_rate_ci95": [
+            1.1102230246251565e-16,
+            0.1135133931739688
+          ]
+        },
+        "average_log_loss": 7.594922247124076,
+        "average_brier": 0.999495232327751,
+        "average_target_probability": 0.0005029990699645308,
+        "average_target_rank": 945.9310344827586,
+        "prior_evidence": {
+          "measured_games": 29,
+          "top_1_recall": 0.0,
+          "top_1_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_3_recall": 0.0,
+          "top_3_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_5_recall": 0.0,
+          "top_5_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "calibration_bins": 10,
+          "expected_calibration_error": 0.0005029990699645308,
+          "expected_calibration_error_ci95": {
+            "lower": 0.0005029582326718309,
+            "upper": 0.000503048661781265
+          },
+          "bootstrap": {
+            "resamples": 2000,
+            "block_length": 7,
+            "seed": 21769571400961093
+          }
+        },
+        "execution": {
+          "total_steps": 109,
+          "proxy_steps": 109,
+          "lookahead_steps": 0,
+          "escalated_exact_steps": 0,
+          "exact_steps": 0,
+          "danger_escalated_steps": 0,
+          "strict_recovery_steps": 0,
+          "uniform_recovery_steps": 0,
+          "epsilon_repair_steps": 1,
+          "dormant_fallback_steps": 16,
+          "exact_date_opener_artifact_hits": 0,
+          "recent_opener_artifact_hits": 0,
+          "reply_book_hits": 0,
+          "session_fallback_hits": 0
+        },
+        "failure_penalty_sensitivity": [
+          {
+            "penalty_guesses": 6.0,
+            "all_game_mean_guesses": 3.6333333333333333,
+            "ci95": {
+              "lower": 3.3,
+              "upper": 3.966666666666667
+            }
+          },
+          {
+            "penalty_guesses": 7.0,
+            "all_game_mean_guesses": 3.6333333333333333,
+            "ci95": {
+              "lower": 3.3,
+              "upper": 3.966666666666667
+            }
+          },
+          {
+            "penalty_guesses": 8.0,
+            "all_game_mean_guesses": 3.6333333333333333,
+            "ci95": {
+              "lower": 3.3,
+              "upper": 3.966666666666667
+            }
+          }
+        ],
+        "latency_p95_ms": 43.3345,
+        "session_fallback_cold_ms": 0.0,
+        "session_fallback_warm_ms": 0.0,
+        "proxy_step_pct": 1.0,
+        "lookahead_step_pct": 0.0,
+        "escalated_exact_step_pct": 0.0,
+        "exact_step_pct": 0.0,
+        "average_lookahead_pool_ratio": 1.0,
+        "average_exact_pool_ratio": 1.0,
+        "games": [
+          {
+            "target": "dusty",
+            "outcome": {
+              "date": "2026-05-19",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "stink",
+              "dusty"
+            ]
+          },
+          {
+            "target": "wreck",
+            "outcome": {
+              "date": "2026-05-20",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "tarse",
+              "dinlo",
+              "recur",
+              "creek",
+              "wreck"
+            ]
+          },
+          {
+            "target": "agree",
+            "outcome": {
+              "date": "2026-05-21",
+              "status": "solved",
+              "guesses": 2
+            },
+            "path": [
+              "tarse",
+              "agree"
+            ]
+          },
+          {
+            "target": "vocal",
+            "outcome": {
+              "date": "2026-05-22",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "focal",
+              "local",
+              "vocal"
+            ]
+          },
+          {
+            "target": "chuck",
+            "outcome": {
+              "date": "2026-05-23",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "chuck"
+            ]
+          },
+          {
+            "target": "niece",
+            "outcome": {
+              "date": "2026-05-24",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "dinlo",
+              "niche",
+              "niece"
+            ]
+          },
+          {
+            "target": "visit",
+            "outcome": {
+              "date": "2026-05-25",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "stink",
+              "posit",
+              "visit"
+            ]
+          },
+          {
+            "target": "couch",
+            "outcome": {
+              "date": "2026-05-26",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "couch"
+            ]
+          },
+          {
+            "target": "stuff",
+            "outcome": {
+              "date": "2026-05-27",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "tarse",
+              "stink",
+              "stool",
+              "study",
+              "stuff"
+            ]
+          },
+          {
+            "target": "divot",
+            "outcome": {
+              "date": "2026-05-28",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "tarse",
+              "litho",
+              "bigot",
+              "pivot",
+              "divot"
+            ]
+          },
+          {
+            "target": "clang",
+            "outcome": {
+              "date": "2026-05-29",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "clang"
+            ]
+          },
+          {
+            "target": "smile",
+            "outcome": {
+              "date": "2026-05-30",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "tarse",
+              "snipe",
+              "seize",
+              "slice",
+              "smile"
+            ]
+          },
+          {
+            "target": "etude",
+            "outcome": {
+              "date": "2026-05-31",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "quite",
+              "etude"
+            ]
+          },
+          {
+            "target": "chili",
+            "outcome": {
+              "date": "2026-06-01",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "child",
+              "chili"
+            ]
+          },
+          {
+            "target": "basis",
+            "outcome": {
+              "date": "2026-06-02",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "tarse",
+              "sappy",
+              "basic",
+              "basin",
+              "basis"
+            ]
+          },
+          {
+            "target": "notch",
+            "outcome": {
+              "date": "2026-06-03",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "litho",
+              "botch",
+              "notch"
+            ]
+          },
+          {
+            "target": "alloy",
+            "outcome": {
+              "date": "2026-06-04",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "aglow",
+              "alloy"
+            ]
+          },
+          {
+            "target": "nobly",
+            "outcome": {
+              "date": "2026-06-05",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "nobly"
+            ]
+          },
+          {
+            "target": "morph",
+            "outcome": {
+              "date": "2026-06-06",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "curly",
+              "forgo",
+              "morph"
+            ]
+          },
+          {
+            "target": "thumb",
+            "outcome": {
+              "date": "2026-06-07",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "thong",
+              "thumb"
+            ]
+          },
+          {
+            "target": "mafia",
+            "outcome": {
+              "date": "2026-06-08",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "mincy",
+              "mafia"
+            ]
+          },
+          {
+            "target": "wharf",
+            "outcome": {
+              "date": "2026-06-09",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "blond",
+              "wrack",
+              "wharf"
+            ]
+          },
+          {
+            "target": "align",
+            "outcome": {
+              "date": "2026-06-10",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "colin",
+              "align"
+            ]
+          },
+          {
+            "target": "testy",
+            "outcome": {
+              "date": "2026-06-11",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "lenes",
+              "testy"
+            ]
+          },
+          {
+            "target": "break",
+            "outcome": {
+              "date": "2026-06-12",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "clear",
+              "break"
+            ]
+          },
+          {
+            "target": "quell",
+            "outcome": {
+              "date": "2026-06-13",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "tarse",
+              "dinlo",
+              "belly",
+              "quell"
+            ]
+          },
+          {
+            "target": "sepia",
+            "outcome": {
+              "date": "2026-06-14",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "sedan",
+              "sepia"
+            ]
+          },
+          {
+            "target": "broil",
+            "outcome": {
+              "date": "2026-06-15",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "coign",
+              "broil"
+            ]
+          },
+          {
+            "target": "amaze",
+            "outcome": {
+              "date": "2026-06-16",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "amble",
+              "amaze"
+            ]
+          },
+          {
+            "target": "token",
+            "outcome": {
+              "date": "2026-06-17",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "tarse",
+              "towel",
+              "token"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "weighted_proxy_only",
+      "description": "Weighted prior and proxy ranking without lookahead, exact escalation, or books",
+      "artifacts": "disabled",
+      "effective_config_toml": "base_seed_weight = 0.75\nbase_history_only_weight = 0.5\ncooldown_days = 365\ncooldown_floor = 0.01\nmidpoint_days = 1080.0\nlogistic_k = 0.02\nfallback_prior_mass = 0.05\nfallback_activation_threshold = 1\nsearch_policy_mode = \"proxy_only\"\nexact_threshold = 64\nexact_exhaustive_threshold = 12\nexact_candidate_pool = 96\nsession_opener_pool = 32\nsession_reply_pool = 20\nsession_window_days = 30\nlookahead_threshold = 160\nmedium_state_lookahead_threshold = 80\nsecond_guess_coverage_min_survivors = 65\nsecond_guess_coverage_max_survivors = 0\nsecond_guess_coverage_pool = 24\nlookahead_candidate_pool = 24\nmedium_state_lookahead_candidate_pool = 48\nlookahead_reply_pool = 12\nmedium_state_lookahead_reply_pool = 20\nlookahead_root_force_in_two_scan = 64\nmedium_state_force_in_two_scan = 160\nlarge_state_split_threshold = 50\npool_tight_gap_threshold = 0.05\npool_medium_gap_threshold = 0.15\npool_diversity_stride = 4\ndanger_lookahead_threshold = 0.58\ndanger_exact_threshold = 0.72\ndanger_reply_pool_bonus = 8\ndanger_exact_root_pool = 24\ndanger_exact_survivor_cap = 192\nlookahead_trap_penalty = 0.35\nlookahead_large_bucket_penalty = 0.12\nlookahead_dangerous_mass_penalty = 0.08\nlookahead_large_bucket_mass_penalty = 0.1\ntrap_size_threshold = 6\ntrap_mass_threshold = 0.15\nsync_reverify_days = 3\nsync_request_timeout_seconds = 10\nsync_retry_attempts = 3\nsync_retry_backoff_millis = 500\nallow_history_gaps = false\nproxy_small_state_lower_bound_threshold = 0\n\n[proxy_weights]\nentropy_w = 0.3375\nbucket_mass_w = 2.1\nbucket_size_w = 0.12\nambiguous_w = 0.75\nproxy_w = 1.0\nsolve_prob_w = 0.1\nposterior_w = 0.05\nsmoothness_w = 0.45\ngray_reuse_w = 0.08\nlarge_bucket_count_w = 0.1782\ndangerous_mass_count_w = 0.22\nlarge_bucket_mass_w = 0.4\n\n[recovery]\nmode = \"epsilon_repair\"\nepsilon_scale = 0.000001\n\n[manual_weights]\n",
+      "paired_vs_selected_default": {
+        "candidate_minus_baseline": -0.26666666666666666,
+        "ci95": {
+          "lower": -0.4666666666666667,
+          "upper": -0.06666666666666667
+        },
+        "candidate_wins": 10,
+        "ties": 18,
+        "baseline_wins": 2
+      },
+      "result": {
+        "config_id": "proxy_only-et64-ee12-cp96-lt160-lc24-lr12-ls50",
+        "mode": "weighted",
+        "variant": "seed_plus_history",
+        "backtest": {
+          "canonical": {
+            "scheduled_games": 30,
+            "modeled_games": 30,
+            "solved_games": 30,
+            "unsolved_games": 0,
+            "coverage_gaps": 0,
+            "coverage_rate": 1.0,
+            "solve_rate": 1.0,
+            "conditional_mean_guesses": 3.2,
+            "conditional_mean_guesses_ci95": {
+              "lower": 3.0,
+              "upper": 3.466666666666667
+            },
+            "failure_penalty_guesses": 7.0,
+            "all_game_penalized_mean_guesses": 3.2,
+            "all_game_penalized_mean_guesses_ci95": {
+              "lower": 3.0,
+              "upper": 3.466666666666667
+            },
+            "median_guesses": 3.0,
+            "p90_guesses": 4,
+            "p95_guesses": 4,
+            "max_guesses": 5,
+            "solved_in_guess_counts": [
+              0,
+              1,
+              23,
+              5,
+              1,
+              0
+            ],
+            "coverage_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "solve_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "bootstrap": {
+              "resamples": 2000,
+              "block_length": 7,
+              "seed": 21769571400961093
+            }
+          },
+          "games": 30,
+          "average_guesses": 3.2,
+          "p95_guesses": 4,
+          "max_guesses": 5,
+          "failures": 0,
+          "coverage_gaps": 0,
+          "average_guesses_ci95": [
+            3.0,
+            3.466666666666667
+          ],
+          "failure_rate_ci95": [
+            1.1102230246251565e-16,
+            0.1135133931739688
+          ]
+        },
+        "average_log_loss": 7.232596717639957,
+        "average_brier": 0.9992333183514325,
+        "average_target_probability": 0.0007542423057204742,
+        "average_target_rank": 343.9310344827586,
+        "prior_evidence": {
+          "measured_games": 29,
+          "top_1_recall": 0.0,
+          "top_1_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_3_recall": 0.0,
+          "top_3_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_5_recall": 0.0,
+          "top_5_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "calibration_bins": 10,
+          "expected_calibration_error": 0.0007779055090691749,
+          "expected_calibration_error_ci95": {
+            "lower": 0.0007775524265950529,
+            "upper": 0.0007782990079462606
+          },
+          "bootstrap": {
+            "resamples": 2000,
+            "block_length": 7,
+            "seed": 21769571400961093
+          }
+        },
+        "execution": {
+          "total_steps": 96,
+          "proxy_steps": 96,
+          "lookahead_steps": 0,
+          "escalated_exact_steps": 0,
+          "exact_steps": 0,
+          "danger_escalated_steps": 0,
+          "strict_recovery_steps": 0,
+          "uniform_recovery_steps": 0,
+          "epsilon_repair_steps": 1,
+          "dormant_fallback_steps": 7,
+          "exact_date_opener_artifact_hits": 0,
+          "recent_opener_artifact_hits": 0,
+          "reply_book_hits": 0,
+          "session_fallback_hits": 0
+        },
+        "failure_penalty_sensitivity": [
+          {
+            "penalty_guesses": 6.0,
+            "all_game_mean_guesses": 3.2,
+            "ci95": {
+              "lower": 3.0,
+              "upper": 3.466666666666667
+            }
+          },
+          {
+            "penalty_guesses": 7.0,
+            "all_game_mean_guesses": 3.2,
+            "ci95": {
+              "lower": 3.0,
+              "upper": 3.466666666666667
+            }
+          },
+          {
+            "penalty_guesses": 8.0,
+            "all_game_mean_guesses": 3.2,
+            "ci95": {
+              "lower": 3.0,
+              "upper": 3.466666666666667
+            }
+          }
+        ],
+        "latency_p95_ms": 50.1294,
+        "session_fallback_cold_ms": 0.0,
+        "session_fallback_warm_ms": 0.0,
+        "proxy_step_pct": 1.0,
+        "lookahead_step_pct": 0.0,
+        "escalated_exact_step_pct": 0.0,
+        "exact_step_pct": 0.0,
+        "average_lookahead_pool_ratio": 1.0,
+        "average_exact_pool_ratio": 1.0,
+        "games": [
+          {
+            "target": "dusty",
+            "outcome": {
+              "date": "2026-05-19",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "putty",
+              "dusty"
+            ]
+          },
+          {
+            "target": "wreck",
+            "outcome": {
+              "date": "2026-05-20",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "sider",
+              "wreck"
+            ]
+          },
+          {
+            "target": "agree",
+            "outcome": {
+              "date": "2026-05-21",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "mange",
+              "agree"
+            ]
+          },
+          {
+            "target": "vocal",
+            "outcome": {
+              "date": "2026-05-22",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "valor",
+              "vocal"
+            ]
+          },
+          {
+            "target": "chuck",
+            "outcome": {
+              "date": "2026-05-23",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "pirns",
+              "duchy",
+              "chuck"
+            ]
+          },
+          {
+            "target": "niece",
+            "outcome": {
+              "date": "2026-05-24",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "pring",
+              "wince",
+              "niece"
+            ]
+          },
+          {
+            "target": "visit",
+            "outcome": {
+              "date": "2026-05-25",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "shift",
+              "visit"
+            ]
+          },
+          {
+            "target": "couch",
+            "outcome": {
+              "date": "2026-05-26",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "croon",
+              "cough",
+              "couch"
+            ]
+          },
+          {
+            "target": "stuff",
+            "outcome": {
+              "date": "2026-05-27",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "shift",
+              "stuff"
+            ]
+          },
+          {
+            "target": "divot",
+            "outcome": {
+              "date": "2026-05-28",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "olate",
+              "snirt",
+              "bigot",
+              "pivot",
+              "divot"
+            ]
+          },
+          {
+            "target": "clang",
+            "outcome": {
+              "date": "2026-05-29",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "slack",
+              "clang"
+            ]
+          },
+          {
+            "target": "smile",
+            "outcome": {
+              "date": "2026-05-30",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "delve",
+              "rifle",
+              "smile"
+            ]
+          },
+          {
+            "target": "etude",
+            "outcome": {
+              "date": "2026-05-31",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "there",
+              "etude"
+            ]
+          },
+          {
+            "target": "chili",
+            "outcome": {
+              "date": "2026-06-01",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "cills",
+              "chili"
+            ]
+          },
+          {
+            "target": "basis",
+            "outcome": {
+              "date": "2026-06-02",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "ringy",
+              "basis"
+            ]
+          },
+          {
+            "target": "notch",
+            "outcome": {
+              "date": "2026-06-03",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "snirt",
+              "notch"
+            ]
+          },
+          {
+            "target": "alloy",
+            "outcome": {
+              "date": "2026-06-04",
+              "status": "solved",
+              "guesses": 2
+            },
+            "path": [
+              "olate",
+              "alloy"
+            ]
+          },
+          {
+            "target": "nobly",
+            "outcome": {
+              "date": "2026-06-05",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "golly",
+              "nobly"
+            ]
+          },
+          {
+            "target": "morph",
+            "outcome": {
+              "date": "2026-06-06",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "croon",
+              "hydro",
+              "morph"
+            ]
+          },
+          {
+            "target": "thumb",
+            "outcome": {
+              "date": "2026-06-07",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "shift",
+              "thumb"
+            ]
+          },
+          {
+            "target": "mafia",
+            "outcome": {
+              "date": "2026-06-08",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "carny",
+              "mafia"
+            ]
+          },
+          {
+            "target": "wharf",
+            "outcome": {
+              "date": "2026-06-09",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "churn",
+              "wharf"
+            ]
+          },
+          {
+            "target": "align",
+            "outcome": {
+              "date": "2026-06-10",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "iliac",
+              "align"
+            ]
+          },
+          {
+            "target": "testy",
+            "outcome": {
+              "date": "2026-06-11",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "zesty",
+              "testy"
+            ]
+          },
+          {
+            "target": "break",
+            "outcome": {
+              "date": "2026-06-12",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "asper",
+              "break"
+            ]
+          },
+          {
+            "target": "quell",
+            "outcome": {
+              "date": "2026-06-13",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "rhies",
+              "quell"
+            ]
+          },
+          {
+            "target": "sepia",
+            "outcome": {
+              "date": "2026-06-14",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "asper",
+              "sepia"
+            ]
+          },
+          {
+            "target": "broil",
+            "outcome": {
+              "date": "2026-06-15",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "golly",
+              "broil"
+            ]
+          },
+          {
+            "target": "amaze",
+            "outcome": {
+              "date": "2026-06-16",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "scare",
+              "amaze"
+            ]
+          },
+          {
+            "target": "token",
+            "outcome": {
+              "date": "2026-06-17",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "totem",
+              "token"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "weighted_proxy_exact_endgame",
+      "description": "Weighted proxy ranking with exact search only inside the configured endgame threshold",
+      "artifacts": "disabled",
+      "effective_config_toml": "base_seed_weight = 0.75\nbase_history_only_weight = 0.5\ncooldown_days = 365\ncooldown_floor = 0.01\nmidpoint_days = 1080.0\nlogistic_k = 0.02\nfallback_prior_mass = 0.05\nfallback_activation_threshold = 1\nsearch_policy_mode = \"proxy_with_exact_endgame\"\nexact_threshold = 64\nexact_exhaustive_threshold = 12\nexact_candidate_pool = 96\nsession_opener_pool = 32\nsession_reply_pool = 20\nsession_window_days = 30\nlookahead_threshold = 160\nmedium_state_lookahead_threshold = 80\nsecond_guess_coverage_min_survivors = 65\nsecond_guess_coverage_max_survivors = 0\nsecond_guess_coverage_pool = 24\nlookahead_candidate_pool = 24\nmedium_state_lookahead_candidate_pool = 48\nlookahead_reply_pool = 12\nmedium_state_lookahead_reply_pool = 20\nlookahead_root_force_in_two_scan = 64\nmedium_state_force_in_two_scan = 160\nlarge_state_split_threshold = 50\npool_tight_gap_threshold = 0.05\npool_medium_gap_threshold = 0.15\npool_diversity_stride = 4\ndanger_lookahead_threshold = 0.58\ndanger_exact_threshold = 0.72\ndanger_reply_pool_bonus = 8\ndanger_exact_root_pool = 24\ndanger_exact_survivor_cap = 192\nlookahead_trap_penalty = 0.35\nlookahead_large_bucket_penalty = 0.12\nlookahead_dangerous_mass_penalty = 0.08\nlookahead_large_bucket_mass_penalty = 0.1\ntrap_size_threshold = 6\ntrap_mass_threshold = 0.15\nsync_reverify_days = 3\nsync_request_timeout_seconds = 10\nsync_retry_attempts = 3\nsync_retry_backoff_millis = 500\nallow_history_gaps = false\nproxy_small_state_lower_bound_threshold = 0\n\n[proxy_weights]\nentropy_w = 0.3375\nbucket_mass_w = 2.1\nbucket_size_w = 0.12\nambiguous_w = 0.75\nproxy_w = 1.0\nsolve_prob_w = 0.1\nposterior_w = 0.05\nsmoothness_w = 0.45\ngray_reuse_w = 0.08\nlarge_bucket_count_w = 0.1782\ndangerous_mass_count_w = 0.22\nlarge_bucket_mass_w = 0.4\n\n[recovery]\nmode = \"epsilon_repair\"\nepsilon_scale = 0.000001\n\n[manual_weights]\n",
+      "paired_vs_selected_default": {
+        "candidate_minus_baseline": 0.0,
+        "ci95": {
+          "lower": -0.06666666666666667,
+          "upper": 0.06666666666666667
+        },
+        "candidate_wins": 3,
+        "ties": 24,
+        "baseline_wins": 3
+      },
+      "result": {
+        "config_id": "proxy_with_exact_endgame-et64-ee12-cp96-lt160-lc24-lr12-ls50",
+        "mode": "weighted",
+        "variant": "seed_plus_history",
+        "backtest": {
+          "canonical": {
+            "scheduled_games": 30,
+            "modeled_games": 30,
+            "solved_games": 30,
+            "unsolved_games": 0,
+            "coverage_gaps": 0,
+            "coverage_rate": 1.0,
+            "solve_rate": 1.0,
+            "conditional_mean_guesses": 3.466666666666667,
+            "conditional_mean_guesses_ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.6
+            },
+            "failure_penalty_guesses": 7.0,
+            "all_game_penalized_mean_guesses": 3.466666666666667,
+            "all_game_penalized_mean_guesses_ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.6
+            },
+            "median_guesses": 3.0,
+            "p90_guesses": 4,
+            "p95_guesses": 4,
+            "max_guesses": 5,
+            "solved_in_guess_counts": [
+              0,
+              0,
+              17,
+              12,
+              1,
+              0
+            ],
+            "coverage_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "solve_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "bootstrap": {
+              "resamples": 2000,
+              "block_length": 7,
+              "seed": 21769571400961093
+            }
+          },
+          "games": 30,
+          "average_guesses": 3.466666666666667,
+          "p95_guesses": 4,
+          "max_guesses": 5,
+          "failures": 0,
+          "coverage_gaps": 0,
+          "average_guesses_ci95": [
+            3.3333333333333335,
+            3.6
+          ],
+          "failure_rate_ci95": [
+            1.1102230246251565e-16,
+            0.1135133931739688
+          ]
+        },
+        "average_log_loss": 7.232596717639957,
+        "average_brier": 0.9992333183514325,
+        "average_target_probability": 0.0007542423057204742,
+        "average_target_rank": 343.9310344827586,
+        "prior_evidence": {
+          "measured_games": 29,
+          "top_1_recall": 0.0,
+          "top_1_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_3_recall": 0.0,
+          "top_3_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_5_recall": 0.0,
+          "top_5_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "calibration_bins": 10,
+          "expected_calibration_error": 0.0007779055090691749,
+          "expected_calibration_error_ci95": {
+            "lower": 0.0007775524265950529,
+            "upper": 0.0007782990079462606
+          },
+          "bootstrap": {
+            "resamples": 2000,
+            "block_length": 7,
+            "seed": 21769571400961093
+          }
+        },
+        "execution": {
+          "total_steps": 104,
+          "proxy_steps": 45,
+          "lookahead_steps": 0,
+          "escalated_exact_steps": 0,
+          "exact_steps": 59,
+          "danger_escalated_steps": 0,
+          "strict_recovery_steps": 0,
+          "uniform_recovery_steps": 0,
+          "epsilon_repair_steps": 1,
+          "dormant_fallback_steps": 14,
+          "exact_date_opener_artifact_hits": 0,
+          "recent_opener_artifact_hits": 0,
+          "reply_book_hits": 0,
+          "session_fallback_hits": 0
+        },
+        "failure_penalty_sensitivity": [
+          {
+            "penalty_guesses": 6.0,
+            "all_game_mean_guesses": 3.466666666666667,
+            "ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.6
+            }
+          },
+          {
+            "penalty_guesses": 7.0,
+            "all_game_mean_guesses": 3.466666666666667,
+            "ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.6
+            }
+          },
+          {
+            "penalty_guesses": 8.0,
+            "all_game_mean_guesses": 3.466666666666667,
+            "ci95": {
+              "lower": 3.3333333333333335,
+              "upper": 3.6
+            }
+          }
+        ],
+        "latency_p95_ms": 37.8534,
+        "session_fallback_cold_ms": 0.0,
+        "session_fallback_warm_ms": 0.0,
+        "proxy_step_pct": 0.4326923076923077,
+        "lookahead_step_pct": 0.0,
+        "escalated_exact_step_pct": 0.0,
+        "exact_step_pct": 0.5673076923076923,
+        "average_lookahead_pool_ratio": 1.0,
+        "average_exact_pool_ratio": 1.0,
+        "games": [
+          {
+            "target": "dusty",
+            "outcome": {
+              "date": "2026-05-19",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "birsy",
+              "dusty"
+            ]
+          },
+          {
+            "target": "wreck",
+            "outcome": {
+              "date": "2026-05-20",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "sider",
+              "buppy",
+              "wreck"
+            ]
+          },
+          {
+            "target": "agree",
+            "outcome": {
+              "date": "2026-05-21",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "cribs",
+              "agree"
+            ]
+          },
+          {
+            "target": "vocal",
+            "outcome": {
+              "date": "2026-05-22",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "valor",
+              "vocal"
+            ]
+          },
+          {
+            "target": "chuck",
+            "outcome": {
+              "date": "2026-05-23",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "pirns",
+              "dogma",
+              "chuck"
+            ]
+          },
+          {
+            "target": "niece",
+            "outcome": {
+              "date": "2026-05-24",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "pring",
+              "chems",
+              "niece"
+            ]
+          },
+          {
+            "target": "visit",
+            "outcome": {
+              "date": "2026-05-25",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "shift",
+              "visit"
+            ]
+          },
+          {
+            "target": "couch",
+            "outcome": {
+              "date": "2026-05-26",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "croon",
+              "comic",
+              "couch"
+            ]
+          },
+          {
+            "target": "stuff",
+            "outcome": {
+              "date": "2026-05-27",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "shift",
+              "stuff"
+            ]
+          },
+          {
+            "target": "divot",
+            "outcome": {
+              "date": "2026-05-28",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "olate",
+              "snirt",
+              "bigot",
+              "pivot",
+              "divot"
+            ]
+          },
+          {
+            "target": "clang",
+            "outcome": {
+              "date": "2026-05-29",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "nicks",
+              "clang"
+            ]
+          },
+          {
+            "target": "smile",
+            "outcome": {
+              "date": "2026-05-30",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "bings",
+              "smile"
+            ]
+          },
+          {
+            "target": "etude",
+            "outcome": {
+              "date": "2026-05-31",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "chirp",
+              "etude"
+            ]
+          },
+          {
+            "target": "chili",
+            "outcome": {
+              "date": "2026-06-01",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "pridy",
+              "kusti",
+              "chili"
+            ]
+          },
+          {
+            "target": "basis",
+            "outcome": {
+              "date": "2026-06-02",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "ringy",
+              "aapas",
+              "basis"
+            ]
+          },
+          {
+            "target": "notch",
+            "outcome": {
+              "date": "2026-06-03",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "snirt",
+              "notch"
+            ]
+          },
+          {
+            "target": "alloy",
+            "outcome": {
+              "date": "2026-06-04",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "funky",
+              "alloy"
+            ]
+          },
+          {
+            "target": "nobly",
+            "outcome": {
+              "date": "2026-06-05",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "goold",
+              "ablow",
+              "nobly"
+            ]
+          },
+          {
+            "target": "morph",
+            "outcome": {
+              "date": "2026-06-06",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "croon",
+              "durrs",
+              "morph"
+            ]
+          },
+          {
+            "target": "thumb",
+            "outcome": {
+              "date": "2026-06-07",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "shift",
+              "thumb"
+            ]
+          },
+          {
+            "target": "mafia",
+            "outcome": {
+              "date": "2026-06-08",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "carny",
+              "mamma",
+              "mafia"
+            ]
+          },
+          {
+            "target": "wharf",
+            "outcome": {
+              "date": "2026-06-09",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "churn",
+              "aksed",
+              "wharf"
+            ]
+          },
+          {
+            "target": "align",
+            "outcome": {
+              "date": "2026-06-10",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "aalii",
+              "align"
+            ]
+          },
+          {
+            "target": "testy",
+            "outcome": {
+              "date": "2026-06-11",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "treys",
+              "testy"
+            ]
+          },
+          {
+            "target": "break",
+            "outcome": {
+              "date": "2026-06-12",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "asper",
+              "break"
+            ]
+          },
+          {
+            "target": "quell",
+            "outcome": {
+              "date": "2026-06-13",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "rilly",
+              "spell",
+              "quell"
+            ]
+          },
+          {
+            "target": "sepia",
+            "outcome": {
+              "date": "2026-06-14",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "asper",
+              "sepia"
+            ]
+          },
+          {
+            "target": "broil",
+            "outcome": {
+              "date": "2026-06-15",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "world",
+              "broil"
+            ]
+          },
+          {
+            "target": "amaze",
+            "outcome": {
+              "date": "2026-06-16",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "crisp",
+              "mahwa",
+              "amaze"
+            ]
+          },
+          {
+            "target": "token",
+            "outcome": {
+              "date": "2026-06-17",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "metro",
+              "token"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "weighted_staged_no_artifacts",
+      "description": "Weighted prior with staged lookahead/exact search and no predictive books",
+      "artifacts": "disabled",
+      "effective_config_toml": "base_seed_weight = 0.75\nbase_history_only_weight = 0.5\ncooldown_days = 365\ncooldown_floor = 0.01\nmidpoint_days = 1080.0\nlogistic_k = 0.02\nfallback_prior_mass = 0.05\nfallback_activation_threshold = 1\nsearch_policy_mode = \"staged\"\nexact_threshold = 64\nexact_exhaustive_threshold = 12\nexact_candidate_pool = 96\nsession_opener_pool = 32\nsession_reply_pool = 20\nsession_window_days = 30\nlookahead_threshold = 160\nmedium_state_lookahead_threshold = 80\nsecond_guess_coverage_min_survivors = 65\nsecond_guess_coverage_max_survivors = 80\nsecond_guess_coverage_pool = 24\nlookahead_candidate_pool = 24\nmedium_state_lookahead_candidate_pool = 48\nlookahead_reply_pool = 12\nmedium_state_lookahead_reply_pool = 20\nlookahead_root_force_in_two_scan = 64\nmedium_state_force_in_two_scan = 160\nlarge_state_split_threshold = 50\npool_tight_gap_threshold = 0.05\npool_medium_gap_threshold = 0.15\npool_diversity_stride = 4\ndanger_lookahead_threshold = 0.58\ndanger_exact_threshold = 0.72\ndanger_reply_pool_bonus = 8\ndanger_exact_root_pool = 24\ndanger_exact_survivor_cap = 192\nlookahead_trap_penalty = 0.35\nlookahead_large_bucket_penalty = 0.12\nlookahead_dangerous_mass_penalty = 0.08\nlookahead_large_bucket_mass_penalty = 0.1\ntrap_size_threshold = 6\ntrap_mass_threshold = 0.15\nsync_reverify_days = 3\nsync_request_timeout_seconds = 10\nsync_retry_attempts = 3\nsync_retry_backoff_millis = 500\nallow_history_gaps = false\nproxy_small_state_lower_bound_threshold = 12\n\n[proxy_weights]\nentropy_w = 0.3375\nbucket_mass_w = 2.1\nbucket_size_w = 0.12\nambiguous_w = 0.75\nproxy_w = 1.0\nsolve_prob_w = 0.1\nposterior_w = 0.05\nsmoothness_w = 0.45\ngray_reuse_w = 0.08\nlarge_bucket_count_w = 0.1782\ndangerous_mass_count_w = 0.22\nlarge_bucket_mass_w = 0.4\n\n[recovery]\nmode = \"epsilon_repair\"\nepsilon_scale = 0.000001\n\n[manual_weights]\n",
+      "paired_vs_selected_default": {
+        "candidate_minus_baseline": 0.0,
+        "ci95": {
+          "lower": 0.0,
+          "upper": 0.0
+        },
+        "candidate_wins": 0,
+        "ties": 30,
+        "baseline_wins": 0
+      },
+      "result": {
+        "config_id": "staged-et64-ee12-cp96-lt160-lc24-lr12-ls50",
+        "mode": "weighted",
+        "variant": "seed_plus_history",
+        "backtest": {
+          "canonical": {
+            "scheduled_games": 30,
+            "modeled_games": 30,
+            "solved_games": 30,
+            "unsolved_games": 0,
+            "coverage_gaps": 0,
+            "coverage_rate": 1.0,
+            "solve_rate": 1.0,
+            "conditional_mean_guesses": 3.466666666666667,
+            "conditional_mean_guesses_ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            },
+            "failure_penalty_guesses": 7.0,
+            "all_game_penalized_mean_guesses": 3.466666666666667,
+            "all_game_penalized_mean_guesses_ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            },
+            "median_guesses": 3.0,
+            "p90_guesses": 4,
+            "p95_guesses": 4,
+            "max_guesses": 5,
+            "solved_in_guess_counts": [
+              0,
+              0,
+              17,
+              12,
+              1,
+              0
+            ],
+            "coverage_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "solve_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "bootstrap": {
+              "resamples": 2000,
+              "block_length": 7,
+              "seed": 21769571400961093
+            }
+          },
+          "games": 30,
+          "average_guesses": 3.466666666666667,
+          "p95_guesses": 4,
+          "max_guesses": 5,
+          "failures": 0,
+          "coverage_gaps": 0,
+          "average_guesses_ci95": [
+            3.3,
+            3.6333333333333333
+          ],
+          "failure_rate_ci95": [
+            1.1102230246251565e-16,
+            0.1135133931739688
+          ]
+        },
+        "average_log_loss": 7.232596717639957,
+        "average_brier": 0.9992333183514325,
+        "average_target_probability": 0.0007542423057204742,
+        "average_target_rank": 343.9310344827586,
+        "prior_evidence": {
+          "measured_games": 29,
+          "top_1_recall": 0.0,
+          "top_1_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_3_recall": 0.0,
+          "top_3_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_5_recall": 0.0,
+          "top_5_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "calibration_bins": 10,
+          "expected_calibration_error": 0.0007779055090691749,
+          "expected_calibration_error_ci95": {
+            "lower": 0.0007775524265950529,
+            "upper": 0.0007782990079462606
+          },
+          "bootstrap": {
+            "resamples": 2000,
+            "block_length": 7,
+            "seed": 21769571400961093
+          }
+        },
+        "execution": {
+          "total_steps": 104,
+          "proxy_steps": 31,
+          "lookahead_steps": 14,
+          "escalated_exact_steps": 0,
+          "exact_steps": 59,
+          "danger_escalated_steps": 0,
+          "strict_recovery_steps": 0,
+          "uniform_recovery_steps": 0,
+          "epsilon_repair_steps": 1,
+          "dormant_fallback_steps": 14,
+          "exact_date_opener_artifact_hits": 0,
+          "recent_opener_artifact_hits": 0,
+          "reply_book_hits": 0,
+          "session_fallback_hits": 0
+        },
+        "failure_penalty_sensitivity": [
+          {
+            "penalty_guesses": 6.0,
+            "all_game_mean_guesses": 3.466666666666667,
+            "ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            }
+          },
+          {
+            "penalty_guesses": 7.0,
+            "all_game_mean_guesses": 3.466666666666667,
+            "ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            }
+          },
+          {
+            "penalty_guesses": 8.0,
+            "all_game_mean_guesses": 3.466666666666667,
+            "ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            }
+          }
+        ],
+        "latency_p95_ms": 38.2853,
+        "session_fallback_cold_ms": 0.0,
+        "session_fallback_warm_ms": 0.0,
+        "proxy_step_pct": 0.2980769230769231,
+        "lookahead_step_pct": 0.1346153846153846,
+        "escalated_exact_step_pct": 0.0,
+        "exact_step_pct": 0.5673076923076923,
+        "average_lookahead_pool_ratio": 1.0,
+        "average_exact_pool_ratio": 1.0,
+        "games": [
+          {
+            "target": "dusty",
+            "outcome": {
+              "date": "2026-05-19",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "birsy",
+              "dusty"
+            ]
+          },
+          {
+            "target": "wreck",
+            "outcome": {
+              "date": "2026-05-20",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "sired",
+              "recur",
+              "wreck"
+            ]
+          },
+          {
+            "target": "agree",
+            "outcome": {
+              "date": "2026-05-21",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "cribs",
+              "agree"
+            ]
+          },
+          {
+            "target": "vocal",
+            "outcome": {
+              "date": "2026-05-22",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "valor",
+              "vocal"
+            ]
+          },
+          {
+            "target": "chuck",
+            "outcome": {
+              "date": "2026-05-23",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "crisp",
+              "chuck"
+            ]
+          },
+          {
+            "target": "niece",
+            "outcome": {
+              "date": "2026-05-24",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "suing",
+              "wince",
+              "niece"
+            ]
+          },
+          {
+            "target": "visit",
+            "outcome": {
+              "date": "2026-05-25",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "midst",
+              "visit"
+            ]
+          },
+          {
+            "target": "couch",
+            "outcome": {
+              "date": "2026-05-26",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "croon",
+              "comic",
+              "couch"
+            ]
+          },
+          {
+            "target": "stuff",
+            "outcome": {
+              "date": "2026-05-27",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "midst",
+              "stunk",
+              "stuff"
+            ]
+          },
+          {
+            "target": "divot",
+            "outcome": {
+              "date": "2026-05-28",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "olate",
+              "trist",
+              "bigot",
+              "pivot",
+              "divot"
+            ]
+          },
+          {
+            "target": "clang",
+            "outcome": {
+              "date": "2026-05-29",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "nicks",
+              "clang"
+            ]
+          },
+          {
+            "target": "smile",
+            "outcome": {
+              "date": "2026-05-30",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "bings",
+              "smile"
+            ]
+          },
+          {
+            "target": "etude",
+            "outcome": {
+              "date": "2026-05-31",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "chirp",
+              "etude"
+            ]
+          },
+          {
+            "target": "chili",
+            "outcome": {
+              "date": "2026-06-01",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "pridy",
+              "kusti",
+              "chili"
+            ]
+          },
+          {
+            "target": "basis",
+            "outcome": {
+              "date": "2026-06-02",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "crimp",
+              "basis"
+            ]
+          },
+          {
+            "target": "notch",
+            "outcome": {
+              "date": "2026-06-03",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "sprit",
+              "botch",
+              "notch"
+            ]
+          },
+          {
+            "target": "alloy",
+            "outcome": {
+              "date": "2026-06-04",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "funky",
+              "alloy"
+            ]
+          },
+          {
+            "target": "nobly",
+            "outcome": {
+              "date": "2026-06-05",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "goold",
+              "ablow",
+              "nobly"
+            ]
+          },
+          {
+            "target": "morph",
+            "outcome": {
+              "date": "2026-06-06",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "croon",
+              "durrs",
+              "morph"
+            ]
+          },
+          {
+            "target": "thumb",
+            "outcome": {
+              "date": "2026-06-07",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "midst",
+              "trump",
+              "thumb"
+            ]
+          },
+          {
+            "target": "mafia",
+            "outcome": {
+              "date": "2026-06-08",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "pricy",
+              "mafia"
+            ]
+          },
+          {
+            "target": "wharf",
+            "outcome": {
+              "date": "2026-06-09",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "crins",
+              "dwarf",
+              "wharf"
+            ]
+          },
+          {
+            "target": "align",
+            "outcome": {
+              "date": "2026-06-10",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "aalii",
+              "align"
+            ]
+          },
+          {
+            "target": "testy",
+            "outcome": {
+              "date": "2026-06-11",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "treys",
+              "testy"
+            ]
+          },
+          {
+            "target": "break",
+            "outcome": {
+              "date": "2026-06-12",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "apgar",
+              "break"
+            ]
+          },
+          {
+            "target": "quell",
+            "outcome": {
+              "date": "2026-06-13",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "rilly",
+              "spell",
+              "quell"
+            ]
+          },
+          {
+            "target": "sepia",
+            "outcome": {
+              "date": "2026-06-14",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "apgar",
+              "sepia"
+            ]
+          },
+          {
+            "target": "broil",
+            "outcome": {
+              "date": "2026-06-15",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "world",
+              "broil"
+            ]
+          },
+          {
+            "target": "amaze",
+            "outcome": {
+              "date": "2026-06-16",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "crisp",
+              "dawah",
+              "amaze"
+            ]
+          },
+          {
+            "target": "token",
+            "outcome": {
+              "date": "2026-06-17",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "metro",
+              "token"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "selected_default_disk_artifacts",
+      "description": "Current default with valid date-matched disk artifacts when available",
+      "artifacts": "valid_disk_only",
+      "effective_config_toml": "base_seed_weight = 0.75\nbase_history_only_weight = 0.5\ncooldown_days = 365\ncooldown_floor = 0.01\nmidpoint_days = 1080.0\nlogistic_k = 0.02\nfallback_prior_mass = 0.05\nfallback_activation_threshold = 1\nsearch_policy_mode = \"staged\"\nexact_threshold = 64\nexact_exhaustive_threshold = 12\nexact_candidate_pool = 96\nsession_opener_pool = 32\nsession_reply_pool = 20\nsession_window_days = 30\nlookahead_threshold = 160\nmedium_state_lookahead_threshold = 80\nsecond_guess_coverage_min_survivors = 65\nsecond_guess_coverage_max_survivors = 80\nsecond_guess_coverage_pool = 24\nlookahead_candidate_pool = 24\nmedium_state_lookahead_candidate_pool = 48\nlookahead_reply_pool = 12\nmedium_state_lookahead_reply_pool = 20\nlookahead_root_force_in_two_scan = 64\nmedium_state_force_in_two_scan = 160\nlarge_state_split_threshold = 50\npool_tight_gap_threshold = 0.05\npool_medium_gap_threshold = 0.15\npool_diversity_stride = 4\ndanger_lookahead_threshold = 0.58\ndanger_exact_threshold = 0.72\ndanger_reply_pool_bonus = 8\ndanger_exact_root_pool = 24\ndanger_exact_survivor_cap = 192\nlookahead_trap_penalty = 0.35\nlookahead_large_bucket_penalty = 0.12\nlookahead_dangerous_mass_penalty = 0.08\nlookahead_large_bucket_mass_penalty = 0.1\ntrap_size_threshold = 6\ntrap_mass_threshold = 0.15\nsync_reverify_days = 3\nsync_request_timeout_seconds = 10\nsync_retry_attempts = 3\nsync_retry_backoff_millis = 500\nallow_history_gaps = false\nproxy_small_state_lower_bound_threshold = 12\n\n[proxy_weights]\nentropy_w = 0.3375\nbucket_mass_w = 2.1\nbucket_size_w = 0.12\nambiguous_w = 0.75\nproxy_w = 1.0\nsolve_prob_w = 0.1\nposterior_w = 0.05\nsmoothness_w = 0.45\ngray_reuse_w = 0.08\nlarge_bucket_count_w = 0.1782\ndangerous_mass_count_w = 0.22\nlarge_bucket_mass_w = 0.4\n\n[recovery]\nmode = \"epsilon_repair\"\nepsilon_scale = 0.000001\n\n[manual_weights]\n",
+      "paired_vs_selected_default": {
+        "candidate_minus_baseline": 0.0,
+        "ci95": {
+          "lower": 0.0,
+          "upper": 0.0
+        },
+        "candidate_wins": 0,
+        "ties": 30,
+        "baseline_wins": 0
+      },
+      "result": {
+        "config_id": "staged-et64-ee12-cp96-lt160-lc24-lr12-ls50",
+        "mode": "weighted",
+        "variant": "seed_plus_history",
+        "backtest": {
+          "canonical": {
+            "scheduled_games": 30,
+            "modeled_games": 30,
+            "solved_games": 30,
+            "unsolved_games": 0,
+            "coverage_gaps": 0,
+            "coverage_rate": 1.0,
+            "solve_rate": 1.0,
+            "conditional_mean_guesses": 3.466666666666667,
+            "conditional_mean_guesses_ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            },
+            "failure_penalty_guesses": 7.0,
+            "all_game_penalized_mean_guesses": 3.466666666666667,
+            "all_game_penalized_mean_guesses_ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            },
+            "median_guesses": 3.0,
+            "p90_guesses": 4,
+            "p95_guesses": 4,
+            "max_guesses": 5,
+            "solved_in_guess_counts": [
+              0,
+              0,
+              17,
+              12,
+              1,
+              0
+            ],
+            "coverage_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "solve_rate_ci95": {
+              "lower": 0.8864866068260312,
+              "upper": 0.9999999999999999
+            },
+            "bootstrap": {
+              "resamples": 2000,
+              "block_length": 7,
+              "seed": 21769571400961093
+            }
+          },
+          "games": 30,
+          "average_guesses": 3.466666666666667,
+          "p95_guesses": 4,
+          "max_guesses": 5,
+          "failures": 0,
+          "coverage_gaps": 0,
+          "average_guesses_ci95": [
+            3.3,
+            3.6333333333333333
+          ],
+          "failure_rate_ci95": [
+            1.1102230246251565e-16,
+            0.1135133931739688
+          ]
+        },
+        "average_log_loss": 7.232596717639957,
+        "average_brier": 0.9992333183514325,
+        "average_target_probability": 0.0007542423057204742,
+        "average_target_rank": 343.9310344827586,
+        "prior_evidence": {
+          "measured_games": 29,
+          "top_1_recall": 0.0,
+          "top_1_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_3_recall": 0.0,
+          "top_3_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "top_5_recall": 0.0,
+          "top_5_recall_ci95": {
+            "lower": 0.0,
+            "upper": 0.11696979849974075
+          },
+          "calibration_bins": 10,
+          "expected_calibration_error": 0.0007779055090691749,
+          "expected_calibration_error_ci95": {
+            "lower": 0.0007775524265950529,
+            "upper": 0.0007782990079462606
+          },
+          "bootstrap": {
+            "resamples": 2000,
+            "block_length": 7,
+            "seed": 21769571400961093
+          }
+        },
+        "execution": {
+          "total_steps": 104,
+          "proxy_steps": 31,
+          "lookahead_steps": 14,
+          "escalated_exact_steps": 0,
+          "exact_steps": 59,
+          "danger_escalated_steps": 0,
+          "strict_recovery_steps": 0,
+          "uniform_recovery_steps": 0,
+          "epsilon_repair_steps": 1,
+          "dormant_fallback_steps": 14,
+          "exact_date_opener_artifact_hits": 0,
+          "recent_opener_artifact_hits": 0,
+          "reply_book_hits": 0,
+          "session_fallback_hits": 0
+        },
+        "failure_penalty_sensitivity": [
+          {
+            "penalty_guesses": 6.0,
+            "all_game_mean_guesses": 3.466666666666667,
+            "ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            }
+          },
+          {
+            "penalty_guesses": 7.0,
+            "all_game_mean_guesses": 3.466666666666667,
+            "ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            }
+          },
+          {
+            "penalty_guesses": 8.0,
+            "all_game_mean_guesses": 3.466666666666667,
+            "ci95": {
+              "lower": 3.3,
+              "upper": 3.6333333333333333
+            }
+          }
+        ],
+        "latency_p95_ms": 45.6356,
+        "session_fallback_cold_ms": 0.0,
+        "session_fallback_warm_ms": 0.0,
+        "proxy_step_pct": 0.2980769230769231,
+        "lookahead_step_pct": 0.1346153846153846,
+        "escalated_exact_step_pct": 0.0,
+        "exact_step_pct": 0.5673076923076923,
+        "average_lookahead_pool_ratio": 1.0,
+        "average_exact_pool_ratio": 1.0,
+        "games": [
+          {
+            "target": "dusty",
+            "outcome": {
+              "date": "2026-05-19",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "birsy",
+              "dusty"
+            ]
+          },
+          {
+            "target": "wreck",
+            "outcome": {
+              "date": "2026-05-20",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "sired",
+              "recur",
+              "wreck"
+            ]
+          },
+          {
+            "target": "agree",
+            "outcome": {
+              "date": "2026-05-21",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "cribs",
+              "agree"
+            ]
+          },
+          {
+            "target": "vocal",
+            "outcome": {
+              "date": "2026-05-22",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "valor",
+              "vocal"
+            ]
+          },
+          {
+            "target": "chuck",
+            "outcome": {
+              "date": "2026-05-23",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "crisp",
+              "chuck"
+            ]
+          },
+          {
+            "target": "niece",
+            "outcome": {
+              "date": "2026-05-24",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "suing",
+              "wince",
+              "niece"
+            ]
+          },
+          {
+            "target": "visit",
+            "outcome": {
+              "date": "2026-05-25",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "midst",
+              "visit"
+            ]
+          },
+          {
+            "target": "couch",
+            "outcome": {
+              "date": "2026-05-26",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "croon",
+              "comic",
+              "couch"
+            ]
+          },
+          {
+            "target": "stuff",
+            "outcome": {
+              "date": "2026-05-27",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "midst",
+              "stunk",
+              "stuff"
+            ]
+          },
+          {
+            "target": "divot",
+            "outcome": {
+              "date": "2026-05-28",
+              "status": "solved",
+              "guesses": 5
+            },
+            "path": [
+              "olate",
+              "trist",
+              "bigot",
+              "pivot",
+              "divot"
+            ]
+          },
+          {
+            "target": "clang",
+            "outcome": {
+              "date": "2026-05-29",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "nicks",
+              "clang"
+            ]
+          },
+          {
+            "target": "smile",
+            "outcome": {
+              "date": "2026-05-30",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "bings",
+              "smile"
+            ]
+          },
+          {
+            "target": "etude",
+            "outcome": {
+              "date": "2026-05-31",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "chirp",
+              "etude"
+            ]
+          },
+          {
+            "target": "chili",
+            "outcome": {
+              "date": "2026-06-01",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "pridy",
+              "kusti",
+              "chili"
+            ]
+          },
+          {
+            "target": "basis",
+            "outcome": {
+              "date": "2026-06-02",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "crimp",
+              "basis"
+            ]
+          },
+          {
+            "target": "notch",
+            "outcome": {
+              "date": "2026-06-03",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "sprit",
+              "botch",
+              "notch"
+            ]
+          },
+          {
+            "target": "alloy",
+            "outcome": {
+              "date": "2026-06-04",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "funky",
+              "alloy"
+            ]
+          },
+          {
+            "target": "nobly",
+            "outcome": {
+              "date": "2026-06-05",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "goold",
+              "ablow",
+              "nobly"
+            ]
+          },
+          {
+            "target": "morph",
+            "outcome": {
+              "date": "2026-06-06",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "croon",
+              "durrs",
+              "morph"
+            ]
+          },
+          {
+            "target": "thumb",
+            "outcome": {
+              "date": "2026-06-07",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "midst",
+              "trump",
+              "thumb"
+            ]
+          },
+          {
+            "target": "mafia",
+            "outcome": {
+              "date": "2026-06-08",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "pricy",
+              "mafia"
+            ]
+          },
+          {
+            "target": "wharf",
+            "outcome": {
+              "date": "2026-06-09",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "crins",
+              "dwarf",
+              "wharf"
+            ]
+          },
+          {
+            "target": "align",
+            "outcome": {
+              "date": "2026-06-10",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "aalii",
+              "align"
+            ]
+          },
+          {
+            "target": "testy",
+            "outcome": {
+              "date": "2026-06-11",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "treys",
+              "testy"
+            ]
+          },
+          {
+            "target": "break",
+            "outcome": {
+              "date": "2026-06-12",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "apgar",
+              "break"
+            ]
+          },
+          {
+            "target": "quell",
+            "outcome": {
+              "date": "2026-06-13",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "rilly",
+              "spell",
+              "quell"
+            ]
+          },
+          {
+            "target": "sepia",
+            "outcome": {
+              "date": "2026-06-14",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "apgar",
+              "sepia"
+            ]
+          },
+          {
+            "target": "broil",
+            "outcome": {
+              "date": "2026-06-15",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "world",
+              "broil"
+            ]
+          },
+          {
+            "target": "amaze",
+            "outcome": {
+              "date": "2026-06-16",
+              "status": "solved",
+              "guesses": 4
+            },
+            "path": [
+              "olate",
+              "crisp",
+              "dawah",
+              "amaze"
+            ]
+          },
+          {
+            "target": "token",
+            "outcome": {
+              "date": "2026-06-17",
+              "status": "solved",
+              "guesses": 3
+            },
+            "path": [
+              "olate",
+              "metro",
+              "token"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "limitations": [
+    "This artifact evaluates development dates only; the sealed final window remains unopened.",
+    "Prior probabilities remain heuristic until calibration improves on rolling-origin validation.",
+    "Identity fields remain non-cryptographic until the planned SHA-256 artifact format is approved and implemented."
+  ]
+}
