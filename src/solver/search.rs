@@ -755,6 +755,10 @@ impl Solver {
 
         let mut metrics =
             self.score_guess_metrics_for_subset(subset, weights, &self.exact_small_state_table);
+        metrics.retain(|metric| reply_guess_makes_progress(metric, subset.len()));
+        if metrics.is_empty() {
+            bail!("bounded lookahead found no progressing reply guess");
+        }
         let split_first = subset.len() > self.config.large_state_split_threshold;
         metrics.sort_by(|left, right| {
             compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
@@ -1155,6 +1159,10 @@ impl Solver {
         }
         selected
     }
+}
+
+pub(super) fn reply_guess_makes_progress(metric: &GuessMetrics, subset_len: usize) -> bool {
+    metric.worst_non_green_bucket_size < subset_len
 }
 
 pub(super) fn scaled_pool_size(base: usize, multiplier: f64) -> usize {

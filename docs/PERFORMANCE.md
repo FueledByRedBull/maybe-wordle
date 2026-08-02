@@ -31,6 +31,17 @@ The reported GUI stall was reproduced with `OLATE` / `10001` on `2026-07-26`, le
 
 This diagnostic is not part of the canonical allocator benchmark artifact and is not solve-quality evidence. It records the user-visible regression case and the latency of the progressive-rendering fix.
 
+## Learned-model experiment runtime
+
+The 2026-08-02 release runs are bounded development diagnostics, not interactive suggestion benchmarks:
+
+| Command | Work | Release wall time | Result |
+| --- | --- | ---: | --- |
+| `learned-proxy-experiment` | 24 states, 401 exact state/guess costs, six ridge values, five reference states | 8.275 s dataset + about 1.4 s reference | not promoted; held-out ordering/test MAE worsened |
+| `survival-experiment` | 12 chronological folds, 360 prior scores + 720 paired proxy-policy solves | 81.768 s | not promoted; only 26 reuse events and worse calibration/penalized guesses/latency |
+
+Both commands flush periodic progress. Learned exact-state generation writes an atomic checkpoint after every state and emits an ETA based on exact work completed in the current invocation; a fresh-generation/resume replay preserved the same semantic dataset digest. The survival fit aggregates identical era/day exposures as weighted binomial rows, avoiding millions of duplicate allocations without changing its objective. Its solve timings include parallel contention and report the maximum of the 12 fold-local p95 measurements; they are a bounded proxy-only comparison, not production-search latency. These timings include model/data loading and artifact generation on the current Windows machine, but not release compilation. The machine-readable results are [`learned-proxy-experiment-v1.json`](../benchmarks/predictive/learned-proxy-experiment-v1.json) and [`survival-experiment-v1.json`](../benchmarks/predictive/survival-experiment-v1.json).
+
 ## Reproduction
 
 From the repository root in PowerShell:

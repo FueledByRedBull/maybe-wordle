@@ -9,6 +9,7 @@ pub mod model;
 pub mod pattern_table;
 pub mod predictive;
 pub(crate) mod process_memory;
+pub mod research;
 pub mod scoring;
 pub mod seed;
 pub mod small_state;

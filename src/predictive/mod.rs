@@ -1,8 +1,10 @@
 pub mod books;
+pub mod learned_proxy;
 pub mod policy;
 pub mod recovery;
 pub mod search;
 pub mod state;
+pub mod survival;
 pub mod types;
 
 pub use books::PredictivePromotionSource;

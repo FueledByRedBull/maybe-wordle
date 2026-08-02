@@ -46,6 +46,107 @@ fn evenly_spaced_indices(total: usize, maximum: usize) -> Vec<usize> {
     }
 }
 
+fn learned_proxy_feature_names() -> Vec<String> {
+    [
+        "entropy",
+        "solve_probability",
+        "expected_remaining",
+        "force_in_two",
+        "worst_non_green_bucket_size",
+        "largest_non_green_bucket_mass",
+        "high_mass_ambiguous_bucket_count",
+        "smoothness_penalty",
+        "large_non_green_bucket_count",
+        "dangerous_mass_bucket_count",
+        "non_green_mass_in_large_buckets",
+        "posterior_answer_probability",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn learned_proxy_features(metric: &GuessMetrics) -> Vec<f64> {
+    vec![
+        metric.entropy,
+        metric.solve_probability,
+        metric.expected_remaining,
+        if metric.force_in_two { 1.0 } else { 0.0 },
+        metric.worst_non_green_bucket_size as f64,
+        metric.largest_non_green_bucket_mass,
+        metric.high_mass_ambiguous_bucket_count as f64,
+        metric.smoothness_penalty,
+        metric.large_non_green_bucket_count as f64,
+        metric.dangerous_mass_bucket_count as f64,
+        metric.non_green_mass_in_large_buckets,
+        metric.posterior_answer_probability,
+    ]
+}
+
+fn learned_proxy_guess_pool(
+    solver: &Solver,
+    metrics: &[GuessMetrics],
+    survivors: &[usize],
+    count: usize,
+) -> Vec<usize> {
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |metric: &GuessMetrics| {
+        if seen.insert(metric.guess_index) {
+            selected.push(metric.guess_index);
+        }
+    };
+    let primary_take = (count / 2).max(1);
+    let secondary_take = (count.saturating_sub(primary_take) / 3).max(1);
+    let mut primary = metrics.iter().collect::<Vec<_>>();
+    primary.sort_by(|left, right| {
+        compare_guess_metrics_for_state(left, right, &solver.guesses, false)
+    });
+    for metric in primary.into_iter().take(primary_take) {
+        push(metric);
+    }
+    let mut by_entropy = metrics.iter().collect::<Vec<_>>();
+    by_entropy.sort_by(|left, right| {
+        right
+            .entropy
+            .total_cmp(&left.entropy)
+            .then_with(|| solver.guesses[left.guess_index].cmp(&solver.guesses[right.guess_index]))
+    });
+    for metric in by_entropy.into_iter().take(secondary_take) {
+        push(metric);
+    }
+    let mut by_worst = metrics.iter().collect::<Vec<_>>();
+    by_worst.sort_by(|left, right| {
+        left.worst_non_green_bucket_size
+            .cmp(&right.worst_non_green_bucket_size)
+            .then_with(|| {
+                left.largest_non_green_bucket_mass
+                    .total_cmp(&right.largest_non_green_bucket_mass)
+            })
+    });
+    for metric in by_worst.into_iter().take(secondary_take) {
+        push(metric);
+    }
+    let mut by_solve = metrics.iter().collect::<Vec<_>>();
+    by_solve.sort_by(|left, right| {
+        right
+            .solve_probability
+            .total_cmp(&left.solve_probability)
+            .then_with(|| solver.guesses[left.guess_index].cmp(&solver.guesses[right.guess_index]))
+    });
+    for metric in by_solve.into_iter().take(secondary_take) {
+        push(metric);
+    }
+    for answer_index in survivors {
+        if let Some(guess_index) = solver.guess_index.get(&solver.answers[*answer_index].word)
+            && seen.insert(*guess_index)
+        {
+            selected.push(*guess_index);
+        }
+    }
+    selected
+}
+
 fn summarize_search_regret(
     states: &[SearchRegretState],
     choice: impl Fn(&SearchRegretState) -> &SearchRegretChoice,
@@ -95,8 +196,30 @@ impl Solver {
         top: usize,
         book_usage: PredictiveBookUsage,
     ) -> Result<DetailedSolveRun> {
+        let state = self.initial_state(as_of);
+        self.solve_target_from_initial_state_detailed(
+            target,
+            as_of,
+            date,
+            top,
+            state,
+            SolveExecutionPolicy {
+                book_usage,
+                search_mode: None,
+            },
+        )
+    }
+
+    fn solve_target_from_initial_state_detailed(
+        &self,
+        target: &str,
+        as_of: NaiveDate,
+        date: NaiveDate,
+        top: usize,
+        mut state: SolveState,
+        policy: SolveExecutionPolicy,
+    ) -> Result<DetailedSolveRun> {
         let target = target.to_ascii_lowercase();
-        let mut state = self.initial_state(as_of);
         let mut observations = Vec::new();
 
         if !state
@@ -116,13 +239,25 @@ impl Solver {
         let mut steps = Vec::new();
         while steps.len() < 6 {
             let surviving_before = state.surviving.len();
-            let batch = self.suggestion_batch_for_history(
-                as_of,
-                &observations,
-                &state,
-                top.max(1),
-                book_usage,
-            )?;
+            let batch = match policy.search_mode {
+                Some(mode) => self.suggestion_batch_internal_with_search_mode(
+                    &state,
+                    top.max(1),
+                    Some(PredictiveContext {
+                        as_of,
+                        observations: &observations,
+                    }),
+                    policy.book_usage,
+                    Some(mode),
+                )?,
+                None => self.suggestion_batch_for_history(
+                    as_of,
+                    &observations,
+                    &state,
+                    top.max(1),
+                    policy.book_usage,
+                )?,
+            };
             let chosen = batch
                 .suggestions
                 .first()
@@ -196,6 +331,454 @@ impl Solver {
         top: usize,
     ) -> Result<DetailedBacktestReport> {
         self.backtest_detailed_with_book_usage(from, to, top, PredictiveBookUsage::DiskOnly)
+    }
+
+    pub fn learned_proxy_dataset(
+        &self,
+        paths: &ProjectPaths,
+        request: LearnedProxyDatasetRequest,
+    ) -> Result<ExhaustiveCostDatasetArtifact> {
+        if request.minimum_survivors < 2 || request.minimum_survivors > request.maximum_survivors {
+            bail!("learned-proxy survivor range is invalid");
+        }
+        if request.maximum_states_per_split == 0 || request.guesses_per_state < 2 {
+            bail!("learned-proxy state and guess budgets must be positive");
+        }
+        if request.maximum_seconds == 0 || request.maximum_memory_mb == 0 {
+            bail!("learned-proxy time and memory budgets must be positive");
+        }
+        let plan = canonical_development_evaluation_plan(paths, "building learned-proxy data")?;
+        if plan.folds.len() < 2 {
+            bail!("learned-proxy data requires at least two development folds");
+        }
+        let validation_fold = &plan.folds[plan.folds.len() - 2];
+        let test_fold = &plan.folds[plan.folds.len() - 1];
+        let split = DatasetSplitMetadata::chronological(ChronologicalSplitMetadata {
+            train_end: validation_fold.training.end,
+            validation_start: validation_fold.validation.start,
+            validation_end: validation_fold.validation.end,
+            test_start: test_fold.validation.start,
+            test_end: test_fold.validation.end,
+        })?;
+        let started = Instant::now();
+        let budget = std::time::Duration::from_secs(request.maximum_seconds);
+        let maximum_memory_bytes = request.maximum_memory_mb.saturating_mul(1024 * 1024);
+        let input_fingerprint = rolling_source_identity(paths)?;
+        let executable_fingerprint = current_executable_fingerprint()?;
+        let config_toml = toml::to_string_pretty(&self.config)?;
+        let config_fingerprint = crate::identity::digest_bytes_tagged(
+            "maybe-wordle-learned-proxy-config-v1",
+            config_toml.as_bytes(),
+        );
+        let replay_identity = ReplayIdentityInput {
+            format_version: crate::experiments::exhaustive_cost::REPLAY_IDENTITY_FORMAT_VERSION,
+            algorithm_version: "native-weighted-exact-v1".to_string(),
+            solver_identity: input_fingerprint.clone(),
+            source_data_fingerprint: input_fingerprint.clone(),
+            config_fingerprint: config_fingerprint.clone(),
+            feedback_fingerprint: crate::identity::digest_bytes_tagged(
+                "maybe-wordle-feedback-contract-v1",
+                b"wordle-two-pass-base3-all-green-242",
+            ),
+            state_encoding_version: 1,
+            weighting_fingerprint: config_fingerprint.clone(),
+        };
+        let replay_identity_digest = replay_identity.digest_hex()?;
+        let resource_budget = ResourceBudget {
+            maximum_states: request.maximum_states_per_split.saturating_mul(3),
+            maximum_rows: request
+                .maximum_states_per_split
+                .saturating_mul(3)
+                .saturating_mul(
+                    request
+                        .guesses_per_state
+                        .saturating_add(request.maximum_survivors),
+                ),
+            maximum_seconds: request.maximum_seconds,
+            maximum_memory_bytes: Some(maximum_memory_bytes),
+            checkpoint_every_rows: request.guesses_per_state.max(1),
+        };
+        resource_budget.validate()?;
+        let ranges = [
+            (
+                DatasetSplit::Train,
+                DateRange::new(plan.history.start, validation_fold.training.end)?,
+            ),
+            (DatasetSplit::Validation, validation_fold.validation),
+            (DatasetSplit::Test, test_fold.validation),
+        ];
+        let mut selected_states = Vec::new();
+        for (row_split, range) in ranges {
+            let candidates = self.collect_learned_proxy_states(
+                range,
+                request.minimum_survivors,
+                request.maximum_survivors,
+                request.maximum_states_per_split.saturating_mul(6).max(12),
+                started,
+                budget,
+            )?;
+            if candidates.is_empty() {
+                bail!(
+                    "learned-proxy split {:?} has no reachable states in {} through {}",
+                    row_split,
+                    range.start,
+                    range.end
+                );
+            }
+            for index in evenly_spaced_indices(candidates.len(), request.maximum_states_per_split) {
+                selected_states.push((row_split, candidates[index].clone()));
+            }
+        }
+
+        let feature_names = learned_proxy_feature_names();
+        let mut rows = Vec::new();
+        let mut completed_state_ids = BTreeSet::new();
+        let mut prior_elapsed_ms = 0_u64;
+        if let Some(checkpoint_path) = request
+            .checkpoint_path
+            .as_ref()
+            .filter(|path| path.exists())
+        {
+            let raw = fs::read_to_string(checkpoint_path).with_context(|| {
+                format!(
+                    "read learned-proxy checkpoint {}",
+                    checkpoint_path.display()
+                )
+            })?;
+            let checkpoint: ExhaustiveCostCheckpoint =
+                serde_json::from_str(&raw).with_context(|| {
+                    format!(
+                        "decode learned-proxy checkpoint {}",
+                        checkpoint_path.display()
+                    )
+                })?;
+            checkpoint.validate(&split)?;
+            if checkpoint.replay_identity_digest != replay_identity_digest {
+                bail!(
+                    "learned-proxy checkpoint {} belongs to different source/config/code inputs",
+                    checkpoint_path.display()
+                );
+            }
+            if checkpoint.budget != resource_budget {
+                bail!(
+                    "learned-proxy checkpoint {} uses a different resource or sampling budget",
+                    checkpoint_path.display()
+                );
+            }
+            prior_elapsed_ms = checkpoint.progress.elapsed_ms;
+            completed_state_ids.extend(checkpoint.completed_state_ids);
+            rows = checkpoint.rows;
+            eprintln!(
+                "learned-proxy phase=resume states={} rows={} prior_elapsed_s={:.1} checkpoint={}",
+                completed_state_ids.len(),
+                rows.len(),
+                prior_elapsed_ms as f64 / 1_000.0,
+                checkpoint_path.display()
+            );
+        }
+        let total_states = selected_states.len();
+        let selected_state_ids = selected_states
+            .iter()
+            .map(|(_, candidate)| {
+                format!(
+                    "{}-turn-{}-{}",
+                    candidate.date, candidate.turn, candidate.target
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if !completed_state_ids.is_subset(&selected_state_ids) {
+            bail!("learned-proxy checkpoint contains states outside the deterministic sample");
+        }
+        let resumed_states = completed_state_ids.len();
+        let exact_started = Instant::now();
+        for (row_split, candidate) in selected_states {
+            let state_id = format!(
+                "{}-turn-{}-{}",
+                candidate.date, candidate.turn, candidate.target
+            );
+            if completed_state_ids.contains(&state_id) {
+                continue;
+            }
+            let cumulative_elapsed_ms = prior_elapsed_ms
+                .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            if cumulative_elapsed_ms > request.maximum_seconds.saturating_mul(1_000) {
+                bail!(
+                    "learned-proxy dataset exceeded its {} second budget",
+                    request.maximum_seconds
+                );
+            }
+            if let Some(snapshot) = crate::process_memory::process_memory_snapshot()
+                && snapshot.peak_working_set_bytes > maximum_memory_bytes
+            {
+                bail!(
+                    "learned-proxy dataset exceeded its {} MiB memory budget",
+                    request.maximum_memory_mb
+                );
+            }
+            let as_of = candidate
+                .date
+                .checked_sub_days(Days::new(1))
+                .ok_or_else(|| anyhow!("cannot audit a game before launch date"))?;
+            let state = self.apply_history(as_of, &candidate.observations)?;
+            if state.surviving.len() != candidate.surviving_answers {
+                bail!("learned-proxy state reconstruction changed survivor count");
+            }
+            let mut metrics = self.score_guess_metrics_for_subset(
+                &state.surviving,
+                &state.weights,
+                &self.exact_small_state_table,
+            );
+            metrics.retain(|metric| reply_guess_makes_progress(metric, state.surviving.len()));
+            let metric_by_guess = metrics
+                .iter()
+                .map(|metric| (metric.guess_index, *metric))
+                .collect::<HashMap<_, _>>();
+            let guess_indexes = learned_proxy_guess_pool(
+                self,
+                &metrics,
+                &state.surviving,
+                request.guesses_per_state,
+            );
+            let mut memo = PredictiveMemoMap::default();
+            let mut scratch = ExactSearchScratch::new();
+            let trajectory_id = format!("{}-{}", candidate.date, candidate.target);
+            let exact_state = ExactState {
+                state_id: state_id.clone(),
+                trajectory_id,
+                date: Some(candidate.date),
+                step_index: candidate.turn.saturating_sub(1),
+                survivor_ids: state
+                    .surviving
+                    .iter()
+                    .map(|index| u32::try_from(*index).context("answer index exceeds u32"))
+                    .collect::<Result<Vec<_>>>()?,
+                survivor_weights: state
+                    .surviving
+                    .iter()
+                    .map(|index| state.weights[*index])
+                    .collect(),
+            };
+            for guess_index in guess_indexes {
+                let metric = metric_by_guess[&guess_index];
+                let exact_cost = self.exact_cost_for_guess(
+                    guess_index,
+                    ExactCostContext {
+                        subset: &state.surviving,
+                        weights: &state.weights,
+                        small_state_table: &self.exact_small_state_table,
+                        memo: &mut memo,
+                        best_bound: f64::INFINITY,
+                        scratch: &mut scratch,
+                        depth: 0,
+                    },
+                )?;
+                if exact_cost.is_finite() {
+                    let mut row = ExhaustiveCostRow {
+                        state: exact_state.clone(),
+                        guess: self.guesses[guess_index].clone(),
+                        exact_continuation_cost: exact_cost,
+                        feature_values: learned_proxy_features(&metric),
+                        baseline_proxy_cost: Some(metric.proxy_cost),
+                        split: row_split,
+                    };
+                    row.canonicalize_numeric_values();
+                    rows.push(row);
+                }
+            }
+            completed_state_ids.insert(state_id.clone());
+            rows.sort_by_key(ExhaustiveCostRow::key);
+            let elapsed_ms = prior_elapsed_ms
+                .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            let completed = completed_state_ids.len();
+            let completed_this_run = completed.saturating_sub(resumed_states);
+            let eta_seconds = if completed_this_run == 0 {
+                0.0
+            } else {
+                exact_started.elapsed().as_secs_f64() * (total_states - completed) as f64
+                    / completed_this_run as f64
+            };
+            if let Some(checkpoint_path) = &request.checkpoint_path {
+                let checkpoint = ExhaustiveCostCheckpoint {
+                    format_version:
+                        crate::experiments::exhaustive_cost::EXHAUSTIVE_COST_FORMAT_VERSION,
+                    replay_identity_digest: replay_identity_digest.clone(),
+                    budget: resource_budget,
+                    progress: ExhaustiveProgress {
+                        phase: "exact".to_string(),
+                        states_evaluated: completed,
+                        rows_emitted: rows.len(),
+                        elapsed_ms,
+                        peak_memory_bytes: crate::process_memory::process_memory_snapshot()
+                            .map(|snapshot| snapshot.peak_working_set_bytes),
+                        last_state_id: completed_state_ids.iter().next_back().cloned(),
+                        complete: false,
+                        stop_reason: None,
+                    },
+                    completed_state_ids: completed_state_ids.iter().cloned().collect(),
+                    rows: rows.clone(),
+                };
+                checkpoint.validate(&split)?;
+                crate::atomic_file::atomic_write(
+                    checkpoint_path,
+                    &serde_json::to_vec_pretty(&checkpoint)?,
+                )?;
+            }
+            eprintln!(
+                "learned-proxy phase=exact states={}/{} rows={} survivors={} elapsed_s={:.1} eta_s={:.1}",
+                completed,
+                total_states,
+                rows.len(),
+                state.surviving.len(),
+                elapsed_ms as f64 / 1_000.0,
+                eta_seconds
+            );
+            let _ = std::io::stderr().flush();
+        }
+        if completed_state_ids.len() != total_states {
+            bail!(
+                "learned-proxy checkpoint/sample mismatch: completed {} of {} states",
+                completed_state_ids.len(),
+                total_states
+            );
+        }
+        rows.sort_by_key(ExhaustiveCostRow::key);
+        let elapsed_ms = prior_elapsed_ms
+            .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        let artifact = ExhaustiveCostDatasetArtifact {
+            format_version: crate::experiments::exhaustive_cost::EXHAUSTIVE_COST_FORMAT_VERSION,
+            provenance: DatasetProvenance {
+                dataset_id: crate::identity::digest_bytes_tagged(
+                    "maybe-wordle-learned-proxy-dataset-v1",
+                    format!("{}:{}", input_fingerprint, rows.len()).as_bytes(),
+                ),
+                generator_version: "native-weighted-exact-v1".to_string(),
+                source_identity: input_fingerprint.clone(),
+                source_data_fingerprint: input_fingerprint.clone(),
+                config_fingerprint,
+                executable_fingerprint: Some(executable_fingerprint),
+                cutoff_start: plan.history.start,
+                cutoff_end: plan.development.end,
+                replay_identity,
+            },
+            split,
+            budget: resource_budget,
+            progress: ExhaustiveProgress {
+                phase: "complete".to_string(),
+                states_evaluated: total_states,
+                rows_emitted: rows.len(),
+                elapsed_ms,
+                peak_memory_bytes: crate::process_memory::process_memory_snapshot()
+                    .map(|snapshot| snapshot.peak_working_set_bytes),
+                last_state_id: rows.last().map(|row| row.state.state_id.clone()),
+                complete: true,
+                stop_reason: None,
+            },
+            rows,
+            checkpoint: None,
+        };
+        artifact.validate()?;
+        if let Some(checkpoint_path) = &request.checkpoint_path {
+            let checkpoint = ExhaustiveCostCheckpoint {
+                format_version: crate::experiments::exhaustive_cost::EXHAUSTIVE_COST_FORMAT_VERSION,
+                replay_identity_digest,
+                budget: resource_budget,
+                progress: artifact.progress.clone(),
+                completed_state_ids: completed_state_ids.into_iter().collect(),
+                rows: artifact.rows.clone(),
+            };
+            checkpoint.validate(&artifact.split)?;
+            crate::atomic_file::atomic_write(
+                checkpoint_path,
+                &serde_json::to_vec_pretty(&checkpoint)?,
+            )?;
+        }
+        ensure_rolling_source_identity(paths, &input_fingerprint)?;
+        eprintln!(
+            "learned-proxy phase=complete features={} rows={} elapsed_s={:.1}",
+            feature_names.len(),
+            artifact.rows.len(),
+            elapsed_ms as f64 / 1_000.0
+        );
+        Ok(artifact)
+    }
+
+    fn collect_learned_proxy_states(
+        &self,
+        range: DateRange,
+        minimum_survivors: usize,
+        maximum_survivors: usize,
+        maximum_games: usize,
+        started: Instant,
+        budget: std::time::Duration,
+    ) -> Result<Vec<SearchRegretCandidateState>> {
+        let games = self
+            .history_dates
+            .iter()
+            .filter(|entry| range.contains(entry.print_date))
+            .collect::<Vec<_>>();
+        let indices = evenly_spaced_indices(games.len(), maximum_games);
+        let total = indices.len();
+        let mut candidates = Vec::new();
+        for (game_number, index) in indices.into_iter().enumerate() {
+            if started.elapsed() > budget {
+                bail!("learned-proxy collection exceeded its wall-clock budget");
+            }
+            let entry = games[index];
+            let as_of = entry
+                .print_date
+                .checked_sub_days(Days::new(1))
+                .ok_or_else(|| anyhow!("cannot audit a game before launch date"))?;
+            let target = entry.solution.to_ascii_lowercase();
+            let mut state = self.initial_state(as_of);
+            let mut observations = Vec::new();
+            for step_index in 0..5 {
+                if (minimum_survivors..=maximum_survivors).contains(&state.surviving.len()) {
+                    candidates.push(SearchRegretCandidateState {
+                        date: entry.print_date,
+                        target: target.clone(),
+                        turn: step_index + 1,
+                        observations,
+                        surviving_answers: state.surviving.len(),
+                    });
+                    break;
+                }
+                if state.surviving.len() < minimum_survivors {
+                    break;
+                }
+                let chosen = self
+                    .suggestion_batch_internal_with_search_mode(
+                        &state,
+                        1,
+                        Some(PredictiveContext {
+                            as_of,
+                            observations: &observations,
+                        }),
+                        PredictiveBookUsage::None,
+                        Some(PredictiveSearchMode::ProxyOnly),
+                    )?
+                    .suggestions
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("proxy path returned no suggestion"))?;
+                let feedback = score_guess(&chosen.word, &target);
+                if feedback == ALL_GREEN_PATTERN {
+                    break;
+                }
+                observations.push((chosen.word.clone(), feedback));
+                self.apply_feedback(&mut state, &chosen.word, feedback)?;
+            }
+            if game_number < 2 || (game_number + 1) % 10 == 0 || game_number + 1 == total {
+                eprintln!(
+                    "learned-proxy phase=collect games={}/{} states={} elapsed_s={:.1}",
+                    game_number + 1,
+                    total,
+                    candidates.len(),
+                    started.elapsed().as_secs_f64()
+                );
+                let _ = std::io::stderr().flush();
+            }
+        }
+        Ok(candidates)
     }
 
     pub fn search_regret_report(
@@ -669,6 +1252,174 @@ impl Solver {
         book_usage: PredictiveBookUsage,
     ) -> Result<DetailedBacktestReport> {
         self.backtest_selected_games_with_progress(games, top, book_usage, None)
+    }
+
+    pub fn compare_survival_model_on_games(
+        &self,
+        games: &[NytDailyEntry],
+        model: &crate::predictive::survival::SurvivalModel,
+        top: usize,
+    ) -> Result<SurvivalSolveComparison> {
+        if games.is_empty() {
+            bail!("survival solve comparison requires at least one game");
+        }
+        model.validate()?;
+        let baseline = self.evaluate_solve_policy(games, "logistic", |entry| {
+            let started = Instant::now();
+            let (outcome, _) = self.solve_backtest_entry_proxy(entry, top)?;
+            Ok((outcome, started.elapsed().as_secs_f64() * 1_000.0))
+        })?;
+        let survival = self.evaluate_solve_policy(games, "survival", |entry| {
+            let started = Instant::now();
+            let (outcome, _) = self.solve_backtest_entry_with_survival(entry, model, top)?;
+            Ok((outcome, started.elapsed().as_secs_f64() * 1_000.0))
+        })?;
+        Ok(SurvivalSolveComparison { baseline, survival })
+    }
+
+    fn evaluate_solve_policy<F>(
+        &self,
+        games: &[NytDailyEntry],
+        label: &str,
+        evaluate: F,
+    ) -> Result<SolvePolicyEvidence>
+    where
+        F: Fn(&NytDailyEntry) -> Result<(GameOutcome, f64)> + Sync,
+    {
+        let started = Instant::now();
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+        let total = games.len();
+        let evaluated = games
+            .par_iter()
+            .map(|entry| {
+                let result = evaluate(entry);
+                let current = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if current == 1 || current.is_multiple_of(10) || current == total {
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let eta = if current == 0 {
+                        0.0
+                    } else {
+                        elapsed * (total - current) as f64 / current as f64
+                    };
+                    eprintln!(
+                        "survival phase=solve policy={} games={}/{} elapsed_s={:.1} eta_s={:.1}",
+                        label, current, total, elapsed, eta
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+                result
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let (outcomes, mut latencies_ms) = evaluated.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+        latencies_ms.sort_by(f64::total_cmp);
+        let p95_index = ((latencies_ms.len() as f64 * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(latencies_ms.len().saturating_sub(1));
+        let canonical = summarize_predictive_outcomes(&outcomes, 7.0, BootstrapConfig::default())?;
+        let failure_rate_ci95 = (
+            1.0 - canonical.solve_rate_ci95.upper,
+            1.0 - canonical.solve_rate_ci95.lower,
+        );
+        Ok(SolvePolicyEvidence {
+            summary: BacktestStats {
+                games: canonical.scheduled_games,
+                average_guesses: canonical.conditional_mean_guesses,
+                p95_guesses: canonical.p95_guesses,
+                max_guesses: canonical.max_guesses,
+                failures: canonical.unsolved_games + canonical.coverage_gaps,
+                coverage_gaps: canonical.coverage_gaps,
+                average_guesses_ci95: (
+                    canonical.conditional_mean_guesses_ci95.lower,
+                    canonical.conditional_mean_guesses_ci95.upper,
+                ),
+                failure_rate_ci95,
+                canonical,
+            },
+            elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            latency_p95_ms: latencies_ms[p95_index],
+            peak_memory_bytes: crate::process_memory::process_memory_snapshot()
+                .map(|snapshot| snapshot.peak_working_set_bytes),
+        })
+    }
+
+    fn solve_backtest_entry_with_survival(
+        &self,
+        entry: &NytDailyEntry,
+        model: &crate::predictive::survival::SurvivalModel,
+        top: usize,
+    ) -> Result<(GameOutcome, DetailedSolveRun)> {
+        let as_of = entry
+            .print_date
+            .checked_sub_days(Days::new(1))
+            .ok_or_else(|| anyhow!("cannot solve before launch date"))?;
+        let modeled_weights = self
+            .answers
+            .iter()
+            .take(self.primary_answer_count)
+            .map(|answer| {
+                let snapshot = weight_snapshot_for_mode(answer, &self.config, as_of, self.mode);
+                let recency_weight = match snapshot.last_seen {
+                    Some(last_seen) => (1.0
+                        - model.try_predict_interval(last_seen, as_of)?.survival)
+                        .max(self.config.cooldown_floor),
+                    None => 1.0,
+                };
+                Ok(snapshot.base_weight * recency_weight * snapshot.manual_weight)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let state = self.initial_state_with_modeled_weights(as_of, Some(&modeled_weights))?;
+        let run = self.solve_target_from_initial_state_detailed(
+            &entry.solution,
+            as_of,
+            entry.print_date,
+            top,
+            state,
+            SolveExecutionPolicy {
+                book_usage: PredictiveBookUsage::None,
+                search_mode: Some(PredictiveSearchMode::ProxyOnly),
+            },
+        )?;
+        let outcome = if run.steps.is_empty() {
+            GameOutcome::coverage_gap(entry.print_date)
+        } else if run.solved {
+            GameOutcome::solved(entry.print_date, run.steps.len())
+        } else {
+            GameOutcome::unsolved(entry.print_date, run.steps.len())
+        };
+        Ok((outcome, run))
+    }
+
+    fn solve_backtest_entry_proxy(
+        &self,
+        entry: &NytDailyEntry,
+        top: usize,
+    ) -> Result<(GameOutcome, DetailedSolveRun)> {
+        let as_of = entry
+            .print_date
+            .checked_sub_days(Days::new(1))
+            .ok_or_else(|| anyhow!("cannot solve before launch date"))?;
+        let state = self.initial_state(as_of);
+        let run = self.solve_target_from_initial_state_detailed(
+            &entry.solution,
+            as_of,
+            entry.print_date,
+            top,
+            state,
+            SolveExecutionPolicy {
+                book_usage: PredictiveBookUsage::None,
+                search_mode: Some(PredictiveSearchMode::ProxyOnly),
+            },
+        )?;
+        let outcome = if run.steps.is_empty() {
+            GameOutcome::coverage_gap(entry.print_date)
+        } else if run.solved {
+            GameOutcome::solved(entry.print_date, run.steps.len())
+        } else {
+            GameOutcome::unsolved(entry.print_date, run.steps.len())
+        };
+        Ok((outcome, run))
     }
 
     pub(super) fn backtest_selected_games_with_progress(
@@ -5039,7 +5790,7 @@ fn filesystem_tree_bytes(path: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
-fn rolling_source_identity(paths: &ProjectPaths) -> Result<String> {
+pub(super) fn rolling_source_identity(paths: &ProjectPaths) -> Result<String> {
     let mut files = Vec::new();
     collect_regular_files(&paths.root.join("src"), &mut files)?;
     collect_regular_files(&paths.root.join("tests"), &mut files)?;
@@ -5073,6 +5824,13 @@ fn rolling_source_identity(paths: &ProjectPaths) -> Result<String> {
     Ok(hash.finish_tagged())
 }
 
+pub(super) fn current_executable_fingerprint() -> Result<String> {
+    let executable = std::env::current_exe().context("failed to locate the current executable")?;
+    let mut hash = crate::identity::CanonicalSha256::new("maybe-wordle-executable-v1");
+    hash_identity_file(&mut hash, &executable)?;
+    Ok(hash.finish_tagged())
+}
+
 fn hash_identity_file(hash: &mut crate::identity::CanonicalSha256, path: &Path) -> Result<()> {
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
@@ -5083,7 +5841,7 @@ fn hash_identity_file(hash: &mut crate::identity::CanonicalSha256, path: &Path) 
     Ok(())
 }
 
-fn ensure_rolling_source_identity(paths: &ProjectPaths, expected: &str) -> Result<()> {
+pub(super) fn ensure_rolling_source_identity(paths: &ProjectPaths, expected: &str) -> Result<()> {
     if rolling_source_identity(paths)? != expected {
         bail!(
             "source, executable, or data inputs changed during evaluation; discard this run and restart from a consistent snapshot"

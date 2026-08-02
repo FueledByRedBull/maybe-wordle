@@ -419,7 +419,7 @@ impl AnswerRecordBuilder {
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDate;
+    use chrono::{Duration, NaiveDate};
 
     use crate::config::PriorConfig;
 
@@ -447,6 +447,57 @@ mod tests {
         assert_eq!(snapshot.base_weight, config.base_seed_weight);
         assert!(snapshot.recency_weight > config.cooldown_floor);
         assert!(snapshot.final_weight > 0.0);
+    }
+
+    #[test]
+    fn weighted_default_config_cooldown_boundary_is_finite_monotonic_and_tightly_bounded() {
+        const MAX_DEFAULT_CONFIG_BOUNDARY_DISCONTINUITY: f64 = 1.0e-6;
+
+        let config = PriorConfig::default();
+        assert!(config.cooldown_days > 0);
+        assert!(config.logistic_k > 0.0);
+        let last_seen = NaiveDate::from_ymd_opt(2024, 1, 1).expect("date");
+        let record = AnswerRecord {
+            word: "cigar".to_string(),
+            in_seed: true,
+            manual_entry: false,
+            manual_weight: 1.0,
+            history_dates: vec![last_seen],
+        };
+        let snapshot_at = |days_since_last_seen: i64| {
+            weight_snapshot_for_mode(
+                &record,
+                &config,
+                last_seen + Duration::days(days_since_last_seen),
+                WeightMode::Weighted,
+            )
+        };
+
+        let before = snapshot_at(config.cooldown_days - 1);
+        let at = snapshot_at(config.cooldown_days);
+        let after = snapshot_at(config.cooldown_days + 1);
+
+        for (label, snapshot) in [("before", &before), ("at", &at), ("after", &after)] {
+            assert!(
+                snapshot.recency_weight.is_finite(),
+                "{label} cooldown weight must be finite"
+            );
+            assert!(
+                (config.cooldown_floor..=1.0).contains(&snapshot.recency_weight),
+                "{label} cooldown weight must be in [floor, 1], got {}",
+                snapshot.recency_weight
+            );
+        }
+
+        assert_eq!(before.recency_weight, config.cooldown_floor);
+        assert!(before.recency_weight < at.recency_weight);
+        assert!(at.recency_weight < after.recency_weight);
+
+        let boundary_discontinuity = at.recency_weight - before.recency_weight;
+        assert!(
+            boundary_discontinuity <= MAX_DEFAULT_CONFIG_BOUNDARY_DISCONTINUITY,
+            "default config cooldown boundary jump is too large: {boundary_discontinuity}"
+        );
     }
 
     #[test]

@@ -60,8 +60,28 @@ pub fn format_feedback_letters(pattern: u8) -> String {
 pub fn score_guess(guess: &str, answer: &str) -> u8 {
     let guess = guess.as_bytes();
     let answer = answer.as_bytes();
-    debug_assert_eq!(guess.len(), WORD_LENGTH);
-    debug_assert_eq!(answer.len(), WORD_LENGTH);
+
+    #[cfg(debug_assertions)]
+    {
+        debug_assert_eq!(
+            guess.len(),
+            WORD_LENGTH,
+            "guess must contain exactly {WORD_LENGTH} bytes"
+        );
+        debug_assert_eq!(
+            answer.len(),
+            WORD_LENGTH,
+            "answer must contain exactly {WORD_LENGTH} bytes"
+        );
+        debug_assert!(
+            guess.iter().all(|byte| byte.is_ascii_lowercase()),
+            "guess must contain only lowercase ASCII bytes"
+        );
+        debug_assert!(
+            answer.iter().all(|byte| byte.is_ascii_lowercase()),
+            "answer must contain only lowercase ASCII bytes"
+        );
+    }
 
     let mut feedback = [0u8; WORD_LENGTH];
     let mut counts = [0u8; 26];
@@ -128,9 +148,15 @@ mod tests {
 
     #[test]
     fn handles_simple_green_case() {
+        assert_eq!(score_guess("cigar", "cigar"), super::ALL_GREEN_PATTERN);
+        assert_eq!(format_feedback_trits(super::ALL_GREEN_PATTERN), "22222");
+    }
+
+    #[test]
+    fn excess_duplicate_copies_are_gray_after_an_exact_match() {
         assert_eq!(
-            format_feedback_trits(score_guess("cigar", "cigar")),
-            "22222"
+            format_feedback_letters(score_guess("aaaaa", "abcde")),
+            "gbbbb"
         );
     }
 }

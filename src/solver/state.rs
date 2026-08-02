@@ -8,6 +8,30 @@ impl Solver {
     }
 
     pub fn initial_state(&self, as_of: NaiveDate) -> SolveState {
+        self.initial_state_with_modeled_weights(as_of, None)
+            .expect("default weight snapshots must construct a valid initial state")
+    }
+
+    pub(super) fn initial_state_with_modeled_weights(
+        &self,
+        as_of: NaiveDate,
+        modeled_weight_override: Option<&[f64]>,
+    ) -> Result<SolveState> {
+        if let Some(overrides) = modeled_weight_override {
+            if overrides.len() != self.primary_answer_count {
+                bail!(
+                    "modeled-weight override has {} values; expected {}",
+                    overrides.len(),
+                    self.primary_answer_count
+                );
+            }
+            if overrides
+                .iter()
+                .any(|weight| !weight.is_finite() || *weight < 0.0)
+            {
+                bail!("modeled-weight override contains a non-finite or negative value");
+            }
+        }
         let recovery_policy = &self.config.recovery;
         let mut modeled_weights = vec![0.0; self.answers.len()];
         let mut recovery_weights = vec![0.0; self.answers.len()];
@@ -25,7 +49,9 @@ impl Solver {
             .enumerate()
         {
             let snapshot = weight_snapshot_for_mode(answer, &self.config, as_of, self.mode);
-            let modeled_weight = snapshot.final_weight.max(0.0);
+            let modeled_weight = modeled_weight_override
+                .map_or(snapshot.final_weight, |weights| weights[index])
+                .max(0.0);
             if snapshot.base_weight > 0.0 {
                 supported_survivors.push(index);
                 recovery_weights[index] = snapshot.base_weight * snapshot.manual_weight;
@@ -77,7 +103,7 @@ impl Solver {
             }
         };
 
-        SolveState {
+        Ok(SolveState {
             surviving,
             fallback_surviving,
             fallback_active: false,
@@ -87,7 +113,7 @@ impl Solver {
             modeled_total_weight,
             total_weight,
             recovery_mode_used,
-        }
+        })
     }
 
     pub fn apply_history(

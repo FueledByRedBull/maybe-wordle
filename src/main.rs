@@ -26,8 +26,12 @@ use maybe_wordle::{
     model::build_model_artifacts,
     model::{ModelVariant, WeightMode},
     predictive::{PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode},
+    research::{fit_learned_proxy_experiment, run_survival_experiment},
     seed::{MergeStrategy, add_manual_addition, merge_seed_lists, reconcile_seed_lists},
-    solver::{AbsurdleSuggestion, EvidenceResourceBudget, SearchRegretRequest, Solver},
+    solver::{
+        AbsurdleSuggestion, EvidenceResourceBudget, LearnedProxyDatasetRequest,
+        SearchRegretRequest, Solver,
+    },
 };
 
 #[derive(Parser, Debug)]
@@ -480,6 +484,45 @@ enum Command {
         about = "Tune registered proxy-ranker weights through the common rolling study runner"
     )]
     FitProxyWeights,
+    #[command(about = "Build development-only exhaustive costs and fit a residual ridge proxy")]
+    LearnedProxyExperiment {
+        #[arg(long, default_value_t = 3)]
+        minimum_survivors: usize,
+        #[arg(long, default_value_t = 12)]
+        maximum_survivors: usize,
+        #[arg(long, default_value_t = 8)]
+        maximum_states_per_split: usize,
+        #[arg(long, default_value_t = 18)]
+        guesses_per_state: usize,
+        #[arg(long, default_value_t = 1200)]
+        maximum_seconds: u64,
+        #[arg(long, default_value_t = 4096)]
+        maximum_memory_mb: u64,
+        #[arg(
+            long,
+            default_value = "target/studies/learned-proxy-checkpoint-v1.json",
+            help = "Atomic resumable checkpoint written after each exact state"
+        )]
+        checkpoint: PathBuf,
+        #[arg(
+            long,
+            default_value = "benchmarks/predictive/learned-proxy-dataset-v1.json"
+        )]
+        dataset_output: PathBuf,
+        #[arg(
+            long,
+            default_value = "benchmarks/predictive/learned-proxy-experiment-v1.json"
+        )]
+        output: PathBuf,
+    },
+    #[command(about = "Evaluate a fold-local policy-era survival prior against logistic recency")]
+    SurvivalExperiment {
+        #[arg(
+            long,
+            default_value = "benchmarks/predictive/survival-experiment-v1.json"
+        )]
+        output: PathBuf,
+    },
     #[command(
         about = "Measure production, proxy, and bounded-lookahead regret against exhaustive search"
     )]
@@ -1627,6 +1670,74 @@ fn run() -> Result<()> {
                 None,
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::LearnedProxyExperiment {
+            minimum_survivors,
+            maximum_survivors,
+            maximum_states_per_split,
+            guesses_per_state,
+            maximum_seconds,
+            maximum_memory_mb,
+            checkpoint,
+            dataset_output,
+            output,
+        } => {
+            let solver = Solver::from_paths(&paths, &config)?;
+            let dataset = solver.learned_proxy_dataset(
+                &paths,
+                LearnedProxyDatasetRequest {
+                    minimum_survivors,
+                    maximum_survivors,
+                    maximum_states_per_split,
+                    guesses_per_state,
+                    maximum_seconds,
+                    maximum_memory_mb,
+                    checkpoint_path: Some(checkpoint),
+                },
+            )?;
+            atomic_write(&dataset_output, dataset.to_json()?.as_bytes())?;
+            let mut report = fit_learned_proxy_experiment(&dataset)?;
+            let test_window = dataset
+                .split
+                .chronological
+                .as_ref()
+                .ok_or_else(|| anyhow!("learned-proxy dataset has no chronological split"))?;
+            report.reference_search_regret = Some(solver.search_regret_report(
+                &paths,
+                SearchRegretRequest {
+                    from: test_window.test_start,
+                    to: test_window.test_end,
+                    minimum_survivors,
+                    maximum_survivors: maximum_survivors.min(6),
+                    maximum_states: maximum_states_per_split,
+                    maximum_seconds: maximum_seconds.clamp(60, 600),
+                },
+            )?);
+            atomic_write(&output, &serde_json::to_vec_pretty(&report)?)?;
+            println!(
+                "learned_proxy={} dataset={} rows={} lambda={} validation_regret={:.6} test_regret={:.6} promotable={}",
+                output.display(),
+                dataset_output.display(),
+                dataset.rows.len(),
+                report.selected_lambda,
+                report.learned_validation.mean_regret,
+                report.learned_test.mean_regret,
+                report.promotable
+            );
+        }
+        Command::SurvivalExperiment { output } => {
+            let solver = Solver::from_paths(&paths, &config)?;
+            let report = run_survival_experiment(&paths, &config, &solver)?;
+            atomic_write(&output, &serde_json::to_vec_pretty(&report)?)?;
+            println!(
+                "survival={} folds={} reuse_events={} logistic_logloss={:.6} survival_logloss={:.6} promotable={}",
+                output.display(),
+                report.folds.len(),
+                report.total_reuse_events,
+                report.logistic.mean_log_loss,
+                report.survival.mean_log_loss,
+                report.promotable
+            );
         }
         Command::SearchRegret {
             config: audit_config,

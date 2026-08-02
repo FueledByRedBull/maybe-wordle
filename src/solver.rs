@@ -1,6 +1,6 @@
 use std::{
     array,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::PriorConfig,
     data::{NytDailyEntry, ProjectPaths, read_history_jsonl},
+    experiments::exhaustive_cost::{
+        ChronologicalSplitMetadata, DatasetProvenance, DatasetSplit, DatasetSplitMetadata,
+        ExactState, ExhaustiveCostCheckpoint, ExhaustiveCostDatasetArtifact, ExhaustiveCostRow,
+        ExhaustiveProgress, ReplayIdentityInput, ResourceBudget,
+    },
     experiments::{
         BootstrapConfig, DateRange, EvaluationPlan, ExperimentArtifactMode, GameOutcome,
         PairedDifference, ParameterRegistry, PredictiveConfigProfile, PredictiveExperimentMatrix,
@@ -55,6 +60,21 @@ use self::books::write_predictive_artifact;
 use self::state::{hard_mode_violation_message as hard_mode_violation, *};
 #[allow(unused_imports)]
 use self::{eval::*, ranking::*, search::*};
+
+pub(crate) fn predictive_source_identity(paths: &ProjectPaths) -> Result<String> {
+    rolling_source_identity(paths)
+}
+
+pub(crate) fn predictive_executable_fingerprint() -> Result<String> {
+    current_executable_fingerprint()
+}
+
+pub(crate) fn ensure_predictive_source_identity(
+    paths: &ProjectPaths,
+    expected: &str,
+) -> Result<()> {
+    ensure_rolling_source_identity(paths, expected)
+}
 
 const PROXY_CALIBRATION_MAX_STEPS: usize = 3;
 const PROXY_CALIBRATION_MAX_CANDIDATES_PER_STATE: usize = 10;
@@ -192,6 +212,20 @@ pub struct BacktestStats {
     pub coverage_gaps: usize,
     pub average_guesses_ci95: (f64, f64),
     pub failure_rate_ci95: (f64, f64),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SolvePolicyEvidence {
+    pub summary: BacktestStats,
+    pub elapsed_ms: u64,
+    pub latency_p95_ms: f64,
+    pub peak_memory_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SurvivalSolveComparison {
+    pub baseline: SolvePolicyEvidence,
+    pub survival: SolvePolicyEvidence,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -575,6 +609,18 @@ pub struct SearchRegretRequest {
     pub maximum_survivors: usize,
     pub maximum_states: usize,
     pub maximum_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LearnedProxyDatasetRequest {
+    pub minimum_survivors: usize,
+    pub maximum_survivors: usize,
+    pub maximum_states_per_split: usize,
+    pub guesses_per_state: usize,
+    pub maximum_seconds: u64,
+    pub maximum_memory_mb: u64,
+    #[serde(default)]
+    pub checkpoint_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1036,6 +1082,12 @@ enum PredictiveBookUsage {
     None,
     DiskOnly,
     Full,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SolveExecutionPolicy {
+    book_usage: PredictiveBookUsage,
+    search_mode: Option<PredictiveSearchMode>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1545,6 +1597,9 @@ mod tests {
             }
 
             let bucket_ratio = worst_non_green_bucket_size as f64 / subset.len().max(1) as f64;
+            if worst_non_green_bucket_size == subset.len() {
+                continue;
+            }
             let penalty = (solver.config.lookahead_trap_penalty * largest_non_green_bucket_mass)
                 + (solver.config.lookahead_large_bucket_penalty
                     * large_non_green_bucket_count as f64)
@@ -3840,6 +3895,8 @@ mod tests {
 
     #[test]
     fn normalized_concentration_penalty_prefers_smoother_partitions() {
+        assert_eq!(super::normalized_concentration_penalty(0.0, 0.0, 0), 0.0);
+        assert_eq!(super::normalized_concentration_penalty(1.0, 1.0, 1), 0.0);
         let smooth = super::normalized_concentration_penalty(1.0, 0.25 * 0.25 * 4.0, 4);
         let spiky =
             super::normalized_concentration_penalty(1.0, 0.70 * 0.70 + 0.10 * 0.10 * 3.0, 4);
@@ -3983,6 +4040,7 @@ mod tests {
         let expected = solver
             .score_guess_metrics_for_subset(&subset, &weights, &solver.exact_small_state_table)
             .into_iter()
+            .filter(|metric| super::search::reply_guess_makes_progress(metric, subset.len()))
             .map(|metric| metric.proxy_cost)
             .fold(f64::INFINITY, f64::min);
         let mut exact_memo = PredictiveMemoMap::default();
@@ -3999,6 +4057,53 @@ mod tests {
             )
             .expect("heuristic child value");
 
+        assert!((actual - expected).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn heuristic_lookahead_excludes_inert_child_reply() {
+        let mut solver =
+            test_solver_with_answer_count(&["cigar", "rebut", "sissy", "humph", "zzzzz"], 4);
+        solver.config.exact_exhaustive_threshold = 0;
+        solver.config.lookahead_reply_pool = solver.guesses.len();
+        solver.config.medium_state_lookahead_reply_pool = solver.guesses.len();
+        solver.config.danger_reply_pool_bonus = 0;
+        solver.config.lookahead_trap_penalty = 0.0;
+        solver.config.lookahead_worst_bucket_ratio_penalty = 0.0;
+        solver.config.lookahead_large_bucket_penalty = 0.0;
+        solver.config.lookahead_dangerous_mass_penalty = 0.0;
+        solver.config.lookahead_large_bucket_mass_penalty = 0.0;
+
+        let subset = (0..solver.answers.len()).collect::<Vec<_>>();
+        let weights = vec![1.0; solver.answers.len()];
+        let metrics = solver.score_guess_metrics_for_subset(
+            &subset,
+            &weights,
+            &solver.exact_small_state_table,
+        );
+        let inert = metrics
+            .iter()
+            .find(|metric| solver.guesses[metric.guess_index] == "zzzzz")
+            .expect("inert metric");
+        assert!(!super::search::reply_guess_makes_progress(
+            inert,
+            subset.len()
+        ));
+        let expected = metrics
+            .iter()
+            .filter(|metric| super::search::reply_guess_makes_progress(metric, subset.len()))
+            .map(|metric| metric.proxy_cost)
+            .fold(f64::INFINITY, f64::min);
+        let actual = solver
+            .lookahead_child_value(
+                &subset,
+                &weights,
+                false,
+                &mut PredictiveMemoMap::default(),
+                &mut ExactSearchScratch::new(),
+                &mut PredictiveMemoMap::default(),
+            )
+            .expect("heuristic child value");
         assert!((actual - expected).abs() <= 1e-12);
     }
 

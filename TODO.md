@@ -14,8 +14,7 @@ The current release did not reach the aspirational flat-three target. Its guarde
 ### [ ] Run the remaining high-cost cohort research
 
 - Run each typed proxy, search, and book cohort with enough candidates for its deterministic one-factor sweep, then pass only Pareto finalists to a small multi-seed joint refinement.
-- Fit leakage-safe out-of-fold continuation costs with a regularized baseline before deciding whether a learned ranker is better than the current explicit proxy.
-- Compare empirical-frequency, recency-bucket, survival/hazard, and regularized prior models under the same coverage-first rolling objective.
+- Compare the remaining empirical-frequency, recency-bucket, and regularized-prior candidates under the same coverage-first rolling objective. The residual-ridge and survival/hazard experiments are complete and were not promoted; their evidence is documented in `README.md`.
 - Promote only configurations that retain full coverage and no failures while improving paired all-game score within declared latency and memory budgets.
 
 ### [ ] Improve long-run study ergonomics
