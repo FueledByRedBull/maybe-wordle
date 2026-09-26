@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "development-matched-dynamic-belief-policy-comparison",
+  "profiles": [
+    {
+      "id": "selected_staged",
+      "description": "Selected staged ranking with its dynamic core and dormant fallback",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "staged" }
+      }
+    },
+    {
+      "id": "finite_fast_dynamic",
+      "description": "Finite Fast search on the same dynamic core and dormant fallback",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "finite_fast_dynamic" }
+      }
+    }
+  ]
+}

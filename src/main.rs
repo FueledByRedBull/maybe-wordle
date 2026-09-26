@@ -14,8 +14,8 @@ use maybe_wordle::{
     config::PriorConfig,
     data::{ProjectPaths, SyncSummary, sync_nyt_history},
     experiments::{
-        DateRange, RollingOriginConfig, StudyFoldSelection, StudySearchStrategy, StudySpec,
-        StudyStage, build_rolling_origin_plan, predictive_parameter_registry,
+        DateRange, EvaluationPolicy, RollingOriginConfig, StudyFoldSelection, StudySearchStrategy,
+        StudySpec, StudyStage, build_declared_rolling_origin_plan, predictive_parameter_registry,
     },
     formal::{
         DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, FormalScaleRequest, FormalVerificationMode,
@@ -25,12 +25,15 @@ use maybe_wordle::{
     gui::run_gui,
     model::build_model_artifacts,
     model::{ModelVariant, WeightMode},
-    predictive::{PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode},
+    predictive::{
+        PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode,
+        history_cutoff,
+    },
     research::{fit_learned_proxy_experiment, run_survival_experiment},
     seed::{MergeStrategy, add_manual_addition, merge_seed_lists, reconcile_seed_lists},
     solver::{
-        AbsurdleSuggestion, EvidenceResourceBudget, LearnedProxyDatasetRequest,
-        SearchRegretRequest, Solver,
+        AbsurdleSuggestion, EvidenceDateSelection, EvidenceResourceBudget,
+        FiniteSearchRegretRequest, LearnedProxyDatasetRequest, SearchRegretRequest, Solver,
     },
 };
 
@@ -52,6 +55,8 @@ enum Command {
             help = "Fail if any date could not be synced after retries"
         )]
         strict: bool,
+        #[arg(long, help = "Last NYT print date to fetch; defaults to today")]
+        through: Option<String>,
     },
     #[command(about = "Build modeled answer CSVs under data/derived")]
     BuildModel,
@@ -168,6 +173,9 @@ enum Command {
             help = "Return the fast proxy preview without lookahead or exact refinement"
         )]
         proxy_preview: bool,
+        #[arg(long, value_parser = ["fast", "strong"], conflicts_with = "live_fallback",
+            help = "Use artifact-free finite-horizon search with a fast or strong budget")]
+        search_budget: Option<String>,
         #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id when --mode formal-optimal is used")]
         model: String,
     },
@@ -276,6 +284,15 @@ enum Command {
             help = "Top suggestion count used during evaluation"
         )]
         top: usize,
+        #[arg(long, help = "Run only the named matrix profile")]
+        profile: Option<String>,
+    },
+    #[command(about = "Screen prior families on the declared rolling development folds")]
+    PriorAblations {
+        #[arg(long = "profile", help = "Matrix profile to include; repeat as needed")]
+        profiles: Vec<String>,
+        #[arg(long, default_value = "benchmarks/predictive/prior-ablation-v1.json")]
+        output: PathBuf,
     },
     #[command(about = "Evaluate an alternate prior config file against a fixed date window")]
     EvaluateLiveConfig {
@@ -336,7 +353,7 @@ enum Command {
         #[arg(
             long,
             default_value = "weighted",
-            help = "Answer-weight model: weighted, uniform, or cooldown_only"
+            help = "Answer-weight model: weighted, uniform, cooldown_only, used_unused, recency_buckets, empirical_frequency, or regularized_frequency"
         )]
         weight_mode: String,
         #[arg(
@@ -353,7 +370,7 @@ enum Command {
         #[arg(
             long,
             default_value = "weighted",
-            help = "Answer-weight model: weighted, uniform, or cooldown_only"
+            help = "Answer-weight model: weighted, uniform, cooldown_only, used_unused, recency_buckets, empirical_frequency, or regularized_frequency"
         )]
         weight_mode: String,
         #[arg(
@@ -421,7 +438,7 @@ enum Command {
         #[arg(
             long,
             default_value_t = 1,
-            help = "Maximum concurrent candidate evaluations"
+            help = "Maximum concurrent candidate evaluations; finite policies require 1 to preserve wall-clock search budgets"
         )]
         jobs: usize,
         #[arg(long, default_value_t = 20260315, help = "Deterministic study seed")]
@@ -524,7 +541,7 @@ enum Command {
         output: PathBuf,
     },
     #[command(
-        about = "Measure production, proxy, and bounded-lookahead regret against exhaustive search"
+        about = "Audit legacy or finite-horizon search choices against tractable exact references"
     )]
     SearchRegret {
         #[arg(long, help = "Optional alternate prior TOML config")]
@@ -537,14 +554,27 @@ enum Command {
         minimum_survivors: usize,
         #[arg(long, default_value_t = 6)]
         maximum_survivors: usize,
-        #[arg(long, default_value_t = 16)]
-        maximum_states: usize,
         #[arg(
             long,
-            default_value_t = 1800,
-            help = "Hard wall-clock budget in seconds, checked between games and states"
+            help = "Maximum reachable states to audit (finite defaults to 6; legacy defaults to 16)"
         )]
-        maximum_seconds: u64,
+        maximum_states: Option<usize>,
+        #[arg(
+            long,
+            help = "Audit budget in seconds (finite defaults to 60; legacy defaults to 1800); legacy checks are between work units"
+        )]
+        maximum_seconds: Option<u64>,
+        #[arg(
+            long,
+            help = "Run the artifact-free finite-horizon audit; requires a finite_fast or finite_strong config"
+        )]
+        finite: bool,
+        #[arg(
+            long,
+            requires = "finite",
+            help = "Apply hard-mode legality to reachable paths and references"
+        )]
+        hard_mode: bool,
         #[arg(long, help = "Versioned JSON report output path")]
         output: PathBuf,
     },
@@ -567,28 +597,55 @@ enum Command {
     },
     #[command(about = "Generate versioned predictive development evidence as JSON and Markdown")]
     BenchmarkEvidence {
-        #[arg(long, help = "Development evaluation start date in YYYY-MM-DD")]
-        from: String,
-        #[arg(long, help = "Development evaluation end date in YYYY-MM-DD")]
-        to: String,
+        #[arg(
+            long,
+            required_unless_present = "rolling_folds",
+            conflicts_with = "rolling_folds",
+            help = "Development evaluation start date in YYYY-MM-DD"
+        )]
+        from: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "rolling_folds",
+            conflicts_with = "rolling_folds",
+            help = "Development evaluation end date in YYYY-MM-DD"
+        )]
+        to: Option<String>,
+        #[arg(
+            long,
+            conflicts_with_all = ["from", "to"],
+            help = "Evaluate the exact canonical rolling development validation folds"
+        )]
+        rolling_folds: bool,
+        #[arg(
+            long,
+            help = "JSON experiment matrix path; defaults to the shipped development matrix"
+        )]
+        matrix: Option<PathBuf>,
         #[arg(long, default_value_t = 5)]
         top: usize,
         #[arg(
             long,
             default_value_t = 3600,
-            help = "Hard evidence-generation wall-clock budget in seconds"
+            help = "Evidence wall-clock budget in seconds; checked between profiles"
         )]
         maximum_seconds: u64,
         #[arg(
             long,
             default_value_t = 4096,
-            help = "Hard process peak-working-set budget in MiB"
+            help = "Process peak-working-set limit in MiB; checked between profiles"
         )]
         maximum_memory_mb: u64,
         #[arg(long, help = "Versioned JSON evidence output path")]
         output: PathBuf,
         #[arg(long, help = "Generated README fragment output path")]
         markdown_output: PathBuf,
+        #[arg(
+            long,
+            default_value = "target/evidence-checkpoints/development-v1.json",
+            help = "Atomic per-profile resume checkpoint"
+        )]
+        checkpoint: PathBuf,
     },
     #[command(about = "Update or verify README evidence from a versioned benchmark artifact")]
     BenchmarkEvidenceDocs {
@@ -715,8 +772,9 @@ fn run() -> Result<()> {
     let config = PriorConfig::load_or_create(&paths.config_prior)?;
 
     match cli.command {
-        Command::SyncData { strict } => {
-            let summary = sync_nyt_history(&paths, &config, Solver::today())?;
+        Command::SyncData { strict, through } => {
+            let through = parse_or_today(through.as_deref())?;
+            let summary = sync_nyt_history(&paths, &config, through)?;
             println!("{}", format_sync_summary(&summary));
             if !summary.changed_dates.is_empty() {
                 println!(
@@ -884,6 +942,7 @@ fn run() -> Result<()> {
             hard,
             live_fallback,
             proxy_preview,
+            search_budget,
             model,
         } => match parse_solver_mode(&mode)? {
             SolverMode::Predictive => {
@@ -893,20 +952,30 @@ fn run() -> Result<()> {
                 let solver = Solver::from_paths(&paths, &config)?;
                 let predictive_mode = predictive_cli_mode(live_fallback);
                 let request = PredictiveSuggestRequest {
-                    as_of,
+                    puzzle_date: as_of,
                     observations: &observations,
                     top,
                     hard_mode: hard,
                     force_in_two_only: false,
                     mode: predictive_mode,
                 };
-                let response = if proxy_preview {
+                let response = if let Some(profile) = search_budget.as_deref() {
+                    let mut options = if profile == "strong" {
+                        maybe_wordle::solver::FiniteSearchOptions::strong()
+                    } else {
+                        maybe_wordle::solver::FiniteSearchOptions::fast()
+                    };
+                    if proxy_preview {
+                        options.budget = std::time::Duration::from_millis(30);
+                    }
+                    solver.suggest_predictive_controlled(request, options, &|| false)?
+                } else if proxy_preview {
                     solver.suggest_predictive_proxy_preview(request)?
                 } else {
                     solver.suggest_predictive(request)?
                 };
                 for warning in
-                    predictive_warning_lines(as_of, &observations, predictive_mode, &response)
+                    predictive_warning_lines(as_of, &observations, predictive_mode, hard, &response)
                 {
                     eprintln!("warning: {warning}");
                 }
@@ -928,11 +997,28 @@ fn run() -> Result<()> {
                 if let Some(mode) = response.state.recovery_mode_used {
                     println!("recovery_mode={}", mode.label());
                 }
+                println!(
+                    "{}",
+                    format_predictive_context(response.puzzle_date, response.history_cutoff)
+                );
+                if let Some(search) = &response.finite_search {
+                    println!(
+                        "search_status={:?} nodes={} work_units={} cache_hits={} proposal_sampled={} artifact_free=true",
+                        search.reason,
+                        search.nodes_visited,
+                        search.work_units,
+                        search.cache_hits,
+                        search.proposal_sampled
+                    );
+                }
                 for suggestion in response.suggestions {
                     println!("{}", format_predictive_suggestion(&suggestion));
                 }
             }
             SolverMode::Absurdle => {
+                if search_budget.is_some() {
+                    bail!("--search-budget is only supported in predictive mode");
+                }
                 if proxy_preview {
                     bail!("--proxy-preview is only supported in predictive mode");
                 }
@@ -949,6 +1035,9 @@ fn run() -> Result<()> {
             SolverMode::FormalOptimal => {
                 if proxy_preview {
                     bail!("--proxy-preview is only supported in predictive mode");
+                }
+                if search_budget.is_some() {
+                    bail!("--search-budget is only supported in predictive mode");
                 }
                 reject_hard_mode_for_non_predictive(hard, "formal-optimal")?;
                 reject_live_fallback_for_non_predictive(live_fallback, "formal-optimal")?;
@@ -994,21 +1083,29 @@ fn run() -> Result<()> {
 
                 loop {
                     let response = solver.suggest_predictive(PredictiveSuggestRequest {
-                        as_of,
+                        puzzle_date: as_of,
                         observations: &observations,
                         top,
                         hard_mode: hard,
                         force_in_two_only: false,
                         mode: predictive_mode,
                     })?;
-                    for warning in
-                        predictive_warning_lines(as_of, &observations, predictive_mode, &response)
-                    {
+                    for warning in predictive_warning_lines(
+                        as_of,
+                        &observations,
+                        predictive_mode,
+                        hard,
+                        &response,
+                    ) {
                         eprintln!("warning: {warning}");
                     }
                     println!(
                         "mode=predictive surviving={} total_weight={:.4}",
                         response.state.surviving, response.state.effective_total_weight
+                    );
+                    println!(
+                        "{}",
+                        format_predictive_context(response.puzzle_date, response.history_cutoff)
                     );
                     if let Some(mode) = response.state.recovery_mode_used {
                         println!("recovery_mode={}", mode.label());
@@ -1041,7 +1138,9 @@ fn run() -> Result<()> {
                     io::stdout().flush().context("failed to flush stdout")?;
                     let feedback = read_line()?;
                     match try_append_observation(&observations, &guess, &feedback, |next| {
-                        solver.apply_history(as_of, next).map(|_| ())
+                        solver
+                            .apply_history(maybe_wordle::predictive::history_cutoff(as_of)?, next)
+                            .map(|_| ())
                     }) {
                         Ok(next) => observations = next,
                         Err(error) => println!("error: {error}"),
@@ -1288,7 +1387,12 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Command::PredictiveAblations { from, to, top } => {
+        Command::PredictiveAblations {
+            from,
+            to,
+            top,
+            profile,
+        } => {
             let (default_from, default_to) = Solver::latest_history_range(&paths)?
                 .ok_or_else(|| anyhow!("run sync-data before predictive-ablations"))?;
             let from = parse_date(from.as_deref())?.unwrap_or(default_from);
@@ -1296,9 +1400,16 @@ fn run() -> Result<()> {
             if from > to {
                 bail!("--from cannot be after --to");
             }
-            for row in Solver::predictive_ablation_report(&paths, &config, from, to, top)? {
+            for row in Solver::predictive_ablation_report_filtered(
+                &paths,
+                &config,
+                from,
+                to,
+                top,
+                profile.as_deref(),
+            )? {
                 println!(
-                    "label={} config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3} session_cold_ms={:.3} session_warm_ms={:.3} lookahead_pool_ratio={:.3} exact_pool_ratio={:.3}",
+                    "label={} config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3} session_cold_ms={} session_warm_ms={} lookahead_pool_ratio={:.3} exact_pool_ratio={:.3}",
                     row.label,
                     row.result.config_id,
                     row.result.mode.label(),
@@ -1311,10 +1422,35 @@ fn run() -> Result<()> {
                     row.result.average_target_probability,
                     row.result.average_target_rank,
                     row.result.latency_p95_ms,
-                    row.result.session_fallback_cold_ms,
-                    row.result.session_fallback_warm_ms,
+                    row.result
+                        .session_fallback_cold_ms
+                        .map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.3}")),
+                    row.result
+                        .session_fallback_warm_ms
+                        .map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.3}")),
                     row.result.average_lookahead_pool_ratio,
                     row.result.average_exact_pool_ratio,
+                );
+            }
+        }
+        Command::PriorAblations { profiles, output } => {
+            let report = Solver::predictive_prior_ablation_report(&paths, &config, &profiles)?;
+            atomic_write(&output, &serde_json::to_vec_pretty(&report)?)?;
+            println!(
+                "prior_ablations={} profiles={} folds={} elapsed_ms={}",
+                output.display(),
+                report.profiles.len(),
+                report.evaluation_plan.folds.len(),
+                report.elapsed_ms
+            );
+            for profile in report.profiles {
+                println!(
+                    "label={} coverage_gaps={} log_loss={:.6} brier={:.6} promotable={}",
+                    profile.label,
+                    profile.coverage_gaps,
+                    profile.average_log_loss,
+                    profile.average_brier,
+                    profile.promotable
                 );
             }
         }
@@ -1496,7 +1632,7 @@ fn run() -> Result<()> {
                     let solver = Solver::from_paths_with_settings(&paths, &config, mode, variant)?;
                     let result = solver.experiment_report(from, to, top)?;
                     println!(
-                        "config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_log_loss={:.6} avg_brier={:.6} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3} session_cold_ms={:.3} session_warm_ms={:.3} lookahead_pool_ratio={:.3} exact_pool_ratio={:.3}",
+                        "config={} mode={} variant={} games={} avg_guesses={:.4} p95={} max={} failures={} avg_log_loss={:.6} avg_brier={:.6} avg_target_prob={:.6} avg_target_rank={:.2} latency_p95_ms={:.3} session_cold_ms={} session_warm_ms={} lookahead_pool_ratio={:.3} exact_pool_ratio={:.3}",
                         result.config_id,
                         result.mode.label(),
                         result.variant.label(),
@@ -1510,8 +1646,12 @@ fn run() -> Result<()> {
                         result.average_target_probability,
                         result.average_target_rank,
                         result.latency_p95_ms,
-                        result.session_fallback_cold_ms,
-                        result.session_fallback_warm_ms,
+                        result
+                            .session_fallback_cold_ms
+                            .map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.3}")),
+                        result
+                            .session_fallback_warm_ms
+                            .map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.3}")),
                         result.average_lookahead_pool_ratio,
                         result.average_exact_pool_ratio
                     );
@@ -1527,7 +1667,8 @@ fn run() -> Result<()> {
         } => {
             let (history_start, history_end) = Solver::latest_history_range(&paths)?
                 .ok_or_else(|| anyhow!("run sync-data before evaluation-plan"))?;
-            let plan = build_rolling_origin_plan(
+            let policy = EvaluationPolicy::load(&paths.root.join("config/evaluation.toml"))?;
+            let plan = build_declared_rolling_origin_plan(
                 DateRange::new(history_start, history_end)?,
                 RollingOriginConfig {
                     minimum_training_days,
@@ -1536,6 +1677,7 @@ fn run() -> Result<()> {
                     sealed_test_days,
                     maximum_folds,
                 },
+                &policy,
             )?;
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
@@ -1621,6 +1763,10 @@ fn run() -> Result<()> {
                 summary.current.exact_step_pct * 100.0
             );
             println!(
+                "current_finite_step_pct={:.1}%",
+                summary.current.finite_step_pct * 100.0
+            );
+            println!(
                 "best_conditional_mean_guesses={:.4} best_all_game_penalized_mean_guesses={:.4} best_failures={} best_coverage_gaps={} best_log_loss={:.6} best_target_rank={:.2} best_latency_p95_ms={:.3} best_hard_case_avg_guesses={:.4} best_hard_case_failures={} best_regime_mix=proxy:{:.1}%/lookahead:{:.1}%/escalated_exact:{:.1}%/exact:{:.1}%",
                 summary.best.average_guesses,
                 summary.best.all_game_penalized_mean_guesses,
@@ -1636,16 +1782,14 @@ fn run() -> Result<()> {
                 summary.best.escalated_exact_step_pct * 100.0,
                 summary.best.exact_step_pct * 100.0
             );
+            println!(
+                "best_finite_step_pct={:.1}%",
+                summary.best.finite_step_pct * 100.0
+            );
             println!("{}", summary.replacement_toml.trim_end());
         }
         Command::FitProxyWeights => {
-            let maximum_validation_folds = Solver::latest_history_range(&paths)?
-                .map(|(start, end)| DateRange::new(start, end))
-                .transpose()?
-                .map_or(1, |history| {
-                    build_rolling_origin_plan(history, RollingOriginConfig::default())
-                        .map_or(1, |plan| plan.folds.len())
-                });
+            let maximum_validation_folds = Solver::development_evaluation_plan(&paths)?.folds.len();
             let summary = Solver::run_predictive_study(
                 &paths,
                 &config,
@@ -1665,7 +1809,7 @@ fn run() -> Result<()> {
                     maximum_trial_seconds: 7_200,
                     maximum_memory_mb: 4_096,
                 },
-                &paths.root.join("target/studies/fit-proxy-weights-v16.json"),
+                &paths.root.join("target/studies/fit-proxy-weights-v18.json"),
                 5,
                 None,
             )?;
@@ -1747,6 +1891,8 @@ fn run() -> Result<()> {
             maximum_survivors,
             maximum_states,
             maximum_seconds,
+            finite,
+            hard_mode,
             output,
         } => {
             let audit_config = audit_config
@@ -1758,30 +1904,58 @@ fn run() -> Result<()> {
                 .ok_or_else(|| anyhow!("--from is required for search-regret"))?;
             let to = parse_date(Some(&to))?
                 .ok_or_else(|| anyhow!("--to is required for search-regret"))?;
+            let maximum_states = maximum_states.unwrap_or(if finite { 6 } else { 16 });
+            let maximum_seconds = maximum_seconds.unwrap_or(if finite { 60 } else { 1800 });
             let solver = Solver::from_paths(&paths, &audit_config)?;
-            let report = solver.search_regret_report(
-                &paths,
-                SearchRegretRequest {
-                    from,
-                    to,
-                    minimum_survivors,
-                    maximum_survivors,
-                    maximum_states,
-                    maximum_seconds,
-                },
-            )?;
-            let encoded = serde_json::to_vec_pretty(&report)
-                .context("failed to encode search-regret JSON")?;
-            atomic_write(&output, &encoded)?;
-            println!(
-                "search_regret={} states={} available={} production_mean={:.6} proxy_mean={:.6} lookahead_mean={:.6}",
-                output.display(),
-                report.sampled_states,
-                report.available_states,
-                report.production.mean_regret,
-                report.proxy.mean_regret,
-                report.lookahead.mean_regret,
-            );
+            if finite {
+                let report = solver.finite_search_regret_report(
+                    &paths,
+                    FiniteSearchRegretRequest {
+                        from,
+                        to,
+                        minimum_survivors,
+                        maximum_survivors,
+                        maximum_states,
+                        maximum_seconds,
+                        hard_mode,
+                    },
+                )?;
+                let encoded = serde_json::to_vec_pretty(&report)
+                    .context("failed to encode finite search-regret JSON")?;
+                atomic_write(&output, &encoded)?;
+                println!(
+                    "finite_search_regret={} states={} available={} resolved={} failure_regret_states={}",
+                    output.display(),
+                    report.sampled_states,
+                    report.available_states,
+                    report.summary.resolved_states,
+                    report.summary.failure_regret_states,
+                );
+            } else {
+                let report = solver.search_regret_report(
+                    &paths,
+                    SearchRegretRequest {
+                        from,
+                        to,
+                        minimum_survivors,
+                        maximum_survivors,
+                        maximum_states,
+                        maximum_seconds,
+                    },
+                )?;
+                let encoded = serde_json::to_vec_pretty(&report)
+                    .context("failed to encode search-regret JSON")?;
+                atomic_write(&output, &encoded)?;
+                println!(
+                    "search_regret={} states={} available={} production_mean={:.6} proxy_mean={:.6} lookahead_mean={:.6}",
+                    output.display(),
+                    report.sampled_states,
+                    report.available_states,
+                    report.production.mean_regret,
+                    report.proxy.mean_regret,
+                    report.lookahead.mean_regret,
+                );
+            }
         }
         Command::Benchmark { runs, mode, model } => {
             if runs == 0 {
@@ -1847,30 +2021,48 @@ fn run() -> Result<()> {
         Command::BenchmarkEvidence {
             from,
             to,
+            rolling_folds,
+            matrix,
             top,
             maximum_seconds,
             maximum_memory_mb,
             output,
             markdown_output,
+            checkpoint,
         } => {
-            let from = NaiveDate::parse_from_str(&from, "%Y-%m-%d")
-                .with_context(|| format!("invalid --from date: {from}"))?;
-            let to = NaiveDate::parse_from_str(&to, "%Y-%m-%d")
-                .with_context(|| format!("invalid --to date: {to}"))?;
-            let artifact = Solver::build_development_evidence_with_budget(
+            let selection = if rolling_folds {
+                EvidenceDateSelection::RollingFolds
+            } else {
+                let from = from
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--from is required unless --rolling-folds is used"))?;
+                let to = to
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--to is required unless --rolling-folds is used"))?;
+                let from = NaiveDate::parse_from_str(from, "%Y-%m-%d")
+                    .with_context(|| format!("invalid --from date: {from}"))?;
+                let to = NaiveDate::parse_from_str(to, "%Y-%m-%d")
+                    .with_context(|| format!("invalid --to date: {to}"))?;
+                if from > to {
+                    bail!("--from cannot be after --to");
+                }
+                EvidenceDateSelection::Range(DateRange::new(from, to)?)
+            };
+            let artifact = Solver::build_development_evidence_with_selection(
                 &paths,
                 &config,
-                from,
-                to,
+                selection,
                 top,
                 EvidenceResourceBudget {
                     maximum_seconds,
                     maximum_memory_mb,
                 },
+                matrix.as_deref(),
+                Some(&checkpoint),
             )?;
             atomic_write(
                 &output,
-                &serde_json::to_vec_pretty(&artifact)
+                &serde_json::to_vec(&artifact)
                     .context("failed to serialize predictive evidence")?,
             )?;
             let markdown = Solver::render_development_evidence_markdown(&artifact)?;
@@ -2154,26 +2346,46 @@ fn canonical_newlines(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
-fn warn_predictive_history_range(paths: &ProjectPaths, as_of: NaiveDate) -> Result<()> {
+fn warn_predictive_history_range(paths: &ProjectPaths, puzzle_date: NaiveDate) -> Result<()> {
     let Some((first_synced, last_synced)) = Solver::latest_history_range(paths)? else {
         eprintln!(
             "warning: no synced NYT history found; run cargo run -- sync-data before relying on predictive history or artifacts"
         );
         return Ok(());
     };
-    if as_of < first_synced {
-        eprintln!(
-            "warning: requested date {} is before the earliest synced NYT date {}; predictive history and artifacts may be incomplete",
-            as_of, first_synced
-        );
-    }
-    if as_of > last_synced {
-        eprintln!(
-            "warning: requested date {} is after the latest synced NYT date {}; predictive history and artifacts may be stale",
-            as_of, last_synced
-        );
+    let history_cutoff = history_cutoff(puzzle_date)?;
+    for warning in
+        predictive_history_range_warnings(puzzle_date, history_cutoff, first_synced, last_synced)
+    {
+        eprintln!("warning: {warning}");
     }
     Ok(())
+}
+
+fn predictive_history_range_warnings(
+    puzzle_date: NaiveDate,
+    history_cutoff: NaiveDate,
+    first_synced: NaiveDate,
+    last_synced: NaiveDate,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if history_cutoff < first_synced {
+        warnings.push(format!(
+            "requested puzzle date {} has usable history cutoff {} before the earliest synced NYT date {}; predictive history and artifacts may be incomplete",
+            puzzle_date, history_cutoff, first_synced
+        ));
+    }
+    if history_cutoff > last_synced {
+        warnings.push(format!(
+            "usable history cutoff {} for requested puzzle date {} is after the latest synced NYT date {}; predictive history and artifacts may be stale",
+            history_cutoff, puzzle_date, last_synced
+        ));
+    }
+    warnings
+}
+
+fn format_predictive_context(puzzle_date: NaiveDate, history_cutoff: NaiveDate) -> String {
+    format!("puzzle_date={puzzle_date} history_cutoff={history_cutoff}")
 }
 
 fn format_sync_summary(summary: &SyncSummary) -> String {
@@ -2213,9 +2425,16 @@ fn predictive_warning_lines(
     as_of: NaiveDate,
     observations: &[(String, u8)],
     mode: PredictiveSuggestionMode,
+    hard_mode: bool,
     response: &PredictiveSuggestResponse,
 ) -> Vec<String> {
+    if response.finite_search.is_some() {
+        return Vec::new();
+    }
     let mut warnings = Vec::new();
+    if hard_mode {
+        warnings.push("legacy continuation costs assume normal-mode replies; finite profiles enforce hard-mode legality recursively".to_string());
+    }
     let artifact_warning = match response.artifact_state {
         maybe_wordle::predictive::PredictiveArtifactState::ExactDateArtifact => {
             if observations.is_empty() {
@@ -2311,6 +2530,16 @@ fn format_predictive_suggestion(suggestion: &maybe_wordle::solver::Suggestion) -
     );
     if suggestion.force_in_two {
         line.push_str(" force_in_two=true");
+    }
+    if let Some(value) = suggestion.finite_value {
+        if value.quality == maybe_wordle::solver::FiniteSearchQuality::Heuristic {
+            line.push_str(" finite_value=unevaluated");
+        } else {
+            line.push_str(&format!(
+                " modeled_failure_prob={:.6} expected_attempts_remaining={:.5} value_quality={:?}",
+                value.failure_probability, value.expected_attempts, value.quality
+            ));
+        }
     }
     if let Some(exact_cost) = suggestion.exact_cost {
         line.push_str(&format!(" candidate_pool_exact_cost={:.5}", exact_cost));
@@ -2412,7 +2641,13 @@ fn parse_weight_mode(raw: &str) -> Result<WeightMode> {
         "weighted" => Ok(WeightMode::Weighted),
         "uniform" => Ok(WeightMode::Uniform),
         "cooldown_only" | "cooldown-only" => Ok(WeightMode::CooldownOnly),
-        _ => bail!("weight mode must be one of: weighted, uniform, cooldown_only"),
+        "used_unused" | "used-unused" => Ok(WeightMode::UsedUnused),
+        "recency_buckets" | "recency-buckets" => Ok(WeightMode::RecencyBuckets),
+        "empirical_frequency" | "empirical-frequency" => Ok(WeightMode::EmpiricalFrequency),
+        "regularized_frequency" | "regularized-frequency" => Ok(WeightMode::RegularizedFrequency),
+        _ => bail!(
+            "weight mode must be one of: weighted, uniform, cooldown_only, used_unused, recency_buckets, empirical_frequency, regularized_frequency"
+        ),
     }
 }
 
@@ -2428,23 +2663,60 @@ fn parse_model_variant(raw: &str) -> Result<ModelVariant> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
     use anyhow::anyhow;
     use chrono::NaiveDate;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
     use maybe_wordle::data::SyncSummary;
     use maybe_wordle::experiments::StudySearchStrategy;
     use maybe_wordle::predictive::{PredictiveArtifactState, PredictiveSuggestResponse};
     use maybe_wordle::solver::AbsurdleSuggestion;
 
     use super::{
-        Cli, canonical_newlines, enforce_sync_policy, find_project_root,
-        format_absurdle_suggestion, format_predictive_suggestion, format_sync_summary,
-        normalize_interactive_guess, parse_solver_mode, parse_study_stage, parse_study_strategy,
-        predictive_cli_mode, predictive_warning_lines, reject_hard_mode_for_non_predictive,
+        Cli, Command, canonical_newlines, enforce_sync_policy, find_project_root,
+        format_absurdle_suggestion, format_predictive_context, format_predictive_suggestion,
+        format_sync_summary, normalize_interactive_guess, parse_solver_mode, parse_study_stage,
+        parse_study_strategy, predictive_cli_mode, predictive_history_range_warnings,
+        predictive_warning_lines, reject_hard_mode_for_non_predictive,
         reject_live_fallback_for_non_predictive, try_append_observation,
     };
+
+    #[test]
+    fn sync_data_accepts_an_explicit_safe_cutoff() {
+        let cli = Cli::try_parse_from([
+            "maybe-wordle",
+            "sync-data",
+            "--strict",
+            "--through",
+            "2026-08-26",
+        ])
+        .expect("CLI");
+        match cli.command {
+            Command::SyncData { strict, through } => {
+                assert!(strict);
+                assert_eq!(through.as_deref(), Some("2026-08-26"));
+            }
+            _ => panic!("expected sync-data"),
+        }
+    }
+
+    #[test]
+    fn predictive_ablations_accepts_a_profile_filter() {
+        let cli = Cli::try_parse_from([
+            "maybe-wordle",
+            "predictive-ablations",
+            "--profile",
+            "regularized_frequency_baseline",
+        ])
+        .expect("CLI");
+        match cli.command {
+            Command::PredictiveAblations { profile, .. } => {
+                assert_eq!(profile.as_deref(), Some("regularized_frequency_baseline"));
+            }
+            _ => panic!("expected predictive-ablations"),
+        }
+    }
 
     #[test]
     fn documentation_verification_ignores_platform_line_endings() {
@@ -2494,7 +2766,8 @@ mod tests {
 
     #[test]
     fn predictive_suggestion_format_includes_force_in_two_marker() {
-        let formatted = format_predictive_suggestion(&maybe_wordle::solver::Suggestion {
+        let mut suggestion = maybe_wordle::solver::Suggestion {
+            finite_value: None,
             word: "crane".into(),
             entropy: 4.0,
             solve_probability: 0.2,
@@ -2511,9 +2784,47 @@ mod tests {
             posterior_answer_probability: 0.1,
             lookahead_cost: None,
             exact_cost: Some(2.5),
-        });
+        };
+        let formatted = format_predictive_suggestion(&suggestion);
         assert!(formatted.contains("force_in_two=true"));
         assert!(formatted.contains("candidate_pool_exact_cost=2.50000"));
+        suggestion.finite_value = Some(maybe_wordle::solver::FiniteSearchCandidate {
+            guess_index: 0,
+            failure_probability: 0.1,
+            expected_attempts: 2.4,
+            quality: maybe_wordle::solver::FiniteSearchQuality::UpperBound,
+        });
+        let formatted = format_predictive_suggestion(&suggestion);
+        assert!(formatted.contains("modeled_failure_prob=0.100000"));
+        assert!(formatted.contains("expected_attempts_remaining=2.40000"));
+        suggestion.finite_value.as_mut().unwrap().quality =
+            maybe_wordle::solver::FiniteSearchQuality::Heuristic;
+        let formatted = format_predictive_suggestion(&suggestion);
+        assert!(formatted.contains("finite_value=unevaluated"));
+        assert!(!formatted.contains("modeled_failure_prob"));
+    }
+
+    #[test]
+    fn suggest_accepts_only_declared_finite_budget_profiles() {
+        let cli = Cli::try_parse_from(["maybe-wordle", "suggest", "--search-budget", "strong"])
+            .expect("finite profile");
+        assert!(
+            matches!(cli.command, Command::Suggest { search_budget: Some(profile), .. } if profile == "strong")
+        );
+        assert!(
+            Cli::try_parse_from(["maybe-wordle", "suggest", "--search-budget", "infinite"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "maybe-wordle",
+                "suggest",
+                "--search-budget",
+                "fast",
+                "--live-fallback"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -2610,6 +2921,43 @@ mod tests {
     }
 
     #[test]
+    fn predictive_history_range_warning_uses_the_preceding_day_cutoff() {
+        let first_synced = NaiveDate::from_ymd_opt(2024, 1, 1).expect("date");
+        let last_synced = NaiveDate::from_ymd_opt(2024, 1, 4).expect("date");
+        let next_puzzle = NaiveDate::from_ymd_opt(2024, 1, 5).expect("date");
+        assert!(
+            predictive_history_range_warnings(
+                next_puzzle,
+                NaiveDate::from_ymd_opt(2024, 1, 4).expect("cutoff"),
+                first_synced,
+                last_synced,
+            )
+            .is_empty()
+        );
+
+        let later_puzzle = NaiveDate::from_ymd_opt(2024, 1, 6).expect("date");
+        let warnings = predictive_history_range_warnings(
+            later_puzzle,
+            NaiveDate::from_ymd_opt(2024, 1, 5).expect("cutoff"),
+            first_synced,
+            last_synced,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("history cutoff 2024-01-05"));
+    }
+
+    #[test]
+    fn predictive_context_format_names_both_public_dates() {
+        assert_eq!(
+            format_predictive_context(
+                NaiveDate::from_ymd_opt(2024, 1, 5).expect("puzzle date"),
+                NaiveDate::from_ymd_opt(2024, 1, 4).expect("history cutoff"),
+            ),
+            "puzzle_date=2024-01-05 history_cutoff=2024-01-04"
+        );
+    }
+
+    #[test]
     fn find_project_root_walks_up_from_nested_binary_path() {
         let temp_root =
             std::env::temp_dir().join(format!("maybe-wordle-root-test-{}", std::process::id()));
@@ -2638,7 +2986,11 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 3, 26).expect("date"),
             &[("crane".to_string(), 17)],
             maybe_wordle::predictive::PredictiveSuggestionMode::Full,
+            true,
             &PredictiveSuggestResponse {
+                finite_search: None,
+                puzzle_date: NaiveDate::from_ymd_opt(2026, 3, 26).expect("date"),
+                history_cutoff: NaiveDate::from_ymd_opt(2026, 3, 25).expect("date"),
                 state: maybe_wordle::predictive::PredictiveStateSummary {
                     surviving: 3,
                     modeled_total_weight: 1.0,
@@ -2665,6 +3017,11 @@ mod tests {
             warnings
                 .iter()
                 .any(|line| line.contains("reply-book artifact is missing"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("normal-mode replies"))
         );
     }
 
@@ -2739,9 +3096,8 @@ mod tests {
         let mut opener_help = Vec::new();
         opener.write_long_help(&mut opener_help).expect("help");
         let opener_rendered = String::from_utf8(opener_help).expect("utf8");
-        assert!(
-            opener_rendered.contains("Answer-weight model: weighted, uniform, or cooldown_only")
-        );
+        assert!(opener_rendered.contains("Answer-weight model:"));
+        assert!(opener_rendered.contains("used_unused"));
 
         let mut study = Cli::command()
             .find_subcommand_mut("study-run")
@@ -2758,5 +3114,133 @@ mod tests {
         assert!(study_rendered.contains("Pause cooperatively"));
         assert!(study_rendered.contains("peak-working-set budget"));
         assert!(study_rendered.contains("Optional TOML base config"));
+    }
+
+    #[test]
+    fn benchmark_evidence_accepts_range_and_rolling_selection() {
+        let range = Cli::try_parse_from([
+            "maybe-wordle",
+            "benchmark-evidence",
+            "--from",
+            "2026-01-01",
+            "--to",
+            "2026-01-31",
+            "--matrix",
+            "matrix.json",
+            "--output",
+            "evidence.json",
+            "--markdown-output",
+            "evidence.md",
+        ])
+        .expect("range selection should parse");
+        match range.command {
+            Command::BenchmarkEvidence {
+                from,
+                to,
+                rolling_folds,
+                matrix,
+                ..
+            } => {
+                assert_eq!(from.as_deref(), Some("2026-01-01"));
+                assert_eq!(to.as_deref(), Some("2026-01-31"));
+                assert!(!rolling_folds);
+                assert_eq!(matrix, Some(PathBuf::from("matrix.json")));
+            }
+            _ => panic!("expected benchmark-evidence"),
+        }
+
+        let rolling = Cli::try_parse_from([
+            "maybe-wordle",
+            "benchmark-evidence",
+            "--rolling-folds",
+            "--output",
+            "evidence.json",
+            "--markdown-output",
+            "evidence.md",
+        ])
+        .expect("rolling selection should parse");
+        match rolling.command {
+            Command::BenchmarkEvidence {
+                from,
+                to,
+                rolling_folds,
+                ..
+            } => {
+                assert!(from.is_none());
+                assert!(to.is_none());
+                assert!(rolling_folds);
+            }
+            _ => panic!("expected benchmark-evidence"),
+        }
+    }
+
+    #[test]
+    fn search_regret_hard_mode_requires_finite_and_preserves_budget_overrides() {
+        let mut arguments = vec![
+            "maybe-wordle",
+            "search-regret",
+            "--from",
+            "2026-08-01",
+            "--to",
+            "2026-08-02",
+            "--output",
+            "regret.json",
+            "--hard-mode",
+        ];
+        assert!(Cli::try_parse_from(&arguments).is_err());
+        arguments.extend([
+            "--finite",
+            "--maximum-states",
+            "3",
+            "--maximum-seconds",
+            "20",
+        ]);
+        let parsed = Cli::try_parse_from(arguments).expect("finite hard-mode audit");
+        match parsed.command {
+            Command::SearchRegret {
+                finite,
+                hard_mode,
+                maximum_states,
+                maximum_seconds,
+                ..
+            } => {
+                assert!(finite && hard_mode);
+                assert_eq!(maximum_states, Some(3));
+                assert_eq!(maximum_seconds, Some(20));
+            }
+            _ => panic!("expected search-regret"),
+        }
+    }
+
+    #[test]
+    fn benchmark_evidence_rejects_incomplete_or_mixed_date_selection() {
+        let missing_to = Cli::try_parse_from([
+            "maybe-wordle",
+            "benchmark-evidence",
+            "--from",
+            "2026-01-01",
+            "--output",
+            "evidence.json",
+            "--markdown-output",
+            "evidence.md",
+        ])
+        .expect_err("range selection must require --to");
+        assert!(missing_to.to_string().contains("--to"));
+
+        let mixed = Cli::try_parse_from([
+            "maybe-wordle",
+            "benchmark-evidence",
+            "--rolling-folds",
+            "--from",
+            "2026-01-01",
+            "--to",
+            "2026-01-31",
+            "--output",
+            "evidence.json",
+            "--markdown-output",
+            "evidence.md",
+        ])
+        .expect_err("rolling selection must not mix explicit dates");
+        assert!(mixed.to_string().contains("cannot be used with"));
     }
 }

@@ -20,6 +20,10 @@ pub enum WeightMode {
     Weighted,
     Uniform,
     CooldownOnly,
+    EmpiricalFrequency,
+    RegularizedFrequency,
+    UsedUnused,
+    RecencyBuckets,
 }
 
 impl WeightMode {
@@ -28,6 +32,10 @@ impl WeightMode {
             Self::Weighted => "weighted",
             Self::Uniform => "uniform",
             Self::CooldownOnly => "cooldown_only",
+            Self::EmpiricalFrequency => "empirical_frequency",
+            Self::RegularizedFrequency => "regularized_frequency",
+            Self::UsedUnused => "used_unused",
+            Self::RecencyBuckets => "recency_buckets",
         }
     }
 }
@@ -283,6 +291,39 @@ pub fn weight_snapshot_for_mode(
             let final_weight = base_weight * recency_weight * record.manual_weight;
             (base_weight, recency_weight, final_weight)
         }
+        WeightMode::EmpiricalFrequency | WeightMode::RegularizedFrequency => {
+            let smoothing = usize::from(mode == WeightMode::RegularizedFrequency);
+            let base_weight = if eligible {
+                (seen_count + smoothing) as f64
+            } else {
+                0.0
+            };
+            (base_weight, 1.0, base_weight * record.manual_weight)
+        }
+        WeightMode::UsedUnused | WeightMode::RecencyBuckets => {
+            let base_weight = if record.in_seed || record.manual_entry {
+                config.base_seed_weight
+            } else if !seen_dates.is_empty() {
+                config.base_history_only_weight
+            } else {
+                0.0
+            };
+            let recency_weight = match mode {
+                WeightMode::UsedUnused => {
+                    if seen_dates.is_empty() {
+                        1.0
+                    } else {
+                        config.cooldown_floor
+                    }
+                }
+                WeightMode::RecencyBuckets => last_seen
+                    .map(|last_seen| recency_bucket_weight(config, (as_of - last_seen).num_days()))
+                    .unwrap_or(1.0),
+                _ => unreachable!("combined arm only contains experimental modes"),
+            };
+            let final_weight = base_weight * recency_weight * record.manual_weight;
+            (base_weight, recency_weight, final_weight)
+        }
         WeightMode::Weighted => {
             let base_weight = if record.in_seed || record.manual_entry {
                 config.base_seed_weight
@@ -320,6 +361,19 @@ pub fn weight_snapshot_for_mode(
         manual_weight: record.manual_weight,
         final_weight,
     }
+}
+
+fn recency_bucket_weight(config: &PriorConfig, days_since_last_seen: i64) -> f64 {
+    let bucket_level = if days_since_last_seen < config.cooldown_days {
+        0.0
+    } else if days_since_last_seen < config.cooldown_days.saturating_mul(2) {
+        0.25
+    } else if days_since_last_seen < config.cooldown_days.saturating_mul(4) {
+        0.5
+    } else {
+        1.0
+    };
+    config.cooldown_floor + (1.0 - config.cooldown_floor) * bucket_level
 }
 
 fn build_history_rows(records: &[AnswerRecord], as_of: NaiveDate) -> Vec<AnswerHistoryRow> {
@@ -490,8 +544,11 @@ mod tests {
         }
 
         assert_eq!(before.recency_weight, config.cooldown_floor);
-        assert!(before.recency_weight < at.recency_weight);
-        assert!(at.recency_weight < after.recency_weight);
+        // Far below the midpoint, consecutive logistic values can round identically.
+        assert!(before.recency_weight <= at.recency_weight);
+        assert!(at.recency_weight <= after.recency_weight);
+        let midpoint = config.midpoint_days as i64;
+        assert!(snapshot_at(midpoint).recency_weight < snapshot_at(midpoint + 1).recency_weight);
 
         let boundary_discontinuity = at.recency_weight - before.recency_weight;
         assert!(
@@ -514,12 +571,170 @@ mod tests {
             WeightMode::Weighted,
             WeightMode::Uniform,
             WeightMode::CooldownOnly,
+            WeightMode::EmpiricalFrequency,
+            WeightMode::RegularizedFrequency,
+            WeightMode::UsedUnused,
+            WeightMode::RecencyBuckets,
         ] {
             let snapshot = weight_snapshot_for_mode(&record, &PriorConfig::default(), as_of, mode);
             assert_eq!(snapshot.seen_count, 0);
             assert_eq!(snapshot.base_weight, 0.0);
             assert_eq!(snapshot.final_weight, 0.0);
         }
+    }
+
+    #[test]
+    fn experimental_weight_modes_have_stable_labels_and_serde_names() {
+        for (mode, label) in [
+            (WeightMode::UsedUnused, "used_unused"),
+            (WeightMode::RecencyBuckets, "recency_buckets"),
+        ] {
+            assert_eq!(mode.label(), label);
+            let encoded = serde_json::to_string(&mode).expect("serialize weight mode");
+            assert_eq!(encoded, format!("\"{label}\""));
+            assert_eq!(
+                serde_json::from_str::<WeightMode>(&encoded).expect("decode weight mode"),
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn used_unused_is_binary_and_recency_buckets_are_monotone_at_boundaries() {
+        let config = PriorConfig {
+            cooldown_days: 4,
+            cooldown_floor: 0.1,
+            ..PriorConfig::default()
+        };
+        let last_seen = NaiveDate::from_ymd_opt(2024, 1, 1).expect("date");
+        let used = AnswerRecord {
+            word: "cigar".to_string(),
+            in_seed: true,
+            manual_entry: false,
+            manual_weight: 1.0,
+            history_dates: vec![last_seen],
+        };
+        let never_used = AnswerRecord {
+            history_dates: Vec::new(),
+            ..used.clone()
+        };
+
+        let used_snapshot = weight_snapshot_for_mode(
+            &used,
+            &config,
+            last_seen + Duration::days(20),
+            WeightMode::UsedUnused,
+        );
+        assert_eq!(used_snapshot.recency_weight, config.cooldown_floor);
+        let never_used_snapshot = weight_snapshot_for_mode(
+            &never_used,
+            &config,
+            last_seen + Duration::days(20),
+            WeightMode::UsedUnused,
+        );
+        assert_eq!(never_used_snapshot.recency_weight, 1.0);
+
+        let snapshot_at = |days_since_last_seen: i64| {
+            weight_snapshot_for_mode(
+                &used,
+                &config,
+                last_seen + Duration::days(days_since_last_seen),
+                WeightMode::RecencyBuckets,
+            )
+            .recency_weight
+        };
+        let expected = |level: f64| config.cooldown_floor + (1.0 - config.cooldown_floor) * level;
+        let boundaries = [
+            (0, expected(0.0)),
+            (3, expected(0.0)),
+            (4, expected(0.25)),
+            (7, expected(0.25)),
+            (8, expected(0.5)),
+            (15, expected(0.5)),
+            (16, expected(1.0)),
+        ];
+        let mut previous = 0.0;
+        for (days, expected_weight) in boundaries {
+            let weight = snapshot_at(days);
+            assert!((weight - expected_weight).abs() < f64::EPSILON);
+            assert!(
+                weight >= previous,
+                "recency bucket decreased at {days} days"
+            );
+            previous = weight;
+        }
+    }
+
+    #[test]
+    fn experimental_modes_ignore_history_after_as_of_date() {
+        let as_of = NaiveDate::from_ymd_opt(2024, 2, 1).expect("date");
+        let future = as_of + Duration::days(1);
+        let without_future_history = AnswerRecord {
+            word: "cigar".to_string(),
+            in_seed: true,
+            manual_entry: false,
+            manual_weight: 1.5,
+            history_dates: Vec::new(),
+        };
+        let with_future_history = AnswerRecord {
+            history_dates: vec![future],
+            ..without_future_history.clone()
+        };
+
+        for mode in [WeightMode::UsedUnused, WeightMode::RecencyBuckets] {
+            let before = weight_snapshot_for_mode(
+                &without_future_history,
+                &PriorConfig::default(),
+                as_of,
+                mode,
+            );
+            let after = weight_snapshot_for_mode(
+                &with_future_history,
+                &PriorConfig::default(),
+                as_of,
+                mode,
+            );
+            assert_eq!(after.seen_count, 0);
+            assert_eq!(after.first_seen, None);
+            assert_eq!(after.last_seen, None);
+            assert_eq!(after.base_weight, before.base_weight);
+            assert_eq!(after.recency_weight, before.recency_weight);
+            assert_eq!(after.manual_weight, before.manual_weight);
+            assert_eq!(after.final_weight, before.final_weight);
+        }
+    }
+
+    #[test]
+    fn frequency_modes_use_observed_counts_and_additive_smoothing() {
+        let as_of = NaiveDate::from_ymd_opt(2024, 3, 1).expect("date");
+        let record = AnswerRecord {
+            word: "cigar".to_string(),
+            in_seed: true,
+            manual_entry: false,
+            manual_weight: 2.0,
+            history_dates: vec![
+                NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"),
+                NaiveDate::from_ymd_opt(2024, 2, 1).expect("date"),
+            ],
+        };
+
+        let empirical = weight_snapshot_for_mode(
+            &record,
+            &PriorConfig::default(),
+            as_of,
+            WeightMode::EmpiricalFrequency,
+        );
+        let regularized = weight_snapshot_for_mode(
+            &record,
+            &PriorConfig::default(),
+            as_of,
+            WeightMode::RegularizedFrequency,
+        );
+
+        assert_eq!(empirical.base_weight, 2.0);
+        assert_eq!(empirical.final_weight, 4.0);
+        assert_eq!(regularized.base_weight, 3.0);
+        assert_eq!(regularized.final_weight, 6.0);
     }
 
     #[test]

@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryMode {
     Strict,
-    UniformOverSupport,
     #[default]
+    UniformOverSupport,
     EpsilonRepair,
 }
 
@@ -30,7 +30,7 @@ impl Default for RecoveryPolicy {
     fn default() -> Self {
         Self {
             mode: RecoveryMode::default(),
-            epsilon_scale: 1e-6,
+            epsilon_scale: 0.00000850780812210975,
         }
     }
 }

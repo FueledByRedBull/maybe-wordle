@@ -541,7 +541,7 @@ fn fingerprint_observations(fold: &FoldSpec, observations: &[SurvivalObservation
     }
     format!(
         "{FINGERPRINT_PREFIX}{}",
-        hex_digest(hasher.finalize().as_slice())
+        crate::identity::hex(&hasher.finalize())
     )
 }
 
@@ -553,15 +553,6 @@ fn hash_field(hasher: &mut Sha256, value: impl AsRef<[u8]>) {
 
 fn date_text(date: NaiveDate) -> String {
     date.format("%Y-%m-%d").to_string()
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut result = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut result, "{byte:02x}");
-    }
-    result
 }
 
 fn validate_fingerprint(value: &str, label: &str) -> SurvivalResult<()> {

@@ -1,0 +1,10 @@
+format_version = 1
+development_cutoff = "2026-08-26"
+
+[sealed_test]
+start = "2026-08-28"
+end = "2026-09-26"
+
+[[excluded_validation]]
+start = "2026-06-18"
+end = "2026-07-17"

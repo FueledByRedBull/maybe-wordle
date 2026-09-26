@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "development-matched-fixed-belief-strong-policy-comparison",
+  "profiles": [
+    {
+      "id": "staged_fixed_belief",
+      "description": "Staged ranking on the frozen core/tail posterior",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "staged_fixed_belief" }
+      }
+    },
+    {
+      "id": "finite_strong",
+      "description": "Finite Strong search on the same frozen core/tail posterior; 2-second cooperative deadline",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "finite_strong" }
+      }
+    }
+  ]
+}

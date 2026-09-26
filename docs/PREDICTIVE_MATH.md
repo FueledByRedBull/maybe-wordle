@@ -8,6 +8,13 @@ The authoritative implementation lives in `src/scoring.rs`, `src/model.rs`, `src
 
 For a game on date `d`, the solver uses information available through `d - 1 day`.
 
+The live request calls this `puzzle_date`; the response exposes both `puzzle_date`
+and the derived inclusive `history_cutoff`. CLI and GUI defaults use the local calendar.
+Lower-level snapshot and book-building APIs retain explicitly inclusive `as_of` dates.
+Effective model identities sort words canonically and omit future history; raw source
+provenance can still change when new records arrive. Existing book hash domains were
+advanced so artifacts made under the old identity semantics are not reused.
+
 The primary answer support is the union of pinned candidate answers, historically observed answers whose first observation is not in the future, and manual additions. Every syntactically valid guess is also retained as dormant fallback support. A future history-only word is not eligible before its first observed date.
 
 For primary candidate `a`, the unnormalized prior is
@@ -37,7 +44,154 @@ P(a | S, d) = w(a, d) / sum_{x in S} w(x, d)
 
 All masses must be finite and non-negative, and the normalized total must be within `1e-9` of one. If modeled mass is zero but supported candidates remain, the declared recovery policy is applied; the runtime never silently deletes date-supported candidates.
 
-Dormant valid guesses receive a total raw fallback mass controlled by `fallback_prior_mass`. They are filtered by every observation but become active only under the declared `fallback_activation_threshold`/inconsistency rule. This provides full historical coverage without constructing a full guess-by-all-valid-answers pattern table.
+Dormant valid guesses receive a total raw fallback mass controlled by `fallback_prior_mass`. They are filtered by every observation but become active only under the declared `fallback_activation_threshold`/inconsistency rule. This extends coverage without constructing a full guess-by-all-valid-answers pattern table; it does not guarantee coverage of future editorial answers. A future history-only word outside the guess dictionary is excluded from dormant support until date-eligible, so it cannot dilute earlier fallback weights.
+
+### Experimental finite-horizon policy
+
+The September `finite_fast` and `finite_strong` policies are under integration and
+validation, not validated replacements for the selected production configuration.
+They freeze a single distribution at the puzzle cutoff. Positive modeled answers
+form the core, with normalized total mass `1 - fallback_prior_mass`; remaining
+supported answers share the tail mass uniformly. A zero modeled weight (including
+a manual zero) means tail membership, not a hard vocabulary exclusion. If there is
+no positive core, the supported universe is uniform; if there is no tail, the core
+has total mass one. An explicitly zero tail mass excludes that tail from planning.
+Feedback filters this distribution without changing individual weights or invoking
+another recovery rule. Prior-only model scores and effective planning probabilities
+must remain distinguishable.
+
+The controlled finite API can also run experimentally on the selected staged
+*dynamic* belief. In that case `S` below includes active weights, dormant
+support, activation/recovery flags and, in hard mode, the observation history;
+it is not merely a survivor subset. Branch probability uses the parent state's
+current mass, then each non-green child applies the same fallback and recovery
+transition as live `apply_feedback`. Dormant words have zero *current* mass
+until activated, so their eventual empirical coverage risk is not a positive
+root failure probability under this model. Memo keys include the dynamic
+weights/support/flags as well as the horizon and hard-mode history. This path
+is opt-in, not a validated replacement for selected `staged`.
+The raw benchmark path below is a local-only diagnostic; it is shown as inline code and is not part of a public clean checkout.
+`../benchmarks/predictive/september-dynamic-finite-30day-v1.json`
+Its score/latency rejection is recorded in [the release ledger](SEPTEMBER_RELEASE.md).
+
+Let `h` be remaining turns, and let `L(S,H)` be guesses legal under the simulated
+hard-mode history `H` (all allowed guesses in normal mode). For an unresolved state:
+
+```text
+V(S, H, 0) = (1, 0)
+V(S, H, h) = lex_min over g in L(S,H) of
+  ( sum_{p != green} P(p | g,S) * F(S_p, H+(g,p), h-1),
+    1 + sum_{p != green} P(p | g,S) * T(S_p, H+(g,p), h-1) )
+```
+
+`F` is modeled failure probability; `T` is expected attempts actually taken before
+solving or exhausting the horizon, including attempts in failed games. Minimize `F`
+first, then `T`. Failure/gap=7 is a separate reporting metric, not the terminal cost
+in this recurrence. Finite-horizon non-progress actions are well-founded because
+`h` decreases, although a useful baseline should not waste turns repeating them.
+Memoization includes survivors, horizon and the full simulated hard-mode history.
+When the initial root shortlist and its endgame refinement finish before the
+deadline, the finite search spends remaining budget on all legal roots with exact
+continuations. Previously completed policies remain usable if widening is
+interrupted. Exact memo entries remain valid across this widening because only
+exact values are stored there; baseline memo entries describe a threshold-independent
+policy. Widening does not guarantee exhaustive completion within the budget.
+Recursive exact minimization skips a non-solving action whose feedback is identical
+for every survivor once an incumbent exists: it provides no information, consumes
+a turn, and can only add hard-mode restrictions. Fixed-root evaluation still
+evaluates such actions, so its reported value remains comparable to the independent
+oracle rather than pretending the requested move was replaced.
+For other recursive actions, a completed feasible incumbent permits branch-level
+pruning. The partial lower bound uses exact failure and attempt contributions from
+completed feedback children, compulsory failure for unexamined one-turn misses,
+and the minimum further attempts compatible with the incumbent's quantized failure
+bucket. It prunes only when that lexicographic lower bound cannot improve the
+incumbent; a heuristic or upper-bound child disables this proof. Normal-mode
+recursion also reuses an already-evaluated action when its full per-answer feedback
+signature (including green) matches. Hard-mode recursion does not deduplicate,
+because the guessed word can change later legal moves even with the same survivor
+partition. These lower bounds are internal dominance proofs, not feasible action
+values or exact child costs. They are not cached or displayed as candidate values;
+public quality labels remain `Heuristic`, `UpperBound` and `Exact`.
+Public predictive requests validate the supplied hard-mode sequence, not just the
+next recommended guess, and reject turns after a solved row. The current hard-mode
+contract preserves green positions, forbids yellow positions, and requires the
+maximum revealed positive count of each letter. Gray tiles filter answer support;
+they do not impose a hard-mode upper-count restriction on probe guesses.
+Recursive dictionary scans compile these existing constraints once per state and
+use the same structured violation check as public validation, without formatting
+rejection messages for internal boolean decisions. The rule set and memo identity
+are unchanged; the public API still validates inputs and formats the same errors.
+
+This recursive legality contract applies to the finite policies. Legacy staged
+search filters the next suggestion for hard-mode legality, but its unlimited-horizon
+continuation estimates use normal-mode replies and subset-only memoization. Those
+legacy costs are not exact hard-mode policy values; use a finite profile when
+recursive hard-mode planning is required.
+
+The staged policy has a direct late-turn exception. After four observations it
+reranks the complete live suggestion list for the two remaining turns: structural
+`force_in_two` witnesses first only when every survivor is a legal final guess,
+then the exact modeled two-turn success mass
+`sum_p max_{a in S_p and a in G} P(a)` (including the all-green bucket), then
+immediate solve probability to minimize attempts among equally successful moves.
+History/manual answer words absent from the guess dictionary `G` cannot count
+as final-turn solves. Hard-mode
+filtering still removes illegal probes. After five observations it ranks immediate
+solve probability first. The earlier staged turns still use the unlimited-horizon
+heuristic/exact-cost machinery; this exception is not a claim that the whole
+staged policy optimizes the six-turn objective or that modeled support covers
+every possible answer.
+
+With one turn left, choose the highest-probability legal answer: `F=1-p_max`,
+`T=1`. With two turns left and a legal final guess in every child, a proposed `g`
+has `F=1-P(g)-sum_{p != green} max_{a legal in S_p} P(a)` and `T=2-P(g)`, where
+the probabilities in the sum are measured against the parent distribution. The
+unlimited-horizon `2-p_max` bound must not be used as an attempts bound at `h=1`.
+For `h>=2`, a feasible zero-failure policy attaining `T=2-p_max` proves the
+lexicographic optimum: failure cannot be negative, and every first-guess miss
+needs at least one further attempt. Exact endgames may stop on this attainment.
+With one or two legal candidate answers, guessing the heavier answer first
+attains the bound (a singleton takes one attempt), avoiding dictionary enumeration.
+
+Complete rollout values describe feasible policies. They upper-bound the optimum
+in lexicographic order, not each coordinate independently. An exact continuation
+value for a shortlisted action does not prove that its root action is globally
+optimal. Unevaluated deadline fallbacks have no numeric value claim; proposal
+sampling is heuristic and must not remove answers from actual rollout evaluation.
+Broad roots first compare grouped baseline-policy rollouts across the root shortlist
+without recursive exact search, then attempt exact endgame refinement. A completed baseline value
+survives an interrupted refinement; incomplete values never enter the exact cache.
+The cheap baseline rescoring pool consists of the highest-mass legal surviving
+answers, limited by `reply_shortlist`, with lexical mass ties. It does not inherit
+the calling root's probe shortlist: the same conditioned state must give the same
+baseline action in a rollout and a fresh request. Root improvement still considers
+non-answer probes. The state-local change introduced finite policy identity v2; earlier
+root-anchor latency results do not establish its solve quality. A matched-budget
+empirical comparison remains required before promotion.
+Proposal partitions use the same proxy-score finalization as the shared ranking
+path, not a separate expected-bucket-count replacement formula.
+The experimental v3 policy schedules root proposals by summed unique-letter
+Bernoulli variance `sum_l p_l * (1 - p_l)` before computing full proxy partitions.
+This is a scheduling heuristic, not an entropy identity, bound, or changed rollout
+objective. Proposal work soft-stops at one quarter of its budget to reserve time
+for completed values; `proposal_sampled` also records this truncation. Even a
+`Complete` status with that flag is not an exhaustive root optimum. Deadlines are
+cooperative: support/proposal sorting and request setup are not individually
+interruptible. The v3 development comparison did not establish a mean-guess gain.
+Execution telemetry records these steps as `finite`, independently of each
+candidate's value quality. Evidence tables use `P/L/XE/X/F` for proxy, lookahead,
+escalated exact, unlimited-horizon exact and finite-policy steps. Legacy pool-size
+ratios do not describe finite search; finite steps leave those fields zero and
+report their completed root candidates through the finite-search result instead.
+
+Finite values use floating-point arithmetic. Comparisons round each coordinate to
+bins of `64 * f64::EPSILON` (about `1.42e-14`) before lexicographic comparison;
+quality and word order resolve remaining ties. This transitive ordering prevents
+accumulation noise from deciding mathematical ties. Model-exact labels mean exhaustive
+continuation search under this numerical contract, not exact rational arithmetic.
+The independent small-state oracle instead accumulates integer probability masses
+and attempt totals before normalization to check both coordinates.
 
 ## 2. Wordle feedback
 
@@ -74,7 +228,10 @@ expected_remaining(g) = sum_p mass[p] * count[p]
 solve_probability(g) = mass[all_green]
 ```
 
-Zero-mass buckets contribute zero to entropy. `force_in_two` means every non-green bucket has at most one answer; it is a structural property of the modeled state, not a guarantee about candidates outside support.
+Zero-mass buckets contribute zero to entropy. In live suggestions,
+`force_in_two` means every non-green bucket has at most one answer and every
+survivor is in the legal guess dictionary. It is a structural property of the
+modeled state, not a guarantee about candidates outside support.
 
 The solver also records the largest non-green bucket mass and size, counts of buckets above declared size/mass thresholds, concentration, and mass in large buckets. These are diagnostics and heuristic features.
 
@@ -94,10 +251,26 @@ For each non-green child bucket, proxy continuation cost is:
 0                                      all green
 1                                      singleton
 1 + (1 - largest_mass / bucket_mass)   2 <= count <= proxy_small_state_lower_bound_threshold
-max(count / 243, entropy_bits / log2(243), 1) otherwise
+max(2 - largest_mass / bucket_mass, count / 243, 1) otherwise
 ```
 
-The guess proxy cost starts at one for the current guess and adds the probability-weighted child costs. Concentration is not embedded here; it is an independent registered feature in the large-state score below.
+The weight-aware floor applies on both sides of the threshold, preventing the previous
+uniform 12-to-13-answer cost drop. The count term remains a heuristic estimate;
+they are not certified branch-and-bound lower bounds. The guess proxy cost starts at
+one and adds probability-weighted child costs. Concentration is a separate feature.
+
+The former child-entropy floor is redundant: `H <= log2(count)`, and
+`H/log2(243) <= max(1, count/243)` for every positive count. It and its per-answer
+weighted-log accumulation are removed. This does not remove feedback-partition
+entropy from the ranking features. Old/new numerical equivalence is regression-tested
+across uniform/skewed distributions and the threshold/243/486 count boundaries.
+
+The weighted floor alone cannot increase under partition refinement: its mass-weighted
+sum is `2M - sum(child maxima)`, and splitting cannot decrease the sum of maxima.
+The full count-based heuristic does not have that property. For example, a 300-answer
+unit-mass bucket with maximum mass 0.8 has proxy 1.234568; splitting into a 298-answer
+bucket of mass 0.9 (maximum 0.8) and two answers of mass 0.05 each gives 1.253704.
+Regression tests preserve this distinction; the full proxy must not be used for pruning.
 
 The large-state ranking score is a linear heuristic:
 
@@ -120,13 +293,28 @@ Feature signs are explicit. Several features are correlated (largest mass, bucke
 
 ### Coupling audit result (2026-07-19)
 
-`exact_exhaustive_threshold` formerly selected both the exact-search budget and the proxy child-cost formula. This made an exact-search knob silently change broad-state ranking. The formula now uses the independent, registered `proxy_small_state_lower_bound_threshold`. The small-state branch also formerly read a uniform-count table under a weighted prior; it now uses the weight-aware one-step cost above. A threshold of zero selects the large-state analytic heuristic for every non-singleton.
+`exact_exhaustive_threshold` formerly selected both exact-search budget and proxy formula.
+The independent `proxy_small_state_lower_bound_threshold` selects where the broader
+analytic heuristic participates. The weighted floor applies throughout, including at
+threshold zero. Neither branch reads the old uniform-count table.
 
 ## 5. Second-turn three-solve coverage
 
-For selected second-guess candidate `g`, the coverage analysis asks for each non-green child whether the child is a singleton or any allowed reply partitions it into singleton non-green buckets. It records covered posterior mass, uncovered answer count, and uncovered bucket count.
+For a selected second guess `g`, success by total turn three includes an immediate
+win and one final answer attempt in each non-green child. Using probabilities in the
+current state (before child normalization), the exact quantity is:
 
-This is an exact structural check within capped child states, but the root candidate scan is bounded. Therefore it proves coverage only for the scanned candidate and modeled child support; it does not prove the globally best second guess was scanned.
+```text
+P(T <= 3 | g, turn 2) = P(answer = g) + sum_non_green_B max_(a in B) P(answer = a)
+```
+
+The root candidate scan is bounded. This calculation assumes each supported answer is
+a legal final guess. Positive-mass answers beyond that one final choice count as
+uncovered; immediate green success is included. It is a success-probability diagnostic,
+not expected attempts or a guarantee over unmodeled answers.
+
+The former structural check could permit completion on turn four and omitted green
+mass. Its evidence must not be labeled success by turn three.
 
 The feature is active only when:
 
@@ -136,7 +324,11 @@ and second_guess_coverage_min_survivors <= |S|
 and |S| <= second_guess_coverage_max_survivors
 ```
 
-`second_guess_coverage_max_survivors = 0` disables it. The number of proxy-ranked roots scanned is exactly `second_guess_coverage_pool`; child buckets larger than `second_guess_coverage_child_cap` are conservatively classified as uncovered.
+`second_guess_coverage_max_survivors = 0` disables it. The number of proxy-ranked roots
+scanned is exactly `second_guess_coverage_pool`. The obsolete
+`second_guess_coverage_child_cap` has been removed from current configuration and
+registry v7; legacy TOML inputs may still contain it, but it has no effect and is not
+written back. Historical configs remain archived without rewriting their identities.
 
 ### Coupling audit result (2026-07-18)
 
@@ -152,11 +344,60 @@ Activation and pool size formerly depended on exact/lookahead thresholds. This m
 
 Within exact mode, states at or below `exact_exhaustive_threshold` scan every allowed guess; larger eligible states use a bounded candidate pool. Candidate-pool exact search is exact only over that pool. The pool is a deduplicated mixture of the primary proxy, entropy, worst-bucket, worst-mass, solve-probability, and posterior-answer rankings. Each source fraction is registered independently. Tight and medium score-gap expansion multipliers are also registered rather than fixed in code.
 
+For a pooled exact request for the top `K` suggestions, the implementation can
+avoid recursive evaluation of roots that provably cannot enter that prefix. For
+root guess `g`, let `M` be the current total mass and, for each non-green
+feedback bucket `b`, let `m_b` be its mass and `w_b` its largest answer mass.
+The admissible root bound is
+
+`LB(g) = 1 + sum_b (2 m_b - w_b) / M`.
+
+The root guess costs one turn. In each non-green bucket, at least one reply is
+needed, and every answer other than the heaviest needs at least one more.
+Roots are evaluated in ascending bound order; once `K` exact costs are known,
+later roots with bounds strictly above the `K`th cost (plus a floating-point
+guard) are skipped. Equal or near-equal bounds remain eligible. This preserves
+the requested exact-cost prefix within the *same candidate pool*, not global
+optimality, a six-turn objective, or exact costs for unrequested rows. The
+shortcut is disabled when coverage is the primary ranking key or exhaustive
+mode is selected.
+
+Common positive scaling of answer masses leaves normalized probabilities unchanged
+(apart from floating-point rounding); this is different from scaling score weights.
+Multiplying every linear large-state coefficient by a positive constant preserves
+its ordering, but scales the absolute top-to-pool-edge score gap. Legacy pool
+expansion compares that gap with `pool_tight_gap_threshold` and
+`pool_medium_gap_threshold`, so coefficient scale is not a redundant policy dimension.
+For example, a gap of 0.04 is below the default tight threshold 0.05, whereas the
+same ordering scaled tenfold has gap 0.4 and receives no gap expansion. Scaling both
+thresholds restores that split-score comparison, but also changes the separate
+proxy-cost branch, whose costs were not scaled. Do not normalize away this degree of
+freedom or remove correlated coefficients without a matched policy ablation.
+
 After five observations, only one guess remains. The runtime therefore overrides unlimited-horizon proxy/lookahead/exact ordering and ranks guesses by immediate solve probability, then posterior answer probability, then lexical order for deterministic ties. Information gain has no value after the final guess. This does not remove irreducible failures when several unseen, cutoff-safe dormant candidates have identical mass; recovery activation must expose those candidates early enough for previous guesses to separate them.
 
-The danger score is a normalized weighted combination of top-posterior concentration, largest-bucket mass, largest-bucket size ratio, ambiguity pressure, and top-candidate disagreement. Registry v6 makes the posterior and candidate windows, mass and size disagreement cutoffs, and ambiguity saturation count explicit alongside the five feature weights and allocation thresholds. Its thresholds allocate computation; it is not a probability of failure. Lookahead starts with one for the root guess and adds each branch probability times the selected child reply's complete proxy cost. That proxy cost already includes the reply guess. The previous heuristic path added another unit at the child, double-counting the reply only above `exact_exhaustive_threshold` and creating a discontinuity with exact children; a hand-computed regression now prevents it. A later domain audit found that bounded child-reply pools could still admit a guess whose largest non-green bucket was the entire child state. Such a reply has no well-founded finite continuation value, so child metrics now apply the same strict-progress predicate used at the root and by exact recursion. The slow reference and a deliberately inert-guess fixture enforce the same domain. Proxy continuation cost no longer embeds an extra concentration surcharge because concentration already has its own registered score weight. Root lookahead penalties apply to four separate inputs—worst-branch posterior mass, large-bucket count, dangerous-mass count, and mass in large buckets. Approximate replies add candidate-count ratio through its own registered coefficient instead of merging it into the posterior-mass coefficient. These penalties remain heuristic and must never be labeled exact expected guesses.
+The danger score is a normalized weighted combination of top-posterior concentration, largest-bucket mass, largest-bucket size ratio, ambiguity pressure, and top-candidate disagreement. Registry v7 makes the posterior and candidate windows, mass and size disagreement cutoffs, and ambiguity saturation count explicit alongside the five feature weights and allocation thresholds. Its thresholds allocate computation; it is not a probability of failure. Lookahead starts with one for the root guess and adds each branch probability times the selected child reply's complete proxy cost. That proxy cost already includes the reply guess. The previous heuristic path added another unit at the child, double-counting the reply only above `exact_exhaustive_threshold` and creating a discontinuity with exact children; a hand-computed regression now prevents it. A later domain audit found that bounded child-reply pools could still admit a guess whose largest non-green bucket was the entire child state. Such a reply has no well-founded finite continuation value, so child metrics now apply the same strict-progress predicate used at the root and by exact recursion. The slow reference and a deliberately inert-guess fixture enforce the same domain. Proxy continuation cost no longer embeds an extra concentration surcharge because concentration already has its own registered score weight. Root lookahead penalties apply to four separate inputs—worst-branch posterior mass, large-bucket count, dangerous-mass count, and mass in large buckets. Approximate replies add candidate-count ratio through its own registered coefficient instead of merging it into the posterior-mass coefficient. These penalties remain heuristic and must never be labeled exact expected guesses.
 
 ### Tractable-state regret audit (2026-07-26)
+
+The legacy scalar-cost reports below do not validate the new six-turn objective.
+`search-regret --finite` accepts only the fixed-belief Fast/Strong modes and
+compares their actions with a
+finite exact reference under the same posterior, remaining turns and hard-mode
+history. An exact global reference requires all legal root actions, exact values,
+completed search and no proposal sampling. Fixed-root references independently
+partition that action with raw feedback, then reuse the finite kernel for each
+child at one fewer turn. This is a shared-kernel cross-check; independent exhaustive
+verification remains confined to the tiny-state tests. The fixed-root reference
+does not validate `finite_fast_dynamic`; that mode needs a dynamic reference
+before a comparable regret claim is possible.
+
+Failure regret is reported first. Expected-attempt regret is reported only when
+failure values tie after quantization at `64 * f64::EPSILON`, matching the kernel's
+comparison convention. An exact fixed-root value that beats the purported global
+optimum is rejected as contradictory evidence. Interrupted or incomplete references
+retain an explicit status and null regret. These bounded diagnostics cannot support
+a claim about unexamined larger states or prospective games.
 
 `search-regret` follows deterministic historical targets with the artifact-free proxy policy until a requested posterior-size band is reached. It then evaluates the production choice, forced proxy choice, and configured bounded-lookahead choice on that identical posterior. The reference scans every allowed root guess and uses exhaustive Bellman continuation. Reports bind the executable, source, config, and data identities; record the exact observation path; enforce a wall-clock cap between games and states; and are diagnostic development evidence, not sealed-test solve scores.
 
@@ -224,6 +465,16 @@ The multiclass Brier score is unhalved, so its range is `[0, 2]`. Input is rejec
 
 Current log loss around `7.23` and Brier around `0.9992` indicate a weakly calibrated editorial prior. GUI/CLI probabilities therefore remain labeled heuristic scores. Calibration claims require rolling-origin reliability/ECE evidence, not only a lower log loss.
 
+Benchmark `average_log_loss` and `average_brier` score each target against the
+date-bounded *initial* state, before gameplay. They are not posterior-path
+averages. The staged policy starts from its modeled support with separate
+recovery, while fixed-belief finite modes freeze a positive-mass core/tail state.
+The opt-in `finite_fast_dynamic` mode instead starts from staged's dynamic belief.
+Thus two
+profiles with the same TOML can have different initial probability vectors;
+their score comparison is an end-to-end policy-bundle comparison unless the
+effective support and weights are explicitly matched.
+
 ## 9. Evaluation contract
 
 Every scheduled date has exactly one status:
@@ -241,11 +492,21 @@ all_game_score = mean(
 )
 ```
 
-`conditional_mean_guesses` is named explicitly and averages modeled games only. It must not be compared with an all-game score when coverage differs.
+In backtest `PredictiveMetrics`, `conditional_mean_guesses` averages modeled games, including failed attempts. In `StudyMeasurement`, the same field is solved-only: its numerator is the exact sum of the 1–6 solved histogram, divided by `solved_games`. These distinct conditional populations must not be compared with each other or with an all-game score when coverage/failures differ. Study format v17 fixes the earlier conversion that multiplied the modeled-game mean by the solved-game count. The study's all-game numerator is the solved total plus `L * (unsolved_games + coverage_gaps)`.
 
 Reported distribution statistics include the 1–6 histogram, median, p90, p95, maximum, and solved-within-three/four rates. Coverage and solve-rate intervals use Wilson score intervals.
 
 Prior ranking evidence reports top-1, top-3, and top-5 recall with Wilson intervals. Ten-bin confidence expected calibration error uses the maximum prior probability as confidence and whether that top-ranked word is the observed answer as correctness. Its interval uses the same deterministic chronological moving-block bootstrap as other standalone statistics.
+
+Benchmark evidence also replays the recorded feedback path to score the posterior
+before each actual guess (turns 1–6), without rerunning search. Per-turn summaries
+report both scored and unscored states: they condition on games still being played,
+not all scheduled games. The all-games group and overlapping never-used, reused,
+historical-only and out-of-core strata use only history before the puzzle date.
+Coverage gaps remain unscored observations rather than disappearing. Persisted
+rows and aggregate scores are checked for arithmetic and path consistency.
+Session-book latency is null/n/a when that path is not used or benchmarked; it is
+not a measured zero-latency result.
 
 Standalone mean-like intervals use a deterministic moving-block bootstrap (`2,000` resamples, block length `7`, recorded seed). Paired comparisons resample chronological candidate-minus-baseline per-game differences, preserving dates. Negative delta favors the candidate. Win/tie/loss counts use per-game penalized values.
 
@@ -261,6 +522,18 @@ The final v20 candidate passed the complete 12-fold development guard at `360/36
 
 After the configuration and artifacts were frozen under `sha256-v1:15cb4c86c7548dbcdf94624a8a80b93009a8ebbdcc57d228617977765d4a543a`, the sealed 2026-06-18 through 2026-07-17 window was evaluated once. The candidate solved `30/30` games with all-game mean `3.3000`, interval `[3.1333, 3.4667]`, no coverage gaps, no failures, median 3, p95 5, and maximum 5. The result does not support a `<= 3.0` claim, and this sealed window must not be reused for tuning.
 
+The September 26 development comparisons are separate from that historical
+sealed result. Across 12 allowed folds, selected staged scored `3.2000` with
+`358/360` solves. An earlier-build finite Fast scored `3.5556` and `3.5639`
+with `360/360` solves in two runs, but its effective initial support differs
+from staged, so this is an end-to-end policy comparison, not a search-only
+ablation. A final-build rerun reproduced all staged and entropy-weight
+candidate game paths: the candidate scored `3.1944` with `359/360` solves;
+its paired difference from selected was `-0.0056` with interval
+`[-0.0278, +0.0139]`. The result does not establish an improvement or meet
+the zero-failure gate. All three remain development evidence; see the
+[September release ledger](SEPTEMBER_RELEASE.md) for identities and dates.
+
 ## 11. Study fidelity and promotion
 
 The common study runner evaluates only rolling-development folds. Given initial fold count `F0`, reduction factor `eta >= 2`, and maximum `Fmax`, its deterministic fidelity schedule is
@@ -269,25 +542,37 @@ The common study runner evaluates only rolling-development folds. Given initial 
 F_r = min(Fmax, F0 * eta^r)
 ```
 
-with the final `Fmax` rung inserted when multiplication would skip it. A candidate resumes from its saved additive fold accumulators; an already-recorded fold cannot be merged twice. At each non-final rung, candidates are ordered lexicographically by coverage gaps, failures, all-game failure-penalized mean when that stage measures solves, log loss, Brier score, latency, peak memory, and stable candidate number. The best `ceil(n / eta)` advance. Candidate zero is retained as the explicit reference baseline even when it would otherwise be pruned.
+with the final `Fmax` rung inserted when multiplication would skip it. A candidate resumes from its saved additive fold accumulators; an already-recorded fold cannot be merged twice. At each non-final rung, candidates are ordered lexicographically by coverage gaps, failures, all-game failure-penalized mean when that stage measures solves, log loss, Brier score, latency when available, and stable candidate number. Process-lifetime peak memory is enforced as a hard budget but cannot rank candidates in a shared process. The best `ceil(n / eta)` advance. Candidate zero is retained as the explicit reference baseline even when it would otherwise be pruned.
 
 The remaining roadmap studies use `F0 = 3`, `eta = 2`, and `Fmax = 12`, so their fidelity rungs are `3 -> 6 -> 12`. Each rung is a deterministic nested, time-spread subset of the same canonical 12 outer development folds; it is not a new resample or additional independent evidence. Spreading low-fidelity measurements across the development span avoids pruning solely on the oldest consecutive months. Every promoted finalist is evaluated on all 12 outer folds. Multiple optimization seeds alter candidate generation only, while `BookPolicy` rebuilds cutoff-safe artifacts for those same outer folds. Any inner chronological out-of-fold rows used to fit continuation-cost models belong exclusively to an outer fold's training data and never replace or augment its held-out validation score.
 
-The declared process-memory cap is enforced against peak working-set bytes on Windows, Linux, and macOS at solver construction, fold/game checkpoints where available, and final latency measurement. Peak bytes are checkpointed and enter guarded/Pareto ordering after latency. Exceeding the cap fails the trial; an unmeasured value ranks behind a measured value. Windows is release-tested; the macOS sampler still requires native-hardware validation. Wall-clock time is cumulative across resumed fidelity rungs and includes contention while a candidate is active. The default is 7,200 seconds: the earlier 3,600-second v11 proxy screen could complete six folds but not the final 12-fold rung, so that partial state is screening evidence only.
+The declared process-memory cap is enforced against peak working-set bytes on Windows, Linux, and macOS at solver construction, fold/game checkpoints where available, and final latency measurement. Peak bytes are checkpointed as shared-process budget diagnostics and are excluded from guarded/Pareto ordering: later trials inherit the process high-water mark. Exceeding the cap fails the trial; candidate-specific memory comparisons require isolated matched processes. Windows is release-tested; the macOS sampler still requires native-hardware validation. Wall-clock time is cumulative across resumed fidelity rungs and includes contention while a candidate is active. The default is 7,200 seconds: the earlier 3,600-second v11 proxy screen could complete six folds but not the final 12-fold rung, so that partial state is screening evidence only.
 
 Calibration-only studies deliberately leave guess means and latency null: zero is not a valid stand-in for an unmeasured solve objective. Their results can nominate prior candidates for later solve-policy evaluation, but cannot directly promote a solver configuration. The equal-compute strategy evidence in `benchmarks/predictive/study-strategy-comparison-v8.json` therefore reports calibration convergence and seed sensitivity, not a mean-guesses improvement.
 
-Static grid, low-discrepancy, random, and local-refinement suggestions are deterministic functions of the declared seed, registry, and budget. They evaluate independent candidates in parallel and may use successive halving. Fold scoring intentionally omits latency while candidates share the worker pool; after the pool joins, complete 12-fold finalists receive serialized latency measurements. This prevents scheduler contention from being mistaken for candidate latency. Model-based mode first evaluates a deterministic global startup pool, then separates completed trials into the guarded best quartile and remainder. It draws kernel proposals near the elite values and maximizes the log density ratio `log l(x) - log g(x)`. Suggestions are sequential and atomically checkpointed before evaluation, so resume preserves the ask/tell sequence. The five-seed evidence shows that both startup exploration and TPE refinement matter; neither is sufficient promotion evidence without solve outcomes.
+Static grid, low-discrepancy, random, and local-refinement suggestions are deterministic functions of the declared seed, registry, and budget. They evaluate independent candidates in parallel and may use successive halving. Fold scoring intentionally omits latency while candidates share the worker pool; after the pool joins, complete 12-fold finalists receive serialized latency measurements. This prevents scheduler contention from being mistaken for candidate latency. Model-based mode first evaluates a deterministic global startup pool, then separates completed trials into the guarded best quartile and remainder. At least two completed observations are required for that split; a two-trial aggregate study therefore uses random startup for its second trial. It draws kernel proposals near the elite values and maximizes the log density ratio `log l(x) - log g(x)`. Suggestions are sequential and atomically checkpointed before evaluation, so resume preserves the ask/tell sequence. The five-seed evidence shows that both startup exploration and TPE refinement matter; neither is sufficient promotion evidence without solve outcomes.
 
-Study domains and cohorts are explicit. `Calibration` changes prior parameters only and measures prior scores; recovery knobs are isolated in `CoverageRecovery`, where they can affect the objective. Proxy work is partitioned into `ProxyCore`, `ProxyRisk`, and `ProxySmallState`; search allocation is partitioned into `SearchRouting`, `SearchExact`, `SearchCoverage`, `SearchLookahead`, `SearchPool`, `SearchDanger`, and `SearchPenalty`. These granular stages measure rolling solve outcomes without books. Registry validation requires each cohort's domain and optimizer role to agree, and tests compare all 85 registry entries with every serialized `PriorConfig` leaf, verify that every entry changes config identity, and prove that all 79 optimizer-controlled knobs occur in exactly one granular stage. The registered values include the opener holdout shortlist, artifact freshness/rebuild cadence, reply-book candidate pool, exact second-guess coverage root pool, its force-in-two child cap, ambiguity cutoff, all danger weights/windows/cutoffs, two pool-expansion multipliers, six exact-pool source fractions, and the separate reply bucket-ratio penalty. Static and model-based granular studies begin with a deterministic valid one-factor perturbation for every eligible setting and reject trial counts that cannot include this sweep plus the baseline; wider proposals begin only after this coverage prelude. `ProxyRanker` and `SolvePolicy` retain their aggregate semantics for compatibility, while `Joint` is the deliberate prior/recovery/proxy/search cross-domain refinement for finalists. `--base-config` carries an exact frozen TOML result into the next stage and that canonical base is part of study identity. `BookPolicy` rebuilds isolated candidate/fold artifacts at chronological cutoffs and evaluates them in disk-only mode. The legacy proxy fitter's greedy per-field objective on one 80/20 state split is no longer an optimization path. Its calibration-row builder is retained only as input preparation for a future leakage-safe, out-of-fold continuation-cost model.
+Study domains and cohorts are explicit. `Calibration` changes prior parameters only and measures prior scores; recovery knobs are isolated in `CoverageRecovery`, where they can affect the objective. Proxy work is partitioned into `ProxyCore`, `ProxyRisk`, and `ProxySmallState`; search allocation is partitioned into `SearchRouting`, `SearchExact`, `SearchCoverage`, `SearchLookahead`, `SearchPool`, `SearchDanger`, and `SearchPenalty`. These granular stages measure rolling solve outcomes without books. Registry validation requires each cohort's domain and optimizer role to agree, and tests compare all 84 registry entries with every serialized `PriorConfig` leaf, verify that every entry changes config identity, and prove that all 78 optimizer-controlled knobs occur in exactly one granular stage. The registered values include the opener holdout shortlist, artifact freshness/rebuild cadence, reply-book candidate pool, exact second-guess coverage root pool, ambiguity cutoff, all danger weights/windows/cutoffs, two pool-expansion multipliers, six exact-pool source fractions, and the separate reply bucket-ratio penalty. Static and model-based granular studies begin with a deterministic valid one-factor perturbation for every eligible setting and reject trial counts that cannot include this sweep plus the baseline; wider proposals begin only after this coverage prelude. `ProxyRanker` and `SolvePolicy` retain their aggregate semantics for compatibility, while `Joint` is the deliberate prior/recovery/proxy/search cross-domain refinement for finalists. `--base-config` carries an exact frozen TOML result into the next stage and that canonical base is part of study identity. `BookPolicy` rebuilds isolated candidate/fold artifacts at chronological cutoffs and evaluates them in disk-only mode. The legacy proxy fitter's greedy per-field objective on one 80/20 state split is no longer an optimization path. Its calibration-row builder is retained only as input preparation for a future leakage-safe, out-of-fold continuation-cost model.
 
 Diagnostic search variants are serialized registry-validated profiles under `config/profiles/`. The offline-book migration corrected a previously hidden inconsistency: its root candidate/reply pools exceeded the declared ranges and were larger than the corresponding medium-state pools. The profile now satisfies `root_pool <= medium_pool` for both candidates and replies; this is a correctness/configuration fix, not evidence that the new values improve guesses.
 
 Fixed experiment cohorts use the same typed values in format-v1 matrices under `config/experiments/`. Optimizer domains retain strictly positive minima for log-scaled weights. A separate diagnostic application rule permits exactly zero for float parameters so a term can be removed in an ablation; it does not permit negative values, arbitrary out-of-range nonzero values, operational/safety parameters, or configs that violate cross-field validation.
 
+Finite-policy studies are an exception to legacy parallel trial execution: they
+require `--jobs 1`, and their backtests execute games sequentially. Competing
+wall-clock-limited searches would change the amount of search completed and hence
+the policy being evaluated, not merely its reported latency. This guard also applies
+to finite calibration studies, which may run live latency diagnostics. The diagnostic
+`finite_baseline` mode is available to comparisons but excluded from optimizer choices.
+The registry classifies `fallback_prior_mass` as prior calibration for fixed-belief
+finite modes, giving that stage seven parameters. Reactive recovery controls are
+inactive under a fixed core/tail posterior, so a fixed-belief finite recovery-only
+study has no tunable parameters and is rejected. Dynamic-belief modes retain the
+recovery cohort.
+
 ## 12. Artifact and identity contract
 
-Model, word-list/pattern-table, predictive-book, formal-proof, rolling/study, and benchmark inputs use SHA-256 with domain separation and unsigned 64-bit little-endian field lengths. File fields are hashed in bounded streaming chunks and are tested against one-shot encoding. Rolling/study/benchmark provenance covers the exact current executable as well as launch-time source, tests, Cargo manifests, and data inputs; phase-boundary rechecks prevent a long command from publishing results after those inputs change. Text identities use the explicit `sha256-v1:` prefix; filename-safe predictive hashes use the same 256-bit digest under manifest version 2. Pattern tables and formal binary artifacts have new magic values, studies use format v16, the parameter registry uses format v6, benchmark evidence uses schema v4, and rolling comparisons use schema v3. Old or mixed formats cannot be resumed/reused as current evidence and produce a regenerate/rebuild error where they cross a persisted boundary.
+Model, word-list/pattern-table, predictive-book, formal-proof, rolling/study, and benchmark inputs use SHA-256 with domain separation and unsigned 64-bit little-endian field lengths. File fields are hashed in bounded streaming chunks and are tested against one-shot encoding. Rolling/study/benchmark provenance covers the exact current executable as well as launch-time source, tests, Cargo manifests, and data inputs; phase-boundary rechecks prevent a long command from publishing results after those inputs change. Text identities use the explicit `sha256-v1:` prefix; filename-safe predictive hashes use the same 256-bit digest under manifest version 2. Pattern tables and formal binary artifacts have new magic values, studies use format v18, the parameter registry uses format v7, benchmark evidence uses schema v7, and rolling comparisons use schema v4. Rolling final artifacts require the evaluated `top` setting and reject baseline reuse with a different value. Old or mixed formats cannot be resumed/reused as current evidence and produce a regenerate/rebuild error where they cross a persisted boundary.
 
 ## 13. Verification map
 

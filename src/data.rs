@@ -105,6 +105,29 @@ pub fn normalize_word(word: &str) -> String {
     word.trim().to_ascii_lowercase()
 }
 
+fn normalize_and_validate_entry(
+    entry: &mut NytDailyEntry,
+    expected_date: Option<NaiveDate>,
+) -> Result<()> {
+    entry.solution = normalize_word(&entry.solution);
+    if entry.solution.len() != 5 || !entry.solution.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        bail!(
+            "NYT solution {:?} must be exactly five lowercase ASCII letters",
+            entry.solution
+        );
+    }
+    if let Some(expected_date) = expected_date
+        && entry.print_date != expected_date
+    {
+        bail!(
+            "NYT response date mismatch: requested {}, returned {}",
+            expected_date,
+            entry.print_date
+        );
+    }
+    Ok(())
+}
+
 pub fn read_word_list(path: &Path) -> Result<Vec<String>> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -141,7 +164,8 @@ pub fn read_history_jsonl(path: &Path) -> Result<Vec<NytDailyEntry>> {
         }
         let mut entry: NytDailyEntry = serde_json::from_str(&line)
             .with_context(|| format!("failed to parse {}", path.display()))?;
-        entry.solution = normalize_word(&entry.solution);
+        normalize_and_validate_entry(&mut entry, None)
+            .with_context(|| format!("invalid history entry in {}", path.display()))?;
         entries.push(entry);
     }
 
@@ -170,7 +194,9 @@ pub fn write_history_jsonl(path: &Path, entries: &[NytDailyEntry]) -> Result<()>
     validate_history_continuity(entries)?;
     let mut bytes = Vec::new();
     for entry in entries {
-        serde_json::to_writer(&mut bytes, entry).context("failed to serialize history entry")?;
+        let mut entry = entry.clone();
+        normalize_and_validate_entry(&mut entry, None)?;
+        serde_json::to_writer(&mut bytes, &entry).context("failed to serialize history entry")?;
         bytes.write_all(b"\n").context("failed to write newline")?;
     }
     let decoded = read_history_jsonl_bytes(&bytes)?;
@@ -186,7 +212,8 @@ fn read_history_jsonl_bytes(bytes: &[u8]) -> Result<Vec<NytDailyEntry>> {
         }
         let mut entry: NytDailyEntry =
             serde_json::from_slice(line).context("failed to validate serialized history entry")?;
-        entry.solution = normalize_word(&entry.solution);
+        normalize_and_validate_entry(&mut entry, None)
+            .context("failed to validate serialized history entry")?;
         entries.push(entry);
     }
     entries.sort_by_key(|entry| entry.print_date);
@@ -421,7 +448,8 @@ fn fetch_nyt_entry(client: &Client, date: NaiveDate, base_url: &str) -> Result<N
     let mut entry = response
         .json::<NytDailyEntry>()
         .with_context(|| format!("failed to decode {}", url))?;
-    entry.solution = normalize_word(&entry.solution);
+    normalize_and_validate_entry(&mut entry, Some(date))
+        .with_context(|| format!("invalid response from {}", url))?;
     Ok(entry)
 }
 
@@ -537,10 +565,12 @@ mod date_format {
 #[cfg(test)]
 mod tests {
     use super::{
-        PriorConfig, ProjectPaths, make_test_entry, spawn_test_server,
-        sync_nyt_history_with_base_url, test_json_response, write_response_with_headers,
+        PriorConfig, ProjectPaths, fetch_nyt_entry, make_test_entry, read_history_jsonl,
+        spawn_test_server, sync_nyt_history_with_base_url, test_json_response, write_history_jsonl,
+        write_response_with_headers,
     };
     use chrono::NaiveDate;
+    use reqwest::blocking::Client;
     use std::{fs, path::PathBuf};
 
     fn temp_project_root(name: &str) -> PathBuf {
@@ -551,6 +581,55 @@ mod tests {
         let root = std::env::temp_dir().join(format!("maybe-wordle-{name}-{unique}"));
         let _ = fs::remove_dir_all(&root);
         root
+    }
+
+    #[test]
+    fn history_read_normalizes_uppercase_solutions_and_rejects_malformed_ones() {
+        let root = temp_project_root("history-validation");
+        let paths = ProjectPaths::new(&root);
+        paths.ensure_layout().expect("layout");
+        let date = NaiveDate::from_ymd_opt(2021, 6, 19).expect("date");
+        fs::write(
+            &paths.raw_history,
+            test_json_response(&make_test_entry(date, "CIGAR")),
+        )
+        .expect("uppercase fixture");
+        let history = read_history_jsonl(&paths.raw_history).expect("read uppercase fixture");
+        assert_eq!(history[0].solution, "cigar");
+
+        fs::write(
+            &paths.raw_history,
+            test_json_response(&make_test_entry(date, "abcd!")),
+        )
+        .expect("malformed fixture");
+        let error = read_history_jsonl(&paths.raw_history).expect_err("malformed solution");
+        assert!(format!("{error:#}").contains("five lowercase ASCII letters"));
+    }
+
+    #[test]
+    fn history_write_rejects_malformed_solutions_before_persisting() {
+        let root = temp_project_root("history-write-validation");
+        let paths = ProjectPaths::new(&root);
+        paths.ensure_layout().expect("layout");
+        let date = NaiveDate::from_ymd_opt(2021, 6, 19).expect("date");
+        let error = write_history_jsonl(&paths.raw_history, &[make_test_entry(date, "four")])
+            .expect_err("malformed solution");
+        assert!(format!("{error:#}").contains("five lowercase ASCII letters"));
+        assert!(!paths.raw_history.exists());
+    }
+
+    #[test]
+    fn fetched_entry_must_match_requested_date() {
+        let requested = NaiveDate::from_ymd_opt(2021, 6, 19).expect("requested date");
+        let returned = requested.succ_opt().expect("returned date");
+        let (base_url, join) = spawn_test_server(1, move |_path, _count| {
+            (200, test_json_response(&make_test_entry(returned, "cigar")))
+        });
+        let client = Client::builder().build().expect("client");
+        let error = fetch_nyt_entry(&client, requested, &base_url)
+            .expect_err("date mismatch must be rejected");
+        join.join().expect("server thread");
+        assert!(format!("{error:#}").contains("response date mismatch"));
     }
 
     #[test]

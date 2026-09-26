@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "development-staged-belief-ablation",
+  "profiles": [
+    {
+      "id": "staged_dynamic_belief",
+      "description": "Selected staged ranking and dynamic recovery belief",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "staged" }
+      }
+    },
+    {
+      "id": "staged_fixed_belief",
+      "description": "Same staged ranking on the frozen core/tail posterior",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "staged_fixed_belief" }
+      }
+    }
+  ]
+}

@@ -1,6 +1,8 @@
 use std::{
+    hint::black_box,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +16,8 @@ use maybe_wordle::{
         verify_optimal_policy_with_mode,
     },
     model::build_model_artifacts,
-    small_state::SmallStateTable,
+    predictive::{PredictiveSuggestRequest, PredictiveSuggestionMode, history_cutoff},
+    scoring::parse_feedback,
     solver::Solver,
 };
 
@@ -128,6 +131,77 @@ fn bench_predictive_session_fallback_warm(c: &mut Criterion) {
     });
 }
 
+fn bench_staged_gameplay(c: &mut Criterion) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let paths = ProjectPaths::new(&root);
+    let config = PriorConfig::load(&paths.config_prior).expect("selected config");
+    assert_eq!(config.search_policy_mode, SearchPolicyMode::Staged);
+    let solver = Solver::from_paths(&paths, &config).expect("selected solver");
+    let puzzle_date = NaiveDate::from_ymd_opt(2026, 8, 26).expect("development date");
+    let as_of = history_cutoff(puzzle_date).expect("history cutoff");
+
+    for (label, clues) in [
+        ("first_feedback", &[("olate", "10001")][..]),
+        (
+            "four_feedback",
+            &[
+                ("olate", "10100"),
+                ("vroom", "00020"),
+                ("axion", "10022"),
+                ("bagsy", "02000"),
+            ][..],
+        ),
+    ] {
+        let observations = clues
+            .iter()
+            .map(|(guess, code)| {
+                (
+                    (*guess).to_string(),
+                    parse_feedback(code).expect("feedback"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !solver
+                .apply_history(as_of, &observations)
+                .expect("reachable state")
+                .surviving
+                .is_empty()
+        );
+        let request = || PredictiveSuggestRequest {
+            puzzle_date,
+            observations: &observations,
+            top: 5,
+            hard_mode: false,
+            force_in_two_only: false,
+            mode: PredictiveSuggestionMode::LiveOnly,
+        };
+        let mut group = c.benchmark_group(format!("staged_gameplay_{label}"));
+        group.sample_size(20);
+        group.warm_up_time(Duration::from_secs(2));
+        group.measurement_time(Duration::from_secs(5));
+        group.bench_function("history", |bench| {
+            bench.iter(|| black_box(solver.apply_history(as_of, &observations).expect("history")))
+        });
+        group.bench_function("preview", |bench| {
+            bench.iter(|| {
+                black_box(
+                    solver
+                        .suggest_predictive_proxy_preview(request())
+                        .expect("preview"),
+                )
+            })
+        });
+        // The first-feedback pooled exact path needs bounded single-call timing.
+        if label == "four_feedback" {
+            group.bench_function("full", |bench| {
+                bench.iter(|| black_box(solver.suggest_predictive(request()).expect("full")))
+            });
+        }
+        group.finish();
+    }
+}
+
 fn bench_formal_build(c: &mut Criterion) {
     let fixture = formal_fixture();
     let paths = ProjectPaths::new(&fixture.root);
@@ -194,12 +268,6 @@ fn bench_formal_verify_oracle(c: &mut Criterion) {
             )
             .expect("verify")
         });
-    });
-}
-
-fn bench_small_state_table(c: &mut Criterion) {
-    c.bench_function("small_state_table_build_12", |bench| {
-        bench.iter(|| SmallStateTable::build(12));
     });
 }
 
@@ -281,10 +349,10 @@ criterion_group!(
     bench_predictive_danger_escalated_exact,
     bench_predictive_hard_cases,
     bench_predictive_session_fallback_warm,
+    bench_staged_gameplay,
     bench_formal_build,
     bench_formal_suggest,
     bench_formal_verify_certificate,
-    bench_formal_verify_oracle,
-    bench_small_state_table
+    bench_formal_verify_oracle
 );
 criterion_main!(benches);

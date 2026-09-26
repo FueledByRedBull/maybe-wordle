@@ -1,4 +1,564 @@
+use super::search::check_predictive_search_cancelled;
 use super::*;
+
+const EVIDENCE_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+const ROLLING_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+pub(super) const BENCHMARK_EVIDENCE_SCHEMA_VERSION: u32 = 7;
+const FINITE_SEARCH_REGRET_SCHEMA_VERSION: u32 = 1;
+const FINITE_REGRET_VALUE_RESOLUTION: f64 = 64.0 * f64::EPSILON;
+
+const POSTERIOR_CALIBRATION_STRATA: [&str; 5] = [
+    "all",
+    "never_used",
+    "reused",
+    "historical_only",
+    "out_of_core",
+];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EvidenceMatrixCheckpoint {
+    schema_version: u32,
+    identity: String,
+    elapsed_ms: u64,
+    peak_working_set_bytes: u64,
+    baselines: Vec<EvidenceBaseline>,
+}
+
+impl EvidenceMatrixCheckpoint {
+    fn validate(&self, identity: &str, profile_ids: &[String]) -> Result<()> {
+        if self.schema_version != EVIDENCE_CHECKPOINT_SCHEMA_VERSION {
+            bail!("unsupported evidence checkpoint schema");
+        }
+        if self.identity != identity {
+            bail!(
+                "evidence checkpoint belongs to different source, config, plan, or matrix inputs"
+            );
+        }
+        let completed_ids = self
+            .baselines
+            .iter()
+            .map(|baseline| baseline.id.clone())
+            .collect::<Vec<_>>();
+        if !is_profile_prefix(&completed_ids, profile_ids) {
+            bail!("evidence checkpoint profiles are not a valid completed prefix");
+        }
+        for baseline in &self.baselines {
+            validate_evidence_baseline(baseline)?;
+        }
+        Ok(())
+    }
+}
+
+fn is_profile_prefix(completed: &[String], expected: &[String]) -> bool {
+    completed.len() <= expected.len()
+        && completed
+            .iter()
+            .zip(expected)
+            .all(|(completed, expected)| completed == expected)
+}
+
+pub(super) fn validate_evidence_baseline(baseline: &EvidenceBaseline) -> Result<()> {
+    let expected_config_fingerprint = crate::identity::digest_bytes_tagged(
+        "maybe-wordle-benchmark-config-v1",
+        baseline.effective_config_toml.as_bytes(),
+    );
+    if baseline.config_fingerprint != expected_config_fingerprint {
+        bail!(
+            "evidence baseline {} config fingerprint mismatch",
+            baseline.id
+        );
+    }
+
+    let mut outcomes = baseline
+        .result
+        .games
+        .iter()
+        .map(|game| game.outcome)
+        .collect::<Vec<_>>();
+    validate_unique_game_dates(&outcomes, "evidence baseline")?;
+    validate_predictive_metrics(
+        &baseline.result.backtest.canonical,
+        &mut outcomes,
+        "evidence baseline",
+    )?;
+
+    let canonical = &baseline.result.backtest.canonical;
+    let summary = &baseline.result.backtest;
+    let expected_failures = canonical
+        .unsolved_games
+        .checked_add(canonical.coverage_gaps)
+        .ok_or_else(|| anyhow!("evidence baseline {} failure count overflowed", baseline.id))?;
+    if summary.games != canonical.scheduled_games
+        || summary.p95_guesses != canonical.p95_guesses
+        || summary.max_guesses != canonical.max_guesses
+        || summary.failures != expected_failures
+        || summary.coverage_gaps != canonical.coverage_gaps
+        || summary.average_guesses.to_bits() != canonical.conditional_mean_guesses.to_bits()
+        || summary.average_guesses_ci95.0.to_bits()
+            != canonical.conditional_mean_guesses_ci95.lower.to_bits()
+        || summary.average_guesses_ci95.1.to_bits()
+            != canonical.conditional_mean_guesses_ci95.upper.to_bits()
+        || summary.failure_rate_ci95.0.to_bits()
+            != (1.0 - canonical.solve_rate_ci95.upper).to_bits()
+        || summary.failure_rate_ci95.1.to_bits()
+            != (1.0 - canonical.solve_rate_ci95.lower).to_bits()
+    {
+        bail!(
+            "evidence baseline {} compatibility metrics do not match canonical metrics",
+            baseline.id
+        );
+    }
+    validate_posterior_calibration_evidence(
+        &baseline.result.games,
+        &baseline.result.posterior_calibration,
+        true,
+        &format!("evidence baseline {}", baseline.id),
+    )?;
+    Ok(())
+}
+
+fn posterior_calibration_stratum_matches(
+    stratum_index: usize,
+    prior_strata: Option<PriorStrata>,
+) -> bool {
+    match stratum_index {
+        0 => true,
+        1 => prior_strata.is_some_and(|strata| strata.never_used),
+        2 => prior_strata.is_some_and(|strata| strata.reused),
+        3 => prior_strata.is_some_and(|strata| strata.historical_only),
+        4 => prior_strata.is_some_and(|strata| strata.out_of_core),
+        _ => false,
+    }
+}
+
+fn summarize_posterior_calibration(
+    games: &[ExperimentGameResult],
+) -> Vec<PosteriorCalibrationSummary> {
+    let mut summaries = Vec::with_capacity(POSTERIOR_CALIBRATION_STRATA.len() * 6);
+    for (stratum_index, stratum) in POSTERIOR_CALIBRATION_STRATA.iter().enumerate() {
+        for turn in 1_u8..=6 {
+            let mut total_states = 0usize;
+            let mut scores = Vec::new();
+            for game in games {
+                if !posterior_calibration_stratum_matches(stratum_index, game.prior_strata) {
+                    continue;
+                }
+                for observation in &game.posterior_calibration {
+                    if observation.turn != turn {
+                        continue;
+                    }
+                    total_states += 1;
+                    if let Some(score) = observation.score {
+                        scores.push(score);
+                    }
+                }
+            }
+            let scored_states = scores.len();
+            let mean_score = if scored_states == 0 {
+                None
+            } else {
+                let divisor = scored_states as f64;
+                Some(crate::experiments::ProbabilityScore {
+                    target_probability: scores
+                        .iter()
+                        .map(|score| score.target_probability)
+                        .sum::<f64>()
+                        / divisor,
+                    log_loss: scores.iter().map(|score| score.log_loss).sum::<f64>() / divisor,
+                    brier: scores.iter().map(|score| score.brier).sum::<f64>() / divisor,
+                })
+            };
+            summaries.push(PosteriorCalibrationSummary {
+                stratum: (*stratum).to_string(),
+                turn,
+                total_states,
+                scored_states,
+                mean_score,
+            });
+        }
+    }
+    summaries
+}
+
+fn validate_probability_score(
+    score: crate::experiments::ProbabilityScore,
+    context: &str,
+) -> Result<()> {
+    if !score.target_probability.is_finite()
+        || !(0.0..=1.0).contains(&score.target_probability)
+        || !score.log_loss.is_finite()
+        || score.log_loss < 0.0
+        || !score.brier.is_finite()
+        || score.brier < 0.0
+        || score.brier > 2.0 + 1e-9
+    {
+        bail!("{context} contains an invalid posterior probability score");
+    }
+    let residual = 1.0 - score.target_probability;
+    let binary = score_multiclass_probabilities(&[score.target_probability, residual], 0)?;
+    if score.log_loss != binary.log_loss
+        || score.brier < residual.powi(2) - 1e-9
+        || score.brier > binary.brier + 1e-9
+    {
+        bail!("{context} posterior score is inconsistent with its target probability");
+    }
+    Ok(())
+}
+
+fn validate_posterior_calibration_game(game: &ExperimentGameResult, context: &str) -> Result<()> {
+    validate_game_path(game, context)?;
+    if game.posterior_calibration.is_empty() {
+        return Ok(());
+    }
+    if let Some(strata) = game.prior_strata {
+        if strata.never_used == strata.reused {
+            bail!(
+                "{context} game {} must mark exactly one of never-used and reused",
+                game.outcome.date
+            );
+        }
+        if strata.historical_only && !strata.reused {
+            bail!(
+                "{context} game {} marks a non-reused target historical-only",
+                game.outcome.date
+            );
+        }
+    }
+    let expected_states = game.path.len().max(1);
+    if game.posterior_calibration.len() != expected_states {
+        bail!(
+            "{context} game {} posterior calibration has {} states; expected {} from its path",
+            game.outcome.date,
+            game.posterior_calibration.len(),
+            expected_states
+        );
+    }
+    for (index, observation) in game.posterior_calibration.iter().enumerate() {
+        let expected_turn = u8::try_from(index + 1).expect("at most six calibration states");
+        if observation.turn != expected_turn {
+            bail!(
+                "{context} game {} posterior calibration turns are not contiguous",
+                game.outcome.date
+            );
+        }
+        if game.path.is_empty() && observation.score.is_some() {
+            bail!(
+                "{context} coverage-gap game {} has a scored turn-1 posterior",
+                game.outcome.date
+            );
+        }
+        if game.prior_strata.is_none() && observation.score.is_some() {
+            bail!(
+                "{context} game {} has a scored posterior without target strata metadata",
+                game.outcome.date
+            );
+        }
+        if let Some(score) = observation.score {
+            validate_probability_score(
+                score,
+                &format!(
+                    "{context} game {} turn {}",
+                    game.outcome.date, observation.turn
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_game_path(game: &ExperimentGameResult, context: &str) -> Result<()> {
+    if game.path.len() > 6 {
+        bail!(
+            "{context} game {} has more than six guesses",
+            game.outcome.date
+        );
+    }
+    if game.path.is_empty() {
+        if game.outcome.status != crate::experiments::GameOutcomeStatus::CoverageGap
+            || game.outcome.guesses.is_some()
+        {
+            bail!(
+                "{context} game {} has an empty path but is not a coverage gap",
+                game.outcome.date
+            );
+        }
+    } else if game.outcome.guesses != Some(game.path.len()) {
+        bail!(
+            "{context} game {} outcome guess count does not match its path",
+            game.outcome.date
+        );
+    }
+    Ok(())
+}
+
+fn validate_posterior_calibration_evidence(
+    games: &[ExperimentGameResult],
+    summaries: &[PosteriorCalibrationSummary],
+    require_calibration: bool,
+    context: &str,
+) -> Result<()> {
+    for game in games {
+        validate_posterior_calibration_game(game, context)?;
+    }
+    if summaries.is_empty() {
+        if require_calibration {
+            bail!("{context} is missing posterior calibration summaries");
+        }
+        if games
+            .iter()
+            .any(|game| !game.posterior_calibration.is_empty())
+        {
+            bail!("{context} contains observations without posterior summaries");
+        }
+        return Ok(());
+    }
+    if games
+        .iter()
+        .any(|game| game.posterior_calibration.is_empty())
+    {
+        bail!("{context} contains a game without posterior calibration observations");
+    }
+    let expected = summarize_posterior_calibration(games);
+    if expected != summaries {
+        bail!("{context} posterior calibration summaries do not match per-game observations");
+    }
+    Ok(())
+}
+
+fn validate_predictive_metrics(
+    metrics: &PredictiveMetrics,
+    outcomes: &mut [GameOutcome],
+    context: &str,
+) -> Result<()> {
+    outcomes.sort_by_key(|outcome| outcome.date);
+    let expected =
+        summarize_predictive_outcomes(outcomes, metrics.failure_penalty_guesses, metrics.bootstrap)
+            .with_context(|| format!("invalid {context} game outcomes"))?;
+    if expected != *metrics {
+        bail!("{context} metrics do not match their per-game outcomes");
+    }
+    Ok(())
+}
+
+fn validate_unique_game_dates(outcomes: &[GameOutcome], context: &str) -> Result<()> {
+    let mut dates = HashSet::new();
+    for outcome in outcomes {
+        if !dates.insert(outcome.date) {
+            bail!("{context} contains duplicate game date {}", outcome.date);
+        }
+    }
+    Ok(())
+}
+
+fn validate_rolling_checkpoint(
+    checkpoint: &RollingEvaluationCheckpoint,
+    source_identity: &str,
+    label: &str,
+    config_toml: &str,
+    evaluation_plan: &EvaluationPlan,
+    require_finite_traces: bool,
+) -> Result<()> {
+    if checkpoint.schema_version != ROLLING_CHECKPOINT_SCHEMA_VERSION {
+        bail!("unsupported rolling checkpoint schema");
+    }
+    if checkpoint.source_identity != source_identity
+        || checkpoint.evaluation_plan != *evaluation_plan
+        || checkpoint.label != label
+        || checkpoint.config_toml != config_toml
+    {
+        bail!(
+            "rolling checkpoint does not match the current source/config/plan; remove the rebuildable checkpoint and retry"
+        );
+    }
+    let config: PriorConfig =
+        toml::from_str(config_toml).context("parse rolling checkpoint config")?;
+    for game in &checkpoint.games {
+        validate_game_path(game, "rolling checkpoint")?;
+        if require_finite_traces || !game.finite_search_steps.is_empty() {
+            let expected_prefix = if config.search_policy_mode.is_finite() {
+                Some(game.path.len())
+            } else {
+                None
+            };
+            if let Some(expected_prefix) = expected_prefix {
+                validate_finite_game_trace(game, expected_prefix)?;
+            }
+        }
+    }
+    let mut seen_fold_ids = HashSet::new();
+    for stored_fold in &checkpoint.folds {
+        if !seen_fold_ids.insert(stored_fold.fold_index) {
+            bail!(
+                "rolling checkpoint contains duplicate fold id {}",
+                stored_fold.fold_index
+            );
+        }
+        let planned_fold = evaluation_plan
+            .folds
+            .iter()
+            .find(|fold| fold.index == stored_fold.fold_index)
+            .ok_or_else(|| {
+                anyhow!(
+                    "rolling checkpoint contains unknown fold id {}",
+                    stored_fold.fold_index
+                )
+            })?;
+        if stored_fold.validation != planned_fold.validation {
+            bail!(
+                "rolling checkpoint fold {} validation range does not match the evaluation plan",
+                stored_fold.fold_index
+            );
+        }
+    }
+    if checkpoint.folds.len() > evaluation_plan.folds.len() {
+        bail!("rolling checkpoint contains more folds than the evaluation plan");
+    }
+
+    validate_unique_game_dates(
+        &checkpoint
+            .games
+            .iter()
+            .map(|game| game.outcome)
+            .collect::<Vec<_>>(),
+        "rolling checkpoint",
+    )?;
+    for game in &checkpoint.games {
+        let matching_planned_folds = evaluation_plan
+            .folds
+            .iter()
+            .filter(|fold| fold.validation.contains(game.outcome.date))
+            .count();
+        if matching_planned_folds != 1 {
+            bail!(
+                "rolling checkpoint game {} does not belong to exactly one planned validation range",
+                game.outcome.date
+            );
+        }
+        let matching_completed_folds = checkpoint
+            .folds
+            .iter()
+            .filter(|fold| fold.validation.contains(game.outcome.date))
+            .count();
+        if matching_completed_folds != 1 {
+            bail!(
+                "rolling checkpoint game {} does not belong to exactly one completed fold",
+                game.outcome.date
+            );
+        }
+    }
+
+    for stored_fold in &checkpoint.folds {
+        let mut fold_outcomes = checkpoint
+            .games
+            .iter()
+            .filter(|game| stored_fold.validation.contains(game.outcome.date))
+            .map(|game| game.outcome)
+            .collect::<Vec<_>>();
+        if fold_outcomes.is_empty() {
+            bail!(
+                "rolling checkpoint fold {} has no games in its validation range",
+                stored_fold.fold_index
+            );
+        }
+        validate_unique_game_dates(&fold_outcomes, "rolling checkpoint fold")?;
+        validate_predictive_metrics(
+            &stored_fold.metrics,
+            &mut fold_outcomes,
+            &format!("rolling checkpoint fold {}", stored_fold.fold_index),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_rolling_comparison_artifact(artifact: &RollingComparisonArtifact) -> Result<()> {
+    artifact.validate_identity()?;
+    if artifact.top == 0 {
+        bail!("rolling comparison top must be positive");
+    }
+    if artifact.sealed_test_evaluated {
+        bail!("rolling comparison must not evaluate the sealed test");
+    }
+
+    for (context, evidence) in [
+        ("baseline", &artifact.baseline),
+        ("candidate", &artifact.candidate),
+    ] {
+        let checkpoint = RollingEvaluationCheckpoint {
+            schema_version: ROLLING_CHECKPOINT_SCHEMA_VERSION,
+            source_identity: artifact.input_fingerprint.clone(),
+            evaluation_plan: artifact.evaluation_plan.clone(),
+            label: evidence.label.clone(),
+            config_toml: evidence.config_toml.clone(),
+            folds: evidence.folds.clone(),
+            games: evidence.games.clone(),
+            prior_observations: Vec::new(),
+            execution: evidence.execution.clone(),
+        };
+        validate_rolling_checkpoint(
+            &checkpoint,
+            &artifact.input_fingerprint,
+            &evidence.label,
+            &evidence.config_toml,
+            &artifact.evaluation_plan,
+            false,
+        )?;
+        if evidence.folds.len() != artifact.evaluation_plan.folds.len() {
+            bail!("rolling {context} evidence does not contain every planned validation fold");
+        }
+
+        for fold in &evidence.folds {
+            if fold.metrics.failure_penalty_guesses.to_bits() != 7.0f64.to_bits()
+                || fold.metrics.bootstrap != BootstrapConfig::default()
+            {
+                bail!(
+                    "rolling {context} fold {} uses an unsupported metric penalty or bootstrap",
+                    fold.fold_index
+                );
+            }
+        }
+        if evidence.aggregate.failure_penalty_guesses.to_bits() != 7.0f64.to_bits()
+            || evidence.aggregate.bootstrap != BootstrapConfig::default()
+        {
+            bail!("rolling {context} aggregate uses an unsupported metric penalty or bootstrap");
+        }
+
+        let mut outcomes = evidence
+            .games
+            .iter()
+            .map(|game| game.outcome)
+            .collect::<Vec<_>>();
+        validate_predictive_metrics(
+            &evidence.aggregate,
+            &mut outcomes,
+            &format!("rolling {context} aggregate"),
+        )?;
+    }
+
+    let mut baseline_outcomes = artifact
+        .baseline
+        .games
+        .iter()
+        .map(|game| game.outcome)
+        .collect::<Vec<_>>();
+    let mut candidate_outcomes = artifact
+        .candidate
+        .games
+        .iter()
+        .map(|game| game.outcome)
+        .collect::<Vec<_>>();
+    baseline_outcomes.sort_by_key(|outcome| outcome.date);
+    candidate_outcomes.sort_by_key(|outcome| outcome.date);
+    let expected = PairedDifference::all_game_penalized(
+        &baseline_outcomes,
+        &candidate_outcomes,
+        7.0,
+        BootstrapConfig::default(),
+    )?;
+    if expected != artifact.candidate_minus_baseline {
+        bail!("rolling paired difference does not match per-game outcomes");
+    }
+    Ok(())
+}
 
 struct StudyEvaluationRequest<'a> {
     paths: &'a ProjectPaths,
@@ -171,6 +731,238 @@ fn summarize_search_regret(
     }
 }
 
+fn finite_quality_name(quality: FiniteSearchQuality) -> &'static str {
+    match quality {
+        FiniteSearchQuality::Heuristic => "heuristic",
+        FiniteSearchQuality::UpperBound => "upper_bound",
+        FiniteSearchQuality::Exact => "exact",
+    }
+}
+
+fn finite_reason_name(reason: FiniteSearchReason) -> &'static str {
+    match reason {
+        FiniteSearchReason::Complete => "complete",
+        FiniteSearchReason::Deadline => "deadline",
+        FiniteSearchReason::Cancelled => "cancelled",
+        FiniteSearchReason::NodeBudget => "node_budget",
+    }
+}
+
+fn finite_regret_value(candidate: FiniteSearchCandidate) -> FiniteSearchRegretValue {
+    FiniteSearchRegretValue {
+        failure_probability: candidate.failure_probability,
+        expected_attempts: candidate.expected_attempts,
+    }
+}
+
+fn finite_value_is_valid(value: FiniteSearchRegretValue) -> bool {
+    value.failure_probability.is_finite()
+        && (0.0..=1.0).contains(&value.failure_probability)
+        && value.expected_attempts.is_finite()
+        && value.expected_attempts >= 0.0
+}
+
+fn validate_finite_trace_step(
+    guess: &str,
+    expected_turn: u8,
+    trace: &FiniteSearchStepEvidence,
+) -> Result<()> {
+    if trace.turn != expected_turn
+        || trace.candidate_count < trace.top_candidates.len()
+        || trace.top_candidates.is_empty()
+        || trace.top_candidates.len() > 8
+        || trace.top_candidates[0].word != guess
+    {
+        bail!("finite search trace does not match its game path");
+    }
+    Ok(())
+}
+
+fn validate_finite_game_trace(game: &ExperimentGameResult, expected_prefix: usize) -> Result<()> {
+    if game.finite_search_steps.len() != expected_prefix {
+        bail!("finite search trace count does not match its game path");
+    }
+    for (index, (guess, trace)) in game.path.iter().zip(&game.finite_search_steps).enumerate() {
+        validate_finite_trace_step(guess, (index + 1) as u8, trace)?;
+    }
+    Ok(())
+}
+
+fn finite_step_evidence(
+    guesses: &[String],
+    turn: u8,
+    search: &FiniteSearchResult,
+) -> Result<FiniteSearchStepEvidence> {
+    for candidate in &search.candidates {
+        if candidate.guess_index >= guesses.len() {
+            bail!("finite candidate guess index is out of range");
+        }
+        if candidate.quality != FiniteSearchQuality::Heuristic
+            && !finite_value_is_valid(finite_regret_value(*candidate))
+        {
+            bail!("completed finite candidate has an invalid value");
+        }
+    }
+    let top_candidates = search
+        .candidates
+        .iter()
+        .take(8)
+        .map(|candidate| {
+            let completed = candidate.quality != FiniteSearchQuality::Heuristic;
+            FiniteSearchCandidateEvidence {
+                word: guesses[candidate.guess_index].clone(),
+                quality: finite_quality_name(candidate.quality).to_string(),
+                modeled_failure_probability: completed.then_some(candidate.failure_probability),
+                expected_attempts_remaining: completed.then_some(candidate.expected_attempts),
+            }
+        })
+        .collect();
+    Ok(FiniteSearchStepEvidence {
+        turn,
+        reason: finite_reason_name(search.reason).to_string(),
+        nodes_visited: search.nodes_visited,
+        work_units: search.work_units,
+        proposal_sampled: search.proposal_sampled,
+        candidate_count: search.candidates.len(),
+        top_candidates,
+    })
+}
+
+fn validate_finite_run_trace(run: &DetailedSolveRun, expected_prefix: usize) -> Result<()> {
+    for (index, step) in run.steps.iter().enumerate() {
+        if index < expected_prefix {
+            let trace = step
+                .finite_search
+                .as_ref()
+                .ok_or_else(|| anyhow!("finite backtest step is missing its search trace"))?;
+            validate_finite_trace_step(&step.guess, (index + 1) as u8, trace)?;
+        } else if step.finite_search.is_some() {
+            bail!("finite backtest trace appears after its expected prefix");
+        }
+    }
+    Ok(())
+}
+
+fn finite_reference_from_result(
+    result: &FiniteSearchResult,
+    expected_legal_guesses: usize,
+    guesses: &[String],
+) -> FiniteSearchRegretReference {
+    if result.reason != FiniteSearchReason::Complete {
+        return FiniteSearchRegretReference {
+            status: format!("unresolved_{}", finite_reason_name(result.reason)),
+            word: None,
+            value: None,
+        };
+    }
+    if result.proposal_sampled {
+        return FiniteSearchRegretReference {
+            status: "incomplete_proposal_sample".to_string(),
+            word: None,
+            value: None,
+        };
+    }
+    if result.candidates.len() != expected_legal_guesses || result.candidates.is_empty() {
+        return FiniteSearchRegretReference {
+            status: "incomplete_root_set".to_string(),
+            word: None,
+            value: None,
+        };
+    }
+    let mut seen = HashSet::with_capacity(result.candidates.len());
+    if result.candidates.iter().any(|candidate| {
+        candidate.guess_index >= guesses.len()
+            || !seen.insert(candidate.guess_index)
+            || candidate.quality != FiniteSearchQuality::Exact
+            || !finite_value_is_valid(finite_regret_value(*candidate))
+    }) {
+        return FiniteSearchRegretReference {
+            status: "incomplete_candidate_set".to_string(),
+            word: None,
+            value: None,
+        };
+    }
+    let candidate = result.candidates[0];
+    FiniteSearchRegretReference {
+        status: "exact".to_string(),
+        word: guesses.get(candidate.guess_index).cloned(),
+        value: Some(finite_regret_value(candidate)),
+    }
+}
+
+fn finite_quantized_value(value: f64) -> f64 {
+    (value / FINITE_REGRET_VALUE_RESOLUTION).round()
+}
+
+fn finite_quantized_equal(left: f64, right: f64) -> bool {
+    left.is_finite()
+        && right.is_finite()
+        && finite_quantized_value(left).total_cmp(&finite_quantized_value(right))
+            == std::cmp::Ordering::Equal
+}
+
+fn finite_regrets(
+    fixed_root: &FiniteSearchRegretReference,
+    global: &FiniteSearchRegretReference,
+) -> Result<(Option<f64>, Option<f64>, Option<bool>)> {
+    let (Some(fixed), Some(optimal)) = (fixed_root.value, global.value) else {
+        return Ok((None, None, None));
+    };
+    if fixed_root.status != "exact" || global.status != "exact" {
+        return Ok((None, None, None));
+    }
+    let fixed_failure = finite_quantized_value(fixed.failure_probability);
+    let optimal_failure = finite_quantized_value(optimal.failure_probability);
+    let fixed_is_better = fixed_failure < optimal_failure
+        || (fixed_failure == optimal_failure
+            && finite_quantized_value(fixed.expected_attempts)
+                < finite_quantized_value(optimal.expected_attempts));
+    if fixed_is_better {
+        bail!("finite reference contradiction: fixed root beats purported global optimum");
+    }
+    let failure_regret = (fixed.failure_probability - optimal.failure_probability).max(0.0);
+    let attempts_regret =
+        finite_quantized_equal(fixed.failure_probability, optimal.failure_probability)
+            .then(|| (fixed.expected_attempts - optimal.expected_attempts).max(0.0));
+    let matches_optimum = Some(
+        finite_quantized_equal(fixed.failure_probability, optimal.failure_probability)
+            && finite_quantized_equal(fixed.expected_attempts, optimal.expected_attempts),
+    );
+    Ok((Some(failure_regret), attempts_regret, matches_optimum))
+}
+
+fn finite_mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn summarize_finite_search_regret(states: &[FiniteSearchRegretState]) -> FiniteSearchRegretSummary {
+    let resolved_states = states
+        .iter()
+        .filter(|state| {
+            state.exact_fixed_root.status == "exact" && state.global_optimum.status == "exact"
+        })
+        .count();
+    let failure_regrets = states
+        .iter()
+        .filter_map(|state| state.failure_regret)
+        .collect::<Vec<_>>();
+    let attempts_regrets = states
+        .iter()
+        .filter_map(|state| state.attempts_regret)
+        .collect::<Vec<_>>();
+    FiniteSearchRegretSummary {
+        states: states.len(),
+        resolved_states,
+        unresolved_states: states.len().saturating_sub(resolved_states),
+        failure_regret_states: failure_regrets.len(),
+        mean_failure_regret: finite_mean(&failure_regrets),
+        maximum_failure_regret: failure_regrets.into_iter().reduce(f64::max),
+        attempts_regret_states: attempts_regrets.len(),
+        mean_attempts_regret: finite_mean(&attempts_regrets),
+        maximum_attempts_regret: attempts_regrets.into_iter().reduce(f64::max),
+    }
+}
+
 impl Solver {
     pub fn solve_target(&self, target: &str, date: NaiveDate, top: usize) -> Result<SolveRun> {
         Ok(self.solve_target_detailed(target, date, top)?.into())
@@ -182,9 +974,7 @@ impl Solver {
         date: NaiveDate,
         top: usize,
     ) -> Result<DetailedSolveRun> {
-        let as_of = date
-            .checked_sub_days(Days::new(1))
-            .ok_or_else(|| anyhow!("cannot solve before launch date"))?;
+        let as_of = crate::predictive::history_cutoff(date)?;
         self.solve_target_from_state_detailed(target, as_of, date, top, PredictiveBookUsage::Full)
     }
 
@@ -206,6 +996,7 @@ impl Solver {
             SolveExecutionPolicy {
                 book_usage,
                 search_mode: None,
+                forced: &[],
             },
         )
     }
@@ -217,10 +1008,18 @@ impl Solver {
         date: NaiveDate,
         top: usize,
         mut state: SolveState,
-        policy: SolveExecutionPolicy,
+        policy: SolveExecutionPolicy<'_>,
     ) -> Result<DetailedSolveRun> {
         let target = target.to_ascii_lowercase();
         let mut observations = Vec::new();
+        if policy.forced.len() > 6 {
+            bail!("forced prefix exceeds the six-turn limit");
+        }
+        for (guess, pattern) in policy.forced {
+            if !self.guess_index.contains_key(guess) || *pattern as usize >= PATTERN_SPACE {
+                bail!("invalid forced guess or feedback: {guess}");
+            }
+        }
 
         if !state
             .surviving
@@ -239,11 +1038,63 @@ impl Solver {
         let mut steps = Vec::new();
         while steps.len() < 6 {
             let surviving_before = state.surviving.len();
+            if let Some((guess, expected_feedback)) = policy.forced.get(steps.len()) {
+                let feedback = score_guess(guess, &target);
+                // Zero is the existing forced-opener API's unspecified-pattern sentinel.
+                if *expected_feedback != 0 && *expected_feedback != feedback {
+                    bail!(
+                        "forced feedback mismatch for {guess}: expected {}, got {}",
+                        format_feedback_letters(*expected_feedback),
+                        format_feedback_letters(feedback)
+                    );
+                }
+                let recovery_mode_used = state.recovery_mode_used;
+                let fallback_active = state.fallback_active;
+                if feedback != ALL_GREEN_PATTERN {
+                    self.apply_feedback(&mut state, guess, feedback)?;
+                }
+                steps.push(DetailedSolveStep {
+                    guess: guess.clone(),
+                    feedback,
+                    surviving_before,
+                    surviving_after: if feedback == ALL_GREEN_PATTERN {
+                        1
+                    } else {
+                        state.surviving.len()
+                    },
+                    chosen_force_in_two: false,
+                    alternative_force_in_two: false,
+                    danger_score: 0.0,
+                    danger_escalated: false,
+                    regime_used: PredictiveRegime::Proxy,
+                    promotion_source: None,
+                    recovery_mode_used,
+                    fallback_active,
+                    lookahead_pool_base: 0,
+                    lookahead_pool_size: 0,
+                    exact_pool_base: 0,
+                    exact_pool_size: 0,
+                    root_candidate_count: 0,
+                    top_suggestions: Vec::new(),
+                    finite_search: None,
+                });
+                if feedback == ALL_GREEN_PATTERN {
+                    return Ok(DetailedSolveRun {
+                        target,
+                        date,
+                        steps,
+                        solved: true,
+                    });
+                }
+                observations.push((guess.clone(), feedback));
+                continue;
+            }
             let batch = match policy.search_mode {
                 Some(mode) => self.suggestion_batch_internal_with_search_mode(
                     &state,
                     top.max(1),
                     Some(PredictiveContext {
+                        hard_mode: false,
                         as_of,
                         observations: &observations,
                     }),
@@ -271,6 +1122,11 @@ impl Solver {
                 self.apply_feedback(&mut next_state, &chosen.word, feedback)?;
                 next_state.surviving.len()
             };
+            let finite_search = batch
+                .finite_search
+                .as_ref()
+                .map(|search| finite_step_evidence(&self.guesses, (steps.len() + 1) as u8, search))
+                .transpose()?;
             steps.push(DetailedSolveStep {
                 guess: chosen.word.clone(),
                 feedback,
@@ -299,6 +1155,7 @@ impl Solver {
                     .take(top.max(1))
                     .map(Self::snapshot_suggestion)
                     .collect(),
+                finite_search,
             });
             if feedback == ALL_GREEN_PATTERN {
                 return Ok(DetailedSolveRun {
@@ -363,7 +1220,7 @@ impl Solver {
         let started = Instant::now();
         let budget = std::time::Duration::from_secs(request.maximum_seconds);
         let maximum_memory_bytes = request.maximum_memory_mb.saturating_mul(1024 * 1024);
-        let input_fingerprint = rolling_source_identity(paths)?;
+        let input_fingerprint = development_source_identity(paths, plan.development.end)?;
         let executable_fingerprint = current_executable_fingerprint()?;
         let config_toml = toml::to_string_pretty(&self.config)?;
         let config_fingerprint = crate::identity::digest_bytes_tagged(
@@ -409,13 +1266,15 @@ impl Solver {
         ];
         let mut selected_states = Vec::new();
         for (row_split, range) in ranges {
-            let candidates = self.collect_learned_proxy_states(
+            let (candidates, _) = self.collect_learned_proxy_states(
                 range,
                 request.minimum_survivors,
                 request.maximum_survivors,
                 request.maximum_states_per_split.saturating_mul(6).max(12),
                 started,
                 budget,
+                false,
+                false,
             )?;
             if candidates.is_empty() {
                 bail!(
@@ -523,11 +1382,7 @@ impl Solver {
             if state.surviving.len() != candidate.surviving_answers {
                 bail!("learned-proxy state reconstruction changed survivor count");
             }
-            let mut metrics = self.score_guess_metrics_for_subset(
-                &state.surviving,
-                &state.weights,
-                &self.exact_small_state_table,
-            );
+            let mut metrics = self.score_guess_metrics_for_subset(&state.surviving, &state.weights);
             metrics.retain(|metric| reply_guess_makes_progress(metric, state.surviving.len()));
             let metric_by_guess = metrics
                 .iter()
@@ -565,7 +1420,6 @@ impl Solver {
                     ExactCostContext {
                         subset: &state.surviving,
                         weights: &state.weights,
-                        small_state_table: &self.exact_small_state_table,
                         memo: &mut memo,
                         best_bound: f64::INFINITY,
                         scratch: &mut scratch,
@@ -692,7 +1546,7 @@ impl Solver {
                 &serde_json::to_vec_pretty(&checkpoint)?,
             )?;
         }
-        ensure_rolling_source_identity(paths, &input_fingerprint)?;
+        ensure_development_source_identity(paths, plan.development.end, &input_fingerprint)?;
         eprintln!(
             "learned-proxy phase=complete features={} rows={} elapsed_s={:.1}",
             feature_names.len(),
@@ -702,6 +1556,10 @@ impl Solver {
         Ok(artifact)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "shared legacy/finite collector keeps sampling rules and deadline behavior explicit"
+    )]
     fn collect_learned_proxy_states(
         &self,
         range: DateRange,
@@ -710,7 +1568,9 @@ impl Solver {
         maximum_games: usize,
         started: Instant,
         budget: std::time::Duration,
-    ) -> Result<Vec<SearchRegretCandidateState>> {
+        hard_mode: bool,
+        allow_partial_on_deadline: bool,
+    ) -> Result<(Vec<SearchRegretCandidateState>, usize)> {
         let games = self
             .history_dates
             .iter()
@@ -719,11 +1579,19 @@ impl Solver {
         let indices = evenly_spaced_indices(games.len(), maximum_games);
         let total = indices.len();
         let mut candidates = Vec::new();
+        let mut scanned_games = 0usize;
         for (game_number, index) in indices.into_iter().enumerate() {
             if started.elapsed() > budget {
+                if allow_partial_on_deadline {
+                    break;
+                }
                 bail!("learned-proxy collection exceeded its wall-clock budget");
             }
+            if allow_partial_on_deadline && started.elapsed() >= budget {
+                break;
+            }
             let entry = games[index];
+            scanned_games += 1;
             let as_of = entry
                 .print_date
                 .checked_sub_days(Days::new(1))
@@ -745,20 +1613,26 @@ impl Solver {
                 if state.surviving.len() < minimum_survivors {
                     break;
                 }
-                let chosen = self
-                    .suggestion_batch_internal_with_search_mode(
-                        &state,
-                        1,
-                        Some(PredictiveContext {
-                            as_of,
-                            observations: &observations,
-                        }),
-                        PredictiveBookUsage::None,
-                        Some(PredictiveSearchMode::ProxyOnly),
-                    )?
+                let mut batch = self.suggestion_batch_internal_with_search_mode(
+                    &state,
+                    if hard_mode { self.guesses.len() } else { 1 },
+                    Some(PredictiveContext {
+                        hard_mode,
+                        as_of,
+                        observations: &observations,
+                    }),
+                    PredictiveBookUsage::None,
+                    Some(PredictiveSearchMode::ProxyOnly),
+                )?;
+                let chosen = batch
                     .suggestions
-                    .into_iter()
-                    .next()
+                    .drain(..)
+                    .find(|suggestion| {
+                        !hard_mode
+                            || self
+                                .hard_mode_violation(&observations, &suggestion.word)
+                                .is_none()
+                    })
                     .ok_or_else(|| anyhow!("proxy path returned no suggestion"))?;
                 let feedback = score_guess(&chosen.word, &target);
                 if feedback == ALL_GREEN_PATTERN {
@@ -778,7 +1652,7 @@ impl Solver {
                 let _ = std::io::stderr().flush();
             }
         }
-        Ok(candidates)
+        Ok((candidates, scanned_games))
     }
 
     pub fn search_regret_report(
@@ -810,8 +1684,9 @@ impl Solver {
             bail!("search-regret maximum seconds must be greater than zero");
         }
 
+        let plan = ensure_development_target_range(paths, from, to, "search-regret")?;
         let started = Instant::now();
-        let input_fingerprint = rolling_source_identity(paths)?;
+        let input_fingerprint = development_source_identity(paths, plan.development.end)?;
         let budget = std::time::Duration::from_secs(maximum_seconds);
         let games = self
             .history_dates
@@ -871,6 +1746,7 @@ impl Solver {
                             &state,
                             1,
                             Some(PredictiveContext {
+                                hard_mode: false,
                                 as_of,
                                 observations: &observations,
                             }),
@@ -939,6 +1815,7 @@ impl Solver {
             }
 
             let context = Some(PredictiveContext {
+                hard_mode: false,
                 as_of,
                 observations: &candidate.observations,
             });
@@ -1016,7 +1893,7 @@ impl Solver {
 
         let config_toml =
             toml::to_string_pretty(&self.config).context("failed to serialize audit config")?;
-        ensure_rolling_source_identity(paths, &input_fingerprint)?;
+        ensure_development_source_identity(paths, plan.development.end, &input_fingerprint)?;
         let (code_revision, code_dirty) = git_provenance(&paths.root);
         Ok(SearchRegretReport {
             schema_version: 1,
@@ -1044,6 +1921,528 @@ impl Solver {
             proxy: summarize_search_regret(&states, |state| &state.proxy),
             lookahead: summarize_search_regret(&states, |state| &state.lookahead),
             states,
+        })
+    }
+
+    pub fn finite_search_regret_report(
+        &self,
+        paths: &ProjectPaths,
+        request: FiniteSearchRegretRequest,
+    ) -> Result<FiniteSearchRegretReport> {
+        let FiniteSearchRegretRequest {
+            from,
+            to,
+            minimum_survivors,
+            maximum_survivors,
+            maximum_states,
+            maximum_seconds,
+            hard_mode,
+        } = request;
+        if !matches!(
+            self.config.search_policy_mode,
+            crate::config::SearchPolicyMode::FiniteFast
+                | crate::config::SearchPolicyMode::FiniteStrong
+        ) {
+            bail!(
+                "finite search-regret requires a finite_fast or finite_strong config; got {}",
+                self.config.search_policy_mode.label()
+            );
+        }
+        if from > to {
+            bail!("finite search-regret start date cannot be after end date");
+        }
+        if minimum_survivors < 2 {
+            bail!("finite search-regret minimum survivors must be at least 2");
+        }
+        if minimum_survivors > maximum_survivors {
+            bail!("finite search-regret minimum survivors cannot exceed maximum survivors");
+        }
+        if maximum_states == 0 {
+            bail!("finite search-regret maximum states must be greater than zero");
+        }
+        if maximum_seconds == 0 {
+            bail!("finite search-regret maximum seconds must be greater than zero");
+        }
+
+        let plan = ensure_development_target_range(paths, from, to, "finite search-regret")?;
+        let started = Instant::now();
+        let budget = std::time::Duration::from_secs(maximum_seconds);
+        let input_fingerprint = development_source_identity(paths, plan.development.end)?;
+        let range = DateRange::new(from, to)?;
+        let historical_games = self
+            .history_dates
+            .iter()
+            .filter(|entry| range.contains(entry.print_date))
+            .count();
+        let (candidates, scanned_games) = self.collect_learned_proxy_states(
+            range,
+            minimum_survivors,
+            maximum_survivors,
+            maximum_states.saturating_mul(2).max(4),
+            started,
+            budget,
+            hard_mode,
+            true,
+        )?;
+        if candidates.is_empty() {
+            bail!(
+                "no reachable states had between {} and {} survivors",
+                minimum_survivors,
+                maximum_survivors
+            );
+        }
+
+        let available_states = candidates.len();
+        let selected_indices = evenly_spaced_indices(available_states, maximum_states);
+        let sampled_states = selected_indices.len();
+        let mut states = Vec::with_capacity(sampled_states);
+        for (sample_index, candidate_index) in selected_indices.into_iter().enumerate() {
+            let candidate = &candidates[candidate_index];
+            let as_of = candidate
+                .date
+                .checked_sub_days(Days::new(1))
+                .ok_or_else(|| anyhow!("cannot audit a game before launch date"))?;
+            let state = self.apply_history(as_of, &candidate.observations)?;
+            if state.surviving.len() != candidate.surviving_answers {
+                bail!(
+                    "finite search-regret state reconstruction mismatch for {} turn {}: expected {} survivors, reconstructed {}",
+                    candidate.date,
+                    candidate.turn,
+                    candidate.surviving_answers,
+                    state.surviving.len()
+                );
+            }
+            states.push(
+                self.finite_search_regret_state(candidate, &state, hard_mode, started, budget)?,
+            );
+            eprintln!(
+                "finite-search-regret phase=reference states={}/{} survivors={} elapsed_s={:.1}",
+                sample_index + 1,
+                sampled_states,
+                candidate.surviving_answers,
+                started.elapsed().as_secs_f64()
+            );
+            let _ = std::io::stderr().flush();
+        }
+
+        let config_toml =
+            toml::to_string_pretty(&self.config).context("failed to serialize audit config")?;
+        let config_identity = format!("hard_mode={hard_mode}\n{config_toml}");
+        ensure_development_source_identity(paths, plan.development.end, &input_fingerprint)?;
+        let (code_revision, code_dirty) = git_provenance(&paths.root);
+        Ok(FiniteSearchRegretReport {
+            schema_version: FINITE_SEARCH_REGRET_SCHEMA_VERSION,
+            identity_format: crate::identity::IDENTITY_FORMAT.to_string(),
+            input_fingerprint,
+            config_fingerprint: crate::identity::digest_bytes_tagged(
+                "maybe-wordle-finite-search-regret-config-v1",
+                config_identity.as_bytes(),
+            ),
+            code_revision,
+            code_dirty,
+            evaluation_from: from,
+            evaluation_to: to,
+            state_path_policy: format!("forced_proxy_without_artifacts_hard_mode={hard_mode}"),
+            reference_kernel: "finite_horizon_search/shared_kernel".to_string(),
+            independent_cross_check: "toy-only independent oracle; not used for report values"
+                .to_string(),
+            rules: if hard_mode {
+                "wordle_feedback_v1+hard_mode".to_string()
+            } else {
+                "wordle_feedback_v1+normal_mode".to_string()
+            },
+            search_policy_mode: self.config.search_policy_mode.label().to_string(),
+            hard_mode,
+            minimum_survivors,
+            maximum_survivors,
+            maximum_states,
+            maximum_seconds,
+            historical_games,
+            scanned_games,
+            available_states,
+            sampled_states: states.len(),
+            generation_elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            summary: summarize_finite_search_regret(&states),
+            states,
+        })
+    }
+
+    fn finite_exact_options(
+        &self,
+        state_size: usize,
+        budget: std::time::Duration,
+    ) -> FiniteSearchOptions {
+        FiniteSearchOptions {
+            root_shortlist: self.guesses.len(),
+            reply_shortlist: self.guesses.len(),
+            exact_state_threshold: state_size.max(1),
+            budget,
+            node_limit: None,
+            baseline_only: false,
+        }
+    }
+
+    fn finite_legal_guess_count(&self, observations: &[(String, u8)], hard_mode: bool) -> usize {
+        (0..self.guesses.len())
+            .filter(|guess_index| {
+                !hard_mode
+                    || self
+                        .hard_mode_violation(observations, &self.guesses[*guess_index])
+                        .is_none()
+            })
+            .count()
+    }
+
+    fn finite_runtime_choice(
+        &self,
+        state: &SolveState,
+        as_of: NaiveDate,
+        observations: &[(String, u8)],
+        hard_mode: bool,
+        started: Instant,
+        budget: std::time::Duration,
+    ) -> Result<FiniteSearchRegretRuntimeChoice> {
+        let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+            return Ok(FiniteSearchRegretRuntimeChoice {
+                word: None,
+                value: None,
+                quality: None,
+                reason: "global_deadline".to_string(),
+            });
+        };
+        if remaining.is_zero() {
+            return Ok(FiniteSearchRegretRuntimeChoice {
+                word: None,
+                value: None,
+                quality: None,
+                reason: "global_deadline".to_string(),
+            });
+        }
+        let mut options = self.finite_search_options();
+        options.budget = options.budget.min(remaining);
+        let cancelled = || started.elapsed() >= budget;
+        let batch = self.finite_suggestion_batch(
+            state,
+            1,
+            Some(PredictiveContext {
+                hard_mode,
+                as_of,
+                observations,
+            }),
+            options,
+            &cancelled,
+        )?;
+        let finite_search = batch.finite_search;
+        let suggestion = batch.suggestions.into_iter().next();
+        let (word, value, quality) = suggestion.map_or((None, None, None), |suggestion| {
+            let value = suggestion
+                .finite_value
+                .map(finite_regret_value)
+                .filter(|value| finite_value_is_valid(*value));
+            (
+                Some(suggestion.word),
+                value,
+                suggestion.finite_value.and_then(|candidate| {
+                    finite_value_is_valid(finite_regret_value(candidate))
+                        .then(|| finite_quality_name(candidate.quality).to_string())
+                }),
+            )
+        });
+        let reason = if started.elapsed() >= budget {
+            "global_deadline".to_string()
+        } else {
+            finite_search.as_ref().map_or_else(
+                || "not_finite".to_string(),
+                |search| finite_reason_name(search.reason).to_string(),
+            )
+        };
+        Ok(FiniteSearchRegretRuntimeChoice {
+            word,
+            value,
+            quality,
+            reason,
+        })
+    }
+
+    fn finite_global_reference(
+        &self,
+        state: &SolveState,
+        observations: &[(String, u8)],
+        horizon: u8,
+        hard_mode: bool,
+        started: Instant,
+        budget: std::time::Duration,
+    ) -> Result<FiniteSearchRegretReference> {
+        let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+            return Ok(FiniteSearchRegretReference {
+                status: "unresolved_global_deadline".to_string(),
+                word: None,
+                value: None,
+            });
+        };
+        if remaining.is_zero() {
+            return Ok(FiniteSearchRegretReference {
+                status: "unresolved_global_deadline".to_string(),
+                word: None,
+                value: None,
+            });
+        }
+        let options = self.finite_exact_options(state.surviving.len(), remaining);
+        let cancelled = || started.elapsed() >= budget;
+        let result = self.finite_horizon_search(
+            &state.surviving,
+            &state.weights,
+            observations,
+            horizon,
+            hard_mode,
+            options,
+            &cancelled,
+        )?;
+        if started.elapsed() >= budget {
+            return Ok(FiniteSearchRegretReference {
+                status: "unresolved_global_deadline".to_string(),
+                word: None,
+                value: None,
+            });
+        }
+        Ok(finite_reference_from_result(
+            &result,
+            self.finite_legal_guess_count(observations, hard_mode),
+            &self.guesses,
+        ))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit fixed action, posterior, history, horizon and shared audit budget"
+    )]
+    fn finite_fixed_root_reference(
+        &self,
+        state: &SolveState,
+        observations: &[(String, u8)],
+        horizon: u8,
+        hard_mode: bool,
+        root_index: usize,
+        started: Instant,
+        budget: std::time::Duration,
+    ) -> Result<FiniteSearchRegretReference> {
+        if root_index >= self.guesses.len() {
+            return Ok(FiniteSearchRegretReference {
+                status: "invalid_root".to_string(),
+                word: None,
+                value: None,
+            });
+        }
+        if hard_mode
+            && self
+                .hard_mode_violation(observations, &self.guesses[root_index])
+                .is_some()
+        {
+            return Ok(FiniteSearchRegretReference {
+                status: "illegal_root".to_string(),
+                word: None,
+                value: None,
+            });
+        }
+        let mut total_weight = 0.0;
+        let mut partitions = (0..PATTERN_SPACE)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<usize>>>();
+        for &answer_index in &state.surviving {
+            let weight = state.weights.get(answer_index).copied().ok_or_else(|| {
+                anyhow!("finite reference answer index {answer_index} is out of range")
+            })?;
+            if !weight.is_finite() || weight < 0.0 {
+                bail!("finite reference weights must be finite and non-negative");
+            }
+            total_weight += weight;
+            let answer = self.answers.get(answer_index).ok_or_else(|| {
+                anyhow!("finite reference answer index {answer_index} is out of range")
+            })?;
+            let pattern = score_guess(&self.guesses[root_index], &answer.word) as usize;
+            partitions[pattern].push(answer_index);
+        }
+        if !total_weight.is_finite() || total_weight <= 0.0 {
+            bail!("finite reference requires positive answer mass");
+        }
+
+        let mut failure_probability = 0.0;
+        let mut expected_attempts = 1.0;
+        for (pattern, child_subset) in partitions.into_iter().enumerate() {
+            if child_subset.is_empty() {
+                continue;
+            }
+            let mass = child_subset
+                .iter()
+                .map(|answer_index| state.weights[*answer_index])
+                .sum::<f64>();
+            if mass <= 0.0 {
+                continue;
+            }
+            let probability = mass / total_weight;
+            if pattern == ALL_GREEN_PATTERN as usize {
+                continue;
+            }
+            if horizon <= 1 {
+                failure_probability += probability;
+                continue;
+            }
+            let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+                return Ok(FiniteSearchRegretReference {
+                    status: "unresolved_global_deadline".to_string(),
+                    word: None,
+                    value: None,
+                });
+            };
+            if remaining.is_zero() {
+                return Ok(FiniteSearchRegretReference {
+                    status: "unresolved_global_deadline".to_string(),
+                    word: None,
+                    value: None,
+                });
+            }
+            let child_observations = if hard_mode {
+                let mut next = observations.to_vec();
+                next.push((self.guesses[root_index].clone(), pattern as u8));
+                next
+            } else {
+                Vec::new()
+            };
+            let options = self.finite_exact_options(child_subset.len(), remaining);
+            let cancelled = || started.elapsed() >= budget;
+            let result = self.finite_horizon_search(
+                &child_subset,
+                &state.weights,
+                &child_observations,
+                horizon - 1,
+                hard_mode,
+                options,
+                &cancelled,
+            )?;
+            if started.elapsed() >= budget {
+                return Ok(FiniteSearchRegretReference {
+                    status: "unresolved_global_deadline".to_string(),
+                    word: None,
+                    value: None,
+                });
+            }
+            let child = finite_reference_from_result(
+                &result,
+                self.finite_legal_guess_count(&child_observations, hard_mode),
+                &self.guesses,
+            );
+            let Some(child_value) = child.value else {
+                return Ok(FiniteSearchRegretReference {
+                    status: format!("child_{}", child.status),
+                    word: None,
+                    value: None,
+                });
+            };
+            if child.status != "exact" {
+                return Ok(FiniteSearchRegretReference {
+                    status: format!("child_{}", child.status),
+                    word: None,
+                    value: None,
+                });
+            }
+            failure_probability += probability * child_value.failure_probability;
+            expected_attempts += probability * child_value.expected_attempts;
+        }
+        let value = FiniteSearchRegretValue {
+            failure_probability: failure_probability.clamp(0.0, 1.0),
+            expected_attempts: expected_attempts.max(0.0),
+        };
+        if !finite_value_is_valid(value) {
+            bail!("finite fixed-root reference produced an invalid value");
+        }
+        Ok(FiniteSearchRegretReference {
+            status: "exact".to_string(),
+            word: Some(self.guesses[root_index].clone()),
+            value: Some(value),
+        })
+    }
+
+    fn finite_search_regret_state(
+        &self,
+        candidate: &SearchRegretCandidateState,
+        state: &SolveState,
+        hard_mode: bool,
+        started: Instant,
+        budget: std::time::Duration,
+    ) -> Result<FiniteSearchRegretState> {
+        let horizon = 6usize
+            .checked_sub(candidate.observations.len())
+            .ok_or_else(|| anyhow!("finite search-regret state exceeds six turns"))?
+            as u8;
+        if horizon == 0 {
+            bail!("finite search-regret cannot audit a terminal state");
+        }
+        let as_of = candidate
+            .date
+            .checked_sub_days(Days::new(1))
+            .ok_or_else(|| anyhow!("cannot audit a game before launch date"))?;
+        let runtime = self.finite_runtime_choice(
+            state,
+            as_of,
+            &candidate.observations,
+            hard_mode,
+            started,
+            budget,
+        )?;
+        let exact_fixed_root = runtime
+            .word
+            .as_deref()
+            .and_then(|word| self.guess_index.get(word).copied())
+            .map_or(
+                Ok(FiniteSearchRegretReference {
+                    status: "unresolved_runtime_choice".to_string(),
+                    word: None,
+                    value: None,
+                }),
+                |root_index| {
+                    self.finite_fixed_root_reference(
+                        state,
+                        &candidate.observations,
+                        horizon,
+                        hard_mode,
+                        root_index,
+                        started,
+                        budget,
+                    )
+                },
+            )?;
+        let global_optimum = self.finite_global_reference(
+            state,
+            &candidate.observations,
+            horizon,
+            hard_mode,
+            started,
+            budget,
+        )?;
+        let (failure_regret, attempts_regret, matches_optimum) =
+            finite_regrets(&exact_fixed_root, &global_optimum)?;
+        Ok(FiniteSearchRegretState {
+            date: candidate.date,
+            target: candidate.target.clone(),
+            turn: candidate.turn,
+            horizon,
+            surviving_answers: candidate.surviving_answers,
+            hard_mode,
+            observations: candidate
+                .observations
+                .iter()
+                .map(|(guess, feedback)| SearchRegretObservation {
+                    guess: guess.clone(),
+                    feedback: format_feedback_letters(*feedback),
+                })
+                .collect(),
+            production_regime: self.config.search_policy_mode.label().to_string(),
+            runtime,
+            exact_fixed_root,
+            global_optimum,
+            failure_regret,
+            attempts_regret,
+            matches_optimum,
         })
     }
 
@@ -1090,7 +2489,6 @@ impl Solver {
                 ExactCostContext {
                     subset: &state.surviving,
                     weights: &state.weights,
-                    small_state_table: &self.exact_small_state_table,
                     memo: &mut memo,
                     best_bound: optimal_cost,
                     scratch: &mut scratch,
@@ -1123,7 +2521,6 @@ impl Solver {
                 ExactCostContext {
                     subset: &state.surviving,
                     weights: &state.weights,
-                    small_state_table: &self.exact_small_state_table,
                     memo: &mut memo,
                     best_bound: f64::INFINITY,
                     scratch: &mut scratch,
@@ -1379,6 +2776,7 @@ impl Solver {
             SolveExecutionPolicy {
                 book_usage: PredictiveBookUsage::None,
                 search_mode: Some(PredictiveSearchMode::ProxyOnly),
+                forced: &[],
             },
         )?;
         let outcome = if run.steps.is_empty() {
@@ -1410,6 +2808,7 @@ impl Solver {
             SolveExecutionPolicy {
                 book_usage: PredictiveBookUsage::None,
                 search_mode: Some(PredictiveSearchMode::ProxyOnly),
+                forced: &[],
             },
         )?;
         let outcome = if run.steps.is_empty() {
@@ -1431,22 +2830,31 @@ impl Solver {
     ) -> Result<DetailedBacktestReport> {
         let completed = std::sync::atomic::AtomicUsize::new(0);
         let total = games.len();
-        let evaluated = games
-            .par_iter()
-            .map(|entry| {
-                let result = self.solve_backtest_entry(entry, top, book_usage);
-                let current = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if let Some(progress) = progress {
-                    progress(current, total);
-                }
-                result
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        // `games.par_iter()` is indexed, so Rayon preserves the canonical
-        // chronological input order even though independent games run in parallel.
+        let evaluate = |entry: &&NytDailyEntry| {
+            let result = self.solve_backtest_entry(entry, top, book_usage);
+            let current = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if let Some(progress) = progress {
+                progress(current, total);
+            }
+            result
+        };
+        // Wall-clock-limited policies must not compete with other games for
+        // their search budget. Unlimited legacy policies retain parallelism.
+        let bounded_search = self.config.search_policy_mode.is_finite();
+        let evaluated = if bounded_search {
+            games.iter().map(evaluate).collect::<Vec<_>>()
+        } else {
+            games.par_iter().map(evaluate).collect::<Vec<_>>()
+        }
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+        // Both iterator paths preserve the canonical chronological input order.
         let (outcomes, runs) = evaluated.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+        if bounded_search {
+            for run in &runs {
+                validate_finite_run_trace(run, run.steps.len())?;
+            }
+        }
 
         let canonical = summarize_predictive_outcomes(&outcomes, 7.0, BootstrapConfig::default())?;
         let failure_rate_ci95 = (
@@ -1501,15 +2909,16 @@ impl Solver {
     }
 
     pub fn hard_case_report(&self, top: usize) -> Result<HardCaseReport> {
-        self.hard_case_report_with_book_usage(top, PredictiveBookUsage::DiskOnly)
+        self.hard_case_report_with_book_usage(Self::today(), top, PredictiveBookUsage::DiskOnly)
     }
 
     pub(super) fn hard_case_report_with_book_usage(
         &self,
+        puzzle_date: NaiveDate,
         top: usize,
         book_usage: PredictiveBookUsage,
     ) -> Result<HardCaseReport> {
-        let as_of = Self::today();
+        let as_of = crate::predictive::history_cutoff(puzzle_date)?;
         let hard_case_spec = default_diagnostic_suite()?.hard_cases;
         let cases = self.select_hard_case_targets(as_of, top, &hard_case_spec)?;
         let mut results = Vec::new();
@@ -1517,8 +2926,13 @@ impl Solver {
         let mut guess_total = 0usize;
 
         for (label, target) in cases {
-            let run =
-                self.solve_target_from_state_detailed(&target, as_of, as_of, top, book_usage)?;
+            let run = self.solve_target_from_state_detailed(
+                &target,
+                as_of,
+                puzzle_date,
+                top,
+                book_usage,
+            )?;
             if !run.solved {
                 failures += 1;
             }
@@ -1571,15 +2985,32 @@ impl Solver {
             .filter(|entry| entry.print_date >= from && entry.print_date <= to)
             .collect::<Vec<_>>();
 
+        self.experiment_report_for_selected_games_with_book_usage_and_progress(
+            &games, top, book_usage, progress,
+        )
+    }
+
+    fn experiment_report_for_selected_games_with_book_usage_and_progress(
+        &self,
+        games: &[&NytDailyEntry],
+        top: usize,
+        book_usage: PredictiveBookUsage,
+        progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+    ) -> Result<ExperimentResult> {
         if games.is_empty() {
             bail!("no games found in the requested experiment range");
         }
 
-        let detailed = self
-            .backtest_detailed_with_book_usage_and_progress(from, to, top, book_usage, progress)?;
+        let detailed =
+            self.backtest_selected_games_with_progress(games, top, book_usage, progress)?;
         let backtest = detailed.summary.clone();
-        let (proxy_step_pct, lookahead_step_pct, escalated_exact_step_pct, exact_step_pct) =
-            Self::regime_mix(&detailed.runs);
+        let (
+            proxy_step_pct,
+            lookahead_step_pct,
+            escalated_exact_step_pct,
+            exact_step_pct,
+            finite_step_pct,
+        ) = Self::regime_mix(&detailed.runs);
         let mut lookahead_pool_ratio_sum = 0.0;
         let mut lookahead_pool_ratio_count = 0usize;
         let mut exact_pool_ratio_sum = 0.0;
@@ -1620,6 +3051,40 @@ impl Solver {
             }
         }
 
+        let game_results = detailed
+            .runs
+            .iter()
+            .map(|run| {
+                let (prior_strata, posterior_calibration) =
+                    self.posterior_calibration_for_run(run)?;
+                Ok(ExperimentGameResult {
+                    target: run.target.clone(),
+                    outcome: if run.steps.is_empty() {
+                        GameOutcome::coverage_gap(run.date)
+                    } else if run.solved {
+                        GameOutcome::solved(run.date, run.steps.len())
+                    } else {
+                        GameOutcome::unsolved(run.date, run.steps.len())
+                    },
+                    path: run.steps.iter().map(|step| step.guess.clone()).collect(),
+                    finite_search_steps: run
+                        .steps
+                        .iter()
+                        .filter_map(|step| step.finite_search.clone())
+                        .collect(),
+                    prior_strata,
+                    posterior_calibration,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let posterior_calibration = summarize_posterior_calibration(&game_results);
+        validate_posterior_calibration_evidence(
+            &game_results,
+            &posterior_calibration,
+            true,
+            "experiment result",
+        )?;
+
         let divisor = measured.max(1) as f64;
         let outcomes = detailed
             .runs
@@ -1649,11 +3114,23 @@ impl Solver {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let fallback_as_of = to
+        let evaluation_to = games
+            .iter()
+            .map(|entry| entry.print_date)
+            .max()
+            .expect("non-empty selected games");
+        let fallback_as_of = evaluation_to
             .checked_sub_days(Days::new(1))
             .ok_or_else(|| anyhow!("session-fallback benchmark cutoff underflowed"))?;
-        let (session_fallback_cold_ms, session_fallback_warm_ms) =
-            self.benchmark_session_fallback_latency(fallback_as_of)?;
+        let (session_fallback_cold_ms, session_fallback_warm_ms) = if book_usage
+            == PredictiveBookUsage::Full
+            && !self.config.search_policy_mode.is_finite()
+        {
+            let (cold, warm) = self.benchmark_session_fallback_latency(fallback_as_of)?;
+            (Some(cold), Some(warm))
+        } else {
+            (None, None)
+        };
         Ok(ExperimentResult {
             config_id: format!(
                 "{}-et{}-ee{}-cp{}-lt{}-lc{}-lr{}-ls{}",
@@ -1682,16 +3159,20 @@ impl Solver {
                     )
                 })
                 .transpose()?,
+            posterior_calibration,
             execution: Self::execution_telemetry(&detailed.runs),
             failure_penalty_sensitivity,
-            latency_p95_ms: self
-                .benchmark_predictive_latency(default_diagnostic_suite()?.latency.evidence_runs)?,
+            latency_p95_ms: self.benchmark_predictive_latency(
+                evaluation_to,
+                default_diagnostic_suite()?.latency.evidence_runs,
+            )?,
             session_fallback_cold_ms,
             session_fallback_warm_ms,
             proxy_step_pct,
             lookahead_step_pct,
             escalated_exact_step_pct,
             exact_step_pct,
+            finite_step_pct,
             average_lookahead_pool_ratio: if lookahead_pool_ratio_count == 0 {
                 0.0
             } else {
@@ -1702,21 +3183,7 @@ impl Solver {
             } else {
                 exact_pool_ratio_sum / exact_pool_ratio_count as f64
             },
-            games: detailed
-                .runs
-                .iter()
-                .map(|run| ExperimentGameResult {
-                    target: run.target.clone(),
-                    outcome: if run.steps.is_empty() {
-                        GameOutcome::coverage_gap(run.date)
-                    } else if run.solved {
-                        GameOutcome::solved(run.date, run.steps.len())
-                    } else {
-                        GameOutcome::unsolved(run.date, run.steps.len())
-                    },
-                    path: run.steps.iter().map(|step| step.guess.clone()).collect(),
-                })
-                .collect(),
+            games: game_results,
         })
     }
 
@@ -1745,31 +3212,153 @@ impl Solver {
         top: usize,
         resource_budget: EvidenceResourceBudget,
     ) -> Result<PredictiveEvidenceArtifact> {
+        Self::build_development_evidence_with_checkpoint(
+            paths,
+            config,
+            from,
+            to,
+            top,
+            resource_budget,
+            None,
+        )
+    }
+
+    pub fn build_development_evidence_with_checkpoint(
+        paths: &ProjectPaths,
+        config: &PriorConfig,
+        from: NaiveDate,
+        to: NaiveDate,
+        top: usize,
+        resource_budget: EvidenceResourceBudget,
+        checkpoint_path: Option<&Path>,
+    ) -> Result<PredictiveEvidenceArtifact> {
+        if from > to {
+            bail!("evidence start date cannot be after end date");
+        }
+        Self::build_development_evidence_with_selection(
+            paths,
+            config,
+            EvidenceDateSelection::Range(DateRange::new(from, to)?),
+            top,
+            resource_budget,
+            None,
+            checkpoint_path,
+        )
+    }
+
+    pub fn build_development_evidence_with_selection(
+        paths: &ProjectPaths,
+        config: &PriorConfig,
+        selection: EvidenceDateSelection,
+        top: usize,
+        resource_budget: EvidenceResourceBudget,
+        matrix_path: Option<&Path>,
+        checkpoint_path: Option<&Path>,
+    ) -> Result<PredictiveEvidenceArtifact> {
         if resource_budget.maximum_seconds == 0 || resource_budget.maximum_memory_mb == 0 {
             bail!("evidence time and memory budgets must be positive");
         }
         let generation_started = Instant::now();
-        let input_fingerprint = rolling_source_identity(paths)?;
-        enforce_evidence_resource_budget(generation_started, resource_budget)?;
-        if from > to {
-            bail!("evidence start date cannot be after end date");
-        }
-        let plan = canonical_development_evaluation_plan(paths, "generating evidence")?;
-        if from > plan.development.end || to > plan.development.end {
-            bail!(
-                "evidence range {}..{} reaches the sealed test; development evidence must end on or before {}",
-                from,
-                to,
-                plan.development.end
+        let (plan, selected_ranges, selection_label, from, to) = match selection {
+            EvidenceDateSelection::Range(range) => {
+                let plan = ensure_development_target_range(
+                    paths,
+                    range.start,
+                    range.end,
+                    "evidence generation",
+                )?;
+                (plan, vec![range], "range", range.start, range.end)
+            }
+            EvidenceDateSelection::RollingFolds => {
+                let plan = canonical_development_evaluation_plan(paths, "evidence generation")?;
+                let selected_ranges = plan
+                    .folds
+                    .iter()
+                    .map(|fold| fold.validation)
+                    .collect::<Vec<_>>();
+                let first = selected_ranges
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow!("canonical development plan has no validation folds"))?;
+                let last = selected_ranges
+                    .last()
+                    .copied()
+                    .expect("non-empty selected ranges");
+                (
+                    plan,
+                    selected_ranges,
+                    "rolling_folds",
+                    first.start,
+                    last.end,
+                )
+            }
+        };
+        let input_fingerprint = development_source_identity(paths, plan.development.end)?;
+
+        let (matrix, matrix_source, matrix_fingerprint) = load_evidence_matrix(paths, matrix_path)?;
+        let profile_ids = matrix
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        let resolved_profile_base_configs =
+            resolved_evidence_profile_base_configs(paths, config, &matrix)?;
+        let config_toml =
+            toml::to_string_pretty(config).context("failed to serialize evidence config")?;
+        let checkpoint_identity = evidence_checkpoint_identity(
+            &input_fingerprint,
+            &config_toml,
+            &plan,
+            selection_label,
+            &selected_ranges,
+            &matrix_source,
+            &matrix_fingerprint,
+            &profile_ids,
+            &resolved_profile_base_configs,
+            DateRange::new(from, to)?,
+            top,
+        )?;
+        let checkpoint_path = checkpoint_path.map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                paths.root.join(path)
+            }
+        });
+        let mut prior_elapsed_ms = 0_u64;
+        let mut prior_peak_working_set_bytes = 0_u64;
+        let mut baselines = Vec::new();
+        if let Some(path) = checkpoint_path.as_deref().filter(|path| path.exists()) {
+            let raw = fs::read(path)
+                .with_context(|| format!("read evidence checkpoint {}", path.display()))?;
+            let checkpoint: EvidenceMatrixCheckpoint = serde_json::from_slice(&raw)
+                .with_context(|| format!("parse evidence checkpoint {}", path.display()))?;
+            checkpoint.validate(&checkpoint_identity, &profile_ids)?;
+            prior_elapsed_ms = checkpoint.elapsed_ms;
+            prior_peak_working_set_bytes = checkpoint.peak_working_set_bytes;
+            baselines = checkpoint.baselines;
+            eprintln!(
+                "benchmark-evidence phase=resume profiles={}/{} prior_elapsed_s={:.1} checkpoint={}",
+                baselines.len(),
+                profile_ids.len(),
+                prior_elapsed_ms as f64 / 1_000.0,
+                path.display()
             );
         }
-
-        let matrix = PredictiveExperimentMatrix::parse_json(include_str!(
-            "../../config/experiments/development-evidence.json"
-        ))?;
+        enforce_evidence_resource_budget(
+            generation_started,
+            prior_elapsed_ms,
+            prior_peak_working_set_bytes,
+            resource_budget,
+        )?;
         let total_profiles = matrix.profiles.len();
-        let completed_games = std::sync::atomic::AtomicUsize::new(0);
-        let mut baselines = Vec::with_capacity(total_profiles);
+        let completed_games = std::sync::atomic::AtomicUsize::new(
+            baselines
+                .iter()
+                .map(|baseline| baseline.result.backtest.canonical.scheduled_games)
+                .sum(),
+        );
+        baselines.reserve(total_profiles.saturating_sub(baselines.len()));
         eprintln!(
             "benchmark-evidence phase=start profiles={} rayon_threads={} from={} to={} elapsed_s=0.0",
             total_profiles,
@@ -1778,7 +3367,10 @@ impl Solver {
             to,
         );
         let _ = std::io::stderr().flush();
-        for (profile_index, profile) in matrix.profiles.into_iter().enumerate() {
+        for (profile_index, profile) in matrix.profiles.iter().cloned().enumerate() {
+            if profile_index < baselines.len() {
+                continue;
+            }
             let profile_id = profile.id.clone();
             eprintln!(
                 "benchmark-evidence phase=profile-start profile={}/{} id={} elapsed_s={:.1}",
@@ -1807,7 +3399,9 @@ impl Solver {
                 let total_games = profile_total.saturating_mul(total_profiles);
                 let global_completed =
                     completed_games.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let elapsed = generation_started.elapsed().as_secs_f64();
+                let elapsed = cumulative_evidence_elapsed_ms(generation_started, prior_elapsed_ms)
+                    as f64
+                    / 1_000.0;
                 let eta = if global_completed == 0 {
                     0.0
                 } else {
@@ -1826,9 +3420,9 @@ impl Solver {
                 );
                 let _ = std::io::stderr().flush();
             };
-            let result = solver.experiment_report_with_book_usage_and_progress(
-                from,
-                to,
+            let games = selected_evidence_games(&solver.history_dates, &selected_ranges)?;
+            let result = solver.experiment_report_for_selected_games_with_book_usage_and_progress(
+                &games,
                 top,
                 book_usage,
                 Some(&progress),
@@ -1862,20 +3456,75 @@ impl Solver {
                 paired_vs_selected_default: None,
                 result,
             });
-            enforce_evidence_resource_budget(generation_started, resource_budget)?;
+            let memory = enforce_evidence_resource_budget(
+                generation_started,
+                prior_elapsed_ms,
+                prior_peak_working_set_bytes,
+                resource_budget,
+            )?;
+            prior_peak_working_set_bytes =
+                prior_peak_working_set_bytes.max(memory.peak_working_set_bytes);
+            ensure_development_source_identity(paths, plan.development.end, &input_fingerprint)?;
+            let (current_matrix, current_matrix_source, current_matrix_fingerprint) =
+                load_evidence_matrix(paths, matrix_path)?;
+            let current_profile_ids = current_matrix
+                .profiles
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect::<Vec<_>>();
+            let current_profile_base_configs =
+                resolved_evidence_profile_base_configs(paths, config, &current_matrix)?;
+            let current_identity = evidence_checkpoint_identity(
+                &input_fingerprint,
+                &config_toml,
+                &plan,
+                selection_label,
+                &selected_ranges,
+                &current_matrix_source,
+                &current_matrix_fingerprint,
+                &current_profile_ids,
+                &current_profile_base_configs,
+                DateRange::new(from, to)?,
+                top,
+            )?;
+            if current_identity != checkpoint_identity {
+                bail!(
+                    "evidence source, config, selection, or matrix changed during evaluation; discard the partial checkpoint and retry"
+                );
+            }
+            if let Some(path) = checkpoint_path.as_deref() {
+                let checkpoint = EvidenceMatrixCheckpoint {
+                    schema_version: EVIDENCE_CHECKPOINT_SCHEMA_VERSION,
+                    identity: checkpoint_identity.clone(),
+                    elapsed_ms: cumulative_evidence_elapsed_ms(
+                        generation_started,
+                        prior_elapsed_ms,
+                    ),
+                    peak_working_set_bytes: prior_peak_working_set_bytes,
+                    baselines: baselines.clone(),
+                };
+                checkpoint.validate(&checkpoint_identity, &profile_ids)?;
+                crate::atomic_file::atomic_write(path, &serde_json::to_vec_pretty(&checkpoint)?)?;
+            }
         }
-        let selected_outcomes = baselines
+        for baseline in &baselines {
+            validate_evidence_baseline(baseline)?;
+        }
+        let reference_profile_id = baselines
             .iter()
             .find(|baseline| baseline.id == "selected_default_disk_artifacts")
-            .map(|baseline| {
-                baseline
-                    .result
-                    .games
-                    .iter()
-                    .map(|game| game.outcome)
-                    .collect::<Vec<_>>()
-            })
-            .ok_or_else(|| anyhow!("selected-default evidence baseline is missing"))?;
+            .or_else(|| baselines.first())
+            .map(|baseline| baseline.id.clone())
+            .ok_or_else(|| anyhow!("evidence matrix has no reference profile"))?;
+        let reference_outcomes = baselines
+            .iter()
+            .find(|baseline| baseline.id == reference_profile_id)
+            .expect("reference profile was selected")
+            .result
+            .games
+            .iter()
+            .map(|game| game.outcome)
+            .collect::<Vec<_>>();
         for baseline in &mut baselines {
             let candidate = baseline
                 .result
@@ -1884,7 +3533,7 @@ impl Solver {
                 .map(|game| game.outcome)
                 .collect::<Vec<_>>();
             baseline.paired_vs_selected_default = Some(PairedDifference::all_game_penalized(
-                &selected_outcomes,
+                &reference_outcomes,
                 &candidate,
                 7.0,
                 BootstrapConfig::default(),
@@ -1892,20 +3541,55 @@ impl Solver {
         }
 
         let (code_revision, code_dirty) = git_provenance(&paths.root);
-        let generation_compute_ms = generation_started
-            .elapsed()
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
-        let memory = enforce_evidence_resource_budget(generation_started, resource_budget)?;
-        let config_toml =
-            toml::to_string_pretty(config).context("failed to serialize evidence config")?;
+        let generation_compute_ms =
+            cumulative_evidence_elapsed_ms(generation_started, prior_elapsed_ms);
+        let memory = enforce_evidence_resource_budget(
+            generation_started,
+            prior_elapsed_ms,
+            prior_peak_working_set_bytes,
+            resource_budget,
+        )?;
         let config_fingerprint = crate::identity::digest_bytes_tagged(
             "maybe-wordle-benchmark-root-config-v1",
             config_toml.as_bytes(),
         );
-        ensure_rolling_source_identity(paths, &input_fingerprint)?;
+        ensure_development_source_identity(paths, plan.development.end, &input_fingerprint)?;
+        let (final_matrix, final_matrix_source, final_matrix_fingerprint) =
+            load_evidence_matrix(paths, matrix_path)?;
+        let final_profile_ids = final_matrix
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        let final_profile_base_configs =
+            resolved_evidence_profile_base_configs(paths, config, &final_matrix)?;
+        let final_identity = evidence_checkpoint_identity(
+            &input_fingerprint,
+            &config_toml,
+            &plan,
+            selection_label,
+            &selected_ranges,
+            &final_matrix_source,
+            &final_matrix_fingerprint,
+            &final_profile_ids,
+            &final_profile_base_configs,
+            DateRange::new(from, to)?,
+            top,
+        )?;
+        if final_identity != checkpoint_identity {
+            bail!(
+                "evidence source, config, selection, or matrix changed during evaluation; discard the partial checkpoint and retry"
+            );
+        }
+        let selection_args = match selection {
+            EvidenceDateSelection::Range(_) => format!("--from {from} --to {to}"),
+            EvidenceDateSelection::RollingFolds => "--rolling-folds".to_string(),
+        };
+        let matrix_args = matrix_path
+            .map(|path| format!(" --matrix {}", path.display()))
+            .unwrap_or_default();
         Ok(PredictiveEvidenceArtifact {
-            schema_version: 4,
+            schema_version: BENCHMARK_EVIDENCE_SCHEMA_VERSION,
             identity_format: crate::identity::IDENTITY_FORMAT.to_string(),
             input_fingerprint,
             config_fingerprint,
@@ -1913,6 +3597,12 @@ impl Solver {
             sealed_test_evaluated: false,
             evaluation_from: from,
             evaluation_to: to,
+            evaluation_selection: selection_label.to_string(),
+            selected_ranges: selected_ranges.clone(),
+            matrix_source,
+            matrix_fingerprint,
+            profile_ids,
+            reference_profile_id: reference_profile_id.clone(),
             history_snapshot_start: plan.history.start,
             history_snapshot_end: plan.history.end,
             code_revision,
@@ -1920,7 +3610,7 @@ impl Solver {
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             cpu: std::env::var("PROCESSOR_IDENTIFIER").ok(),
             release_command: format!(
-                "cargo run --release -- benchmark-evidence --from {from} --to {to} --maximum-seconds {} --maximum-memory-mb {} --output <json> --markdown-output <md>",
+                "cargo run --release -- benchmark-evidence {selection_args}{matrix_args} --maximum-seconds {} --maximum-memory-mb {} --output <json> --markdown-output <md> --checkpoint <checkpoint>",
                 resource_budget.maximum_seconds,
                 resource_budget.maximum_memory_mb
             ),
@@ -1929,7 +3619,9 @@ impl Solver {
             resources: EvidenceResourceTelemetry {
                 generation_compute_ms,
                 current_working_set_bytes: Some(memory.current_working_set_bytes),
-                peak_working_set_bytes: Some(memory.peak_working_set_bytes),
+                peak_working_set_bytes: Some(
+                    prior_peak_working_set_bytes.max(memory.peak_working_set_bytes),
+                ),
                 artifact_sizes: evidence_artifact_sizes(paths)?,
             },
             historical_diagnostic: HistoricalDiagnosticBaseline {
@@ -1946,8 +3638,9 @@ impl Solver {
             baselines,
             limitations: vec![
                 "This artifact evaluates development dates only; the sealed final window remains unopened.".to_string(),
+                format!("The `{selection_label}` selection uses these exact validation ranges: {}.", selected_ranges.iter().map(|range| format!("{}..{}", range.start, range.end)).collect::<Vec<_>>().join(", ")),
                 "Prior probabilities remain heuristic until calibration improves on rolling-origin validation.".to_string(),
-                "Identity fields remain non-cryptographic until the planned SHA-256 artifact format is approved and implemented.".to_string(),
+                "SHA-256 identity fields detect changed inputs but do not prove statistical validity or authenticate an external artifact producer.".to_string(),
             ],
         })
     }
@@ -1959,9 +3652,19 @@ impl Solver {
         let mut output = String::new();
         output.push_str("<!-- BEGIN GENERATED PREDICTIVE EVIDENCE -->\n");
         output.push_str("## Predictive solver evidence\n\n");
+        let selected_ranges = artifact
+            .selected_ranges
+            .iter()
+            .map(|range| format!("{}..{}", range.start, range.end))
+            .collect::<Vec<_>>()
+            .join(", ");
         output.push_str(&format!(
-            "Development-only diagnostic for `{}` through `{}` using history through `{}`. The sealed test was **not** evaluated.\n\n",
-            artifact.evaluation_from, artifact.evaluation_to, artifact.history_snapshot_end
+            "Development-only diagnostic for `{}` through `{}` using selection `{}` ({}) and history through `{}`. The sealed test was **not** evaluated.\n\n",
+            artifact.evaluation_from,
+            artifact.evaluation_to,
+            artifact.evaluation_selection,
+            selected_ranges,
+            artifact.history_snapshot_end
         ));
         if let Some(peak_bytes) = artifact.resources.peak_working_set_bytes {
             output.push_str(&format!(
@@ -1972,7 +3675,7 @@ impl Solver {
                 artifact.resource_budget.maximum_memory_mb
             ));
         }
-        output.push_str("| Baseline | Coverage | Solved | All-game mean (7-guess penalty) | Conditional mean | 3 guesses | 4 guesses | Paired delta vs default | W/T/L | Log loss | Brier | Latency p95 | Session fallback cold/warm |\n");
+        output.push_str("| Baseline | Coverage | Solved | All-game mean (7-guess penalty) | Conditional mean | 3 guesses | 4 guesses | Paired delta vs reference | W/T/L | Log loss | Brier | Latency p95 | Session fallback cold/warm |\n");
         output.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
         for baseline in &artifact.baselines {
             let metrics = &baseline.result.backtest.canonical;
@@ -1980,7 +3683,7 @@ impl Solver {
                 .paired_vs_selected_default
                 .expect("generated evidence always has paired comparisons");
             output.push_str(&format!(
-                "| `{}` | {:.1}% ({}/{}) | {:.1}% ({}/{}) | {:.4} [{:.4}, {:.4}] | {:.4} [{:.4}, {:.4}] | {:.1}% | {:.1}% | {:+.4} [{:+.4}, {:+.4}] | {}/{}/{} | {:.4} | {:.4} | {:.2} ms | {:.2}/{:.3} ms |\n",
+                "| `{}` | {:.1}% ({}/{}) | {:.1}% ({}/{}) | {:.4} [{:.4}, {:.4}] | {:.4} [{:.4}, {:.4}] | {:.1}% | {:.1}% | {:+.4} [{:+.4}, {:+.4}] | {}/{}/{} | {:.4} | {:.4} | {:.2} ms | {}/{} |\n",
                 baseline.id,
                 metrics.coverage_rate * 100.0,
                 metrics.modeled_games,
@@ -2009,10 +3712,11 @@ impl Solver {
                 baseline.result.average_log_loss,
                 baseline.result.average_brier,
                 baseline.result.latency_p95_ms,
-                baseline.result.session_fallback_cold_ms,
-                baseline.result.session_fallback_warm_ms,
+                baseline.result.session_fallback_cold_ms.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.3}")),
+                baseline.result.session_fallback_warm_ms.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.3}")),
             ));
         }
+        output.push_str("\nSession-fallback timings are milliseconds; n/a means live session books are not used by that profile and were not benchmarked.\n");
         if !artifact.resources.artifact_sizes.is_empty() {
             output.push_str("\nMeasured artifact sizes: ");
             output.push_str(
@@ -2026,7 +3730,7 @@ impl Solver {
             );
             output.push_str(".\n");
         }
-        output.push_str("\n| Baseline | Prior top-1 | Prior top-3 | Prior top-5 | Confidence ECE | Search steps P/L/XE/X | Recovery/fallback steps | Artifact/session hits |\n");
+        output.push_str("\n| Baseline | Prior top-1 | Prior top-3 | Prior top-5 | Confidence ECE | Search steps P/L/XE/X/F | Recovery/fallback steps | Artifact/session hits |\n");
         output.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
         for baseline in &artifact.baselines {
             let prior = baseline.result.prior_evidence.as_ref();
@@ -2049,7 +3753,7 @@ impl Solver {
                 },
             );
             output.push_str(&format!(
-                "| `{}` | {} | {} | {} | {} | {}/{}/{}/{} | {}/{} | {}/{} |\n",
+                "| `{}` | {} | {} | {} | {} | {}/{}/{}/{}/{} | {}/{} | {}/{} |\n",
                 baseline.id,
                 recall(prior.map(|metrics| metrics.top_1_recall)),
                 recall(prior.map(|metrics| metrics.top_3_recall)),
@@ -2059,6 +3763,7 @@ impl Solver {
                 telemetry.lookahead_steps,
                 telemetry.escalated_exact_steps,
                 telemetry.exact_steps,
+                telemetry.finite_steps,
                 telemetry.strict_recovery_steps
                     + telemetry.uniform_recovery_steps
                     + telemetry.epsilon_repair_steps,
@@ -2069,13 +3774,57 @@ impl Solver {
                 telemetry.session_fallback_hits,
             ));
         }
-        if let Some(selected) = artifact
+        if artifact
             .baselines
             .iter()
-            .find(|baseline| baseline.id == "selected_default_disk_artifacts")
+            .any(|baseline| !baseline.result.posterior_calibration.is_empty())
         {
-            output.push_str("\nSelected-default all-game mean sensitivity: ");
-            for (index, metric) in selected
+            output.push_str(
+                "\nPost-feedback posterior proper scores (means are conditional on scored states; scored/total keeps unscored gaps visible):\n\n",
+            );
+            output.push_str(
+                "| Baseline | Stratum | Turn | Scored/total states | Target probability | Log loss | Brier |\n",
+            );
+            output.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
+            for baseline in &artifact.baselines {
+                for summary in &baseline.result.posterior_calibration {
+                    if summary.total_states == 0 {
+                        continue;
+                    }
+                    let (target_probability, log_loss, brier) = summary.mean_score.map_or(
+                        ("n/a".to_string(), "n/a".to_string(), "n/a".to_string()),
+                        |score| {
+                            (
+                                format!("{:.4}", score.target_probability),
+                                format!("{:.4}", score.log_loss),
+                                format!("{:.4}", score.brier),
+                            )
+                        },
+                    );
+                    output.push_str(&format!(
+                        "| `{}` | {} | {} | {}/{} | {} | {} | {} |\n",
+                        baseline.id,
+                        summary.stratum,
+                        summary.turn,
+                        summary.scored_states,
+                        summary.total_states,
+                        target_probability,
+                        log_loss,
+                        brier,
+                    ));
+                }
+            }
+        }
+        if let Some(reference) = artifact
+            .baselines
+            .iter()
+            .find(|baseline| baseline.id == artifact.reference_profile_id)
+        {
+            output.push_str(&format!(
+                "\nReference `{}` all-game mean sensitivity: ",
+                artifact.reference_profile_id
+            ));
+            for (index, metric) in reference
                 .result
                 .failure_penalty_sensitivity
                 .iter()
@@ -2095,7 +3844,7 @@ impl Solver {
             output.push_str(".\n");
         }
         output.push_str("\nThe old `3.2222` figure was conditional on 27 modeled games and omitted three coverage gaps. It is retained only as an attribution baseline, not as current performance. A flat three guesses is an aspiration; it is not supported unless the failure-penalized all-game sealed-test result reaches it after configuration freeze.\n\n");
-        output.push_str("Regenerate both files with the `release_command` recorded in [`benchmarks/predictive/development-2026-06-17.json`](./benchmarks/predictive/development-2026-06-17.json). Full provenance, per-game paths, effective profile configs, paired comparisons, and limitations live in that artifact. The generated source fragment is [`docs/generated/predictive-evidence.md`](./docs/generated/predictive-evidence.md).\n");
+        output.push_str("The source JSON artifact records the `release_command`, full provenance, per-game paths, effective profile configs, paired comparisons, and limitations. Regenerate documentation with `benchmark-evidence-docs --evidence <source-json> --markdown-output <fragment> --readme <readme> --update`.\n");
         output.push_str("<!-- END GENERATED PREDICTIVE EVIDENCE -->\n");
         Ok(output)
     }
@@ -2109,12 +3858,16 @@ impl Solver {
         top: usize,
         reusable_baseline: Option<&RollingComparisonArtifact>,
     ) -> Result<RollingComparisonArtifact> {
-        let input_fingerprint = rolling_source_identity(paths)?;
         let evaluation_plan = canonical_development_evaluation_plan(paths, "rolling comparison")?;
+        let input_fingerprint =
+            development_source_identity(paths, evaluation_plan.development.end)?;
         let baseline_toml = toml::to_string_pretty(baseline_config)
             .context("failed to serialize baseline config")?;
         let baseline = if let Some(reusable) = reusable_baseline {
-            reusable.validate_identity()?;
+            validate_rolling_comparison_artifact(reusable)?;
+            if reusable.top != top {
+                bail!("reusable baseline uses a different top setting; regenerate it");
+            }
             if reusable.input_fingerprint != input_fingerprint {
                 bail!("reusable baseline input fingerprint is stale; regenerate it");
             }
@@ -2160,10 +3913,15 @@ impl Solver {
             7.0,
             BootstrapConfig::default(),
         )?;
-        ensure_rolling_source_identity(paths, &input_fingerprint)?;
+        ensure_development_source_identity(
+            paths,
+            evaluation_plan.development.end,
+            &input_fingerprint,
+        )?;
         let (code_revision, code_dirty) = git_provenance(&paths.root);
-        Ok(RollingComparisonArtifact {
-            schema_version: 3,
+        let comparison = RollingComparisonArtifact {
+            schema_version: 4,
+            top,
             identity_format: crate::identity::IDENTITY_FORMAT.to_string(),
             input_fingerprint,
             evaluation_plan,
@@ -2173,7 +3931,9 @@ impl Solver {
             baseline,
             candidate,
             candidate_minus_baseline: comparison,
-        })
+        };
+        validate_rolling_comparison_artifact(&comparison)?;
+        Ok(comparison)
     }
 
     pub fn freeze_predictive_candidate(
@@ -2188,10 +3948,11 @@ impl Solver {
             .with_context(|| format!("failed to read {}", comparison_path.display()))?;
         let comparison: RollingComparisonArtifact = serde_json::from_slice(&comparison_bytes)
             .with_context(|| format!("failed to parse {}", comparison_path.display()))?;
-        comparison.validate_identity()?;
-        let input_fingerprint = rolling_source_identity(paths)?;
+        validate_rolling_comparison_artifact(&comparison)?;
         let evaluation_plan =
             canonical_development_evaluation_plan(paths, "freezing predictive candidate")?;
+        let input_fingerprint =
+            development_source_identity(paths, evaluation_plan.development.end)?;
         if comparison.input_fingerprint != input_fingerprint
             || comparison.evaluation_plan != evaluation_plan
             || comparison.sealed_test_evaluated
@@ -2266,7 +4027,9 @@ impl Solver {
         output_path: &Path,
     ) -> Result<SealedTestReport> {
         frozen.validate_identity()?;
-        if rolling_source_identity(paths)? != frozen.input_fingerprint {
+        if development_source_identity(paths, frozen.evaluation_plan.development.end)?
+            != frozen.input_fingerprint
+        {
             bail!(
                 "source, executable, or data changed after candidate freeze; the sealed test remains closed"
             );
@@ -2341,6 +4104,13 @@ impl Solver {
                     GameOutcome::unsolved(run.date, run.steps.len())
                 },
                 path: run.steps.iter().map(|step| step.guess.clone()).collect(),
+                finite_search_steps: run
+                    .steps
+                    .iter()
+                    .filter_map(|step| step.finite_search.clone())
+                    .collect(),
+                prior_strata: None,
+                posterior_calibration: Vec::new(),
             })
             .collect::<Vec<_>>();
         let outcomes = games.iter().map(|game| game.outcome).collect::<Vec<_>>();
@@ -2384,8 +4154,10 @@ impl Solver {
                 .transpose()?,
             execution: Self::execution_telemetry(&report.runs),
             games,
-            latency_p95_ms: solver
-                .benchmark_predictive_latency(default_diagnostic_suite()?.latency.evidence_runs)?,
+            latency_p95_ms: solver.benchmark_predictive_latency(
+                frozen.evaluation_plan.development.end,
+                default_diagnostic_suite()?.latency.evidence_runs,
+            )?,
         };
         crate::atomic_file::atomic_write(
             &output_path,
@@ -2406,15 +4178,15 @@ impl Solver {
             .first()
             .ok_or_else(|| anyhow!("at least one rolling comparison is required"))?;
         for comparison in comparisons {
-            comparison.validate_identity()?;
+            validate_rolling_comparison_artifact(comparison)?;
         }
         if comparisons.iter().any(|comparison| {
-            comparison.sealed_test_evaluated
-                || comparison.evaluation_plan != first.evaluation_plan
+            comparison.evaluation_plan != first.evaluation_plan
+                || comparison.baseline.label != first.baseline.label
                 || comparison.baseline.config_toml != first.baseline.config_toml
                 || comparison.baseline.aggregate != first.baseline.aggregate
         }) {
-            bail!("rolling comparisons must share one development plan and default baseline");
+            bail!("rolling comparisons must share one development plan and baseline");
         }
         let baseline = &first.baseline;
         let mut output = String::new();
@@ -2425,15 +4197,22 @@ impl Solver {
             first.evaluation_plan.folds.len(),
             baseline.aggregate.scheduled_games
         ));
-        output.push_str("| Configuration | Solved | All-game mean | Delta vs default | W/T/L | Latency p95 | Guard decision |\n");
+        output.push_str("| Configuration | Solved | All-game mean | Delta vs baseline | W/T/L | Latency p95 | Guard decision |\n");
         output.push_str("| --- | ---: | ---: | ---: | ---: | ---: | --- |\n");
         output.push_str(&format!(
-            "| `current_default` | {}/{} | {:.4} [{:.4}, {:.4}] | reference | -- | {:.2} ms | retained |\n",
+            "| `{}` | {}/{} | {:.4} [{:.4}, {:.4}] | reference | -- | {:.2} ms | retained |\n",
+            baseline.label,
             baseline.aggregate.solved_games,
             baseline.aggregate.scheduled_games,
             baseline.aggregate.all_game_penalized_mean_guesses,
-            baseline.aggregate.all_game_penalized_mean_guesses_ci95.lower,
-            baseline.aggregate.all_game_penalized_mean_guesses_ci95.upper,
+            baseline
+                .aggregate
+                .all_game_penalized_mean_guesses_ci95
+                .lower,
+            baseline
+                .aggregate
+                .all_game_penalized_mean_guesses_ci95
+                .upper,
             baseline.latency_p95_ms,
         ));
         for comparison in comparisons {
@@ -2470,7 +4249,7 @@ impl Solver {
                 decision,
             ));
         }
-        output.push_str("\n| Configuration | Prior top-1/3/5 | Confidence ECE | Search steps P/L/XE/X | Recovery/fallback steps |\n");
+        output.push_str("\n| Configuration | Prior top-1/3/5 | Confidence ECE | Search steps P/L/XE/X/F | Recovery/fallback steps |\n");
         output.push_str("| --- | ---: | ---: | ---: | ---: |\n");
         for evidence in std::iter::once(baseline)
             .chain(comparisons.iter().map(|comparison| &comparison.candidate))
@@ -2478,7 +4257,7 @@ impl Solver {
             let prior = evidence.prior_evidence.as_ref();
             let telemetry = &evidence.execution;
             output.push_str(&format!(
-                "| `{}` | {} | {} | {}/{}/{}/{} | {}/{} |\n",
+                "| `{}` | {} | {} | {}/{}/{}/{}/{} | {}/{} |\n",
                 evidence.label,
                 prior.map_or_else(
                     || "n/a".to_string(),
@@ -2502,6 +4281,7 @@ impl Solver {
                 telemetry.lookahead_steps,
                 telemetry.escalated_exact_steps,
                 telemetry.exact_steps,
+                telemetry.finite_steps,
                 telemetry.strict_recovery_steps
                     + telemetry.uniform_recovery_steps
                     + telemetry.epsilon_repair_steps,
@@ -2533,7 +4313,7 @@ impl Solver {
             output.push_str(&format!("- `{}` is {}.\n", candidate.label, explanation));
         }
         output.push_str(
-            "\nThis comparison did not access the sealed window; the release summary records its subsequent once-only evaluation.\n",
+            "\nThis development comparison did not access the sealed window and does not establish prospective performance. Any later sealed evaluation requires separate evidence.\n",
         );
         output.push_str("<!-- END GENERATED ROLLING EVIDENCE -->\n");
         Ok(output)
@@ -2554,29 +4334,28 @@ impl Solver {
         )?;
         let config_toml = toml::to_string_pretty(config)
             .context("failed to serialize rolling comparison config")?;
-        let source_identity = rolling_source_identity(paths)?;
-        let checkpoint_path = rolling_checkpoint_path(paths, label, &config_toml, &source_identity);
+        let source_identity = development_source_identity(paths, evaluation_plan.development.end)?;
+        let checkpoint_path =
+            rolling_checkpoint_path(paths, label, &config_toml, &source_identity, top);
         let mut checkpoint = if checkpoint_path.exists() {
             let raw = fs::read(&checkpoint_path)
                 .with_context(|| format!("failed to read {}", checkpoint_path.display()))?;
             let checkpoint: RollingEvaluationCheckpoint = serde_json::from_slice(&raw)
                 .with_context(|| format!("failed to parse {}", checkpoint_path.display()))?;
-            if checkpoint.schema_version != 1
-                || checkpoint.source_identity != source_identity
-                || checkpoint.evaluation_plan != *evaluation_plan
-                || checkpoint.label != label
-                || checkpoint.config_toml != config_toml
-            {
-                bail!(
-                    "rolling checkpoint {} does not match the current source/config/plan; remove the rebuildable checkpoint and retry",
-                    checkpoint_path.display()
-                );
-            }
+            validate_rolling_checkpoint(
+                &checkpoint,
+                &source_identity,
+                label,
+                &config_toml,
+                evaluation_plan,
+                true,
+            )
+            .with_context(|| format!("invalid rolling checkpoint {}", checkpoint_path.display()))?;
             checkpoint
         } else {
             RollingEvaluationCheckpoint {
-                schema_version: 1,
-                source_identity,
+                schema_version: ROLLING_CHECKPOINT_SCHEMA_VERSION,
+                source_identity: source_identity.clone(),
                 evaluation_plan: evaluation_plan.clone(),
                 label: label.to_string(),
                 config_toml: config_toml.clone(),
@@ -2586,6 +4365,14 @@ impl Solver {
                 execution: ExecutionTelemetry::default(),
             }
         };
+        validate_rolling_checkpoint(
+            &checkpoint,
+            &source_identity,
+            label,
+            &config_toml,
+            evaluation_plan,
+            true,
+        )?;
         let completed_folds = checkpoint
             .folds
             .iter()
@@ -2613,9 +4400,8 @@ impl Solver {
                 validation: fold.validation,
                 metrics: report.summary.canonical.clone(),
             });
-            checkpoint
-                .games
-                .extend(report.runs.iter().map(|run| ExperimentGameResult {
+            checkpoint.games.extend(report.runs.iter().map(|run| {
+                ExperimentGameResult {
                     target: run.target.clone(),
                     outcome: if run.steps.is_empty() {
                         GameOutcome::coverage_gap(run.date)
@@ -2625,7 +4411,15 @@ impl Solver {
                         GameOutcome::unsolved(run.date, run.steps.len())
                     },
                     path: run.steps.iter().map(|step| step.guess.clone()).collect(),
-                }));
+                    finite_search_steps: run
+                        .steps
+                        .iter()
+                        .filter_map(|step| step.finite_search.clone())
+                        .collect(),
+                    prior_strata: None,
+                    posterior_calibration: Vec::new(),
+                }
+            }));
             merge_execution_telemetry(
                 &mut checkpoint.execution,
                 &Self::execution_telemetry(&report.runs),
@@ -2647,6 +4441,14 @@ impl Solver {
             }
             checkpoint.folds.sort_by_key(|fold| fold.fold_index);
             checkpoint.games.sort_by_key(|game| game.outcome.date);
+            validate_rolling_checkpoint(
+                &checkpoint,
+                &source_identity,
+                label,
+                &config_toml,
+                evaluation_plan,
+                true,
+            )?;
             crate::atomic_file::atomic_write(
                 &checkpoint_path,
                 &serde_json::to_vec_pretty(&checkpoint)
@@ -2664,6 +4466,14 @@ impl Solver {
                 started.elapsed().as_millis()
             );
         }
+        validate_rolling_checkpoint(
+            &checkpoint,
+            &source_identity,
+            label,
+            &config_toml,
+            evaluation_plan,
+            true,
+        )?;
         if checkpoint.folds.len() != evaluation_plan.folds.len() {
             bail!("rolling evaluation ended before every planned fold completed");
         }
@@ -2711,8 +4521,10 @@ impl Solver {
             execution: checkpoint.execution,
             failure_penalty_sensitivity,
             games: checkpoint.games,
-            latency_p95_ms: solver
-                .benchmark_predictive_latency(default_diagnostic_suite()?.latency.evidence_runs)?,
+            latency_p95_ms: solver.benchmark_predictive_latency(
+                evaluation_plan.development.end,
+                default_diagnostic_suite()?.latency.evidence_runs,
+            )?,
         })
     }
 
@@ -2741,6 +4553,19 @@ impl Solver {
             .map(|(first, last)| (first.print_date, last.print_date)))
     }
 
+    pub fn development_evaluation_plan(paths: &ProjectPaths) -> Result<EvaluationPlan> {
+        let (history_start, history_end) = Self::latest_history_range(paths)?
+            .ok_or_else(|| anyhow!("run sync-data before development evaluation"))?;
+        let history = DateRange::new(history_start, history_end)?;
+        let policy =
+            crate::experiments::EvaluationPolicy::load(&paths.root.join("config/evaluation.toml"))?;
+        crate::experiments::build_declared_rolling_origin_plan(
+            history,
+            rolling_origin_config_for_history(history)?,
+            &policy,
+        )
+    }
+
     pub fn pattern_table_bytes(&self) -> usize {
         self.pattern_table.bytes_len()
     }
@@ -2763,6 +4588,7 @@ impl Solver {
                 &state,
                 offline.config.session_opener_pool.max(1),
                 Some(PredictiveContext {
+                    hard_mode: false,
                     as_of,
                     observations: &[],
                 }),
@@ -2865,6 +4691,7 @@ impl Solver {
                 &child,
                 reply_candidate_limit,
                 Some(PredictiveContext {
+                    hard_mode: false,
                     as_of,
                     observations: &observation,
                 }),
@@ -2929,6 +4756,7 @@ impl Solver {
                         &grandchild,
                         reply_candidate_limit,
                         Some(PredictiveContext {
+                            hard_mode: false,
                             as_of,
                             observations: &grand_observations,
                         }),
@@ -3014,12 +4842,39 @@ impl Solver {
         to: NaiveDate,
         top: usize,
     ) -> Result<Vec<PredictiveAblationResult>> {
+        Self::predictive_ablation_report_filtered(paths, config, from, to, top, None)
+    }
+
+    pub fn predictive_ablation_report_filtered(
+        paths: &ProjectPaths,
+        config: &PriorConfig,
+        from: NaiveDate,
+        to: NaiveDate,
+        top: usize,
+        profile_filter: Option<&str>,
+    ) -> Result<Vec<PredictiveAblationResult>> {
+        ensure_development_target_range(paths, from, to, "predictive ablation")?;
         let registry = predictive_parameter_registry(config);
-        let matrix = PredictiveExperimentMatrix::parse_json(include_str!(
+        let mut matrix = PredictiveExperimentMatrix::parse_json(include_str!(
             "../../config/experiments/predictive-ablations.json"
         ))?;
+        if let Some(profile_id) = profile_filter {
+            matrix.profiles.retain(|profile| profile.id == profile_id);
+            if matrix.profiles.is_empty() {
+                bail!("unknown predictive ablation profile {profile_id}");
+            }
+        }
+        let started = Instant::now();
+        let profile_count = matrix.profiles.len();
         let mut rows = Vec::with_capacity(matrix.profiles.len());
-        for profile in matrix.profiles {
+        for (profile_index, profile) in matrix.profiles.into_iter().enumerate() {
+            eprintln!(
+                "predictive-ablation phase=profile-start profile={}/{} id={} elapsed_s={:.1}",
+                profile_index + 1,
+                profile_count,
+                profile.id,
+                started.elapsed().as_secs_f64()
+            );
             let candidate = profile.apply(&registry, config)?;
             let book_usage = match profile.artifact_mode {
                 ExperimentArtifactMode::Disabled => PredictiveBookUsage::None,
@@ -3031,12 +4886,179 @@ impl Solver {
                 profile.weight_mode,
                 profile.model_variant,
             )?;
+            let result = solver.experiment_report_with_book_usage(from, to, top, book_usage)?;
             rows.push(PredictiveAblationResult {
                 label: profile.id,
-                result: solver.experiment_report_with_book_usage(from, to, top, book_usage)?,
+                result,
             });
+            let elapsed = started.elapsed().as_secs_f64();
+            let remaining = profile_count - profile_index - 1;
+            let eta = elapsed / (profile_index + 1) as f64 * remaining as f64;
+            eprintln!(
+                "predictive-ablation phase=profile-done profile={}/{} id={} elapsed_s={elapsed:.1} eta_s={eta:.1}",
+                profile_index + 1,
+                profile_count,
+                rows.last().expect("just pushed").label
+            );
         }
         Ok(rows)
+    }
+
+    pub fn predictive_prior_ablation_report(
+        paths: &ProjectPaths,
+        config: &PriorConfig,
+        profile_filter: &[String],
+    ) -> Result<PredictivePriorAblationReport> {
+        let started = Instant::now();
+        let evaluation_plan = Self::development_evaluation_plan(paths)?;
+        let input_fingerprint =
+            development_source_identity(paths, evaluation_plan.development.end)?;
+        let matrix_source = include_str!("../../config/experiments/predictive-ablations.json");
+        let matrix_fingerprint = crate::identity::digest_bytes_tagged(
+            "maybe-wordle-prior-ablation-matrix-v1",
+            matrix_source.as_bytes(),
+        );
+        let registry = predictive_parameter_registry(config);
+        let mut matrix = PredictiveExperimentMatrix::parse_json(matrix_source)?;
+        if profile_filter.is_empty() {
+            matrix
+                .profiles
+                .retain(|profile| profile.id.ends_with("_baseline"));
+        } else {
+            matrix
+                .profiles
+                .retain(|profile| profile_filter.contains(&profile.id));
+            if matrix.profiles.len() != profile_filter.len() {
+                bail!("one or more requested predictive prior profiles are unknown or duplicated");
+            }
+        }
+
+        let mut profiles = Vec::with_capacity(matrix.profiles.len());
+        for profile in matrix.profiles {
+            let candidate = profile.apply(&registry, config)?;
+            let config_toml = toml::to_string_pretty(&candidate)?;
+            let solver = Self::from_paths_with_settings(
+                paths,
+                &candidate,
+                profile.weight_mode,
+                profile.model_variant,
+            )?;
+            let mut folds = Vec::with_capacity(evaluation_plan.folds.len());
+            let mut scheduled_games = 0usize;
+            let mut measured_games = 0usize;
+            let mut log_loss_sum = 0.0;
+            let mut brier_sum = 0.0;
+            for fold in &evaluation_plan.folds {
+                let mut fold_scheduled = 0usize;
+                let mut fold_measured = 0usize;
+                let mut fold_log_loss = 0.0;
+                let mut fold_brier = 0.0;
+                for entry in solver
+                    .history_dates
+                    .iter()
+                    .filter(|entry| fold.validation.contains(entry.print_date))
+                {
+                    fold_scheduled += 1;
+                    if let Some(metrics) =
+                        solver.initial_prior_metrics(&entry.solution, entry.print_date)
+                    {
+                        fold_measured += 1;
+                        fold_log_loss += metrics.log_loss;
+                        fold_brier += metrics.brier;
+                    }
+                }
+                scheduled_games += fold_scheduled;
+                measured_games += fold_measured;
+                log_loss_sum += fold_log_loss;
+                brier_sum += fold_brier;
+                folds.push(PredictivePriorAblationFold {
+                    fold_index: fold.index,
+                    validation: fold.validation,
+                    scheduled_games: fold_scheduled,
+                    measured_games: fold_measured,
+                    coverage_gaps: fold_scheduled.saturating_sub(fold_measured),
+                    average_log_loss: fold_log_loss / fold_measured.max(1) as f64,
+                    average_brier: fold_brier / fold_measured.max(1) as f64,
+                });
+            }
+            profiles.push(PredictivePriorAblationProfile {
+                label: profile.id,
+                mode: profile.weight_mode,
+                variant: profile.model_variant,
+                config_fingerprint: crate::identity::digest_bytes_tagged(
+                    "maybe-wordle-prior-ablation-config-v1",
+                    config_toml.as_bytes(),
+                ),
+                scheduled_games,
+                measured_games,
+                coverage_gaps: scheduled_games.saturating_sub(measured_games),
+                average_log_loss: log_loss_sum / measured_games.max(1) as f64,
+                average_brier: brier_sum / measured_games.max(1) as f64,
+                folds,
+                promotable: false,
+                promotion_blockers: Vec::new(),
+            });
+        }
+
+        let baseline = profiles
+            .iter()
+            .find(|profile| profile.label == "weighted_baseline")
+            .map(|profile| {
+                (
+                    profile.coverage_gaps,
+                    profile.average_log_loss,
+                    profile.average_brier,
+                )
+            });
+        for profile in &mut profiles {
+            if profile.label == "weighted_baseline" {
+                profile
+                    .promotion_blockers
+                    .push("Reference weighted baseline; not a replacement candidate.".to_string());
+                continue;
+            }
+            if profile.coverage_gaps > 0 {
+                profile.promotion_blockers.push(format!(
+                    "The prior has {} rolling-development coverage gaps.",
+                    profile.coverage_gaps
+                ));
+            }
+            if let Some((baseline_gaps, baseline_log_loss, baseline_brier)) = baseline {
+                if profile.coverage_gaps > baseline_gaps {
+                    profile
+                        .promotion_blockers
+                        .push("Coverage is worse than the weighted reference prior.".to_string());
+                }
+                if profile.average_log_loss >= baseline_log_loss {
+                    profile.promotion_blockers.push(
+                        "Log loss does not improve on the weighted reference prior.".to_string(),
+                    );
+                }
+                if profile.average_brier >= baseline_brier {
+                    profile.promotion_blockers.push(
+                        "Brier score does not improve on the weighted reference prior.".to_string(),
+                    );
+                }
+            } else {
+                profile.promotion_blockers.push(
+                    "The weighted reference profile was not included in this run.".to_string(),
+                );
+            }
+            profile.promotable = profile.promotion_blockers.is_empty();
+        }
+        ensure_development_source_identity(
+            paths,
+            evaluation_plan.development.end,
+            &input_fingerprint,
+        )?;
+        Ok(PredictivePriorAblationReport {
+            schema_version: 1,
+            input_fingerprint,
+            matrix_fingerprint,
+            evaluation_plan,
+            profiles,
+            elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        })
     }
 
     pub fn build_proxy_calibration_set(
@@ -3096,11 +5118,8 @@ impl Solver {
                     ));
                     break;
                 }
-                let mut metrics = self.score_guess_metrics_for_subset(
-                    &state.surviving,
-                    &state.weights,
-                    &self.exact_small_state_table,
-                );
+                let mut metrics =
+                    self.score_guess_metrics_for_subset(&state.surviving, &state.weights);
                 let known_absent_mask = known_absent_letter_mask(&observations);
                 for metric in &mut metrics {
                     metric.known_absent_letter_hits =
@@ -3307,11 +5326,12 @@ impl Solver {
         }
     }
 
-    pub(super) fn regime_mix(runs: &[DetailedSolveRun]) -> (f64, f64, f64, f64) {
+    pub(super) fn regime_mix(runs: &[DetailedSolveRun]) -> (f64, f64, f64, f64, f64) {
         let mut proxy_steps = 0usize;
         let mut lookahead_steps = 0usize;
         let mut escalated_exact_steps = 0usize;
         let mut exact_steps = 0usize;
+        let mut finite_steps = 0usize;
         let mut total_steps = 0usize;
 
         for run in runs {
@@ -3322,12 +5342,13 @@ impl Solver {
                     PredictiveRegime::Lookahead => lookahead_steps += 1,
                     PredictiveRegime::EscalatedExact => escalated_exact_steps += 1,
                     PredictiveRegime::Exact => exact_steps += 1,
+                    PredictiveRegime::Finite => finite_steps += 1,
                 }
             }
         }
 
         if total_steps == 0 {
-            return (0.0, 0.0, 0.0, 0.0);
+            return (0.0, 0.0, 0.0, 0.0, 0.0);
         }
         let divisor = total_steps as f64;
         (
@@ -3335,6 +5356,7 @@ impl Solver {
             lookahead_steps as f64 / divisor,
             escalated_exact_steps as f64 / divisor,
             exact_steps as f64 / divisor,
+            finite_steps as f64 / divisor,
         )
     }
 
@@ -3347,6 +5369,7 @@ impl Solver {
                 PredictiveRegime::Lookahead => telemetry.lookahead_steps += 1,
                 PredictiveRegime::EscalatedExact => telemetry.escalated_exact_steps += 1,
                 PredictiveRegime::Exact => telemetry.exact_steps += 1,
+                PredictiveRegime::Finite => telemetry.finite_steps += 1,
             }
             telemetry.danger_escalated_steps += usize::from(step.danger_escalated);
             telemetry.dormant_fallback_steps += usize::from(step.fallback_active);
@@ -3524,6 +5547,11 @@ impl Solver {
         cancellation_path: Option<&Path>,
     ) -> Result<StudyRunSummary> {
         spec.validate()?;
+        if base_config.search_policy_mode.is_finite() && spec.parallelism != 1 {
+            bail!(
+                "bounded-search studies require --jobs 1 so wall-clock search budgets do not contend across trials"
+            );
+        }
         if top == 0 {
             bail!("study top-suggestion count must be positive");
         }
@@ -3553,7 +5581,7 @@ impl Solver {
             base_config_toml,
             registry_format_version: registry.format_version,
             registry_fingerprint,
-            input_fingerprint: rolling_source_identity(paths)?,
+            input_fingerprint: development_source_identity(paths, evaluation_plan.development.end)?,
             operating_system: std::env::consts::OS.to_string(),
             architecture: std::env::consts::ARCH.to_string(),
             compute_threads,
@@ -3651,7 +5679,11 @@ impl Solver {
             .context("failed to create the study worker pool")?;
         let shared_state = Arc::new(Mutex::new(state));
         'fidelity: for target_folds in spec.fidelity_schedule() {
-            ensure_rolling_source_identity(paths, &provenance.input_fingerprint)?;
+            ensure_development_source_identity(
+                paths,
+                provenance.development_cutoff,
+                &provenance.input_fingerprint,
+            )?;
             if cancellation_path.is_some_and(Path::exists) {
                 break;
             }
@@ -3830,7 +5862,11 @@ impl Solver {
                     let Some((measurement, prior_elapsed_ms)) = latency_request else {
                         continue;
                     };
-                    ensure_rolling_source_identity(paths, &provenance.input_fingerprint)?;
+                    ensure_development_source_identity(
+                        paths,
+                        provenance.development_cutoff,
+                        &provenance.input_fingerprint,
+                    )?;
                     let result = Self::measure_study_candidate_latency(
                         paths,
                         config,
@@ -3888,7 +5924,10 @@ impl Solver {
                     if completed_folds >= target_folds
                         && !matches!(
                             trial.status,
-                            TrialStatus::Failed | TrialStatus::Rejected | TrialStatus::Pruned
+                            TrialStatus::Complete
+                                | TrialStatus::Failed
+                                | TrialStatus::Rejected
+                                | TrialStatus::Pruned
                         )
                     {
                         if survivors.contains(&trial.candidate.number) {
@@ -3914,7 +5953,11 @@ impl Solver {
             .map_err(|_| anyhow!("study state still has active worker references"))?
             .into_inner()
             .map_err(|_| anyhow!("study state lock poisoned"))?;
-        ensure_rolling_source_identity(paths, &provenance.input_fingerprint)?;
+        ensure_development_source_identity(
+            paths,
+            provenance.development_cutoff,
+            &provenance.input_fingerprint,
+        )?;
 
         Self::summarize_study_run(
             state,
@@ -3970,7 +6013,11 @@ impl Solver {
         state.save(state_path)?;
 
         loop {
-            ensure_rolling_source_identity(paths, &provenance.input_fingerprint)?;
+            ensure_development_source_identity(
+                paths,
+                provenance.development_cutoff,
+                &provenance.input_fingerprint,
+            )?;
             if cancellation_path.is_some_and(Path::exists) {
                 break;
             }
@@ -4101,7 +6148,11 @@ impl Solver {
                 break;
             }
         }
-        ensure_rolling_source_identity(paths, &provenance.input_fingerprint)?;
+        ensure_development_source_identity(
+            paths,
+            provenance.development_cutoff,
+            &provenance.input_fingerprint,
+        )?;
 
         Self::summarize_study_run(
             state,
@@ -4371,16 +6422,7 @@ impl Solver {
                     )?)
                 };
                 if let Some(report) = report {
-                    let metrics = &report.summary.canonical;
-                    fold_measurement.solve_metrics_recorded = true;
-                    fold_measurement.scheduled_games = metrics.scheduled_games;
-                    fold_measurement.solved_games = metrics.solved_games;
-                    fold_measurement.failures = metrics.unsolved_games;
-                    fold_measurement.coverage_gaps = metrics.coverage_gaps;
-                    fold_measurement.penalized_guess_sum =
-                        metrics.all_game_penalized_mean_guesses * metrics.scheduled_games as f64;
-                    fold_measurement.solved_guess_sum =
-                        metrics.conditional_mean_guesses * metrics.solved_games as f64;
+                    fold_measurement.record_solve_metrics(&report.summary.canonical);
                     for entry in active_solver
                         .history_dates
                         .iter()
@@ -4407,10 +6449,10 @@ impl Solver {
             bail!("no games were evaluated by the requested study stage");
         }
         if !stage.evaluates_prior_only() && measure_latency {
-            measurement.latency_p95_ms = Some(
-                solver
-                    .benchmark_predictive_latency(default_diagnostic_suite()?.latency.study_runs)?,
-            );
+            measurement.latency_p95_ms = Some(solver.benchmark_predictive_latency(
+                evaluation_plan.development.end,
+                default_diagnostic_suite()?.latency.study_runs,
+            )?);
             observe_memory(&mut measurement)?;
             let elapsed_ms = prior_elapsed_ms
                 .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
@@ -4445,7 +6487,12 @@ impl Solver {
             ModelVariant::SeedPlusHistory,
         )?;
         measurement.latency_p95_ms = Some(
-            solver.benchmark_predictive_latency(default_diagnostic_suite()?.latency.study_runs)?,
+            solver.benchmark_predictive_latency(
+                canonical_development_evaluation_plan(paths, "study latency")?
+                    .development
+                    .end,
+                default_diagnostic_suite()?.latency.study_runs,
+            )?,
         );
         let snapshot = crate::process_memory::process_memory_snapshot().ok_or_else(|| {
             anyhow!(
@@ -4493,7 +6540,7 @@ impl Solver {
         let validation_end = last_fold.validation.end;
         let test_start = evaluation_plan.sealed_test.start;
         let test_end = evaluation_plan.sealed_test.end;
-        let study_state_path = paths.root.join("target/studies/tune-prior-v16.json");
+        let study_state_path = paths.root.join("target/studies/tune-prior-v18.json");
         let study_summary = Self::run_predictive_study(
             paths,
             config,
@@ -4572,16 +6619,8 @@ impl Solver {
         if from > to {
             bail!("live-config evaluation start date cannot be after end date");
         }
-        let evaluation_plan =
-            canonical_development_evaluation_plan(paths, "evaluating a live config")?;
-        if to > evaluation_plan.development.end {
-            bail!(
-                "live-config range {}..{} reaches the sealed test; development evaluation must end on or before {}",
-                from,
-                to,
-                evaluation_plan.development.end
-            );
-        }
+        let _evaluation_plan =
+            ensure_development_target_range(paths, from, to, "live-config evaluation")?;
         let solver = Self::from_paths_with_settings(
             paths,
             config,
@@ -4590,9 +6629,12 @@ impl Solver {
         )?;
         let backtest =
             solver.backtest_detailed_with_book_usage(from, to, top, PredictiveBookUsage::None)?;
-        let hard_cases = solver.hard_case_report_with_book_usage(top, PredictiveBookUsage::None)?;
-        let latency_p95_ms = solver
-            .benchmark_predictive_latency(default_diagnostic_suite()?.latency.evaluation_runs)?;
+        let hard_cases =
+            solver.hard_case_report_with_book_usage(to, top, PredictiveBookUsage::None)?;
+        let latency_p95_ms = solver.benchmark_predictive_latency(
+            to,
+            default_diagnostic_suite()?.latency.evaluation_runs,
+        )?;
         Ok(LiveConfigEvaluation {
             config: config.clone(),
             predictive_metrics: backtest.summary.canonical.clone(),
@@ -4791,8 +6833,19 @@ impl Solver {
         target: &str,
         date: NaiveDate,
     ) -> Option<PriorMetrics> {
-        let as_of = date.checked_sub_days(Days::new(1))?;
+        let as_of = crate::predictive::history_cutoff(date).ok()?;
         let state = self.initial_state(as_of);
+        self.posterior_metrics_for_state(&state, target)
+    }
+
+    fn posterior_metrics_for_state(
+        &self,
+        state: &SolveState,
+        target: &str,
+    ) -> Option<PriorMetrics> {
+        if state.total_weight <= 0.0 || !state.total_weight.is_finite() {
+            return None;
+        }
         let target = target.to_ascii_lowercase();
         let target_index = state
             .surviving
@@ -4833,14 +6886,93 @@ impl Solver {
         })
     }
 
-    pub(super) fn benchmark_predictive_latency(&self, runs: usize) -> Result<f64> {
+    fn prior_strata_for_answer(
+        answer: &AnswerRecord,
+        modeled_weight: f64,
+        as_of: NaiveDate,
+    ) -> PriorStrata {
+        let prior_count = answer.history_dates.partition_point(|date| *date <= as_of);
+        PriorStrata {
+            never_used: prior_count == 0,
+            reused: prior_count > 0,
+            historical_only: !answer.in_seed && prior_count > 0,
+            out_of_core: modeled_weight <= 0.0,
+        }
+    }
+
+    fn posterior_calibration_for_run(
+        &self,
+        run: &DetailedSolveRun,
+    ) -> Result<(Option<PriorStrata>, Vec<PosteriorCalibrationObservation>)> {
+        if run.steps.len() > 6 {
+            bail!(
+                "posterior calibration run {} has more than six guesses",
+                run.date
+            );
+        }
+        let as_of = crate::predictive::history_cutoff(run.date)?;
+        let mut state = self.initial_state(as_of);
+        let target = run.target.to_ascii_lowercase();
+        let target_index = self.answers.iter().position(|answer| answer.word == target);
+        let prior_strata = target_index.map(|target_index| {
+            let answer = &self.answers[target_index];
+            Self::prior_strata_for_answer(answer, state.modeled_weights[target_index], as_of)
+        });
+
+        // A coverage-gap run has no actual guess state to score. Keep its
+        // first-turn denominator visible, but never manufacture a score.
+        if run.steps.is_empty() {
+            return Ok((
+                prior_strata,
+                vec![PosteriorCalibrationObservation {
+                    turn: 1,
+                    score: None,
+                }],
+            ));
+        }
+
+        let mut observations = Vec::with_capacity(run.steps.len());
+        for (step_index, step) in run.steps.iter().enumerate() {
+            let score = self
+                .posterior_metrics_for_state(&state, &target)
+                .map(|metrics| crate::experiments::ProbabilityScore {
+                    target_probability: metrics.target_probability,
+                    log_loss: metrics.log_loss,
+                    brier: metrics.brier,
+                });
+            observations.push(PosteriorCalibrationObservation {
+                turn: u8::try_from(step_index + 1).expect("calibration has at most six turns"),
+                score,
+            });
+
+            // The all-green state has no next decision. Likewise, do not
+            // create a turn seven row after the final allowed guess.
+            if step.feedback == ALL_GREEN_PATTERN || step_index + 1 == run.steps.len() {
+                break;
+            }
+            self.apply_feedback(&mut state, &step.guess, step.feedback)?;
+        }
+        Ok((prior_strata, observations))
+    }
+
+    pub(super) fn benchmark_predictive_latency(
+        &self,
+        puzzle_date: NaiveDate,
+        runs: usize,
+    ) -> Result<f64> {
         let run_count = runs.max(1);
         let top = default_diagnostic_suite()?.latency.top_suggestions;
-        let state = self.initial_state(Self::today());
         let mut samples = Vec::with_capacity(run_count);
         for _ in 0..run_count {
             let start = Instant::now();
-            let _ = self.suggestions(&state, top)?;
+            let _ = self.suggest_predictive(PredictiveSuggestRequest {
+                puzzle_date,
+                observations: &[],
+                top,
+                hard_mode: false,
+                force_in_two_only: false,
+                mode: PredictiveSuggestionMode::LiveOnly,
+            })?;
             samples.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         samples.sort_by(|left, right| left.total_cmp(right));
@@ -4899,6 +7031,7 @@ impl Solver {
             &root,
             root_candidate_limit.max(top),
             Some(PredictiveContext {
+                hard_mode: false,
                 as_of,
                 observations: &[],
             }),
@@ -4938,6 +7071,7 @@ impl Solver {
                 &child,
                 reply_candidate_limit.max(top),
                 Some(PredictiveContext {
+                    hard_mode: false,
                     as_of,
                     observations: &observations,
                 }),
@@ -4964,90 +7098,101 @@ impl Solver {
         Ok(best)
     }
 
+    #[cfg(test)]
     pub(super) fn medium_second_guess_coverage(
         &self,
         subset: &[usize],
         weights: &[f64],
         metrics: &[GuessMetrics],
     ) -> Result<FxHashMap<usize, ThreeSolveCoverage>> {
+        self.medium_second_guess_coverage_controlled(subset, weights, metrics, &|| false)
+    }
+
+    pub(super) fn medium_second_guess_coverage_controlled(
+        &self,
+        subset: &[usize],
+        weights: &[f64],
+        metrics: &[GuessMetrics],
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<FxHashMap<usize, ThreeSolveCoverage>> {
+        check_predictive_search_cancelled(cancelled)?;
         let limit = metrics.len().min(self.config.second_guess_coverage_pool);
         let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
-        let mut memo = FxHashMap::default();
         let mut coverage = FxHashMap::default();
         for metric in metrics.iter().take(limit) {
+            check_predictive_search_cancelled(cancelled)?;
             coverage.insert(
                 metric.guess_index,
-                self.three_solve_coverage_for_guess(
+                self.three_solve_coverage_for_guess_controlled(
                     metric.guess_index,
                     subset,
                     weights,
                     total_weight,
-                    &mut memo,
+                    cancelled,
                 )?,
             );
         }
+        check_predictive_search_cancelled(cancelled)?;
         Ok(coverage)
     }
 
+    /// At turn two, one guess remains after this move to finish by total turn three.
+    #[cfg(test)]
     pub(super) fn three_solve_coverage_for_guess(
         &self,
         guess_index: usize,
         subset: &[usize],
         weights: &[f64],
         total_weight: f64,
-        memo: &mut FxHashMap<ExactSubsetKey, bool>,
     ) -> Result<ThreeSolveCoverage> {
-        let mut masses = [0.0_f64; PATTERN_SPACE];
-        let mut touched = Vec::with_capacity(PATTERN_SPACE);
-        let mut buckets = array::from_fn::<_, PATTERN_SPACE, _>(|_| Vec::new());
-        for answer_index in subset {
-            let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
-            if buckets[pattern].is_empty() {
-                touched.push(pattern as u8);
-            }
-            masses[pattern] += weights[*answer_index];
-            buckets[pattern].push(*answer_index);
-        }
-        let mut result = ThreeSolveCoverage::default();
-        for pattern in touched {
-            if pattern == ALL_GREEN_PATTERN {
-                continue;
-            }
-            let child = &buckets[pattern as usize];
-            let covered =
-                child.len() <= 1 || self.child_subset_has_force_in_two(child, weights, memo)?;
-            if covered {
-                if total_weight > 0.0 {
-                    result.mass += masses[pattern as usize] / total_weight;
-                }
-            } else {
-                result.uncovered_buckets += 1;
-                result.uncovered_answers += child.len();
-            }
-        }
-        Ok(result)
+        self.three_solve_coverage_for_guess_controlled(
+            guess_index,
+            subset,
+            weights,
+            total_weight,
+            &|| false,
+        )
     }
 
-    pub(super) fn child_subset_has_force_in_two(
+    fn three_solve_coverage_for_guess_controlled(
         &self,
+        guess_index: usize,
         subset: &[usize],
         weights: &[f64],
-        memo: &mut FxHashMap<ExactSubsetKey, bool>,
-    ) -> Result<bool> {
-        if subset.len() <= 1 {
-            return Ok(true);
+        total_weight: f64,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<ThreeSolveCoverage> {
+        check_predictive_search_cancelled(cancelled)?;
+        if !total_weight.is_finite() || total_weight <= 0.0 {
+            bail!("coverage requires finite positive answer mass");
         }
-        if subset.len() > self.config.second_guess_coverage_child_cap {
-            return Ok(false);
+        let mut largest = [0.0_f64; PATTERN_SPACE];
+        let mut counts = [0usize; PATTERN_SPACE];
+        for (position, &answer_index) in subset.iter().enumerate() {
+            if position % 64 == 0 {
+                check_predictive_search_cancelled(cancelled)?;
+            }
+            let pattern = self.answer_pattern(guess_index, answer_index) as usize;
+            let weight = weights[answer_index];
+            if !weight.is_finite() || weight < 0.0 {
+                bail!("coverage requires finite non-negative weights");
+            }
+            if weight > 0.0 {
+                largest[pattern] = largest[pattern].max(weight);
+                counts[pattern] += 1;
+            }
         }
-        let key = ExactSubsetKey::from_sorted_subset(subset);
-        if let Some(cached) = memo.get(&key) {
-            return Ok(*cached);
+        let mut result = ThreeSolveCoverage {
+            mass: largest.iter().sum::<f64>() / total_weight,
+            ..ThreeSolveCoverage::default()
+        };
+        for count in counts {
+            if count > 1 {
+                result.uncovered_buckets += 1;
+                result.uncovered_answers += count - 1;
+            }
         }
-        let metrics =
-            self.score_guess_metrics_for_subset(subset, weights, &self.exact_small_state_table);
-        let result = metrics.iter().any(|metric| metric.force_in_two);
-        memo.insert(key, result);
+        check_predictive_search_cancelled(cancelled)?;
         Ok(result)
     }
 
@@ -5121,6 +7266,7 @@ impl Solver {
             lookahead_step_pct: report.lookahead_step_pct,
             escalated_exact_step_pct: report.escalated_exact_step_pct,
             exact_step_pct: report.exact_step_pct,
+            finite_step_pct: report.finite_step_pct,
         })
     }
 
@@ -5135,12 +7281,6 @@ impl Solver {
     pub(super) fn clone_with_config(&self, config: PriorConfig) -> Self {
         let mut cloned = self.clone();
         cloned.config = config.clone();
-        cloned.exact_small_state_table = SmallStateTable::build(
-            config
-                .exact_exhaustive_threshold
-                .max(config.proxy_small_state_lower_bound_threshold)
-                .max(2),
-        );
         cloned
     }
 
@@ -5426,218 +7566,31 @@ impl Solver {
         forced: &[(String, u8)],
         top: usize,
     ) -> Result<DetailedSolveRun> {
-        let target = target.to_ascii_lowercase();
-        let mut state = self.initial_state(as_of);
-        if !state
-            .surviving
-            .iter()
-            .any(|index| self.answers[*index].word == target)
-        {
-            return Ok(DetailedSolveRun {
-                target,
-                date,
-                steps: Vec::new(),
-                solved: false,
-            });
-        }
-
-        let mut steps = Vec::new();
-        let mut observations = Vec::new();
-        for (position, (guess, expected_feedback)) in forced.iter().enumerate() {
-            let feedback = score_guess(guess, &target);
-            if position == 0 && *expected_feedback != 0 && *expected_feedback != feedback {
-                bail!(
-                    "forced opener feedback mismatch for {}: expected {}, got {}",
-                    guess,
-                    format_feedback_letters(*expected_feedback),
-                    format_feedback_letters(feedback)
-                );
-            }
-            let surviving_before = state.surviving.len();
-            let surviving_after = if feedback == ALL_GREEN_PATTERN {
-                1
-            } else {
-                let mut next_state = state.clone();
-                self.apply_feedback(&mut next_state, guess, feedback)?;
-                next_state.surviving.len()
-            };
-            steps.push(DetailedSolveStep {
-                guess: guess.clone(),
-                feedback,
-                surviving_before,
-                surviving_after,
-                chosen_force_in_two: false,
-                alternative_force_in_two: false,
-                danger_score: 0.0,
-                danger_escalated: false,
-                regime_used: PredictiveRegime::Proxy,
-                promotion_source: None,
-                recovery_mode_used: state.recovery_mode_used,
-                fallback_active: state.fallback_active,
-                lookahead_pool_base: 0,
-                lookahead_pool_size: 0,
-                exact_pool_base: 0,
-                exact_pool_size: 0,
-                root_candidate_count: 0,
-                top_suggestions: Vec::new(),
-            });
-            if feedback == ALL_GREEN_PATTERN {
-                return Ok(DetailedSolveRun {
-                    target,
-                    date,
-                    steps,
-                    solved: true,
-                });
-            }
-            observations.push((guess.clone(), feedback));
-            self.apply_feedback(&mut state, guess, feedback)?;
-        }
-
-        while steps.len() < 6 {
-            let surviving_before = state.surviving.len();
-            let batch = self.suggestion_batch_internal(
-                &state,
-                top.max(1),
-                Some(PredictiveContext {
-                    as_of,
-                    observations: &observations,
-                }),
-                PredictiveBookUsage::None,
-            )?;
-            let chosen = batch
-                .suggestions
-                .first()
-                .ok_or_else(|| anyhow!("solver returned no suggestions"))?
-                .clone();
-            let feedback = score_guess(&chosen.word, &target);
-            let surviving_after = if feedback == ALL_GREEN_PATTERN {
-                1
-            } else {
-                let mut next_state = state.clone();
-                self.apply_feedback(&mut next_state, &chosen.word, feedback)?;
-                next_state.surviving.len()
-            };
-            steps.push(DetailedSolveStep {
-                guess: chosen.word.clone(),
-                feedback,
-                surviving_before,
-                surviving_after,
-                chosen_force_in_two: chosen.force_in_two,
-                alternative_force_in_two: batch
-                    .suggestions
-                    .iter()
-                    .skip(1)
-                    .any(|suggestion| suggestion.force_in_two),
-                danger_score: batch.danger_score,
-                danger_escalated: batch.danger_escalated,
-                regime_used: batch.regime_used,
-                promotion_source: batch.promotion_source,
-                recovery_mode_used: state.recovery_mode_used,
-                fallback_active: state.fallback_active,
-                lookahead_pool_base: batch.lookahead_pool_base,
-                lookahead_pool_size: batch.lookahead_pool_size,
-                exact_pool_base: batch.exact_pool_base,
-                exact_pool_size: batch.exact_pool_size,
-                root_candidate_count: batch.root_candidate_count,
-                top_suggestions: batch
-                    .suggestions
-                    .iter()
-                    .take(top.max(1))
-                    .map(Self::snapshot_suggestion)
-                    .collect(),
-            });
-            if feedback == ALL_GREEN_PATTERN {
-                return Ok(DetailedSolveRun {
-                    target,
-                    date,
-                    steps,
-                    solved: true,
-                });
-            }
-            observations.push((chosen.word.clone(), feedback));
-            self.apply_feedback(&mut state, &chosen.word, feedback)?;
-        }
-
-        Ok(DetailedSolveRun {
+        self.solve_target_from_initial_state_detailed(
             target,
+            as_of,
             date,
-            steps,
-            solved: false,
-        })
+            top,
+            self.initial_state(as_of),
+            SolveExecutionPolicy {
+                book_usage: PredictiveBookUsage::None,
+                search_mode: None,
+                forced,
+            },
+        )
     }
 
     pub(super) fn score_target_with_forced_prefix(
         &self,
         target: &str,
         as_of: NaiveDate,
-        _date: NaiveDate,
+        date: NaiveDate,
         forced: &[(String, u8)],
     ) -> Result<ForcedSolveScore> {
-        let target = target.to_ascii_lowercase();
-        let mut state = self.initial_state(as_of);
-        if !state
-            .surviving
-            .iter()
-            .any(|index| self.answers[*index].word == target)
-        {
-            return Ok(ForcedSolveScore {
-                guesses: 0,
-                solved: false,
-            });
-        }
-
-        let mut guess_count = 0usize;
-        let mut observations = Vec::new();
-        for (position, (guess, expected_feedback)) in forced.iter().enumerate() {
-            let feedback = score_guess(guess, &target);
-            if position == 0 && *expected_feedback != 0 && *expected_feedback != feedback {
-                bail!(
-                    "forced opener feedback mismatch for {}: expected {}, got {}",
-                    guess,
-                    format_feedback_letters(*expected_feedback),
-                    format_feedback_letters(feedback)
-                );
-            }
-            guess_count += 1;
-            if feedback == ALL_GREEN_PATTERN {
-                return Ok(ForcedSolveScore {
-                    guesses: guess_count,
-                    solved: true,
-                });
-            }
-            observations.push((guess.clone(), feedback));
-            self.apply_feedback(&mut state, guess, feedback)?;
-        }
-
-        while guess_count < 6 {
-            let batch = self.suggestion_batch_internal(
-                &state,
-                1,
-                Some(PredictiveContext {
-                    as_of,
-                    observations: &observations,
-                }),
-                PredictiveBookUsage::None,
-            )?;
-            let chosen = batch
-                .suggestions
-                .first()
-                .ok_or_else(|| anyhow!("solver returned no suggestions"))?;
-            let feedback = score_guess(&chosen.word, &target);
-            guess_count += 1;
-            if feedback == ALL_GREEN_PATTERN {
-                return Ok(ForcedSolveScore {
-                    guesses: guess_count,
-                    solved: true,
-                });
-            }
-            observations.push((chosen.word.clone(), feedback));
-            self.apply_feedback(&mut state, &chosen.word, feedback)?;
-        }
-
+        let run = self.solve_target_with_forced_prefix(target, as_of, date, forced, 1)?;
         Ok(ForcedSolveScore {
-            guesses: guess_count,
-            solved: false,
+            guesses: run.steps.len(),
+            solved: run.solved,
         })
     }
 }
@@ -5646,10 +7599,35 @@ fn canonical_development_evaluation_plan(
     paths: &ProjectPaths,
     operation: &str,
 ) -> Result<EvaluationPlan> {
-    let (history_start, history_end) = Solver::latest_history_range(paths)?
-        .ok_or_else(|| anyhow!("run sync-data before {operation}"))?;
-    let history = DateRange::new(history_start, history_end)?;
-    build_rolling_origin_plan(history, rolling_origin_config_for_history(history)?)
+    Solver::development_evaluation_plan(paths)
+        .with_context(|| format!("cannot build development plan for {operation}"))
+}
+
+fn ensure_development_target_range(
+    paths: &ProjectPaths,
+    from: NaiveDate,
+    to: NaiveDate,
+    operation: &str,
+) -> Result<EvaluationPlan> {
+    let plan = canonical_development_evaluation_plan(paths, operation)?;
+    let policy =
+        crate::experiments::EvaluationPolicy::load(&paths.root.join("config/evaluation.toml"))?;
+    let requested = DateRange::new(from, to)?;
+    if from < plan.development.start || to > plan.development.end {
+        bail!(
+            "{operation} range {from}..{to} is outside declared development {}..{}",
+            plan.development.start,
+            plan.development.end
+        );
+    }
+    if policy
+        .excluded_validation
+        .iter()
+        .any(|excluded| requested.start <= excluded.end && excluded.start <= requested.end)
+    {
+        bail!("{operation} range {from}..{to} intersects a consumed validation window");
+    }
+    Ok(plan)
 }
 
 fn rolling_origin_config_for_history(history: DateRange) -> Result<RollingOriginConfig> {
@@ -5676,6 +7654,7 @@ fn rolling_checkpoint_path(
     label: &str,
     config_toml: &str,
     source_identity: &str,
+    top: usize,
 ) -> PathBuf {
     let safe_label = label
         .chars()
@@ -5687,16 +7666,26 @@ fn rolling_checkpoint_path(
             }
         })
         .collect::<String>();
-    let fingerprint = rolling_checkpoint_fingerprint(config_toml, source_identity);
+    let fingerprint = rolling_checkpoint_fingerprint_with_top(config_toml, source_identity, top);
     paths.root.join(format!(
         "target/rolling-checkpoints/{safe_label}-{fingerprint}.json"
     ))
 }
 
+#[cfg(test)]
 pub(super) fn rolling_checkpoint_fingerprint(config_toml: &str, source_identity: &str) -> String {
-    let mut hash = crate::identity::CanonicalSha256::new("maybe-wordle-rolling-checkpoint-v2");
+    rolling_checkpoint_fingerprint_with_top(config_toml, source_identity, 0)
+}
+
+fn rolling_checkpoint_fingerprint_with_top(
+    config_toml: &str,
+    source_identity: &str,
+    top: usize,
+) -> String {
+    let mut hash = crate::identity::CanonicalSha256::new("maybe-wordle-rolling-checkpoint-v3");
     hash.field(config_toml.as_bytes())
-        .field(source_identity.as_bytes());
+        .field(source_identity.as_bytes())
+        .field(&(top as u64).to_le_bytes());
     hash.finish_hex()
 }
 
@@ -5740,11 +7729,17 @@ fn evidence_artifact_sizes(paths: &ProjectPaths) -> Result<Vec<EvidenceArtifactS
         .collect()
 }
 
+fn cumulative_evidence_elapsed_ms(started: Instant, prior_elapsed_ms: u64) -> u64 {
+    prior_elapsed_ms.saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+}
+
 fn enforce_evidence_resource_budget(
     started: Instant,
+    prior_elapsed_ms: u64,
+    prior_peak_working_set_bytes: u64,
     budget: EvidenceResourceBudget,
 ) -> Result<crate::process_memory::ProcessMemorySnapshot> {
-    let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let elapsed_ms = cumulative_evidence_elapsed_ms(started, prior_elapsed_ms);
     if elapsed_ms > budget.maximum_seconds.saturating_mul(1_000) {
         bail!(
             "evidence generation took {:.3} seconds and exceeded the {} second budget",
@@ -5758,14 +7753,141 @@ fn enforce_evidence_resource_budget(
         )
     })?;
     let memory_budget_bytes = budget.maximum_memory_mb.saturating_mul(1024 * 1024);
-    if memory.peak_working_set_bytes > memory_budget_bytes {
+    let peak_working_set_bytes = prior_peak_working_set_bytes.max(memory.peak_working_set_bytes);
+    if peak_working_set_bytes > memory_budget_bytes {
         bail!(
             "evidence peak working set {} MiB exceeded the {} MiB budget",
-            memory.peak_working_set_bytes.div_ceil(1024 * 1024),
+            peak_working_set_bytes.div_ceil(1024 * 1024),
             budget.maximum_memory_mb
         );
     }
     Ok(memory)
+}
+
+// Keep each resume-identity input explicit; grouping them would hide which
+// changing source invalidates a partial evidence checkpoint.
+#[allow(clippy::too_many_arguments)]
+fn evidence_checkpoint_identity(
+    input_fingerprint: &str,
+    config_toml: &str,
+    plan: &EvaluationPlan,
+    selection_label: &str,
+    selected_ranges: &[DateRange],
+    matrix_source: &str,
+    matrix_fingerprint: &str,
+    profile_ids: &[String],
+    resolved_profile_base_configs: &[(String, String)],
+    dates: DateRange,
+    top: usize,
+) -> Result<String> {
+    // Disk artifacts are validated by the solver when they are used and are reported in the
+    // baseline policy. Their mutable bytes are not available as a single checkpoint input, so
+    // this identity deliberately makes no authentication claim about those artifacts.
+    let mut hash = crate::identity::CanonicalSha256::new("maybe-wordle-evidence-checkpoint-v3");
+    hash.field(input_fingerprint.as_bytes())
+        .field(config_toml.as_bytes())
+        .field(&serde_json::to_vec(plan)?)
+        .field(selection_label.as_bytes())
+        .field(&serde_json::to_vec(selected_ranges)?)
+        .field(matrix_source.as_bytes())
+        .field(matrix_fingerprint.as_bytes())
+        .field(&serde_json::to_vec(profile_ids)?)
+        .field(&(resolved_profile_base_configs.len() as u64).to_le_bytes());
+    for (profile_id, base_config_source) in resolved_profile_base_configs {
+        hash.field(profile_id.as_bytes())
+            .field(base_config_source.as_bytes());
+    }
+    hash.field(dates.start.to_string().as_bytes())
+        .field(dates.end.to_string().as_bytes())
+        .field(&(top as u64).to_le_bytes());
+    Ok(hash.finish_tagged())
+}
+
+fn load_evidence_matrix(
+    paths: &ProjectPaths,
+    matrix_path: Option<&Path>,
+) -> Result<(PredictiveExperimentMatrix, String, String)> {
+    let (source, source_label) = match matrix_path {
+        Some(path) => {
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                paths.root.join(path)
+            };
+            let source = fs::read_to_string(&resolved)
+                .with_context(|| format!("read evidence matrix {}", resolved.display()))?;
+            let label = path
+                .strip_prefix(&paths.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            (source, label)
+        }
+        None => (
+            include_str!("../../config/experiments/development-evidence.json").to_string(),
+            "config/experiments/development-evidence.json".to_string(),
+        ),
+    };
+    let matrix = PredictiveExperimentMatrix::parse_json(&source)
+        .with_context(|| format!("parse evidence matrix {source_label}"))?;
+    let fingerprint =
+        crate::identity::digest_bytes_tagged("maybe-wordle-evidence-matrix-v1", source.as_bytes());
+    Ok((matrix, source_label, fingerprint))
+}
+
+fn selected_evidence_games<'a>(
+    history: &'a [NytDailyEntry],
+    selected_ranges: &[DateRange],
+) -> Result<Vec<&'a NytDailyEntry>> {
+    if selected_ranges.is_empty() {
+        bail!("evidence selection has no date ranges");
+    }
+    for (index, range) in selected_ranges.iter().enumerate() {
+        DateRange::new(range.start, range.end)?;
+        if index > 0 && selected_ranges[index - 1].end >= range.start {
+            bail!("evidence selection ranges must be sorted and non-overlapping");
+        }
+    }
+    let mut games = history
+        .iter()
+        .filter(|entry| {
+            selected_ranges
+                .iter()
+                .any(|range| range.contains(entry.print_date))
+        })
+        .collect::<Vec<_>>();
+    games.sort_by_key(|entry| entry.print_date);
+    if games.is_empty() {
+        bail!("no games found in the selected evidence dates");
+    }
+    Ok(games)
+}
+
+fn resolved_evidence_profile_base_configs(
+    paths: &ProjectPaths,
+    fallback: &PriorConfig,
+    matrix: &PredictiveExperimentMatrix,
+) -> Result<Vec<(String, String)>> {
+    matrix
+        .profiles
+        .iter()
+        .map(|profile| {
+            let base = profile.load_base_config(&paths.root, fallback)?;
+            let source = profile
+                .base_config_path
+                .as_deref()
+                .map(|relative| {
+                    fs::read_to_string(paths.root.join(relative))
+                        .with_context(|| format!("read evidence profile base config {relative}"))
+                })
+                .transpose()?
+                .unwrap_or(
+                    toml::to_string_pretty(&base)
+                        .context("failed to serialize evidence profile fallback base config")?,
+                );
+            Ok((profile.id.clone(), source))
+        })
+        .collect()
 }
 
 fn filesystem_tree_bytes(path: &Path) -> Result<u64> {
@@ -5790,13 +7912,24 @@ fn filesystem_tree_bytes(path: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
-pub(super) fn rolling_source_identity(paths: &ProjectPaths) -> Result<String> {
+pub(super) fn development_source_identity(
+    paths: &ProjectPaths,
+    development_cutoff: NaiveDate,
+) -> Result<String> {
+    rolling_source_identity_with_history_cutoff(paths, development_cutoff)
+}
+
+fn rolling_source_identity_with_history_cutoff(
+    paths: &ProjectPaths,
+    development_cutoff: NaiveDate,
+) -> Result<String> {
     let mut files = Vec::new();
     collect_regular_files(&paths.root.join("src"), &mut files)?;
     collect_regular_files(&paths.root.join("tests"), &mut files)?;
     files.extend([
         paths.root.join("Cargo.toml"),
         paths.root.join("Cargo.lock"),
+        paths.root.join("config/evaluation.toml"),
         paths.raw_history.clone(),
         paths.seed_guesses.clone(),
         paths.seed_answers.clone(),
@@ -5816,7 +7949,24 @@ pub(super) fn rolling_source_identity(paths: &ProjectPaths) -> Result<String> {
         hash.field(relative.as_bytes());
         if path.is_file() {
             hash.field(&[1]);
-            hash_identity_file(&mut hash, &path)?;
+            if path == paths.raw_history {
+                let cutoff = development_cutoff;
+                let history = read_history_jsonl(&path)?
+                    .into_iter()
+                    .filter(|entry| entry.print_date <= cutoff)
+                    .collect::<Vec<_>>();
+                if history.last().map(|entry| entry.print_date) != Some(cutoff) {
+                    bail!("history does not contain the declared development cutoff {cutoff}");
+                }
+                let mut canonical_history = Vec::new();
+                for entry in history {
+                    serde_json::to_writer(&mut canonical_history, &entry)?;
+                    canonical_history.push(b'\n');
+                }
+                hash.field(&canonical_history);
+            } else {
+                hash_identity_file(&mut hash, &path)?;
+            }
         } else {
             hash.field(&[0]);
         }
@@ -5841,10 +7991,14 @@ fn hash_identity_file(hash: &mut crate::identity::CanonicalSha256, path: &Path) 
     Ok(())
 }
 
-pub(super) fn ensure_rolling_source_identity(paths: &ProjectPaths, expected: &str) -> Result<()> {
-    if rolling_source_identity(paths)? != expected {
+pub(super) fn ensure_development_source_identity(
+    paths: &ProjectPaths,
+    development_cutoff: NaiveDate,
+    expected: &str,
+) -> Result<()> {
+    if development_source_identity(paths, development_cutoff)? != expected {
         bail!(
-            "source, executable, or data inputs changed during evaluation; discard this run and restart from a consistent snapshot"
+            "source, executable, or declared development inputs changed during evaluation; discard this run and restart from a consistent snapshot"
         );
     }
     Ok(())
@@ -5874,6 +8028,7 @@ fn merge_execution_telemetry(target: &mut ExecutionTelemetry, addition: &Executi
     target.lookahead_steps += addition.lookahead_steps;
     target.escalated_exact_steps += addition.escalated_exact_steps;
     target.exact_steps += addition.exact_steps;
+    target.finite_steps += addition.finite_steps;
     target.danger_escalated_steps += addition.danger_escalated_steps;
     target.strict_recovery_steps += addition.strict_recovery_steps;
     target.uniform_recovery_steps += addition.uniform_recovery_steps;
@@ -5909,7 +8064,704 @@ fn git_provenance(root: &Path) -> (Option<String>, Option<bool>) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashMap,
+        fs,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    use chrono::{Days, NaiveDate};
+
     use super::*;
+    use crate::{
+        config::PriorConfig,
+        experiments::RollingOriginFold,
+        model::{AnswerRecord, ModelVariant, WeightMode},
+        pattern_table::PatternTable,
+    };
+
+    #[test]
+    fn finite_step_evidence_keeps_deadline_and_does_not_serialize_heuristic_values() {
+        let guesses = vec!["cigar".to_string(), "rebut".to_string()];
+        let search = FiniteSearchResult {
+            candidates: vec![
+                FiniteSearchCandidate {
+                    guess_index: 0,
+                    failure_probability: 1.0,
+                    expected_attempts: f64::INFINITY,
+                    quality: FiniteSearchQuality::Heuristic,
+                },
+                FiniteSearchCandidate {
+                    guess_index: 1,
+                    failure_probability: 0.25,
+                    expected_attempts: 1.75,
+                    quality: FiniteSearchQuality::UpperBound,
+                },
+            ],
+            reason: FiniteSearchReason::Deadline,
+            nodes_visited: 17,
+            work_units: 42,
+            cache_hits: 0,
+            proposal_sampled: true,
+        };
+        let trace = finite_step_evidence(&guesses, 2, &search).expect("trace");
+        assert_eq!(trace.reason, "deadline");
+        assert_eq!(trace.work_units, 42);
+        assert_eq!(trace.candidate_count, 2);
+        assert_eq!(trace.top_candidates[0].quality, "heuristic");
+        assert_eq!(trace.top_candidates[0].modeled_failure_probability, None);
+        assert_eq!(trace.top_candidates[0].expected_attempts_remaining, None);
+        assert_eq!(trace.top_candidates[1].word, "rebut");
+        assert_eq!(
+            trace.top_candidates[1].modeled_failure_probability,
+            Some(0.25)
+        );
+        serde_json::to_string(&trace).expect("finite JSON");
+
+        let mut invalid = search;
+        invalid.candidates[0].quality = FiniteSearchQuality::UpperBound;
+        assert!(finite_step_evidence(&guesses, 2, &invalid).is_err());
+
+        invalid.candidates = vec![
+            FiniteSearchCandidate {
+                guess_index: 1,
+                failure_probability: 0.25,
+                expected_attempts: 1.75,
+                quality: FiniteSearchQuality::UpperBound,
+            };
+            9
+        ];
+        invalid.candidates[8].expected_attempts = f64::INFINITY;
+        assert!(finite_step_evidence(&guesses, 2, &invalid).is_err());
+    }
+
+    #[test]
+    fn finite_backtest_trace_rejects_missing_or_misaligned_steps() {
+        let mut solver = finite_audit_test_solver(&["cigar", "rebut", "sissy"]);
+        solver.config.search_policy_mode = crate::config::SearchPolicyMode::FiniteFast;
+        let date = NaiveDate::from_ymd_opt(2026, 8, 1).expect("date");
+        let run = solver
+            .solve_target_detailed("cigar", date, 1)
+            .expect("finite run");
+        validate_finite_run_trace(&run, run.steps.len()).expect("aligned trace");
+
+        let mut missing = run.clone();
+        missing.steps[0].finite_search = None;
+        assert!(validate_finite_run_trace(&missing, missing.steps.len()).is_err());
+
+        let mut misaligned = run;
+        misaligned.steps[0]
+            .finite_search
+            .as_mut()
+            .expect("trace")
+            .top_candidates[0]
+            .word = "rebut".to_string();
+        assert!(validate_finite_run_trace(&misaligned, misaligned.steps.len()).is_err());
+    }
+
+    fn finite_audit_test_solver(words: &[&str]) -> Solver {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let guesses = words
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>();
+        let answers = words
+            .iter()
+            .map(|word| AnswerRecord {
+                word: (*word).to_string(),
+                in_seed: true,
+                manual_entry: false,
+                manual_weight: 1.0,
+                history_dates: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "maybe-wordle-finite-audit-test-{}-{unique}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("test pattern root");
+        let pattern_table =
+            PatternTable::load_or_build_at(&root.join("pattern.bin"), &guesses, &answers)
+                .expect("pattern table");
+        fs::remove_file(root.join("pattern.bin")).expect("remove in-memory fixture's backing file");
+        fs::remove_dir(&root).expect("remove empty fixture directory");
+        Solver {
+            config: PriorConfig::default(),
+            mode: WeightMode::Uniform,
+            variant: ModelVariant::SeedPlusHistory,
+            guesses: guesses.clone(),
+            answers,
+            primary_answer_count: words.len(),
+            history_dates: Vec::new(),
+            pattern_table,
+            guess_index: guesses
+                .iter()
+                .enumerate()
+                .map(|(index, word)| (word.clone(), index))
+                .collect::<HashMap<_, _>>(),
+            artifact_dir: root.join("predictive"),
+            session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn finite_audit_test_state(answer_count: usize) -> SolveState {
+        let weights = vec![1.0; answer_count];
+        SolveState {
+            condition_only: true,
+            surviving: (0..answer_count).collect(),
+            fallback_surviving: Vec::new(),
+            fallback_active: false,
+            modeled_weights: weights.clone(),
+            recovery_weights: weights.clone(),
+            weights,
+            modeled_total_weight: answer_count as f64,
+            total_weight: answer_count as f64,
+            recovery_mode_used: None,
+        }
+    }
+
+    fn exact_finite_reference(
+        word: &str,
+        failure_probability: f64,
+        expected_attempts: f64,
+    ) -> FiniteSearchRegretReference {
+        FiniteSearchRegretReference {
+            status: "exact".to_string(),
+            word: Some(word.to_string()),
+            value: Some(FiniteSearchRegretValue {
+                failure_probability,
+                expected_attempts,
+            }),
+        }
+    }
+
+    #[test]
+    fn finite_search_regret_rejects_fixed_root_better_than_global_reference() {
+        let fixed = exact_finite_reference("fixed", 0.1, 1.0);
+        let global = exact_finite_reference("global", 0.2, 1.5);
+        let error = finite_regrets(&fixed, &global).expect_err("contradictory references");
+        assert!(error.to_string().contains("reference contradiction"));
+    }
+
+    #[test]
+    fn finite_search_regret_finds_known_two_turn_optimum() {
+        let solver = finite_audit_test_solver(&["aaaaa", "bbbbb", "ccccc", "abcde"]);
+        let state = finite_audit_test_state(solver.answers.len());
+        let reference = solver
+            .finite_global_reference(
+                &state,
+                &[],
+                2,
+                false,
+                Instant::now(),
+                Duration::from_secs(10),
+            )
+            .expect("finite global reference");
+        assert_eq!(reference.status, "exact");
+        assert_eq!(reference.word.as_deref(), Some("abcde"));
+        assert_eq!(
+            reference
+                .value
+                .expect("reference value")
+                .failure_probability,
+            0.0
+        );
+    }
+
+    #[test]
+    fn finite_search_regret_reports_unresolved_global_deadline() {
+        let solver = finite_audit_test_solver(&["aaaaa", "bbbbb", "ccccc"]);
+        let state = finite_audit_test_state(solver.answers.len());
+        let reference = solver
+            .finite_global_reference(&state, &[], 2, false, Instant::now(), Duration::ZERO)
+            .expect("bounded reference");
+        assert_eq!(reference.status, "unresolved_global_deadline");
+        assert!(reference.value.is_none());
+    }
+
+    #[test]
+    fn proposal_reservation_cutoff_is_reported_and_not_exact() {
+        let solver = finite_audit_test_solver(&[
+            "aaaaa", "bbbbb", "ccccc", "ddddd", "eeeee", "fffff", "ggggg", "hhhhh", "iiiii",
+        ]);
+        let state = finite_audit_test_state(solver.answers.len());
+        let result = solver
+            .finite_horizon_search(
+                &state.surviving,
+                &state.weights,
+                &[],
+                3,
+                false,
+                FiniteSearchOptions {
+                    root_shortlist: 1,
+                    reply_shortlist: 1,
+                    exact_state_threshold: 8,
+                    budget: Duration::from_secs(10),
+                    node_limit: Some(1),
+                    baseline_only: false,
+                },
+                &|| false,
+            )
+            .expect("bounded finite search");
+        assert!(result.proposal_sampled);
+        assert_eq!(result.reason, FiniteSearchReason::NodeBudget);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.quality != FiniteSearchQuality::Exact)
+        );
+        let reference =
+            finite_reference_from_result(&result, solver.guesses.len(), &solver.guesses);
+        assert_eq!(reference.status, "unresolved_node_budget");
+        assert!(reference.value.is_none());
+    }
+
+    #[test]
+    fn finite_search_regret_fixed_root_uses_hard_history_in_children() {
+        let solver =
+            finite_audit_test_solver(&["allee", "llama", "llava", "llaza", "apple", "ample"]);
+        let mut state = finite_audit_test_state(solver.answers.len());
+        let observations = vec![("allee".to_string(), score_guess("allee", "llama"))];
+        solver
+            .apply_feedback(&mut state, &observations[0].0, observations[0].1)
+            .expect("condition the reachable hard-mode state");
+        assert_eq!(state.surviving.len(), 3);
+        let root_index = solver.guess_index["llama"];
+        let reference = solver
+            .finite_fixed_root_reference(
+                &state,
+                &observations,
+                2,
+                true,
+                root_index,
+                Instant::now(),
+                Duration::from_secs(10),
+            )
+            .expect("hard-mode fixed-root reference");
+        assert_eq!(reference.status, "exact");
+        assert_eq!(reference.word.as_deref(), Some("llama"));
+        let value = reference.value.expect("completed fixed-root value");
+        assert!((value.failure_probability - 1.0 / 3.0).abs() < 1e-12);
+        assert!((value.expected_attempts - 5.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn posterior_calibration_summary_preserves_overlapping_strata() {
+        let first_date = NaiveDate::from_ymd_opt(2026, 8, 1).expect("date");
+        let second_date = first_date.checked_add_days(Days::new(1)).expect("date");
+        let score = |target_probability, log_loss, brier| crate::experiments::ProbabilityScore {
+            target_probability,
+            log_loss,
+            brier,
+        };
+        let games = vec![
+            ExperimentGameResult {
+                target: "alpha".to_string(),
+                outcome: GameOutcome::solved(first_date, 2),
+                path: vec!["probe".to_string(), "alpha".to_string()],
+                finite_search_steps: Vec::new(),
+                prior_strata: Some(PriorStrata {
+                    never_used: false,
+                    reused: true,
+                    historical_only: true,
+                    out_of_core: true,
+                }),
+                posterior_calibration: vec![
+                    PosteriorCalibrationObservation {
+                        turn: 1,
+                        score: Some(score(0.5, std::f64::consts::LN_2, 0.5)),
+                    },
+                    PosteriorCalibrationObservation {
+                        turn: 2,
+                        score: Some(score(1.0, 0.0, 0.0)),
+                    },
+                ],
+            },
+            ExperimentGameResult {
+                target: "bravo".to_string(),
+                outcome: GameOutcome::coverage_gap(second_date),
+                path: Vec::new(),
+                finite_search_steps: Vec::new(),
+                prior_strata: Some(PriorStrata {
+                    never_used: true,
+                    reused: false,
+                    historical_only: false,
+                    out_of_core: false,
+                }),
+                posterior_calibration: vec![PosteriorCalibrationObservation {
+                    turn: 1,
+                    score: None,
+                }],
+            },
+        ];
+        let summaries = summarize_posterior_calibration(&games);
+        validate_posterior_calibration_evidence(&games, &summaries, true, "toy")
+            .expect("valid toy calibration");
+
+        let summary = |stratum: &str, turn: u8| {
+            summaries
+                .iter()
+                .find(|summary| summary.stratum == stratum && summary.turn == turn)
+                .expect("summary row")
+        };
+        assert_eq!(summary("all", 1).total_states, 2);
+        assert_eq!(summary("all", 1).scored_states, 1);
+        assert_eq!(summary("all", 2).total_states, 1);
+        assert_eq!(summary("reused", 1).total_states, 1);
+        assert_eq!(summary("historical_only", 1).total_states, 1);
+        assert_eq!(summary("out_of_core", 1).total_states, 1);
+        assert_eq!(summary("never_used", 1).total_states, 1);
+        assert_eq!(summary("never_used", 1).scored_states, 0);
+        assert_eq!(summary("never_used", 1).mean_score, None);
+        assert_eq!(summary("reused", 2).mean_score, Some(score(1.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn posterior_calibration_validation_rejects_bad_turns_and_arithmetic() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 1).expect("date");
+        let game = ExperimentGameResult {
+            target: "alpha".to_string(),
+            outcome: GameOutcome::solved(date, 2),
+            path: vec!["probe".to_string(), "alpha".to_string()],
+            finite_search_steps: Vec::new(),
+            prior_strata: Some(PriorStrata {
+                never_used: true,
+                reused: false,
+                historical_only: false,
+                out_of_core: false,
+            }),
+            posterior_calibration: vec![
+                PosteriorCalibrationObservation {
+                    turn: 1,
+                    score: None,
+                },
+                PosteriorCalibrationObservation {
+                    turn: 2,
+                    score: None,
+                },
+            ],
+        };
+        let games = vec![game];
+        let summaries = summarize_posterior_calibration(&games);
+        let mut bad_game = games.clone();
+        bad_game[0].posterior_calibration[1].turn = 3;
+        let error = validate_posterior_calibration_evidence(&bad_game, &summaries, true, "toy")
+            .expect_err("non-contiguous turns");
+        assert!(error.to_string().contains("not contiguous"));
+
+        let mut bad_summaries = summaries.clone();
+        bad_summaries[0].total_states += 1;
+        let error = validate_posterior_calibration_evidence(&games, &bad_summaries, true, "toy")
+            .expect_err("summary arithmetic");
+        assert!(error.to_string().contains("do not match"));
+        for invalid in [
+            crate::experiments::ProbabilityScore {
+                target_probability: 0.5,
+                log_loss: 0.0,
+                brier: 0.5,
+            },
+            crate::experiments::ProbabilityScore {
+                target_probability: 1.0,
+                log_loss: 0.0,
+                brier: 0.5,
+            },
+        ] {
+            assert!(validate_probability_score(invalid, "corrupt row").is_err());
+        }
+    }
+
+    fn benchmark_evidence_test_fixture() -> PredictiveEvidenceArtifact {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 1).expect("date");
+        let game = ExperimentGameResult {
+            target: "cigar".to_string(),
+            outcome: GameOutcome::solved(date, 1),
+            path: vec!["cigar".to_string()],
+            finite_search_steps: Vec::new(),
+            prior_strata: Some(PriorStrata {
+                never_used: true,
+                reused: false,
+                historical_only: false,
+                out_of_core: false,
+            }),
+            posterior_calibration: vec![PosteriorCalibrationObservation {
+                turn: 1,
+                score: None,
+            }],
+        };
+        let outcome = game.outcome;
+        let games = vec![game];
+        let canonical = summarize_predictive_outcomes(&[outcome], 7.0, BootstrapConfig::default())
+            .expect("metrics");
+        let backtest = BacktestStats {
+            canonical: canonical.clone(),
+            games: canonical.scheduled_games,
+            average_guesses: canonical.conditional_mean_guesses,
+            p95_guesses: canonical.p95_guesses,
+            max_guesses: canonical.max_guesses,
+            failures: canonical.unsolved_games + canonical.coverage_gaps,
+            coverage_gaps: canonical.coverage_gaps,
+            average_guesses_ci95: (
+                canonical.conditional_mean_guesses_ci95.lower,
+                canonical.conditional_mean_guesses_ci95.upper,
+            ),
+            failure_rate_ci95: (
+                1.0 - canonical.solve_rate_ci95.upper,
+                1.0 - canonical.solve_rate_ci95.lower,
+            ),
+        };
+        let config_toml = "test = true\n".to_string();
+        let baseline = EvidenceBaseline {
+            id: "test".to_string(),
+            description: "test".to_string(),
+            artifacts: "disabled".to_string(),
+            effective_config_toml: config_toml.clone(),
+            config_fingerprint: crate::identity::digest_bytes_tagged(
+                "maybe-wordle-benchmark-config-v1",
+                config_toml.as_bytes(),
+            ),
+            paired_vs_selected_default: None,
+            result: ExperimentResult {
+                config_id: "test".to_string(),
+                mode: WeightMode::Uniform,
+                variant: ModelVariant::SeedPlusHistory,
+                backtest,
+                average_log_loss: 0.0,
+                average_brier: 0.0,
+                average_target_probability: 1.0,
+                average_target_rank: 1.0,
+                prior_evidence: None,
+                posterior_calibration: summarize_posterior_calibration(&games),
+                execution: ExecutionTelemetry::default(),
+                failure_penalty_sensitivity: Vec::new(),
+                latency_p95_ms: 0.0,
+                session_fallback_cold_ms: None,
+                session_fallback_warm_ms: None,
+                proxy_step_pct: 0.0,
+                lookahead_step_pct: 0.0,
+                escalated_exact_step_pct: 0.0,
+                exact_step_pct: 0.0,
+                finite_step_pct: 0.0,
+                average_lookahead_pool_ratio: 0.0,
+                average_exact_pool_ratio: 0.0,
+                games,
+            },
+        };
+        let range = DateRange::new(date, date).expect("range");
+        PredictiveEvidenceArtifact {
+            schema_version: BENCHMARK_EVIDENCE_SCHEMA_VERSION,
+            identity_format: crate::identity::IDENTITY_FORMAT.to_string(),
+            input_fingerprint: crate::identity::digest_bytes_tagged("test", b"source"),
+            config_fingerprint: crate::identity::digest_bytes_tagged(
+                "maybe-wordle-benchmark-root-config-v1",
+                config_toml.as_bytes(),
+            ),
+            scope: "test".to_string(),
+            sealed_test_evaluated: false,
+            evaluation_from: date,
+            evaluation_to: date,
+            evaluation_selection: "range".to_string(),
+            selected_ranges: vec![range],
+            matrix_source: "test".to_string(),
+            matrix_fingerprint: crate::identity::digest_bytes_tagged("test", b"matrix"),
+            profile_ids: vec!["test".to_string()],
+            reference_profile_id: "test".to_string(),
+            history_snapshot_start: date,
+            history_snapshot_end: date,
+            code_revision: None,
+            code_dirty: None,
+            platform: "test".to_string(),
+            cpu: None,
+            release_command: "test".to_string(),
+            config_toml,
+            resource_budget: EvidenceResourceBudget::default(),
+            resources: EvidenceResourceTelemetry::default(),
+            historical_diagnostic: HistoricalDiagnosticBaseline {
+                date_range: "test".to_string(),
+                scheduled_games: 0,
+                modeled_games: 0,
+                coverage_gaps: 0,
+                conditional_mean_guesses: 0.0,
+                average_log_loss: 0.0,
+                average_brier_score: 0.0,
+                interpretation: "test".to_string(),
+            },
+            baselines: vec![baseline],
+            limitations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn benchmark_evidence_rejects_sealed_test_flag() {
+        let mut artifact = benchmark_evidence_test_fixture();
+        artifact.sealed_test_evaluated = true;
+        let error = artifact
+            .validate_identity()
+            .expect_err("sealed-test evidence must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("benchmark evidence must not evaluate the sealed test"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn prior_strata_do_not_look_through_future_history() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 8, 1).expect("date");
+        let answer = AnswerRecord {
+            word: "alpha".to_string(),
+            in_seed: false,
+            manual_entry: false,
+            manual_weight: 1.0,
+            history_dates: vec![
+                as_of.checked_add_days(Days::new(1)).expect("date"),
+                as_of.checked_add_days(Days::new(2)).expect("date"),
+            ],
+        };
+        assert_eq!(
+            Solver::prior_strata_for_answer(&answer, 0.0, as_of),
+            PriorStrata {
+                never_used: true,
+                reused: false,
+                historical_only: false,
+                out_of_core: true,
+            }
+        );
+        let answer = AnswerRecord {
+            history_dates: vec![
+                as_of.checked_sub_days(Days::new(1)).expect("date"),
+                as_of.checked_add_days(Days::new(1)).expect("date"),
+            ],
+            ..answer
+        };
+        assert_eq!(
+            Solver::prior_strata_for_answer(&answer, 1.0, as_of),
+            PriorStrata {
+                never_used: false,
+                reused: true,
+                historical_only: true,
+                out_of_core: false,
+            }
+        );
+    }
+
+    #[test]
+    fn finite_studies_reject_competing_trials_before_loading_data() {
+        let spec: StudySpec = serde_json::from_str(
+            r#"{"name":"finite-budget","stage":"calibration","seed":1,"trial_count":2,"parallelism":2}"#,
+        ).unwrap();
+        for mode in [
+            crate::config::SearchPolicyMode::FiniteBaseline,
+            crate::config::SearchPolicyMode::FiniteFast,
+            crate::config::SearchPolicyMode::FiniteStrong,
+        ] {
+            let config = PriorConfig {
+                search_policy_mode: mode,
+                ..PriorConfig::default()
+            };
+            let root = Path::new("unused-finite-study-fixture");
+            let error = Solver::run_predictive_study(
+                &ProjectPaths::new(root),
+                &config,
+                spec.clone(),
+                &root.join("study.json"),
+                5,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("require --jobs 1"));
+        }
+    }
+
+    fn rolling_checkpoint_test_fixture() -> (RollingEvaluationCheckpoint, EvaluationPlan, NaiveDate)
+    {
+        let validation_date = NaiveDate::from_ymd_opt(2026, 8, 1).expect("date");
+        let training_end = validation_date
+            .checked_sub_days(chrono::Days::new(1))
+            .expect("training end");
+        let training_start = training_end
+            .checked_sub_days(chrono::Days::new(1))
+            .expect("training start");
+        let history = DateRange::new(training_start, validation_date).expect("history");
+        let validation = DateRange::new(validation_date, validation_date).expect("validation");
+        let plan = EvaluationPlan {
+            history,
+            development: history,
+            sealed_test: validation,
+            folds: vec![RollingOriginFold {
+                index: 0,
+                training: DateRange::new(training_start, training_end).expect("training"),
+                validation,
+            }],
+            config: RollingOriginConfig {
+                minimum_training_days: 2,
+                validation_days: 1,
+                step_days: 1,
+                sealed_test_days: 1,
+                maximum_folds: 1,
+            },
+        };
+        let outcomes = [GameOutcome::solved(validation_date, 1)];
+        let metrics = summarize_predictive_outcomes(&outcomes, 7.0, BootstrapConfig::default())
+            .expect("metrics");
+        let checkpoint = RollingEvaluationCheckpoint {
+            schema_version: ROLLING_CHECKPOINT_SCHEMA_VERSION,
+            source_identity: "source".to_string(),
+            evaluation_plan: plan.clone(),
+            label: "test".to_string(),
+            config_toml: toml::to_string_pretty(&PriorConfig {
+                search_policy_mode: crate::config::SearchPolicyMode::ProxyOnly,
+                ..PriorConfig::default()
+            })
+            .expect("config"),
+            folds: vec![RollingFoldEvidence {
+                fold_index: 0,
+                validation,
+                metrics,
+            }],
+            games: vec![ExperimentGameResult {
+                target: "cigar".to_string(),
+                outcome: outcomes[0],
+                path: vec!["cigar".to_string()],
+                finite_search_steps: Vec::new(),
+                prior_strata: None,
+                posterior_calibration: Vec::new(),
+            }],
+            prior_observations: Vec::new(),
+            execution: ExecutionTelemetry::default(),
+        };
+        (checkpoint, plan, validation_date)
+    }
+
+    fn validate_test_rolling_checkpoint(
+        checkpoint: &RollingEvaluationCheckpoint,
+        plan: &EvaluationPlan,
+    ) -> Result<()> {
+        validate_rolling_checkpoint(
+            checkpoint,
+            "source",
+            "test",
+            &checkpoint.config_toml,
+            plan,
+            true,
+        )
+    }
+
+    fn identity_test_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "maybe-wordle-development-identity-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
 
     #[test]
     fn serialized_latency_only_selects_complete_unmeasured_finalists() {
@@ -5937,5 +8789,613 @@ mod tests {
             12,
             true
         ));
+    }
+
+    #[test]
+    fn evidence_checkpoint_rejects_another_identity() {
+        let checkpoint = EvidenceMatrixCheckpoint {
+            schema_version: EVIDENCE_CHECKPOINT_SCHEMA_VERSION,
+            identity: "first".into(),
+            elapsed_ms: 10,
+            peak_working_set_bytes: 20,
+            baselines: Vec::new(),
+        };
+        assert!(checkpoint.validate("first", &[]).is_ok());
+        assert!(checkpoint.validate("second", &[]).is_err());
+        let mut old = checkpoint;
+        old.schema_version = 1;
+        assert!(old.validate("first", &[]).is_err());
+    }
+
+    #[test]
+    fn evidence_checkpoint_profiles_must_be_an_ordered_prefix() {
+        let expected = vec!["first".to_string(), "second".to_string()];
+        assert!(is_profile_prefix(&[], &expected));
+        assert!(is_profile_prefix(&["first".to_string()], &expected));
+        assert!(!is_profile_prefix(&["second".to_string()], &expected));
+        assert!(!is_profile_prefix(
+            &[
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ],
+            &expected
+        ));
+    }
+
+    #[test]
+    fn evidence_checkpoint_identity_changes_for_resolved_base_config_content() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 1).expect("date");
+        let range = DateRange::new(date, date).expect("range");
+        let plan = EvaluationPlan {
+            history: range,
+            development: range,
+            sealed_test: range,
+            folds: Vec::new(),
+            config: RollingOriginConfig {
+                minimum_training_days: 1,
+                validation_days: 1,
+                step_days: 1,
+                sealed_test_days: 1,
+                maximum_folds: 1,
+            },
+        };
+        let base = vec![("previous".to_string(), "base-a".to_string())];
+        let changed = vec![("previous".to_string(), "base-b".to_string())];
+        let profiles = vec!["profile".to_string()];
+        let first = evidence_checkpoint_identity(
+            "input",
+            "config",
+            &plan,
+            "range",
+            &[range],
+            "matrix",
+            "matrix-fingerprint",
+            &profiles,
+            &base,
+            range,
+            3,
+        )
+        .expect("identity");
+        let second = evidence_checkpoint_identity(
+            "input",
+            "config",
+            &plan,
+            "range",
+            &[range],
+            "matrix",
+            "matrix-fingerprint",
+            &profiles,
+            &changed,
+            range,
+            3,
+        )
+        .expect("identity");
+        assert_ne!(first, second);
+
+        let rolling = evidence_checkpoint_identity(
+            "input",
+            "config",
+            &plan,
+            "rolling_folds",
+            &[range],
+            "matrix",
+            "matrix-fingerprint",
+            &profiles,
+            &base,
+            range,
+            3,
+        )
+        .expect("identity");
+        assert_ne!(first, rolling);
+
+        let changed_matrix = evidence_checkpoint_identity(
+            "input",
+            "config",
+            &plan,
+            "range",
+            &[range],
+            "matrix",
+            "changed-matrix-fingerprint",
+            &profiles,
+            &base,
+            range,
+            3,
+        )
+        .expect("identity");
+        assert_ne!(first, changed_matrix);
+    }
+
+    #[test]
+    fn selected_evidence_games_uses_exact_ranges_without_gap_or_seal_leakage() {
+        let entry = |raw: &str, solution: &str| NytDailyEntry {
+            id: None,
+            solution: solution.to_string(),
+            print_date: NaiveDate::parse_from_str(raw, "%Y-%m-%d").expect("date"),
+            days_since_launch: None,
+            editor: None,
+        };
+        let history = vec![
+            entry("2026-06-17", "cigar"),
+            entry("2026-06-18", "rebut"),
+            entry("2026-07-18", "sissy"),
+            entry("2026-08-26", "humph"),
+            entry("2026-08-28", "awake"),
+        ];
+        let selected_ranges = vec![
+            DateRange::new(
+                NaiveDate::from_ymd_opt(2026, 6, 17).expect("date"),
+                NaiveDate::from_ymd_opt(2026, 6, 17).expect("date"),
+            )
+            .expect("range"),
+            DateRange::new(
+                NaiveDate::from_ymd_opt(2026, 7, 18).expect("date"),
+                NaiveDate::from_ymd_opt(2026, 7, 18).expect("date"),
+            )
+            .expect("range"),
+            DateRange::new(
+                NaiveDate::from_ymd_opt(2026, 8, 26).expect("date"),
+                NaiveDate::from_ymd_opt(2026, 8, 26).expect("date"),
+            )
+            .expect("range"),
+        ];
+        let selected = selected_evidence_games(&history, &selected_ranges)
+            .expect("selected games")
+            .into_iter()
+            .map(|entry| entry.print_date)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            [
+                NaiveDate::from_ymd_opt(2026, 6, 17).expect("date"),
+                NaiveDate::from_ymd_opt(2026, 7, 18).expect("date"),
+                NaiveDate::from_ymd_opt(2026, 8, 26).expect("date"),
+            ]
+        );
+    }
+
+    fn rolling_comparison_test_fixture() -> RollingComparisonArtifact {
+        let (checkpoint, plan, _) = rolling_checkpoint_test_fixture();
+        let config = RollingConfigEvidence {
+            label: checkpoint.label,
+            config_toml: checkpoint.config_toml.clone(),
+            config_fingerprint: crate::identity::digest_bytes_tagged(
+                "maybe-wordle-rolling-config-v1",
+                checkpoint.config_toml.as_bytes(),
+            ),
+            folds: checkpoint.folds.clone(),
+            aggregate: checkpoint.folds[0].metrics.clone(),
+            prior_evidence: None,
+            execution: checkpoint.execution,
+            failure_penalty_sensitivity: Vec::new(),
+            games: checkpoint.games.clone(),
+            latency_p95_ms: 0.0,
+        };
+        let outcomes = checkpoint
+            .games
+            .iter()
+            .map(|game| game.outcome)
+            .collect::<Vec<_>>();
+        RollingComparisonArtifact {
+            schema_version: 4,
+            top: 5,
+            identity_format: crate::identity::IDENTITY_FORMAT.to_string(),
+            input_fingerprint: crate::identity::digest_bytes_tagged("test", b"source"),
+            evaluation_plan: plan,
+            sealed_test_evaluated: false,
+            code_revision: None,
+            code_dirty: None,
+            baseline: config.clone(),
+            candidate: config,
+            candidate_minus_baseline: PairedDifference::all_game_penalized(
+                &outcomes,
+                &outcomes,
+                7.0,
+                BootstrapConfig::default(),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn rolling_metric_validation_survives_fractional_json_roundtrips() {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        for count in [3, 7, 17, 30] {
+            let mut baseline = (0..count)
+                .map(|index| {
+                    GameOutcome::solved(start + chrono::Days::new(index), (index as usize % 6) + 1)
+                })
+                .collect::<Vec<_>>();
+            let candidate = baseline
+                .iter()
+                .enumerate()
+                .map(|(index, outcome)| GameOutcome::solved(outcome.date, (index % 5) + 1))
+                .collect::<Vec<_>>();
+            let metrics =
+                summarize_predictive_outcomes(&baseline, 7.0, BootstrapConfig::default()).unwrap();
+            let decoded = serde_json::from_slice(&serde_json::to_vec(&metrics).unwrap()).unwrap();
+            validate_predictive_metrics(&decoded, &mut baseline, "roundtrip").unwrap();
+            let paired = PairedDifference::all_game_penalized(
+                &baseline,
+                &candidate,
+                7.0,
+                BootstrapConfig::default(),
+            )
+            .unwrap();
+            let decoded: PairedDifference =
+                serde_json::from_slice(&serde_json::to_vec(&paired).unwrap()).unwrap();
+            assert_eq!(paired, decoded);
+        }
+    }
+
+    #[test]
+    fn rolling_final_artifact_requires_top_and_current_schema() {
+        let artifact = rolling_comparison_test_fixture();
+        let value = serde_json::to_value(&artifact).unwrap();
+        let decoded: RollingComparisonArtifact = serde_json::from_value(value.clone()).unwrap();
+        validate_rolling_comparison_artifact(&decoded).unwrap();
+        assert_eq!(decoded.top, 5);
+        let rendered =
+            Solver::render_rolling_comparison_markdown(std::slice::from_ref(&decoded)).unwrap();
+        assert!(rendered.contains("| `test` |"));
+        assert!(!rendered.contains("`current_default`"));
+        assert!(!rendered.contains("subsequent once-only evaluation"));
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("top");
+        assert!(serde_json::from_value::<RollingComparisonArtifact>(missing).is_err());
+        let mut old: RollingComparisonArtifact = serde_json::from_value(value).unwrap();
+        old.schema_version = 3;
+        assert!(old.validate_identity().is_err());
+    }
+
+    #[test]
+    fn rolling_final_artifact_accepts_historical_finite_games_without_traces() {
+        let mut artifact = rolling_comparison_test_fixture();
+        let mut config = PriorConfig::default();
+        config.search_policy_mode = crate::config::SearchPolicyMode::FiniteFast;
+        let config_toml = toml::to_string_pretty(&config).expect("finite config");
+        let fingerprint = crate::identity::digest_bytes_tagged(
+            "maybe-wordle-rolling-config-v1",
+            config_toml.as_bytes(),
+        );
+        for evidence in [&mut artifact.baseline, &mut artifact.candidate] {
+            evidence.config_toml = config_toml.clone();
+            evidence.config_fingerprint = fingerprint.clone();
+        }
+        assert!(artifact.baseline.games[0].finite_search_steps.is_empty());
+        validate_rolling_comparison_artifact(&artifact)
+            .expect("historical finite artifact without optional traces remains readable");
+    }
+
+    #[test]
+    fn rolling_final_artifact_rejects_path_guess_mismatch_without_posterior_calibration() {
+        let mut artifact = rolling_comparison_test_fixture();
+        artifact.baseline.games[0].path = vec!["cigar".to_string(), "rebut".to_string()];
+        let error = validate_rolling_comparison_artifact(&artifact)
+            .expect_err("path count must match a solved outcome");
+        assert!(
+            error
+                .to_string()
+                .contains("outcome guess count does not match its path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rolling_checkpoint_accepts_unsolved_games_and_coverage_gaps() {
+        let (mut checkpoint, plan, validation_date) = rolling_checkpoint_test_fixture();
+        checkpoint.games[0].outcome = GameOutcome::unsolved(validation_date, 6);
+        checkpoint.games[0].path = vec!["cigar".to_string(); 6];
+        checkpoint.folds[0].metrics = summarize_predictive_outcomes(
+            &[checkpoint.games[0].outcome],
+            7.0,
+            BootstrapConfig::default(),
+        )
+        .expect("unsolved metrics");
+        validate_test_rolling_checkpoint(&checkpoint, &plan)
+            .expect("unsolved path count should remain valid");
+
+        checkpoint.games[0].outcome = GameOutcome::coverage_gap(validation_date);
+        checkpoint.games[0].path.clear();
+        checkpoint.folds[0].metrics = summarize_predictive_outcomes(
+            &[checkpoint.games[0].outcome],
+            7.0,
+            BootstrapConfig::default(),
+        )
+        .expect("coverage-gap metrics");
+        validate_test_rolling_checkpoint(&checkpoint, &plan)
+            .expect("coverage gaps should retain empty paths");
+    }
+
+    #[test]
+    fn rolling_final_artifact_rejects_corrupt_structure_and_arithmetic() {
+        let artifact = rolling_comparison_test_fixture();
+        validate_rolling_comparison_artifact(&artifact).expect("valid artifact");
+
+        let mut no_top = artifact.clone();
+        no_top.top = 0;
+        let error = validate_rolling_comparison_artifact(&no_top).expect_err("zero top");
+        assert!(error.to_string().contains("top must be positive"));
+
+        let mut duplicate_fold = artifact.clone();
+        duplicate_fold
+            .candidate
+            .folds
+            .push(duplicate_fold.candidate.folds[0].clone());
+        let error = validate_rolling_comparison_artifact(&duplicate_fold)
+            .expect_err("duplicate candidate fold");
+        assert!(
+            error.to_string().contains("duplicate fold id"),
+            "unexpected error: {error}"
+        );
+
+        let mut duplicate_game = artifact.clone();
+        duplicate_game
+            .candidate
+            .games
+            .push(duplicate_game.candidate.games[0].clone());
+        let error = validate_rolling_comparison_artifact(&duplicate_game)
+            .expect_err("duplicate candidate game");
+        assert!(error.to_string().contains("duplicate game date"));
+
+        let mut out_of_range = artifact.clone();
+        out_of_range.candidate.games[0].outcome =
+            GameOutcome::solved(NaiveDate::from_ymd_opt(2026, 8, 2).expect("date"), 1);
+        let error = validate_rolling_comparison_artifact(&out_of_range)
+            .expect_err("out-of-range candidate game");
+        assert!(error.to_string().contains("planned validation range"));
+
+        let mut bad_aggregate = artifact.clone();
+        bad_aggregate.candidate.aggregate.solved_games = 0;
+        let error =
+            validate_rolling_comparison_artifact(&bad_aggregate).expect_err("aggregate arithmetic");
+        assert!(error.to_string().contains("metrics do not match"));
+
+        let mut bad_paired = artifact;
+        bad_paired.candidate_minus_baseline.candidate_wins = 1;
+        let error =
+            validate_rolling_comparison_artifact(&bad_paired).expect_err("paired arithmetic");
+        assert!(error.to_string().contains("paired difference"));
+    }
+
+    #[test]
+    fn rolling_checkpoint_identity_changes_with_top() {
+        assert_ne!(
+            rolling_checkpoint_fingerprint_with_top("config", "source", 1),
+            rolling_checkpoint_fingerprint_with_top("config", "source", 2)
+        );
+    }
+
+    #[test]
+    fn rolling_checkpoint_rejects_malformed_fold_and_game_overlaps() {
+        let (checkpoint, plan, _) = rolling_checkpoint_test_fixture();
+        validate_test_rolling_checkpoint(&checkpoint, &plan).expect("valid checkpoint");
+
+        let mut old_schema = checkpoint.clone();
+        old_schema.schema_version = 1;
+        let error = validate_test_rolling_checkpoint(&old_schema, &plan).expect_err("old schema");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported rolling checkpoint schema")
+        );
+
+        let mut duplicate_fold = checkpoint.clone();
+        duplicate_fold.folds.push(duplicate_fold.folds[0].clone());
+        let error =
+            validate_test_rolling_checkpoint(&duplicate_fold, &plan).expect_err("duplicate fold");
+        assert!(error.to_string().contains("duplicate fold id"));
+
+        let mut duplicate_game = checkpoint.clone();
+        duplicate_game.games.push(duplicate_game.games[0].clone());
+        let error = validate_test_rolling_checkpoint(&duplicate_game, &plan)
+            .expect_err("duplicate game date");
+        assert!(error.to_string().contains("duplicate game date"));
+
+        let mut wrong_range = checkpoint.clone();
+        wrong_range.folds[0].validation = DateRange::new(
+            wrong_range.folds[0]
+                .validation
+                .start
+                .checked_sub_days(chrono::Days::new(1))
+                .expect("date"),
+            wrong_range.folds[0].validation.end,
+        )
+        .expect("range");
+        let error = validate_test_rolling_checkpoint(&wrong_range, &plan).expect_err("wrong range");
+        assert!(error.to_string().contains("validation range"));
+
+        let mut out_of_range = checkpoint;
+        out_of_range.games[0].outcome =
+            GameOutcome::solved(NaiveDate::from_ymd_opt(2026, 8, 2).expect("date"), 1);
+        let error =
+            validate_test_rolling_checkpoint(&out_of_range, &plan).expect_err("out-of-range game");
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to exactly one planned validation range")
+        );
+    }
+
+    #[test]
+    fn finite_rolling_checkpoint_rejects_missing_or_misaligned_search_traces() {
+        let (mut checkpoint, plan, _) = rolling_checkpoint_test_fixture();
+        let mut config = PriorConfig::default();
+        config.search_policy_mode = crate::config::SearchPolicyMode::FiniteFast;
+        checkpoint.config_toml = toml::to_string(&config).expect("finite config");
+        let trace = FiniteSearchStepEvidence {
+            turn: 1,
+            reason: "complete".to_string(),
+            nodes_visited: 1,
+            work_units: 1,
+            proposal_sampled: false,
+            candidate_count: 1,
+            top_candidates: vec![FiniteSearchCandidateEvidence {
+                word: "cigar".to_string(),
+                quality: "exact".to_string(),
+                modeled_failure_probability: Some(0.0),
+                expected_attempts_remaining: Some(0.0),
+            }],
+        };
+        checkpoint.games[0].finite_search_steps = vec![trace.clone()];
+        validate_rolling_checkpoint(
+            &checkpoint,
+            "source",
+            "test",
+            &checkpoint.config_toml,
+            &plan,
+            true,
+        )
+        .expect("aligned finite trace");
+
+        checkpoint.games[0].finite_search_steps.clear();
+        let missing = validate_rolling_checkpoint(
+            &checkpoint,
+            "source",
+            "test",
+            &checkpoint.config_toml,
+            &plan,
+            true,
+        )
+        .expect_err("missing finite trace");
+        assert!(missing.to_string().contains("finite search trace"));
+
+        checkpoint.games[0].finite_search_steps = vec![trace.clone()];
+        checkpoint.games[0].finite_search_steps[0].turn = 2;
+        let misaligned = validate_rolling_checkpoint(
+            &checkpoint,
+            "source",
+            "test",
+            &checkpoint.config_toml,
+            &plan,
+            true,
+        )
+        .expect_err("misaligned finite trace");
+        assert!(misaligned.to_string().contains("finite search trace"));
+
+        checkpoint.games[0].finite_search_steps = vec![trace];
+        checkpoint.games[0].finite_search_steps[0].top_candidates[0].word = "rebut".to_string();
+        let wrong_guess = validate_rolling_checkpoint(
+            &checkpoint,
+            "source",
+            "test",
+            &checkpoint.config_toml,
+            &plan,
+            true,
+        )
+        .expect_err("trace guess does not match path");
+        assert!(wrong_guess.to_string().contains("finite search trace"));
+    }
+
+    #[test]
+    fn rolling_checkpoint_fresh_partial_resume_preserves_results() {
+        let (partial, plan, _) = rolling_checkpoint_test_fixture();
+        let mut fresh = partial.clone();
+        fresh.folds.clear();
+        fresh.games.clear();
+        validate_test_rolling_checkpoint(&fresh, &plan).expect("fresh checkpoint");
+        validate_test_rolling_checkpoint(&partial, &plan).expect("partial checkpoint");
+
+        let encoded = serde_json::to_vec(&partial).expect("serialize");
+        let resumed: RollingEvaluationCheckpoint =
+            serde_json::from_slice(&encoded).expect("deserialize");
+        validate_test_rolling_checkpoint(&resumed, &plan).expect("resumed checkpoint");
+        assert_eq!(serde_json::to_vec(&resumed).expect("reserialize"), encoded);
+    }
+
+    #[test]
+    fn rolling_checkpoint_rejects_metric_arithmetic_mismatch() {
+        let (mut checkpoint, plan, _) = rolling_checkpoint_test_fixture();
+        checkpoint.folds[0].metrics.solved_games = 0;
+        let error =
+            validate_test_rolling_checkpoint(&checkpoint, &plan).expect_err("metric mismatch");
+        assert!(error.to_string().contains("metrics do not match"));
+    }
+
+    #[test]
+    fn development_identity_ignores_history_after_the_declared_cutoff() {
+        let root = identity_test_root();
+        let _ = fs::remove_dir_all(&root);
+        for directory in ["src", "tests", "config", "data/raw", "data/seed"] {
+            fs::create_dir_all(root.join(directory)).expect("directory");
+        }
+        fs::write(root.join("Cargo.toml"), "[package]\nname='identity-test'\n").expect("manifest");
+        fs::write(root.join("Cargo.lock"), "").expect("lock");
+        fs::write(
+            root.join("config/evaluation.toml"),
+            include_str!("../../config/evaluation.toml"),
+        )
+        .expect("policy");
+        for file in [
+            "valid_guesses.txt",
+            "candidate_answers.txt",
+            "reference_candidate_answers.txt",
+            "manual_additions.txt",
+        ] {
+            fs::write(root.join("data/seed").join(file), "cigar\n").expect("seed");
+        }
+        let cutoff = NaiveDate::from_ymd_opt(2026, 8, 26).expect("date");
+        let entry = NytDailyEntry {
+            id: Some(1),
+            solution: "cigar".into(),
+            print_date: cutoff,
+            days_since_launch: None,
+            editor: None,
+        };
+        let history_path = root.join("data/raw/nyt_daily_answers.jsonl");
+        fs::write(
+            &history_path,
+            format!("{}\n", serde_json::to_string(&entry).expect("entry")),
+        )
+        .expect("history");
+        let paths = ProjectPaths::new(&root);
+        let before = development_source_identity(&paths, cutoff).expect("identity");
+        let later = NytDailyEntry {
+            id: Some(2),
+            solution: "rebut".into(),
+            print_date: NaiveDate::from_ymd_opt(2026, 8, 27).expect("date"),
+            days_since_launch: None,
+            editor: None,
+        };
+        fs::write(
+            &history_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&entry).expect("entry"),
+                serde_json::to_string(&later).expect("later")
+            ),
+        )
+        .expect("extended history");
+        let after = development_source_identity(&paths, cutoff).expect("identity");
+        assert_eq!(before, after);
+        for relative in [
+            "src/lib.rs",
+            "tests/replay.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "config/evaluation.toml",
+            "data/seed/candidate_answers.txt",
+        ] {
+            let path = root.join(relative);
+            let original = path
+                .is_file()
+                .then(|| fs::read(&path).expect("original input"));
+            fs::write(&path, b"changed identity input\n").expect("mutate owned fixture input");
+            assert_ne!(
+                before,
+                development_source_identity(&paths, cutoff).expect("changed identity"),
+                "identity ignored {relative}"
+            );
+            if let Some(bytes) = original {
+                fs::write(&path, bytes).expect("restore fixture input");
+            } else {
+                fs::remove_file(&path).expect("remove added fixture input");
+            }
+            assert_eq!(
+                before,
+                development_source_identity(&paths, cutoff).expect("restored identity")
+            );
+        }
+        let _ = fs::remove_dir_all(root);
     }
 }

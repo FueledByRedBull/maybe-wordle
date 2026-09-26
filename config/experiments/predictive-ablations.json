@@ -45,6 +45,20 @@
       }
     },
     {
+      "id": "empirical_frequency_baseline",
+      "description": "Observed-frequency baseline without smoothing",
+      "weight_mode": "empirical_frequency",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled"
+    },
+    {
+      "id": "regularized_frequency_baseline",
+      "description": "Observed-frequency baseline with additive-one smoothing",
+      "weight_mode": "regularized_frequency",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled"
+    },
+    {
       "id": "weighted_baseline",
       "description": "Weighted baseline with valid disk artifacts when available",
       "weight_mode": "weighted",

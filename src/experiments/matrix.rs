@@ -107,6 +107,90 @@ mod tests {
     use crate::experiments::predictive_parameter_registry;
 
     #[test]
+    fn fixed_work_diagnostic_changes_only_finite_budget_policy() {
+        let matrix = PredictiveExperimentMatrix::parse_json(include_str!(
+            "../../config/experiments/september-policy-fixed-work.json"
+        ))
+        .unwrap();
+        assert_eq!(matrix.profiles.len(), 2);
+        let mut configs = matrix
+            .profiles
+            .iter()
+            .map(|profile| {
+                assert_eq!(profile.artifact_mode, ExperimentArtifactMode::Disabled);
+                let base = profile
+                    .load_base_config(
+                        Path::new(env!("CARGO_MANIFEST_DIR")),
+                        &PriorConfig::default(),
+                    )
+                    .unwrap();
+                profile
+                    .apply(&predictive_parameter_registry(&base), &base)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            configs[0].search_policy_mode,
+            crate::config::SearchPolicyMode::FiniteFast
+        );
+        assert_eq!(
+            configs[1].search_policy_mode,
+            crate::config::SearchPolicyMode::FiniteFastFixedWork
+        );
+        configs[0].search_policy_mode = configs[1].search_policy_mode;
+        assert_eq!(
+            toml::to_string(&configs[0]).unwrap(),
+            toml::to_string(&configs[1]).unwrap()
+        );
+    }
+
+    #[test]
+    fn finite_prior_families_share_one_artifact_free_policy() {
+        let matrix = PredictiveExperimentMatrix::parse_json(include_str!(
+            "../../config/experiments/finite-prior-families.json"
+        ))
+        .unwrap();
+        assert_eq!(matrix.profiles.len(), 5);
+        assert_eq!(matrix.profiles[0].id, "logistic_prior");
+        let mut reference = None;
+        let mut modes = HashSet::new();
+        for profile in matrix.profiles {
+            assert_eq!(profile.artifact_mode, ExperimentArtifactMode::Disabled);
+            assert_eq!(profile.model_variant, ModelVariant::SeedPlusHistory);
+            assert!(modes.insert(profile.weight_mode.label()));
+            let base = profile
+                .load_base_config(
+                    Path::new(env!("CARGO_MANIFEST_DIR")),
+                    &PriorConfig::default(),
+                )
+                .unwrap();
+            let config = profile
+                .apply(&predictive_parameter_registry(&base), &base)
+                .unwrap();
+            assert_eq!(
+                config.search_policy_mode,
+                crate::config::SearchPolicyMode::FiniteFast
+            );
+            let serialized = toml::to_string(&config).unwrap();
+            if let Some(reference) = &reference {
+                assert_eq!(&serialized, reference);
+            } else {
+                reference = Some(serialized);
+            }
+        }
+        assert_eq!(
+            modes,
+            HashSet::from([
+                "weighted",
+                "uniform",
+                "used_unused",
+                "recency_buckets",
+                "regularized_frequency",
+            ])
+        );
+    }
+
+    #[test]
     fn shipped_development_matrix_is_unique_and_registry_validated() {
         let base = PriorConfig::default();
         let registry = predictive_parameter_registry(&base);
@@ -133,11 +217,27 @@ mod tests {
         assert_eq!(entropy.proxy_weights.entropy_w, 1.0);
         assert_eq!(entropy.proxy_weights.bucket_mass_w, 0.0);
 
+        let finite_base = PriorConfig {
+            search_policy_mode: crate::config::SearchPolicyMode::FiniteFast,
+            ..base.clone()
+        };
+        let staged = matrix
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "weighted_staged_no_artifacts")
+            .expect("staged profile")
+            .apply(&predictive_parameter_registry(&finite_base), &finite_base)
+            .expect("staged config");
+        assert_eq!(
+            staged.search_policy_mode,
+            crate::config::SearchPolicyMode::Staged
+        );
+
         let ablations = PredictiveExperimentMatrix::parse_json(include_str!(
             "../../config/experiments/predictive-ablations.json"
         ))
         .expect("ablations");
-        assert_eq!(ablations.profiles.len(), 6);
+        assert_eq!(ablations.profiles.len(), 8);
         for profile in &ablations.profiles {
             profile.apply(&registry, &base).expect("ablation profile");
         }

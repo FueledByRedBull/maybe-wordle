@@ -11,9 +11,10 @@ jobs:
   rust:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.97.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
@@ -22,7 +23,27 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests
         run: cargo test --all-targets
-      - name: Verify rolling evidence documentation
+      - name: Check public evidence redaction
+        run: pwsh -NoProfile -File scripts/redact_public_evidence.ps1 -Check
+      - name: Verify published rolling evidence
         run: >-
-          cargo run -- rolling-evidence-docs
-          --comparison benchmarks/predictive/rolling-selected-v20-final-20260726.json
+          cargo run --locked --bin maybe-wordle -- rolling-evidence-docs
+          --comparison docs/evidence/september-finite-preordered-public-v1.json
+          --markdown-output docs/generated/rolling-evidence.md --readme README.md
+      - name: Verify current predictive evidence
+        run: >-
+          cargo run --locked --bin maybe-wordle -- benchmark-evidence-docs
+          --evidence docs/evidence/september-post-layout-tests-rolling-public-v1.json
+          --markdown-output docs/generated/september-post-layout-tests-rolling-v1.md
+          --readme README.md
+
+  macos-memory:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate native resident-set sampler
+        run: cargo test process_memory_is_available_and_sane --lib

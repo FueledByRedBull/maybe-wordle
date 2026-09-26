@@ -1,0 +1,3 @@
+# Experimental only; not a production promotion.
+# Other values use the canonical shipped Rust defaults, as the baseline does.
+search_policy_mode = "finite_fast"

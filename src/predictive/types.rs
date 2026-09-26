@@ -22,7 +22,7 @@ pub enum PredictiveSuggestionMode {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PredictiveSuggestRequest<'a> {
-    pub as_of: NaiveDate,
+    pub puzzle_date: NaiveDate,
     pub observations: &'a [(String, u8)],
     pub top: usize,
     pub hard_mode: bool,
@@ -30,8 +30,18 @@ pub struct PredictiveSuggestRequest<'a> {
     pub mode: PredictiveSuggestionMode,
 }
 
+/// Inclusive snapshot cutoff for information available before a puzzle.
+pub fn history_cutoff(puzzle_date: NaiveDate) -> anyhow::Result<NaiveDate> {
+    puzzle_date
+        .pred_opt()
+        .ok_or_else(|| anyhow::anyhow!("puzzle date has no preceding history date"))
+}
+
 #[derive(Clone, Debug)]
 pub struct PredictiveSuggestResponse {
+    pub finite_search: Option<crate::solver::FiniteSearchResult>,
+    pub puzzle_date: NaiveDate,
+    pub history_cutoff: NaiveDate,
     pub state: PredictiveStateSummary,
     pub suggestions: Vec<Suggestion>,
     pub candidates: Vec<PredictiveCandidateSummary>,

@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "name": "september-staged-versus-fixed-work",
+  "profiles": [
+    {
+      "id": "staged_incumbent",
+      "description": "Selected staged configuration on current code, without predictive artifacts",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml"
+    },
+    {
+      "id": "finite_fast_fixed_work",
+      "description": "Same prior and rules; finite Fast geometry with four million cooperative work units",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "finite_fast_fixed_work" }
+      }
+    }
+  ]
+}

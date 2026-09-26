@@ -95,6 +95,7 @@ impl Solver {
                 &state,
                 offline.config.session_opener_pool.max(1),
                 Some(PredictiveContext {
+                    hard_mode: false,
                     as_of,
                     observations: &[],
                 }),
@@ -244,17 +245,14 @@ impl Solver {
             state,
             self.config.session_reply_pool.max(1),
             Some(PredictiveContext {
+                hard_mode: false,
                 as_of,
                 observations,
             }),
             PredictiveBookUsage::None,
         )?;
         let split_first = state.surviving.len() > self.config.large_state_split_threshold;
-        let mut metrics = self.score_guess_metrics_for_subset(
-            &state.surviving,
-            &state.weights,
-            &self.exact_small_state_table,
-        );
+        let mut metrics = self.score_guess_metrics_for_subset(&state.surviving, &state.weights);
         metrics.sort_by(|left, right| {
             compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
         });

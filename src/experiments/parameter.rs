@@ -422,10 +422,6 @@ pub fn validate_predictive_config(config: &PriorConfig) -> Result<()> {
             "second_guess_coverage_pool",
             config.second_guess_coverage_pool,
         ),
-        (
-            "second_guess_coverage_child_cap",
-            config.second_guess_coverage_child_cap,
-        ),
         ("lookahead_candidate_pool", config.lookahead_candidate_pool),
         (
             "medium_state_lookahead_candidate_pool",
@@ -708,13 +704,21 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
         ),
         float(
             "fallback_prior_mass",
-            ParameterDomain::Recovery,
+            if config.search_policy_mode.uses_fixed_belief() {
+                ParameterDomain::Prior
+            } else {
+                ParameterDomain::Recovery
+            },
             config.fallback_prior_mass,
             0.0001,
             0.25,
             None,
             ParameterScale::Log,
-            &[ObjectiveKind::Coverage, ObjectiveKind::SolveQuality],
+            if config.search_policy_mode.uses_fixed_belief() {
+                &[ObjectiveKind::Calibration, ObjectiveKind::SolveQuality]
+            } else {
+                &[ObjectiveKind::Coverage, ObjectiveKind::SolveQuality]
+            },
             "Prior probability reserved for valid-guess answers outside date-safe primary support.",
         ),
         integer(
@@ -751,7 +755,7 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
     });
 
     ParameterRegistry {
-        format_version: 6,
+        format_version: 7,
         parameters,
         constraints: vec![
             "exact_exhaustive_threshold <= exact_threshold".to_string(),
@@ -918,8 +922,14 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
             kind: ParameterKind::Categorical {
                 choices: vec![
                     "staged".to_string(),
+                    "staged_fixed_belief".to_string(),
                     "proxy_with_exact_endgame".to_string(),
                     "proxy_only".to_string(),
+                    "finite_fast".to_string(),
+                    "finite_fast_dynamic".to_string(),
+                    "finite_fast_fixed_work".to_string(),
+                    "finite_strong".to_string(),
+                    "finite_baseline".to_string(),
                 ],
             },
             objectives: objectives.to_vec(),
@@ -985,16 +995,6 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
             8,
             objectives,
             "Number of proxy-ranked second guesses checked by the three-solve coverage objective.",
-        ),
-        integer(
-            "second_guess_coverage_child_cap",
-            ParameterDomain::SearchPolicy,
-            config.second_guess_coverage_child_cap as i64,
-            4,
-            64,
-            1,
-            objectives,
-            "Largest child bucket scanned for a force-in-two continuation.",
         ),
         integer(
             "lookahead_threshold",
@@ -1628,8 +1628,7 @@ fn parameter_cohort(name: &str, domain: ParameterDomain, role: ParameterRole) ->
             }
             "second_guess_coverage_min_survivors"
             | "second_guess_coverage_max_survivors"
-            | "second_guess_coverage_pool"
-            | "second_guess_coverage_child_cap" => ParameterCohort::SearchCoverage,
+            | "second_guess_coverage_pool" => ParameterCohort::SearchCoverage,
             "lookahead_threshold"
             | "medium_state_lookahead_threshold"
             | "lookahead_candidate_pool"
@@ -1826,7 +1825,31 @@ mod tests {
         let config = PriorConfig::default();
         let registry = predictive_parameter_registry(&config);
         registry.validate().expect("registry");
-        assert_eq!(registry.format_version, 6);
+        assert_eq!(registry.format_version, 7);
+        let search_policy = registry
+            .get("search_policy_mode")
+            .expect("search policy parameter");
+        let ParameterKind::Categorical { choices } = &search_policy.kind else {
+            panic!("search policy parameter must be categorical");
+        };
+        assert!(choices.contains(&"finite_fast_dynamic".to_string()));
+        let dynamic = registry
+            .apply_tunable_values(
+                &config,
+                &BTreeMap::from([(
+                    "search_policy_mode".to_string(),
+                    ParameterValue::Categorical("finite_fast_dynamic".to_string()),
+                )]),
+            )
+            .expect("dynamic finite mode");
+        assert_eq!(dynamic.search_policy_mode.label(), "finite_fast_dynamic");
+        assert!(!dynamic.search_policy_mode.uses_fixed_belief());
+        predictive_parameter_registry(&PriorConfig {
+            search_policy_mode: crate::config::SearchPolicyMode::FiniteBaseline,
+            ..config.clone()
+        })
+        .validate()
+        .expect("diagnostic baseline registry");
 
         let config_value = toml::Value::try_from(config).expect("serialize config");
         let mut config_paths = BTreeSet::new();
@@ -1852,7 +1875,7 @@ mod tests {
                 (ParameterCohort::ProxySmallState, 1),
                 (ParameterCohort::SearchRouting, 2),
                 (ParameterCohort::SearchExact, 3),
-                (ParameterCohort::SearchCoverage, 4),
+                (ParameterCohort::SearchCoverage, 3),
                 (ParameterCohort::SearchLookahead, 8),
                 (ParameterCohort::SearchPool, 11),
                 (ParameterCohort::SearchDanger, 15),

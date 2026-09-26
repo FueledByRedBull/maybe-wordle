@@ -4,6 +4,7 @@ pub enum PredictiveRegime {
     Lookahead,
     EscalatedExact,
     Exact,
+    Finite,
 }
 
 impl PredictiveRegime {
@@ -13,6 +14,7 @@ impl PredictiveRegime {
             Self::Lookahead => "lookahead",
             Self::EscalatedExact => "escalated_exact",
             Self::Exact => "exact",
+            Self::Finite => "finite",
         }
     }
 }

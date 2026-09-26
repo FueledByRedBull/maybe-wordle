@@ -17,6 +17,7 @@ use crate::{
     SOLVER_THREAD_STACK_BYTES,
     config::PriorConfig,
     data::{ProjectPaths, sync_nyt_history},
+    experiments::predictive_parameter_registry,
     formal::{
         DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, FormalStateExplanation, FormalSuggestion,
         artifacts_exist,
@@ -27,7 +28,10 @@ use crate::{
         PredictiveSuggestRequest, PredictiveSuggestionMode, RecoveryMode,
     },
     scoring::parse_feedback,
-    solver::{AbsurdleSuggestion, SolveState, Solver, Suggestion},
+    solver::{
+        AbsurdleSuggestion, FiniteSearchCandidate, FiniteSearchOptions, FiniteSearchQuality,
+        FiniteSearchReason, FiniteSearchResult, SolveState, Solver, Suggestion,
+    },
 };
 
 pub fn run_gui(root: PathBuf) -> Result<()> {
@@ -332,6 +336,35 @@ enum SuggestionSort {
     WorstBucket,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum GuiSearchProfile {
+    #[default]
+    Configured,
+    FiniteFast,
+    FiniteStrong,
+}
+
+impl GuiSearchProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Configured => "Configured",
+            Self::FiniteFast => "Finite fast (experimental)",
+            Self::FiniteStrong => "Finite strong (experimental)",
+        }
+    }
+
+    fn finite_options(self, solver: &Solver) -> Option<FiniteSearchOptions> {
+        match self {
+            Self::Configured if solver.config.search_policy_mode.is_finite() => {
+                Some(solver.finite_search_options())
+            }
+            Self::Configured => None,
+            Self::FiniteFast => Some(FiniteSearchOptions::fast()),
+            Self::FiniteStrong => Some(FiniteSearchOptions::strong()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BoardDraft {
     guess: String,
@@ -411,6 +444,7 @@ struct WordleGuiApp {
     formal_solver: Option<FormalPolicyRuntime>,
     workspace_view: WorkspaceView,
     mode: GuiSolverMode,
+    search_profile: GuiSearchProfile,
     text_scale: f32,
     date_text: String,
     current_guess: String,
@@ -427,6 +461,7 @@ struct WordleGuiApp {
     predictive_recovery_mode: Option<RecoveryMode>,
     predictive_artifact_state: PredictiveArtifactState,
     predictive_model_metadata: String,
+    predictive_finite_search: Option<FiniteSearchResult>,
     top: usize,
     force_in_two_only: bool,
     hard_mode: bool,
@@ -446,6 +481,8 @@ struct LatestWorkerQueue {
     pending: Option<WorkerRequest>,
     latest_generation: u64,
     shutdown: bool,
+    #[cfg(test)]
+    test_cancel_hook: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 struct LatestWorkerDispatcher {
@@ -487,6 +524,7 @@ struct WorkerRequest {
     top: usize,
     force_in_two_only: bool,
     hard_mode: bool,
+    search_profile: GuiSearchProfile,
 }
 
 #[derive(Clone, Debug)]
@@ -497,6 +535,7 @@ enum WorkerPayload {
         candidates: Vec<PredictiveCandidateSummary>,
         artifact_state: PredictiveArtifactState,
         model_metadata: String,
+        finite_search: Option<FiniteSearchResult>,
     },
     Absurdle {
         state: SolveState,
@@ -563,6 +602,7 @@ impl WordleGuiApp {
             formal_solver,
             workspace_view: WorkspaceView::Play,
             mode,
+            search_profile: GuiSearchProfile::Configured,
             text_scale: 1.0,
             date_text,
             current_guess: String::new(),
@@ -579,6 +619,7 @@ impl WordleGuiApp {
             predictive_recovery_mode: None,
             predictive_artifact_state: PredictiveArtifactState::NoPredictiveArtifactAvailable,
             predictive_model_metadata: String::new(),
+            predictive_finite_search: None,
             top: 10,
             force_in_two_only: false,
             hard_mode: false,
@@ -606,10 +647,15 @@ impl WordleGuiApp {
             top: self.top,
             force_in_two_only: self.force_in_two_only,
             hard_mode: self.hard_mode,
+            search_profile: self.search_profile,
         };
         self.computing = true;
         self.status = if self.mode == GuiSolverMode::Predictive {
-            predictive_compute_status(self.predictive_artifact_state)
+            if let Some(options) = self.search_profile.finite_options(&self.predictive_solver) {
+                predictive_finite_compute_status(self.search_profile, options)
+            } else {
+                predictive_compute_status(self.predictive_artifact_state)
+            }
         } else {
             "Computing...".to_string()
         };
@@ -631,12 +677,14 @@ impl WordleGuiApp {
                     candidates,
                     artifact_state,
                     model_metadata,
+                    finite_search,
                 }) => {
                     self.surviving_count = state.surviving;
                     self.total_weight = state.effective_total_weight;
                     self.predictive_recovery_mode = state.recovery_mode_used;
                     self.predictive_artifact_state = artifact_state;
                     self.predictive_model_metadata = model_metadata;
+                    self.predictive_finite_search = finite_search;
                     self.predictive_suggestions = suggestions;
                     self.predictive_candidates = candidates;
                     if self
@@ -648,12 +696,10 @@ impl WordleGuiApp {
                     self.absurdle_suggestions.clear();
                     self.formal_suggestions.clear();
                     self.formal_explanation = None;
-                    self.status = if response.complete {
-                        String::new()
-                    } else {
-                        "Fast proxy preview shown; refining the exact ranking in the background."
-                            .to_string()
-                    };
+                    self.status = predictive_response_status(
+                        response.complete,
+                        self.predictive_finite_search.as_ref(),
+                    );
                 }
                 Ok(WorkerPayload::Absurdle { state, suggestions }) => {
                     self.surviving_count = state.surviving.len();
@@ -661,6 +707,7 @@ impl WordleGuiApp {
                     self.predictive_recovery_mode = None;
                     self.predictive_artifact_state =
                         PredictiveArtifactState::NoPredictiveArtifactAvailable;
+                    self.predictive_finite_search = None;
                     self.absurdle_suggestions = suggestions;
                     self.predictive_suggestions.clear();
                     self.predictive_candidates.clear();
@@ -677,6 +724,7 @@ impl WordleGuiApp {
                     self.predictive_recovery_mode = None;
                     self.predictive_artifact_state =
                         PredictiveArtifactState::NoPredictiveArtifactAvailable;
+                    self.predictive_finite_search = None;
                     self.formal_explanation = Some(explanation);
                     self.formal_suggestions = suggestions;
                     self.predictive_suggestions.clear();
@@ -701,6 +749,7 @@ impl WordleGuiApp {
         self.total_weight = 0.0;
         self.predictive_recovery_mode = None;
         self.predictive_artifact_state = PredictiveArtifactState::NoPredictiveArtifactAvailable;
+        self.predictive_finite_search = None;
         self.computing = false;
     }
 
@@ -765,18 +814,26 @@ impl WordleGuiApp {
                     );
                     for index in sorted.into_iter().take(8) {
                         let suggestion = &self.predictive_suggestions[index];
-                        if ui
-                            .selectable_label(
-                                self.selected_suggestion == Some(index),
-                                format!(
-                                    "{}  {}  solve {:.3}  H {:.3}  cost {}",
-                                    suggestion.word.to_ascii_uppercase(),
-                                    suggestion_method(suggestion),
-                                    suggestion.solve_probability,
-                                    suggestion.entropy,
-                                    format_suggestion_cost(suggestion)
-                                ),
+                        let label = if let Some(value) = &suggestion.finite_value {
+                            format!(
+                                "{}  {}  failure risk {}  expected remaining attempts {}",
+                                suggestion.word.to_ascii_uppercase(),
+                                finite_quality_label(value.quality),
+                                format_finite_failure_risk(value),
+                                format_finite_expected_attempts(value),
                             )
+                        } else {
+                            format!(
+                                "{}  {}  solve {:.3}  H {:.3}  cost {}",
+                                suggestion.word.to_ascii_uppercase(),
+                                suggestion_method(suggestion),
+                                suggestion.solve_probability,
+                                suggestion.entropy,
+                                format_suggestion_cost(suggestion)
+                            )
+                        };
+                        if ui
+                            .selectable_label(self.selected_suggestion == Some(index), label)
                             .clicked()
                         {
                             self.selected_suggestion = Some(index);
@@ -874,18 +931,30 @@ impl WordleGuiApp {
                 ui.add_space(8.0);
                 policy_row(
                     ui,
-                    "As-of cutoff",
+                    "Puzzle date",
                     if self.date_text.is_empty() {
                         "not selected"
                     } else {
                         &self.date_text
                     },
                 );
+                policy_row(ui, "Profile", self.search_profile.label());
                 policy_row(
                     ui,
                     "Artifact path",
-                    predictive_banner_text(self.predictive_artifact_state),
+                    if self
+                        .search_profile
+                        .finite_options(&self.predictive_solver)
+                        .is_some()
+                    {
+                        predictive_finite_banner_text(self.search_profile)
+                    } else {
+                        predictive_banner_text(self.predictive_artifact_state)
+                    },
                 );
+                if let Some(search) = &self.predictive_finite_search {
+                    policy_row(ui, "Finite search", &format_finite_search_summary(search));
+                }
                 policy_row(
                     ui,
                     "Recovery",
@@ -900,7 +969,7 @@ impl WordleGuiApp {
                         self.config.manual_weights.len()
                     ),
                 );
-                policy_row(ui, "Registry", "v6 · 85 leaves · 79 tunable");
+                policy_row(ui, "Registry", &predictive_registry_summary(&self.config));
             });
         });
         ui.add_space(16.0);
@@ -914,10 +983,15 @@ impl WordleGuiApp {
                 } else {
                     ui.label(&self.predictive_model_metadata);
                 }
-                if let Some(message) = predictive_reply_book_text(
-                    self.observations.len(),
-                    self.predictive_artifact_state,
-                ) {
+                if self
+                    .search_profile
+                    .finite_options(&self.predictive_solver)
+                    .is_none()
+                    && let Some(message) = predictive_reply_book_text(
+                        self.observations.len(),
+                        self.predictive_artifact_state,
+                    )
+                {
                     ui.label(message);
                 }
             });
@@ -945,10 +1019,25 @@ impl WordleGuiApp {
             diagnostic_badge(
                 ui,
                 "ARTIFACT",
-                predictive_banner_text(self.predictive_artifact_state),
+                if self
+                    .search_profile
+                    .finite_options(&self.predictive_solver)
+                    .is_some()
+                {
+                    predictive_finite_banner_text(self.search_profile)
+                } else {
+                    predictive_banner_text(self.predictive_artifact_state)
+                },
             );
             diagnostic_badge(ui, "SURVIVORS", &self.surviving_count.to_string());
         });
+        if let Some(search) = &self.predictive_finite_search {
+            ui.label(
+                RichText::new(format_finite_search_summary(search))
+                    .small()
+                    .color(Color32::from_rgb(92, 72, 54)),
+            );
+        }
         ui.add_space(16.0);
         if is_compact_layout(ui.available_width()) {
             ui.group(|ui| self.show_live_trace(ui));
@@ -963,7 +1052,7 @@ impl WordleGuiApp {
         ui.add_space(16.0);
         ui.label(
             RichText::new(
-                "The two isolated workers share one replaceable pending slot: obsolete queued work is discarded, while a newer generation can run even if one older request is still expensive.",
+                "The cancellable solver worker shares one replaceable pending slot: obsolete queued work is discarded, and bounded finite searches exit when a newer generation arrives.",
             )
             .small()
             .color(Color32::from_rgb(92, 72, 54)),
@@ -1242,6 +1331,33 @@ impl eframe::App for WordleGuiApp {
                     if self.mode != previous_mode {
                         self.schedule_recompute();
                     }
+                    if self.mode == GuiSolverMode::Predictive {
+                        ui.separator();
+                        let previous_profile = self.search_profile;
+                        ui.label("Profile");
+                        egui::ComboBox::from_id_salt("predictive-search-profile")
+                            .selected_text(self.search_profile.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.search_profile,
+                                    GuiSearchProfile::Configured,
+                                    GuiSearchProfile::Configured.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut self.search_profile,
+                                    GuiSearchProfile::FiniteFast,
+                                    GuiSearchProfile::FiniteFast.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut self.search_profile,
+                                    GuiSearchProfile::FiniteStrong,
+                                    GuiSearchProfile::FiniteStrong.label(),
+                                );
+                            });
+                        if self.search_profile != previous_profile {
+                            self.schedule_recompute();
+                        }
+                    }
                 });
 
                 ui.add_space(8.0);
@@ -1297,7 +1413,7 @@ impl eframe::App for WordleGuiApp {
 
                 ui.add_space(16.0);
                 let mut keyboard_apply = false;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Guess");
                     let response = ui.add_sized(
                         [120.0, 30.0],
@@ -1381,10 +1497,25 @@ impl eframe::App for WordleGuiApp {
                                 .strong()
                                 .color(Color32::from_rgb(67, 53, 39)),
                         );
+                        let banner = if self
+                            .search_profile
+                            .finite_options(&self.predictive_solver)
+                            .is_some()
+                        {
+                            predictive_finite_banner_text(self.search_profile)
+                        } else {
+                            predictive_banner_text(self.predictive_artifact_state)
+                        };
                         ui.label(
-                            RichText::new(predictive_banner_text(self.predictive_artifact_state))
-                                .color(Color32::from_rgb(92, 72, 54)),
+                            RichText::new(banner).color(Color32::from_rgb(92, 72, 54)),
                         );
+                        if let Some(search) = &self.predictive_finite_search {
+                            ui.label(
+                                RichText::new(format_finite_search_summary(search))
+                                    .small()
+                                    .color(Color32::from_rgb(92, 72, 54)),
+                            );
+                        }
                         if !self.predictive_model_metadata.is_empty() {
                             ui.label(
                                 RichText::new(&self.predictive_model_metadata)
@@ -1392,13 +1523,17 @@ impl eframe::App for WordleGuiApp {
                                     .color(Color32::from_rgb(92, 72, 54)),
                             );
                         }
-                        if let Some(message) = predictive_reply_book_text(
-                            self.observations.len(),
-                            self.predictive_artifact_state,
-                        ) {
-                            ui.label(
-                                RichText::new(message).color(Color32::from_rgb(92, 72, 54)),
-                            );
+                        if self
+                            .search_profile
+                            .finite_options(&self.predictive_solver)
+                            .is_none()
+                            && let Some(message) = predictive_reply_book_text(
+                                self.observations.len(),
+                                self.predictive_artifact_state,
+                            ) {
+                                ui.label(
+                                    RichText::new(message).color(Color32::from_rgb(92, 72, 54)),
+                                );
                         }
                     }
                     GuiSolverMode::Absurdle => {
@@ -1429,7 +1564,7 @@ impl eframe::App for WordleGuiApp {
 
                 if !self.status.is_empty() {
                     ui.add_space(8.0);
-                    let color = if self.computing {
+                    let color = if self.computing || self.predictive_finite_search.is_some() {
                         Color32::from_rgb(92, 72, 54)
                     } else {
                         Color32::from_rgb(150, 45, 45)
@@ -1473,7 +1608,15 @@ impl eframe::App for WordleGuiApp {
                         let (heading, summary) = match self.mode {
                             GuiSolverMode::Predictive => (
                                 "Wordle Suggestions",
-                                "Ranks guesses by predictive expected progress.",
+                                if self
+                                    .search_profile
+                                    .finite_options(&self.predictive_solver)
+                                    .is_some()
+                                {
+                                    "Ranks by modeled six-turn failure risk, then expected attempts."
+                                } else {
+                                    "Ranks guesses by predictive expected progress."
+                                },
                             ),
                             GuiSolverMode::Absurdle => (
                                 "Absurdle Suggestions",
@@ -1499,6 +1642,10 @@ impl eframe::App for WordleGuiApp {
                                         .color(Color32::from_rgb(92, 72, 54)),
                                     );
                                 } else {
+                                    let finite_table = self
+                                        .search_profile
+                                        .finite_options(&self.predictive_solver)
+                                        .is_some();
                                     let sorted_indices = sorted_predictive_indices(
                                         &self.predictive_suggestions,
                                         self.suggestion_sort,
@@ -1518,28 +1665,36 @@ impl eframe::App for WordleGuiApp {
                                                         );
                                                     }
                                                     ui.label("Word");
-                                                    ui.label("Method");
-                                                    if ui.button("Solve").clicked() {
-                                                        self.toggle_suggestion_sort(
-                                                            SuggestionSort::SolveProbability,
-                                                        );
-                                                    }
-                                                    if ui.button("Entropy").clicked() {
-                                                        self.toggle_suggestion_sort(
-                                                            SuggestionSort::Entropy,
-                                                        );
-                                                    }
-                                                    if ui.button("Remain").clicked() {
-                                                        self.toggle_suggestion_sort(
-                                                            SuggestionSort::ExpectedRemaining,
-                                                        );
+                                                    if finite_table {
+                                                        ui.label("Quality");
+                                                        ui.label("Failure risk");
+                                                        ui.label("Expected attempts");
+                                                    } else {
+                                                        ui.label("Method");
+                                                        if ui.button("Solve").clicked() {
+                                                            self.toggle_suggestion_sort(
+                                                                SuggestionSort::SolveProbability,
+                                                            );
+                                                        }
+                                                        if ui.button("Entropy").clicked() {
+                                                            self.toggle_suggestion_sort(
+                                                                SuggestionSort::Entropy,
+                                                            );
+                                                        }
+                                                        if ui.button("Remain").clicked() {
+                                                            self.toggle_suggestion_sort(
+                                                                SuggestionSort::ExpectedRemaining,
+                                                            );
+                                                        }
                                                     }
                                                     if ui.button("Worst").clicked() {
                                                         self.toggle_suggestion_sort(
                                                             SuggestionSort::WorstBucket,
                                                         );
                                                     }
-                                                    ui.label("Cost");
+                                                    if !finite_table {
+                                                        ui.label("Cost");
+                                                    }
                                                     ui.end_row();
 
                                                     for (rank, index) in
@@ -1566,27 +1721,49 @@ impl eframe::App for WordleGuiApp {
                                                         {
                                                             self.selected_suggestion = Some(index);
                                                         }
-                                                        ui.label(suggestion_method(suggestion));
-                                                        ui.label(format!(
-                                                            "{:.3}",
-                                                            suggestion.solve_probability
-                                                        ));
-                                                        ui.label(format!(
-                                                            "{:.3}",
-                                                            suggestion.entropy
-                                                        ));
-                                                        ui.label(format!(
-                                                            "{:.2}",
-                                                            suggestion.expected_remaining
-                                                        ));
+                                                        if finite_table {
+                                                            if let Some(value) = &suggestion.finite_value {
+                                                                ui.label(finite_quality_label(
+                                                                    value.quality,
+                                                                ));
+                                                                ui.label(format_finite_failure_risk(
+                                                                    value,
+                                                                ));
+                                                                ui.label(
+                                                                    format_finite_expected_attempts(
+                                                                        value,
+                                                                    ),
+                                                                );
+                                                            } else {
+                                                                ui.label("pending");
+                                                                ui.label("pending");
+                                                                ui.label("unevaluated");
+                                                            }
+                                                        } else {
+                                                            ui.label(suggestion_method(suggestion));
+                                                            ui.label(format!(
+                                                                "{:.3}",
+                                                                suggestion.solve_probability
+                                                            ));
+                                                            ui.label(format!(
+                                                                "{:.3}",
+                                                                suggestion.entropy
+                                                            ));
+                                                            ui.label(format!(
+                                                                "{:.2}",
+                                                                suggestion.expected_remaining
+                                                            ));
+                                                        }
                                                         ui.label(
                                                             suggestion
                                                                 .worst_non_green_bucket_size
                                                                 .to_string(),
                                                         );
-                                                        ui.label(format_suggestion_cost(
-                                                            suggestion,
-                                                        ));
+                                                        if !finite_table {
+                                                            ui.label(format_suggestion_cost(
+                                                                suggestion,
+                                                            ));
+                                                        }
                                                         ui.end_row();
                                                     }
                                                 });
@@ -1667,7 +1844,7 @@ fn spawn_worker(
     predictive_solver: Solver,
     formal_solver: Option<FormalPolicyRuntime>,
 ) -> (LatestWorkerDispatcher, Receiver<WorkerResponse>) {
-    const WORKER_COUNT: usize = 2;
+    const WORKER_COUNT: usize = 1;
     let shared = Arc::new((Mutex::new(LatestWorkerQueue::default()), Condvar::new()));
     let (response_sender, response_receiver) = mpsc::channel::<WorkerResponse>();
     for worker_index in 0..WORKER_COUNT {
@@ -1699,12 +1876,14 @@ fn spawn_worker(
                     };
                     let should_preview = request.mode == GuiSolverMode::Predictive
                         && !request.observations.is_empty();
+                    let cancelled = || worker_request_cancelled(&shared, request.generation);
                     if should_preview {
                         let preview = compute_worker_payload(
                             &predictive_solver,
                             formal_solver.as_ref(),
                             &request,
                             true,
+                            &cancelled,
                         )
                         .map_err(|error| error.to_string());
                         let preview_failed = preview.is_err();
@@ -1739,6 +1918,7 @@ fn spawn_worker(
                         formal_solver.as_ref(),
                         &request,
                         false,
+                        &cancelled,
                     )
                     .map_err(|error| error.to_string());
                     if response_sender
@@ -1764,27 +1944,43 @@ fn compute_worker_payload(
     formal_solver: Option<&FormalPolicyRuntime>,
     request: &WorkerRequest,
     proxy_preview: bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<WorkerPayload> {
     match request.mode {
         GuiSolverMode::Predictive => {
             let date = NaiveDate::parse_from_str(&request.date_text, "%Y-%m-%d")
                 .with_context(|| format!("invalid date: {}", request.date_text))?;
-            let request = PredictiveSuggestRequest {
-                as_of: date,
+            let search_profile = request.search_profile;
+            let predictive_request = PredictiveSuggestRequest {
+                puzzle_date: date,
                 observations: &request.observations,
                 top: request.top,
                 hard_mode: request.hard_mode,
                 force_in_two_only: request.force_in_two_only,
                 mode: PredictiveSuggestionMode::FastDiskOnly,
             };
-            let response = if proxy_preview {
-                predictive_solver.suggest_predictive_proxy_preview(request)?
+            let response = if let Some(mut options) =
+                search_profile.finite_options(predictive_solver)
+            {
+                if proxy_preview {
+                    options.budget = Duration::from_millis(30);
+                }
+                predictive_solver.suggest_predictive_controlled(
+                    predictive_request,
+                    options,
+                    cancelled,
+                )?
+            } else if proxy_preview {
+                predictive_solver
+                    .suggest_predictive_proxy_preview_cancellable(predictive_request, cancelled)?
             } else {
-                predictive_solver.suggest_predictive(request)?
+                predictive_solver.suggest_predictive_cancellable(predictive_request, cancelled)?
             };
             let artifact_state = response.artifact_state;
-            let model_metadata = format!(
-                "Predictive model: {}\nConfig identity: {}\nHistory snapshot: {} ({})\nCached promotion: {}",
+            let mut model_metadata = format!(
+                "Puzzle date: {} (history through {})\nPredictive model: {}\nConfig identity: {}\nHistory snapshot: {} ({})\nCached promotion: {}",
+                response.puzzle_date,
+                response.history_cutoff,
                 response.model_version,
                 response.model_manifest_hash,
                 response
@@ -1794,12 +1990,16 @@ fn compute_worker_payload(
                 response.history_snapshot_hash,
                 response.promotion_source.is_some()
             );
+            if request.hard_mode && response.finite_search.is_none() {
+                model_metadata.push_str("\nLegacy costs assume normal-mode future replies; finite profiles enforce hard-mode legality recursively.");
+            }
             Ok(WorkerPayload::Predictive {
                 state: response.state,
                 suggestions: response.suggestions,
                 candidates: response.candidates,
                 artifact_state,
                 model_metadata,
+                finite_search: response.finite_search,
             })
         }
         GuiSolverMode::Absurdle => {
@@ -1819,6 +2019,26 @@ fn compute_worker_payload(
                 suggestions,
             })
         }
+    }
+}
+
+fn worker_request_cancelled(
+    shared: &Arc<(Mutex<LatestWorkerQueue>, Condvar)>,
+    generation: u64,
+) -> bool {
+    let (lock, _) = &**shared;
+    #[cfg(test)]
+    let test_cancel_hook = match lock.lock() {
+        Ok(queue) => queue.test_cancel_hook.clone(),
+        Err(_) => return true,
+    };
+    #[cfg(test)]
+    if let Some(hook) = test_cancel_hook {
+        hook(generation);
+    }
+    match lock.lock() {
+        Ok(queue) => queue.shutdown || queue.latest_generation > generation,
+        Err(_) => true,
     }
 }
 
@@ -1884,6 +2104,21 @@ fn policy_row(ui: &mut egui::Ui, label: &str, value: &str) {
         );
         ui.label(value);
     });
+}
+
+fn predictive_registry_summary(config: &PriorConfig) -> String {
+    let registry = predictive_parameter_registry(config);
+    let tunable = registry
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.tunable())
+        .count();
+    format!(
+        "v{} · {} leaves · {} tunable",
+        registry.format_version,
+        registry.parameters.len(),
+        tunable
+    )
 }
 
 fn diagnostic_badge(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -1952,12 +2187,109 @@ fn sorted_predictive_indices(
 }
 
 fn suggestion_method(suggestion: &Suggestion) -> &'static str {
-    if suggestion.exact_cost.is_some() {
+    if suggestion.finite_value.is_some() {
+        "finite"
+    } else if suggestion.exact_cost.is_some() {
         "exact"
     } else if suggestion.lookahead_cost.is_some() {
         "lookahead"
     } else {
         "proxy"
+    }
+}
+
+fn finite_quality_label(quality: FiniteSearchQuality) -> &'static str {
+    match quality {
+        FiniteSearchQuality::Heuristic => "pending heuristic",
+        FiniteSearchQuality::UpperBound => "completed rollout",
+        FiniteSearchQuality::Exact => "model-exact action value",
+    }
+}
+
+fn format_finite_failure_risk(candidate: &FiniteSearchCandidate) -> String {
+    if candidate.quality == FiniteSearchQuality::Heuristic {
+        "pending".to_string()
+    } else {
+        format!("{:.3}%", candidate.failure_probability * 100.0)
+    }
+}
+
+fn format_finite_expected_attempts(candidate: &FiniteSearchCandidate) -> String {
+    if candidate.quality == FiniteSearchQuality::Heuristic {
+        "unevaluated".to_string()
+    } else {
+        format!("{:.3}", candidate.expected_attempts)
+    }
+}
+
+fn predictive_finite_banner_text(profile: GuiSearchProfile) -> &'static str {
+    match profile {
+        GuiSearchProfile::Configured => "Using configured bounded finite search",
+        GuiSearchProfile::FiniteFast => "Using finite fast search (experimental)",
+        GuiSearchProfile::FiniteStrong => "Using finite strong search (experimental)",
+    }
+}
+
+fn finite_reason_label(reason: FiniteSearchReason) -> &'static str {
+    match reason {
+        FiniteSearchReason::Complete => "complete",
+        FiniteSearchReason::Deadline => "deadline",
+        FiniteSearchReason::Cancelled => "cancelled",
+        FiniteSearchReason::NodeBudget => "node budget",
+    }
+}
+
+fn format_finite_search_summary(search: &FiniteSearchResult) -> String {
+    format!(
+        "Finite search: {} · {} candidates · {} nodes · {} work units · {} cache hits{}",
+        finite_reason_label(search.reason),
+        search.candidates.len(),
+        search.nodes_visited,
+        search.work_units,
+        search.cache_hits,
+        if search.proposal_sampled {
+            " · sampled proposals"
+        } else {
+            ""
+        },
+    )
+}
+
+fn predictive_finite_compute_status(
+    profile: GuiSearchProfile,
+    options: FiniteSearchOptions,
+) -> String {
+    format!(
+        "Computing... {} ({} ms budget)",
+        predictive_finite_banner_text(profile),
+        options.budget.as_millis(),
+    )
+}
+
+fn predictive_response_status(
+    complete: bool,
+    finite_search: Option<&FiniteSearchResult>,
+) -> String {
+    if !complete {
+        if finite_search.is_some() {
+            "Finite preview shown; refining the bounded ranking in the background.".to_string()
+        } else {
+            "Fast proxy preview shown; refining the configured ranking in the background."
+                .to_string()
+        }
+    } else {
+        match finite_search.map(|search| search.reason) {
+            Some(FiniteSearchReason::Deadline) => {
+                "Finite search reached its time budget; showing completed results.".to_string()
+            }
+            Some(FiniteSearchReason::NodeBudget) => {
+                "Finite search reached its node budget; showing completed results.".to_string()
+            }
+            Some(FiniteSearchReason::Cancelled) => {
+                "Finite search was cancelled before completion.".to_string()
+            }
+            Some(FiniteSearchReason::Complete) | None => String::new(),
+        }
     }
 }
 
@@ -1986,13 +2318,27 @@ fn show_suggestion_inspector(
             .size(22.0)
             .strong(),
     );
-    ui.label(format!(
-        "{} ranking · solve probability {:.4} · entropy {:.4} bits · expected remaining {:.2}",
-        suggestion_method(suggestion),
-        suggestion.solve_probability,
-        suggestion.entropy,
-        suggestion.expected_remaining
-    ));
+    if let Some(value) = &suggestion.finite_value {
+        ui.label(format!(
+            "{} · failure risk {} · expected remaining attempts {}",
+            finite_quality_label(value.quality),
+            format_finite_failure_risk(value),
+            format_finite_expected_attempts(value),
+        ));
+        if value.quality == FiniteSearchQuality::UpperBound {
+            ui.label(
+                "Completed rollout: the combined lexicographic objective is bounded, while these two displayed scalars are rollout values rather than individual bounds.",
+            );
+        }
+    } else {
+        ui.label(format!(
+            "{} ranking · solve probability {:.4} · entropy {:.4} bits · expected remaining {:.2}",
+            suggestion_method(suggestion),
+            suggestion.solve_probability,
+            suggestion.entropy,
+            suggestion.expected_remaining
+        ));
+    }
     ui.label(format!(
         "Worst non-green bucket {} answers ({:.1}% posterior mass); {} large buckets; {} dangerous-mass buckets.",
         suggestion.worst_non_green_bucket_size,
@@ -2008,7 +2354,11 @@ fn show_suggestion_inspector(
     }
     ui.label(format!(
         "Artifact source: {}. Recovery: {}.",
-        predictive_banner_text(artifact_state),
+        if suggestion.finite_value.is_some() {
+            "bounded finite search (predictive books not used)"
+        } else {
+            predictive_banner_text(artifact_state)
+        },
         recovery_mode.map_or("not active", RecoveryMode::label)
     ));
 }
@@ -2123,20 +2473,27 @@ fn show_game_board(
                     Color32::from_rgb(225, 218, 208)
                 };
                 let marker = if applied { feedback_marker(value) } else { " " };
-                ui.add_sized(
-                    [48.0, 48.0],
-                    egui::Button::new(
-                        RichText::new(format!("{letter}\n{marker}"))
-                            .size(15.0)
-                            .strong()
-                            .color(if applied {
-                                Color32::WHITE
-                            } else {
-                                Color32::from_rgb(42, 49, 43)
-                            }),
-                    )
-                    .fill(color),
-                );
+                egui::Frame::default()
+                    .fill(color)
+                    .corner_radius(3.0)
+                    .show(ui, |ui| {
+                        ui.set_width(48.0);
+                        ui.set_min_height(48.0);
+                        if applied || letter != " " {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    RichText::new(format!("{letter}\n{marker}"))
+                                        .size(15.0)
+                                        .strong()
+                                        .color(if applied {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::from_rgb(42, 49, 43)
+                                        }),
+                                );
+                            });
+                        }
+                    });
             }
         });
         ui.add_space(4.0);
@@ -2239,17 +2596,84 @@ fn formal_unavailable_text() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+        mpsc,
+    };
 
-    use crate::predictive::PredictiveArtifactState;
+    use chrono::NaiveDate;
+
+    use crate::predictive::{
+        PredictiveArtifactState, PredictiveSuggestRequest, PredictiveSuggestionMode,
+    };
 
     use super::{
-        BoardAction, BoardDraft, GuiSolverMode, GuiSurfaceState, LatestWorkerDispatcher,
-        LatestWorkerQueue, WorkerRequest, feedback_accessible_label, feedback_marker,
-        formal_unavailable_text, gui_surface_state, is_compact_layout, predictive_banner_text,
-        predictive_compute_status, predictive_reply_book_text, reduce_board_draft,
+        BoardAction, BoardDraft, FiniteSearchCandidate, FiniteSearchQuality, FiniteSearchReason,
+        FiniteSearchResult, GuiSearchProfile, GuiSolverMode, GuiSurfaceState,
+        LatestWorkerDispatcher, LatestWorkerQueue, Solver, Suggestion, WorkerPayload,
+        WorkerRequest, feedback_accessible_label, feedback_marker, finite_quality_label,
+        formal_unavailable_text, format_finite_expected_attempts, format_finite_failure_risk,
+        gui_surface_state, is_compact_layout, predictive_banner_text, predictive_compute_status,
+        predictive_finite_banner_text, predictive_registry_summary, predictive_reply_book_text,
+        predictive_response_status, reduce_board_draft, spawn_worker, worker_request_cancelled,
         worker_response_is_current,
     };
+
+    fn worker_fixture_solver() -> (Solver, std::path::PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "maybe-wordle-gui-worker-test-{}-{unique}",
+            std::process::id()
+        ));
+        let paths = crate::data::ProjectPaths::new(&root);
+        paths.ensure_layout().expect("fixture layout");
+        let words = [
+            "cigar", "rebut", "sissy", "humph", "awake", "blush", "focal", "evade", "naval",
+            "serve", "heath", "dwarf", "model", "karma", "stink", "grade", "quiet", "bench",
+            "abate", "feign", "major", "death", "fresh", "crust", "stool", "colon", "abase",
+            "marry", "react", "batty", "pride", "floss",
+        ];
+        let word_list = format!("{}\n", words.join("\n"));
+        std::fs::write(&paths.seed_guesses, &word_list).expect("fixture guesses");
+        std::fs::write(&paths.seed_answers, &word_list).expect("fixture answers");
+        std::fs::write(&paths.manual_additions, "").expect("fixture manual additions");
+        let solver = Solver::from_paths(&paths, &crate::config::PriorConfig::default())
+            .expect("fixture solver");
+        (solver, root)
+    }
+
+    fn predictive_worker_request(generation: u64, profile: GuiSearchProfile) -> WorkerRequest {
+        WorkerRequest {
+            generation,
+            mode: GuiSolverMode::Predictive,
+            date_text: "2026-07-26".to_string(),
+            observations: vec![("cigar".to_string(), 0)],
+            top: 3,
+            force_in_two_only: false,
+            hard_mode: false,
+            search_profile: profile,
+        }
+    }
+
+    #[test]
+    fn configured_staged_gui_keeps_experimental_finite_search_opt_in() {
+        let (solver, root) = worker_fixture_solver();
+        assert!(
+            GuiSearchProfile::Configured
+                .finite_options(&solver)
+                .is_none()
+        );
+        assert!(
+            GuiSearchProfile::FiniteFast
+                .finite_options(&solver)
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn board_reducer_normalizes_input_cycles_feedback_and_resets() {
@@ -2290,6 +2714,7 @@ mod tests {
             top: 10,
             force_in_two_only: false,
             hard_mode: false,
+            search_profile: GuiSearchProfile::Configured,
         };
         dispatcher.send(request(4)).expect("first request");
         dispatcher.send(request(5)).expect("replacement request");
@@ -2299,6 +2724,148 @@ mod tests {
             Some(5)
         );
         assert_eq!(queue.latest_generation, 5);
+    }
+
+    #[test]
+    fn spawned_worker_hands_off_to_superseding_predictive_request() {
+        let (solver, root) = worker_fixture_solver();
+        let (dispatcher, receiver) = spawn_worker(solver, None);
+        dispatcher
+            .send(predictive_worker_request(1, GuiSearchProfile::FiniteStrong))
+            .expect("first predictive request");
+        dispatcher
+            .send(predictive_worker_request(2, GuiSearchProfile::FiniteFast))
+            .expect("superseding predictive request");
+
+        let current = loop {
+            let response = receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("superseding predictive request did not complete");
+            if response.generation == 2 && response.complete {
+                break response;
+            }
+        };
+        assert_eq!(current.generation, 2);
+        match current.payload.expect("current predictive payload") {
+            WorkerPayload::Predictive { finite_search, .. } => {
+                assert!(
+                    finite_search.is_some(),
+                    "finite request lost its bounded result"
+                );
+            }
+            payload => panic!("unexpected payload after predictive handoff: {payload:?}"),
+        }
+
+        drop(dispatcher);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn spawned_worker_cancels_in_flight_obsolete_request_before_next_request() {
+        let (solver, root) = worker_fixture_solver();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let release_receiver = Arc::new(Mutex::new(release_receiver));
+        let first_poll = Arc::new(AtomicBool::new(false));
+        let hook_poll = Arc::clone(&first_poll);
+        let hook_release = Arc::clone(&release_receiver);
+        let hook = Arc::new(move |generation| {
+            if generation == 1 && !hook_poll.swap(true, AtomicOrdering::SeqCst) {
+                started_sender
+                    .send(generation)
+                    .expect("worker start receiver");
+                hook_release
+                    .lock()
+                    .expect("release receiver")
+                    .recv()
+                    .expect("release first request");
+            }
+        });
+        let (dispatcher, receiver) = spawn_worker(solver, None);
+        {
+            let (lock, _) = &*dispatcher.shared;
+            let mut queue = lock.lock().expect("queue");
+            queue.test_cancel_hook = Some(hook);
+        }
+
+        let mut first_request = predictive_worker_request(1, GuiSearchProfile::FiniteStrong);
+        first_request.observations.clear();
+        dispatcher
+            .send(first_request)
+            .expect("first predictive request");
+        assert_eq!(
+            started_receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("first request did not start before supersession"),
+            1
+        );
+
+        dispatcher
+            .send(predictive_worker_request(2, GuiSearchProfile::FiniteFast))
+            .expect("superseding predictive request");
+        release_sender.send(()).expect("release first request");
+
+        let mut cancelled_obsolete_response = false;
+        let current = loop {
+            let response = receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("superseding predictive request did not complete");
+            if response.generation == 1 {
+                let WorkerPayload::Predictive { finite_search, .. } =
+                    response.payload.expect("obsolete predictive payload")
+                else {
+                    panic!("unexpected obsolete worker payload");
+                };
+                assert_eq!(
+                    finite_search.expect("obsolete finite metadata").reason,
+                    FiniteSearchReason::Cancelled
+                );
+                cancelled_obsolete_response = true;
+            } else if response.generation == 2 && response.complete {
+                break response;
+            }
+        };
+        assert!(cancelled_obsolete_response);
+        assert_eq!(current.generation, 2);
+        assert!(current.payload.is_ok());
+
+        drop(dispatcher);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancellable_configured_search_stops_after_ranking_begins() {
+        let (mut solver, root) = worker_fixture_solver();
+        solver.config.search_policy_mode = crate::config::SearchPolicyMode::Staged;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let cancellation_polls = Arc::clone(&polls);
+        let cancelled = move || {
+            let poll = cancellation_polls.fetch_add(1, AtomicOrdering::SeqCst);
+            // The first four polls are the API/state/search-entry checks. One
+            // ranking worker is allowed to start before cancellation becomes
+            // true, so this exercises cancellation from the ranking stage.
+            poll >= 5
+        };
+        let observations = [("cigar".to_string(), 0)];
+        let request = PredictiveSuggestRequest {
+            puzzle_date: NaiveDate::from_ymd_opt(2026, 7, 26).expect("fixture date"),
+            observations: &observations,
+            top: 3,
+            hard_mode: false,
+            force_in_two_only: false,
+            mode: PredictiveSuggestionMode::FastDiskOnly,
+        };
+
+        let error = solver
+            .suggest_predictive_cancellable(request, &cancelled)
+            .expect_err("configured legacy search should observe cancellation");
+        assert!(error.to_string().contains("predictive search cancelled"));
+        assert!(
+            polls.load(AtomicOrdering::SeqCst) >= 6,
+            "cancellation must be observed by the ranking stage"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2348,6 +2915,23 @@ mod tests {
         assert!(worker_response_is_current(7, 7));
         assert!(!worker_response_is_current(7, 6));
         assert!(!worker_response_is_current(7, 8));
+    }
+
+    #[test]
+    fn worker_cancellation_tracks_newer_generation_and_shutdown() {
+        let shared = Arc::new((Mutex::new(LatestWorkerQueue::default()), Condvar::new()));
+        assert!(!worker_request_cancelled(&shared, 4));
+        {
+            let mut queue = shared.0.lock().expect("queue");
+            queue.latest_generation = 5;
+        }
+        assert!(worker_request_cancelled(&shared, 4));
+        assert!(!worker_request_cancelled(&shared, 5));
+        {
+            let mut queue = shared.0.lock().expect("queue");
+            queue.shutdown = true;
+        }
+        assert!(worker_request_cancelled(&shared, 5));
     }
 
     #[test]
@@ -2401,10 +2985,471 @@ mod tests {
     }
 
     #[test]
+    fn finite_display_keeps_unevaluated_fallbacks_truthful() {
+        let heuristic = FiniteSearchCandidate {
+            guess_index: 0,
+            failure_probability: 0.25,
+            expected_attempts: 2.5,
+            quality: FiniteSearchQuality::Heuristic,
+        };
+        assert_eq!(finite_quality_label(heuristic.quality), "pending heuristic");
+        assert_eq!(format_finite_failure_risk(&heuristic), "pending");
+        assert_eq!(format_finite_expected_attempts(&heuristic), "unevaluated");
+
+        let exact = FiniteSearchCandidate {
+            quality: FiniteSearchQuality::Exact,
+            ..heuristic
+        };
+        assert_eq!(
+            finite_quality_label(exact.quality),
+            "model-exact action value"
+        );
+        assert_eq!(format_finite_failure_risk(&exact), "25.000%");
+        assert_eq!(format_finite_expected_attempts(&exact), "2.500");
+    }
+
+    #[test]
+    fn finite_profile_and_completion_status_expose_boundaries() {
+        assert!(predictive_response_status(false, None).contains("configured ranking"));
+        assert!(!predictive_response_status(false, None).contains("exact ranking"));
+        assert_eq!(
+            GuiSearchProfile::FiniteFast.label(),
+            "Finite fast (experimental)"
+        );
+        assert_eq!(
+            GuiSearchProfile::FiniteStrong.label(),
+            "Finite strong (experimental)"
+        );
+        assert_eq!(
+            predictive_finite_banner_text(GuiSearchProfile::FiniteFast),
+            "Using finite fast search (experimental)"
+        );
+        let search = FiniteSearchResult {
+            candidates: Vec::new(),
+            reason: FiniteSearchReason::Deadline,
+            nodes_visited: 3,
+            work_units: 4,
+            cache_hits: 1,
+            proposal_sampled: false,
+        };
+        assert!(predictive_response_status(true, Some(&search)).contains("time budget"));
+    }
+
+    #[test]
+    fn predictive_registry_summary_uses_the_current_registry() {
+        assert_eq!(
+            predictive_registry_summary(&crate::config::PriorConfig::default()),
+            "v7 · 84 leaves · 78 tunable"
+        );
+    }
+
+    #[test]
+    fn legacy_hard_mode_payload_labels_relaxed_continuations() {
+        let (solver, root) = worker_fixture_solver();
+        let mut request = predictive_worker_request(1, GuiSearchProfile::FiniteFast);
+        request.hard_mode = true;
+        let bounded = super::compute_worker_payload(&solver, None, &request, true, &|| false)
+            .expect("experimental bounded hard-mode preview");
+        let super::WorkerPayload::Predictive {
+            model_metadata,
+            finite_search,
+            ..
+        } = bounded
+        else {
+            panic!("expected predictive payload");
+        };
+        assert!(finite_search.is_some());
+        assert!(!model_metadata.contains("normal-mode future replies"));
+
+        request.search_profile = GuiSearchProfile::Configured;
+        let payload = super::compute_worker_payload(&solver, None, &request, true, &|| false)
+            .expect("legacy hard-mode preview");
+        let super::WorkerPayload::Predictive { model_metadata, .. } = payload else {
+            panic!("expected predictive payload");
+        };
+        assert!(model_metadata.contains("normal-mode future replies"));
+        drop(solver);
+        std::fs::remove_dir_all(root).expect("remove owned fixture");
+    }
+
+    #[test]
     fn formal_unavailable_text_is_actionable() {
         assert_eq!(
             formal_unavailable_text(),
             "Formal artifacts missing; run build-optimal-policy first."
+        );
+    }
+
+    #[test]
+    fn decorative_game_board_tiles_are_not_accessibility_buttons() {
+        let context = eframe::egui::Context::default();
+        context.enable_accesskit();
+        let output = context.run(eframe::egui::RawInput::default(), |context| {
+            eframe::egui::CentralPanel::default().show(context, |ui| {
+                super::show_game_board(ui, &[("olate".to_string(), 0)], "crane", [0; 5]);
+            });
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree");
+        assert!(
+            update
+                .nodes
+                .iter()
+                .all(|(_, node)| node.role() != eframe::egui::accesskit::Role::Button),
+            "display-only board tiles must not appear as actionable buttons"
+        );
+        assert!(
+            update
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == eframe::egui::accesskit::Role::Label)
+                .count()
+                >= 10,
+            "filled and draft board tiles should remain readable labels"
+        );
+    }
+
+    #[test]
+    fn first_guess_board_tiles_stay_inside_their_column() {
+        let context = eframe::egui::Context::default();
+        for width in [861.0, 1180.0] {
+            for applied in [false, true] {
+                let mut suggestions_left = None;
+                let output = context.run(
+                    eframe::egui::RawInput {
+                        screen_rect: Some(eframe::egui::Rect::from_min_size(
+                            eframe::egui::Pos2::ZERO,
+                            eframe::egui::vec2(width, 820.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        eframe::egui::CentralPanel::default().show(context, |ui| {
+                            ui.columns(2, |columns| {
+                                columns[0].group(|ui| {
+                                    let observations = if applied {
+                                        vec![("olate".to_string(), 0)]
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let draft = if applied { "" } else { "olate" };
+                                    super::show_game_board(ui, &observations, draft, [0; 5]);
+                                });
+                                let response = columns[1].group(|ui| {
+                                    ui.heading("Wordle Suggestions");
+                                });
+                                suggestions_left = Some(response.response.rect.left());
+                            });
+                        });
+                    },
+                );
+                let tile_color = if applied {
+                    super::tile_label_and_color(0).1
+                } else {
+                    eframe::egui::Color32::from_rgb(225, 218, 208)
+                };
+                let tile_rects = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        eframe::egui::Shape::Rect(rect) if rect.fill == tile_color => {
+                            Some(rect.rect)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let suggestions_left = suggestions_left.expect("suggestions column should render");
+                assert!(
+                    tile_rects.len() >= 5,
+                    "first-guess tiles should be painted: applied={applied}"
+                );
+                assert!(
+                    tile_rects.iter().all(|rect| rect.width() <= 60.0),
+                    "first-guess tiles must stay compact at width {width}, applied={applied}: {tile_rects:?}"
+                );
+                assert!(
+                    tile_rects
+                        .iter()
+                        .all(|rect| rect.right() <= suggestions_left),
+                    "first-guess tiles must end before suggestions at width {width}, applied={applied}: {tile_rects:?}; suggestions start at {suggestions_left}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_play_layout_bounds_first_guess_and_recommendations_near_compact_threshold() {
+        for (width, applied) in [
+            (1180.0, false),
+            (1210.0, false),
+            (1240.0, true),
+            (1260.0, true),
+        ] {
+            let (solver, root) = worker_fixture_solver();
+            let (request_sender, response_receiver) = spawn_worker(solver.clone(), None);
+            let mut app = super::WordleGuiApp {
+                config: crate::config::PriorConfig::default(),
+                predictive_solver: solver,
+                formal_solver: None,
+                workspace_view: super::WorkspaceView::Play,
+                mode: GuiSolverMode::Predictive,
+                search_profile: GuiSearchProfile::Configured,
+                text_scale: 1.35,
+                date_text: "2026-07-26".to_string(),
+                current_guess: "crane".to_string(),
+                feedback_code: "01210".to_string(),
+                current_feedback: [0, 1, 2, 1, 0],
+                observations: if applied {
+                    vec![("wawww".to_string(), 48)]
+                } else {
+                    Vec::new()
+                },
+                predictive_suggestions: vec![Suggestion {
+                    finite_value: None,
+                    word: "humph".to_string(),
+                    entropy: 1.0,
+                    solve_probability: 0.2,
+                    expected_remaining: 2.0,
+                    force_in_two: false,
+                    known_absent_letter_hits: 0,
+                    worst_non_green_bucket_size: 4,
+                    largest_non_green_bucket_mass: 0.4,
+                    large_non_green_bucket_count: 1,
+                    dangerous_mass_bucket_count: 1,
+                    non_green_mass_in_large_buckets: 0.4,
+                    proxy_cost: Some(1.0),
+                    large_state_score: Some(0.5),
+                    posterior_answer_probability: 0.2,
+                    lookahead_cost: Some(1.2),
+                    exact_cost: Some(1.3),
+                }],
+                predictive_candidates: Vec::new(),
+                candidate_filter: String::new(),
+                absurdle_suggestions: Vec::new(),
+                formal_suggestions: Vec::new(),
+                surviving_count: 1,
+                total_weight: 1.0,
+                predictive_recovery_mode: None,
+                predictive_artifact_state: PredictiveArtifactState::NoPredictiveArtifactAvailable,
+                predictive_model_metadata: String::new(),
+                predictive_finite_search: None,
+                top: 10,
+                force_in_two_only: false,
+                hard_mode: false,
+                status: String::new(),
+                formal_explanation: None,
+                suggestion_sort: super::SuggestionSort::Rank,
+                suggestion_sort_descending: false,
+                selected_suggestion: None,
+                request_sender,
+                response_receiver,
+                latest_generation: 0,
+                computing: false,
+            };
+            let screen_rect = eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(width, 1400.0),
+            );
+            let context = eframe::egui::Context::default();
+            let mut frame = eframe::Frame::_new_kittest();
+            let output = context.run(
+                eframe::egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    ..Default::default()
+                },
+                |context| eframe::App::update(&mut app, context, &mut frame),
+            );
+
+            let text_rect = |needle: &str| {
+                output.shapes.iter().find_map(|shape| match &shape.shape {
+                    eframe::egui::Shape::Text(text)
+                        if text.galley.text().replace('\n', " ").contains(needle) =>
+                    {
+                        Some(text.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+            };
+            let board_heading = text_rect("Game Board")
+                .or_else(|| text_rect("BOARD / HISTORY"))
+                .expect("production board heading should render");
+            let recommendations_heading = text_rect("Wordle Suggestions")
+                .or_else(|| text_rect("NEXT ACTION"))
+                .expect("production recommendations heading should render");
+            let recommendations_group = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    eframe::egui::Shape::Rect(rect)
+                        if rect.fill == eframe::egui::Color32::TRANSPARENT
+                            && rect.stroke.width > 0.0
+                            && rect.rect.contains(recommendations_heading.center()) =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .expect("production recommendations group should render");
+
+            let board_fills = [
+                eframe::egui::Color32::from_rgb(225, 218, 208),
+                super::tile_label_and_color(0).1,
+                super::tile_label_and_color(1).1,
+                super::tile_label_and_color(2).1,
+            ];
+            let board_tiles = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    eframe::egui::Shape::Rect(rect)
+                        if board_fills.contains(&rect.fill)
+                            && rect.rect.top() >= board_heading.bottom() =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                board_tiles.len() >= 30,
+                "the six-row board should render at width {width}, applied={applied}: {board_tiles:?}"
+            );
+            if text_rect("Wordle Suggestions").is_some() {
+                assert!(
+                    board_tiles
+                        .iter()
+                        .all(|rect| rect.right() <= recommendations_heading.left()),
+                    "board tiles must stay left of recommendations at width {width}, applied={applied}: {board_tiles:?}; recommendations start at {}",
+                    recommendations_heading.left()
+                );
+            } else {
+                assert!(
+                    board_tiles
+                        .iter()
+                        .all(|rect| rect.bottom() <= recommendations_heading.top()),
+                    "stacked board must end before recommendations at width {width}, applied={applied}: {board_tiles:?}; recommendations start at {}",
+                    recommendations_heading.top()
+                );
+            }
+
+            let recommendation_text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    eframe::egui::Shape::Text(text) => Some(text.visual_bounding_rect()),
+                    _ => None,
+                })
+                .filter(|rect| {
+                    rect.min.x.is_finite()
+                        && rect.min.y.is_finite()
+                        && rect.max.x.is_finite()
+                        && rect.max.y.is_finite()
+                        && rect.top() >= recommendations_heading.top()
+                        && rect.top() <= recommendations_group.bottom()
+                        && rect.left() >= recommendations_heading.left() - 2.0
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !recommendation_text.is_empty(),
+                "recommendation content should render at width {width}"
+            );
+            assert!(
+                text_rect("HUMPH").is_some(),
+                "the seeded recommendation should render at width {width}"
+            );
+            assert!(
+                recommendation_text
+                    .iter()
+                    .all(|rect| recommendations_group.contains_rect(*rect)),
+                "recommendation content must stay within its group at width {width}: group {recommendations_group:?}, text {recommendation_text:?}"
+            );
+
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn guess_feedback_controls_stay_inside_minimum_window() {
+        let (solver, root) = worker_fixture_solver();
+        let (request_sender, response_receiver) = spawn_worker(solver.clone(), None);
+        let mut app = super::WordleGuiApp {
+            config: crate::config::PriorConfig::default(),
+            predictive_solver: solver,
+            formal_solver: None,
+            workspace_view: super::WorkspaceView::Play,
+            mode: GuiSolverMode::Predictive,
+            search_profile: GuiSearchProfile::Configured,
+            text_scale: 1.0,
+            date_text: "2026-07-26".to_string(),
+            current_guess: "olate".to_string(),
+            feedback_code: "00000".to_string(),
+            current_feedback: [0; 5],
+            observations: Vec::new(),
+            predictive_suggestions: Vec::new(),
+            predictive_candidates: Vec::new(),
+            candidate_filter: String::new(),
+            absurdle_suggestions: Vec::new(),
+            formal_suggestions: Vec::new(),
+            surviving_count: 0,
+            total_weight: 0.0,
+            predictive_recovery_mode: None,
+            predictive_artifact_state: PredictiveArtifactState::NoPredictiveArtifactAvailable,
+            predictive_model_metadata: String::new(),
+            predictive_finite_search: None,
+            top: 10,
+            force_in_two_only: false,
+            hard_mode: false,
+            status: String::new(),
+            formal_explanation: None,
+            suggestion_sort: super::SuggestionSort::Rank,
+            suggestion_sort_descending: false,
+            selected_suggestion: None,
+            request_sender,
+            response_receiver,
+            latest_generation: 0,
+            computing: false,
+        };
+        let screen_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::Pos2::ZERO,
+            eframe::egui::vec2(560.0, 620.0),
+        );
+        let context = eframe::egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = context.run(
+            eframe::egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |context| eframe::App::update(&mut app, context, &mut frame),
+        );
+        let feedback_tiles = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                eframe::egui::Shape::Rect(rect)
+                    if rect.fill == super::tile_label_and_color(0).1 =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+
+        assert_eq!(
+            feedback_tiles.len(),
+            5,
+            "all feedback buttons should render"
+        );
+        assert!(
+            feedback_tiles
+                .iter()
+                .all(|rect| screen_rect.contains_rect(*rect)),
+            "feedback buttons should not extend beyond the minimum window: {feedback_tiles:?}"
         );
     }
 }

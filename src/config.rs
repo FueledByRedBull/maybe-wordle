@@ -13,17 +13,52 @@ use crate::{
 pub enum SearchPolicyMode {
     #[default]
     Staged,
+    /// Diagnostic staged ranking on the finite modes' frozen core/tail belief.
+    StagedFixedBelief,
     ProxyWithExactEndgame,
     ProxyOnly,
+    FiniteFast,
+    FiniteFastDynamic,
+    FiniteFastFixedWork,
+    FiniteStrong,
+    FiniteBaseline,
 }
 
 impl SearchPolicyMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Staged => "staged",
+            Self::StagedFixedBelief => "staged_fixed_belief",
             Self::ProxyWithExactEndgame => "proxy_with_exact_endgame",
             Self::ProxyOnly => "proxy_only",
+            Self::FiniteFast => "finite_fast",
+            Self::FiniteFastDynamic => "finite_fast_dynamic",
+            Self::FiniteFastFixedWork => "finite_fast_fixed_work",
+            Self::FiniteStrong => "finite_strong",
+            Self::FiniteBaseline => "finite_baseline",
         }
+    }
+
+    pub fn is_finite(self) -> bool {
+        matches!(
+            self,
+            Self::FiniteFast
+                | Self::FiniteFastDynamic
+                | Self::FiniteFastFixedWork
+                | Self::FiniteStrong
+                | Self::FiniteBaseline
+        )
+    }
+
+    pub fn uses_fixed_belief(self) -> bool {
+        matches!(
+            self,
+            Self::StagedFixedBelief
+                | Self::FiniteFast
+                | Self::FiniteFastFixedWork
+                | Self::FiniteStrong
+                | Self::FiniteBaseline
+        )
     }
 }
 
@@ -47,16 +82,16 @@ pub struct ProxyWeights {
 impl Default for ProxyWeights {
     fn default() -> Self {
         Self {
-            entropy_w: 1.35,
-            bucket_mass_w: 1.40,
+            entropy_w: 0.14634824837897314,
+            bucket_mass_w: 2.1000,
             bucket_size_w: 0.12,
-            ambiguous_w: 0.30,
+            ambiguous_w: 0.7500,
             proxy_w: 1.00,
             solve_prob_w: 0.10,
             posterior_w: 0.05,
             smoothness_w: 0.45,
             gray_reuse_w: 0.08,
-            large_bucket_count_w: 0.198,
+            large_bucket_count_w: 0.1782,
             dangerous_mass_count_w: 0.22,
             large_bucket_mass_w: 0.40,
         }
@@ -88,7 +123,6 @@ pub struct PriorConfig {
     pub second_guess_coverage_min_survivors: usize,
     pub second_guess_coverage_max_survivors: usize,
     pub second_guess_coverage_pool: usize,
-    pub second_guess_coverage_child_cap: usize,
     pub lookahead_candidate_pool: usize,
     pub medium_state_lookahead_candidate_pool: usize,
     pub lookahead_reply_pool: usize,
@@ -148,10 +182,10 @@ impl Default for PriorConfig {
             base_history_only_weight: 0.50,
             cooldown_days: 365,
             cooldown_floor: 0.01,
-            midpoint_days: 1080.0,
-            logistic_k: 0.02,
-            fallback_prior_mass: 0.05,
-            fallback_activation_threshold: 1,
+            midpoint_days: 1680.0,
+            logistic_k: 0.030542173853450913,
+            fallback_prior_mass: 0.06644939273961506,
+            fallback_activation_threshold: 4,
             search_policy_mode: SearchPolicyMode::Staged,
             exact_threshold: 64,
             exact_exhaustive_threshold: 12,
@@ -166,7 +200,6 @@ impl Default for PriorConfig {
             second_guess_coverage_min_survivors: 65,
             second_guess_coverage_max_survivors: 80,
             second_guess_coverage_pool: 24,
-            second_guess_coverage_child_cap: 24,
             lookahead_candidate_pool: 24,
             medium_state_lookahead_candidate_pool: 48,
             lookahead_reply_pool: 12,
@@ -271,7 +304,157 @@ impl PriorConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::PriorConfig;
+    use std::path::Path;
+
+    use super::{PriorConfig, SearchPolicyMode};
+    use crate::predictive::RecoveryMode;
+
+    fn shipped_toml() -> toml::Value {
+        toml::from_str(include_str!("../config/prior.toml")).expect("parse shipped config")
+    }
+
+    fn effective_toml(config: &PriorConfig) -> toml::Value {
+        toml::from_str(&toml::to_string(config).expect("serialize config"))
+            .expect("parse serialized config")
+    }
+
+    #[test]
+    fn shipped_default_is_canonical_for_empty_and_new_configs() {
+        let shipped = shipped_toml();
+        assert_eq!(effective_toml(&PriorConfig::default()), shipped);
+
+        let empty: PriorConfig = toml::from_str("").expect("deserialize empty config");
+        assert_eq!(effective_toml(&empty), shipped);
+
+        let path = std::env::temp_dir().join(format!(
+            "maybe-wordle-shipped-default-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let created = PriorConfig::load_or_create(&path).expect("create default config");
+        assert_eq!(effective_toml(&created), shipped);
+        let written = std::fs::read_to_string(&path).expect("read created config");
+        let written: toml::Value = toml::from_str(&written).expect("parse created config");
+        assert_eq!(written, shipped);
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn partial_nested_deserialization_uses_canonical_defaults() {
+        let config: PriorConfig = toml::from_str(
+            r#"
+base_seed_weight = 1.0
+
+[proxy_weights]
+entropy_w = 1.0
+
+[recovery]
+mode = "strict"
+"#,
+        )
+        .expect("deserialize partial config");
+        let defaults = PriorConfig::default();
+
+        assert_eq!(config.base_seed_weight, 1.0);
+        assert_eq!(
+            config.base_history_only_weight,
+            defaults.base_history_only_weight
+        );
+        assert_eq!(config.midpoint_days, defaults.midpoint_days);
+        assert_eq!(config.fallback_prior_mass, defaults.fallback_prior_mass);
+        assert_eq!(config.proxy_weights.entropy_w, 1.0);
+        assert_eq!(
+            config.proxy_weights.bucket_mass_w,
+            defaults.proxy_weights.bucket_mass_w
+        );
+        assert_eq!(config.recovery.mode, RecoveryMode::Strict);
+        assert_eq!(
+            config.recovery.epsilon_scale,
+            defaults.recovery.epsilon_scale
+        );
+    }
+
+    #[test]
+    fn obsolete_coverage_child_cap_is_dropped_without_changing_active_settings() {
+        let current = "second_guess_coverage_pool = 17\nbase_seed_weight = 1.25\n";
+        let historical = format!("second_guess_coverage_child_cap = 24\n{current}");
+        let expected: PriorConfig = toml::from_str(current).expect("current config");
+        let migrated: PriorConfig = toml::from_str(&historical).expect("historical config");
+        assert_eq!(effective_toml(&migrated), effective_toml(&expected));
+        let serialized = toml::to_string(&migrated).expect("serialize migrated config");
+        assert!(!serialized.contains("second_guess_coverage_child_cap"));
+        let reloaded: PriorConfig = toml::from_str(&serialized).expect("reload migrated config");
+        assert_eq!(effective_toml(&reloaded), effective_toml(&expected));
+    }
+
+    #[test]
+    fn every_serialized_leaf_preserves_nondefault_values_on_roundtrip() {
+        fn perturb(value: &mut toml::Value) {
+            match value {
+                toml::Value::Table(table) => table.iter_mut().for_each(|(_, value)| perturb(value)),
+                toml::Value::Array(array) => array.iter_mut().for_each(perturb),
+                toml::Value::Integer(value) => *value += 1,
+                toml::Value::Float(value) => *value = *value * 1.03125 + 0.125,
+                toml::Value::Boolean(value) => *value = !*value,
+                toml::Value::String(value) => {
+                    *value = match value.as_str() {
+                        "staged" => "proxy_only",
+                        "uniform_over_support" => "strict",
+                        other => {
+                            panic!("add a valid alternate value for new categorical leaf: {other}")
+                        }
+                    }
+                    .to_string()
+                }
+                toml::Value::Datetime(_) => panic!("add a nondefault date fixture"),
+            }
+        }
+        // This checks serialization, independently of cross-field search bounds.
+        let mut expected = effective_toml(&PriorConfig::default());
+        perturb(&mut expected);
+        expected["manual_weights"]
+            .as_table_mut()
+            .unwrap()
+            .insert("cigar".to_string(), toml::Value::Float(0.375));
+        let config: PriorConfig = expected.clone().try_into().unwrap();
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        let decoded: PriorConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(effective_toml(&decoded), expected);
+    }
+
+    #[test]
+    fn finite_diagnostic_candidates_only_change_search_policy_mode() {
+        assert_eq!(
+            PriorConfig::default().search_policy_mode,
+            SearchPolicyMode::Staged
+        );
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let baseline =
+            PriorConfig::load(&root.join("config/candidates/september-finite-baseline.toml"))
+                .expect("load baseline candidate");
+        let fast = PriorConfig::load(&root.join("config/candidates/september-finite-fast.toml"))
+            .expect("load fast candidate");
+        assert_eq!(
+            baseline.search_policy_mode,
+            SearchPolicyMode::FiniteBaseline
+        );
+        assert_eq!(fast.search_policy_mode, SearchPolicyMode::FiniteFast);
+
+        let mut baseline_effective = effective_toml(&baseline);
+        let mut fast_effective = effective_toml(&fast);
+        baseline_effective
+            .as_table_mut()
+            .expect("baseline table")
+            .remove("search_policy_mode");
+        fast_effective
+            .as_table_mut()
+            .expect("fast table")
+            .remove("search_policy_mode");
+        assert_eq!(baseline_effective, fast_effective);
+    }
 
     #[test]
     fn prior_config_round_trips_lookahead_fields() {
@@ -287,7 +470,6 @@ mod tests {
             second_guess_coverage_min_survivors: 20,
             second_guess_coverage_max_survivors: 72,
             second_guess_coverage_pool: 56,
-            second_guess_coverage_child_cap: 28,
             proxy_small_state_lower_bound_threshold: 7,
             lookahead_candidate_pool: 18,
             medium_state_lookahead_candidate_pool: 40,
@@ -345,7 +527,6 @@ mod tests {
         assert!(encoded.contains("second_guess_coverage_min_survivors = 20"));
         assert!(encoded.contains("second_guess_coverage_max_survivors = 72"));
         assert!(encoded.contains("second_guess_coverage_pool = 56"));
-        assert!(encoded.contains("second_guess_coverage_child_cap = 28"));
         assert!(encoded.contains("proxy_small_state_lower_bound_threshold = 7"));
         assert!(encoded.contains("lookahead_candidate_pool = 18"));
         assert!(encoded.contains("medium_state_lookahead_candidate_pool = 40"));
@@ -389,7 +570,7 @@ mod tests {
         assert!(encoded.contains("trap_size_threshold = 7"));
         assert!(encoded.contains("trap_mass_threshold = 0.18"));
         assert!(encoded.contains("entropy_w = 1.1"));
-        assert!(encoded.contains("mode = \"epsilon_repair\""));
+        assert!(encoded.contains("mode = \"uniform_over_support\""));
 
         let decoded: PriorConfig = toml::from_str(&encoded).expect("decode");
         assert_eq!(decoded.exact_exhaustive_threshold, 14);
@@ -403,7 +584,6 @@ mod tests {
         assert_eq!(decoded.second_guess_coverage_min_survivors, 20);
         assert_eq!(decoded.second_guess_coverage_max_survivors, 72);
         assert_eq!(decoded.second_guess_coverage_pool, 56);
-        assert_eq!(decoded.second_guess_coverage_child_cap, 28);
         assert_eq!(decoded.proxy_small_state_lower_bound_threshold, 7);
         assert_eq!(decoded.lookahead_candidate_pool, 18);
         assert_eq!(decoded.medium_state_lookahead_candidate_pool, 40);
@@ -450,7 +630,7 @@ mod tests {
         assert_eq!(decoded.sync_retry_attempts, 3);
         assert_eq!(decoded.sync_retry_backoff_millis, 500);
         assert_eq!(decoded.proxy_weights.entropy_w, 1.1);
-        assert_eq!(decoded.recovery.mode.label(), "epsilon_repair");
+        assert_eq!(decoded.recovery.mode.label(), "uniform_over_support");
     }
 
     #[test]

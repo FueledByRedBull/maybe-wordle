@@ -1,0 +1,29 @@
+{
+  "format_version": 1,
+  "name": "development-finite-tail-mass-fixed-work-ablation",
+  "profiles": [
+    {
+      "id": "finite_selected_tail_fixed",
+      "description": "Finite fixed-work with selected fallback tail mass",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "finite_fast_fixed_work" }
+      }
+    },
+    {
+      "id": "finite_near_core_fixed",
+      "description": "Finite fixed-work with 0.0001 tail mass",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "finite_fast_fixed_work" },
+        "fallback_prior_mass": { "type": "float", "value": 0.0001 }
+      }
+    }
+  ]
+}

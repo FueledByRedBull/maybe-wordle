@@ -842,7 +842,7 @@ impl ReplayIdentityInput {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value.as_bytes());
         }
-        Ok(hex_digest(&hasher.finalize()))
+        Ok(crate::identity::hex(&hasher.finalize()))
     }
 }
 
@@ -1091,7 +1091,7 @@ impl ExhaustiveCostDatasetArtifact {
         hasher.update(b"maybe-wordle-exhaustive-cost-artifact-v1");
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
-        Ok(hex_digest(&hasher.finalize()))
+        Ok(crate::identity::hex(&hasher.finalize()))
     }
 
     pub fn rows_for_split(&self, split: DatasetSplit) -> impl Iterator<Item = &ExhaustiveCostRow> {
@@ -1198,14 +1198,6 @@ pub fn build_exhaustive_cost_dataset(
     };
     artifact.validate()?;
     Ok(artifact)
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
 }
 
 #[cfg(test)]

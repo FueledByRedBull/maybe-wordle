@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -733,7 +733,7 @@ pub fn evaluate_proxy_ranking(
     let mut total_regret = 0.0;
     let mut maximum_regret: f64 = 0.0;
     let mut absolute_error = 0.0;
-    for (state_id, mut group) in groups {
+    for mut group in groups.into_values() {
         group.sort_by(|left, right| left.guess.cmp(&right.guess));
         let predictions = group
             .iter()
@@ -781,9 +781,6 @@ pub fn evaluate_proxy_ranking(
                     _ => discordant_pairs += 1,
                 }
             }
-        }
-        if group.is_empty() {
-            bail!("state {} unexpectedly has no rows", state_id);
         }
     }
     let states = rows
@@ -835,7 +832,7 @@ pub fn feature_schema_digest(feature_names: &[String]) -> String {
         hasher.update(name.as_bytes());
     }
     let digest = hasher.finalize();
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::identity::hex(&digest)
 }
 
 #[cfg(test)]

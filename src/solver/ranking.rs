@@ -1,12 +1,12 @@
 use super::*;
 
 impl Solver {
-    pub(super) fn score_guess_metrics_for_subset(
+    pub(super) fn score_guess_metrics_for_subset_controlled(
         &self,
         subset: &[usize],
         weights: &[f64],
-        _small_state_table: &SmallStateTable,
-    ) -> Vec<GuessMetrics> {
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<GuessMetrics>> {
         let total_weight = subset.iter().map(|index| weights[*index]).sum::<f64>();
         let mut posterior_answer_probability = vec![0.0; self.guesses.len()];
         if total_weight > 0.0 {
@@ -21,7 +21,10 @@ impl Solver {
         (0..self.guesses.len())
             .into_par_iter()
             .map_init(GuessMetricScratch::new, |scratch, guess_index| {
-                self.score_guess_metrics(
+                if cancelled() {
+                    return Err(anyhow!("predictive search cancelled"));
+                }
+                Ok(self.score_guess_metrics(
                     guess_index,
                     scratch,
                     GuessMetricContext {
@@ -30,9 +33,18 @@ impl Solver {
                         total_weight,
                         posterior_answer_probability: posterior_answer_probability[guess_index],
                     },
-                )
+                ))
             })
             .collect()
+    }
+
+    pub(super) fn score_guess_metrics_for_subset(
+        &self,
+        subset: &[usize],
+        weights: &[f64],
+    ) -> Vec<GuessMetrics> {
+        self.score_guess_metrics_for_subset_controlled(subset, weights, &|| false)
+            .expect("no-op cancellation cannot fail")
     }
 
     pub(super) fn absurdle_score_guess(
@@ -107,12 +119,23 @@ impl Solver {
             scratch.masses[pattern] += weight;
             scratch.largest_weights[pattern] = scratch.largest_weights[pattern].max(weight);
             scratch.counts[pattern] += 1;
-            if weight > 0.0 {
-                scratch.weighted_log_sums[pattern] += weight * weight.log2();
-            }
         }
 
-        let pattern_space_log = (PATTERN_SPACE as f64).log2();
+        self.score_partition_metrics(
+            guess_index,
+            scratch,
+            total_weight,
+            posterior_answer_probability,
+        )
+    }
+
+    pub(super) fn score_partition_metrics(
+        &self,
+        guess_index: usize,
+        scratch: &GuessMetricScratch,
+        total_weight: f64,
+        posterior_answer_probability: f64,
+    ) -> GuessMetrics {
         let mut sum_mass_log_mass = 0.0;
         let mut expected_remaining = 0.0;
         let mut solve_probability = 0.0;
@@ -167,20 +190,13 @@ impl Solver {
             }
             let child_proxy = if pattern == ALL_GREEN_PATTERN {
                 0.0
-            } else if scratch.counts[index] == 1 {
-                1.0
-            } else if scratch.counts[index] <= self.config.proxy_small_state_lower_bound_threshold {
-                weighted_proxy_child_floor(mass, scratch.largest_weights[index])
             } else {
-                let expected_remaining_floor =
-                    (scratch.counts[index] as f64 / PATTERN_SPACE as f64).max(1.0);
-                let entropy_bits = if mass > 0.0 {
-                    mass.log2() - (scratch.weighted_log_sums[index] / mass)
-                } else {
-                    0.0
-                };
-                let entropy_floor = (entropy_bits / pattern_space_log).max(1.0);
-                expected_remaining_floor.max(entropy_floor)
+                proxy_child_cost(
+                    scratch.counts[index],
+                    mass,
+                    scratch.largest_weights[index],
+                    self.config.proxy_small_state_lower_bound_threshold,
+                )
             };
             proxy_cost += probability * child_proxy;
         }
@@ -231,6 +247,37 @@ impl Solver {
             posterior_answer_probability,
         }
     }
+
+    pub(super) fn two_turn_success_by_guess_controlled(
+        &self,
+        state: &SolveState,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<f64>> {
+        let guessable_answers = state
+            .surviving
+            .iter()
+            .copied()
+            .filter(|answer_index| {
+                self.guess_index
+                    .contains_key(&self.answers[*answer_index].word)
+            })
+            .collect::<Vec<_>>();
+        let mut scores = vec![0.0; self.guesses.len()];
+        let mut best_by_feedback = [0.0_f64; PATTERN_SPACE];
+        for (guess_index, score) in scores.iter_mut().enumerate() {
+            if guess_index % 64 == 0 {
+                check_predictive_search_cancelled(cancelled)?;
+            }
+            best_by_feedback.fill(0.0);
+            for answer_index in &guessable_answers {
+                let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
+                best_by_feedback[pattern] =
+                    best_by_feedback[pattern].max(state.weights[*answer_index]);
+            }
+            *score = best_by_feedback.iter().sum::<f64>() / state.total_weight;
+        }
+        Ok(scores)
+    }
 }
 
 pub(super) fn weighted_proxy_child_floor(total_mass: f64, largest_mass: f64) -> f64 {
@@ -238,6 +285,25 @@ pub(super) fn weighted_proxy_child_floor(total_mass: f64, largest_mass: f64) -> 
         return 0.0;
     }
     1.0 + ((total_mass - largest_mass) / total_mass)
+}
+
+fn proxy_child_cost(
+    count: usize,
+    mass: f64,
+    largest_mass: f64,
+    small_state_threshold: usize,
+) -> f64 {
+    let weighted_floor = weighted_proxy_child_floor(mass, largest_mass);
+    if count <= small_state_threshold {
+        return weighted_floor;
+    }
+
+    // The count floor is a broad-state heuristic; the weight-aware floor keeps
+    // its transition from lowering the proxy for a larger child. The normalized
+    // entropy floor is dominated because H <= log2(count) and
+    // log2(count) / log2(PATTERN_SPACE) <= max(1, count / PATTERN_SPACE).
+    let expected_remaining_floor = (count as f64 / PATTERN_SPACE as f64).max(1.0);
+    weighted_floor.max(expected_remaining_floor)
 }
 
 pub(super) fn compare_force_in_two(left: bool, right: bool) -> std::cmp::Ordering {
@@ -274,7 +340,7 @@ pub(super) fn compare_guess_metrics_with_coverage(
 pub(super) fn compare_suggestions_with_coverage(
     left: &Suggestion,
     right: &Suggestion,
-    split_first: bool,
+    _split_first: bool,
     guess_index: &HashMap<String, usize>,
     coverage: &FxHashMap<usize, ThreeSolveCoverage>,
 ) -> std::cmp::Ordering {
@@ -288,8 +354,9 @@ pub(super) fn compare_suggestions_with_coverage(
         .and_then(|index| coverage.get(index))
         .copied()
         .unwrap_or_default();
+    // Callers append the mode-specific comparator (lookahead or exact). Keep
+    // this stage coverage-only so proxy/lexical ties cannot shadow that cost.
     compare_three_solve_coverage(left_coverage, right_coverage)
-        .then_with(|| compare_suggestions_for_state(left, right, split_first))
 }
 
 pub(super) fn has_repeated_letters(word: &str) -> bool {
@@ -694,4 +761,187 @@ pub(super) fn compare_final_turn(left: &Suggestion, right: &Suggestion) -> std::
                 .total_cmp(&left.posterior_answer_probability)
         })
         .then_with(|| left.word.cmp(&right.word))
+}
+
+pub(super) fn compare_two_turn(
+    left: &Suggestion,
+    right: &Suggestion,
+    left_success: f64,
+    right_success: f64,
+) -> std::cmp::Ordering {
+    compare_force_in_two(left.force_in_two, right.force_in_two)
+        .then_with(|| right_success.total_cmp(&left_success))
+        .then_with(|| right.solve_probability.total_cmp(&left.solve_probability))
+        .then_with(|| left.word.cmp(&right.word))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn weighted_child_floor_cannot_increase_under_partition_refinement() {
+        for buckets in [
+            vec![vec![0.8, 0.1], vec![0.05, 0.05]],
+            vec![vec![1.0], vec![1.0, 1.0]],
+        ] {
+            let total: f64 = buckets.iter().flatten().sum();
+            let largest = buckets.iter().flatten().copied().fold(0.0, f64::max);
+            let coarse = total * weighted_proxy_child_floor(total, largest);
+            let refined: f64 = buckets
+                .iter()
+                .map(|bucket| {
+                    let mass = bucket.iter().sum();
+                    let largest = bucket.iter().copied().fold(0.0, f64::max);
+                    mass * weighted_proxy_child_floor(mass, largest)
+                })
+                .sum();
+            assert!(refined <= coarse + 1e-12);
+        }
+    }
+
+    #[test]
+    fn broad_state_count_heuristic_is_not_a_refinement_monotone_bound() {
+        let coarse = proxy_child_cost(300, 1.0, 0.8, 12);
+        let refined =
+            0.9 * proxy_child_cost(298, 0.9, 0.8, 12) + 0.1 * proxy_child_cost(2, 0.1, 0.05, 12);
+        assert!(refined > coarse);
+    }
+
+    #[test]
+    fn proxy_child_cost_has_no_uniform_threshold_drop() {
+        let threshold = 12;
+        let at_threshold = proxy_child_cost(threshold, threshold as f64, 1.0, threshold);
+        let above_threshold =
+            proxy_child_cost(threshold + 1, (threshold + 1) as f64, 1.0, threshold);
+
+        assert!((at_threshold - (2.0 - 1.0 / threshold as f64)).abs() <= 1e-12);
+        assert!(above_threshold > at_threshold);
+    }
+
+    #[test]
+    fn proxy_child_cost_keeps_skewed_mass_floor_across_threshold() {
+        let threshold = 12;
+        let at_threshold = proxy_child_cost(threshold, 1.0, 0.99, threshold);
+        let above_threshold = proxy_child_cost(threshold + 1, 1.0, 0.99, threshold);
+
+        assert!((at_threshold - 1.01).abs() <= 1e-12);
+        assert!((above_threshold - at_threshold).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn proxy_child_cost_matches_the_dominated_entropy_floor() {
+        fn old_proxy_child_cost(
+            count: usize,
+            mass: f64,
+            largest_mass: f64,
+            weighted_log_sum: f64,
+            pattern_space_log: f64,
+            small_state_threshold: usize,
+        ) -> f64 {
+            let weighted_floor = weighted_proxy_child_floor(mass, largest_mass);
+            if count <= small_state_threshold {
+                return weighted_floor;
+            }
+            let expected_remaining_floor = (count as f64 / PATTERN_SPACE as f64).max(1.0);
+            let entropy_bits = if mass > 0.0 {
+                mass.log2() - (weighted_log_sum / mass)
+            } else {
+                0.0
+            };
+            let entropy_floor = (entropy_bits / pattern_space_log).max(1.0);
+            weighted_floor.max(expected_remaining_floor.max(entropy_floor))
+        }
+
+        let pattern_space_log = (PATTERN_SPACE as f64).log2();
+        let threshold = 12;
+        for count in [1, threshold, threshold + 1, 242, 243, 244, 486] {
+            for weights in [
+                vec![1.0; count],
+                if count == 1 {
+                    vec![1.0]
+                } else {
+                    let mut weights = vec![0.2 / (count - 1) as f64; count];
+                    weights[0] = 0.8;
+                    weights
+                },
+            ] {
+                let mass = weights.iter().sum::<f64>();
+                let largest_mass = weights.iter().copied().fold(0.0, f64::max);
+                let weighted_log_sum = weights
+                    .iter()
+                    .filter(|weight| **weight > 0.0)
+                    .map(|weight| weight * weight.log2())
+                    .sum::<f64>();
+                let old = old_proxy_child_cost(
+                    count,
+                    mass,
+                    largest_mass,
+                    weighted_log_sum,
+                    pattern_space_log,
+                    threshold,
+                );
+                let new = proxy_child_cost(count, mass, largest_mass, threshold);
+                assert!(
+                    (new - old).abs() <= 1e-12,
+                    "count={count} weights={weights:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_coverage_defers_to_appended_search_cost() {
+        fn suggestion(word: &str, proxy_cost: f64, lookahead_cost: f64) -> Suggestion {
+            Suggestion {
+                finite_value: None,
+                word: word.to_string(),
+                entropy: 0.0,
+                solve_probability: 0.0,
+                expected_remaining: 0.0,
+                force_in_two: false,
+                known_absent_letter_hits: 0,
+                worst_non_green_bucket_size: 0,
+                largest_non_green_bucket_mass: 0.0,
+                large_non_green_bucket_count: 0,
+                dangerous_mass_bucket_count: 0,
+                non_green_mass_in_large_buckets: 0.0,
+                proxy_cost: Some(proxy_cost),
+                large_state_score: None,
+                posterior_answer_probability: 0.0,
+                lookahead_cost: Some(lookahead_cost),
+                exact_cost: Some(lookahead_cost),
+            }
+        }
+
+        let left = suggestion("zebra", 2.0, 1.0);
+        let right = suggestion("alpha", 1.0, 2.0);
+        let guess_index =
+            HashMap::from([(left.word.clone(), 0usize), (right.word.clone(), 1usize)]);
+        let mut coverage = FxHashMap::default();
+        let equal = ThreeSolveCoverage {
+            mass: 0.5,
+            uncovered_answers: 2,
+            uncovered_buckets: 1,
+        };
+        coverage.insert(0, equal);
+        coverage.insert(1, equal);
+
+        assert_eq!(
+            compare_suggestions_with_coverage(&left, &right, false, &guess_index, &coverage,),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_suggestions_with_coverage(&left, &right, false, &guess_index, &coverage,)
+                .then_with(|| compare_lookahead(&left, &right, false)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_suggestions_with_coverage(&left, &right, false, &guess_index, &coverage)
+                .then_with(|| compare_exact(&left, &right, false)),
+            std::cmp::Ordering::Less
+        );
+    }
 }

@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Days, NaiveDate, Utc};
+use chrono::{Days, NaiveDate};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -27,8 +27,8 @@ use crate::{
         PairedDifference, ParameterRegistry, PredictiveConfigProfile, PredictiveExperimentMatrix,
         PredictiveMetrics, PriorEvidenceMetrics, RankedProbabilityObservation, RollingOriginConfig,
         StudyMeasurement, StudyProvenance, StudySearchStrategy, StudySpec, StudyStage, StudyState,
-        StudyTrial, TrialStatus, build_rolling_origin_plan, default_diagnostic_suite,
-        generate_candidates, predictive_parameter_registry, score_multiclass_probabilities,
+        StudyTrial, TrialStatus, default_diagnostic_suite, generate_candidates,
+        predictive_parameter_registry, score_multiclass_probabilities,
         summarize_predictive_outcomes, summarize_ranked_probability_observations,
     },
     model::{
@@ -45,15 +45,21 @@ use crate::{
         ALL_GREEN_PATTERN, PATTERN_SPACE, decode_feedback, format_feedback_letters, parse_feedback,
         score_guess,
     },
-    small_state::SmallStateTable,
 };
 
 mod artifact_identity;
 mod books;
 mod eval;
+mod finite;
+mod online;
 mod ranking;
 mod search;
 mod state;
+
+pub use finite::{
+    FiniteSearchCandidate, FiniteSearchOptions, FiniteSearchQuality, FiniteSearchReason,
+    FiniteSearchResult,
+};
 
 use self::books::write_predictive_artifact;
 #[allow(unused_imports)]
@@ -61,19 +67,23 @@ use self::state::{hard_mode_violation_message as hard_mode_violation, *};
 #[allow(unused_imports)]
 use self::{eval::*, ranking::*, search::*};
 
-pub(crate) fn predictive_source_identity(paths: &ProjectPaths) -> Result<String> {
-    rolling_source_identity(paths)
+pub(crate) fn predictive_development_source_identity(
+    paths: &ProjectPaths,
+    development_cutoff: NaiveDate,
+) -> Result<String> {
+    development_source_identity(paths, development_cutoff)
 }
 
 pub(crate) fn predictive_executable_fingerprint() -> Result<String> {
     current_executable_fingerprint()
 }
 
-pub(crate) fn ensure_predictive_source_identity(
+pub(crate) fn ensure_predictive_development_source_identity(
     paths: &ProjectPaths,
+    development_cutoff: NaiveDate,
     expected: &str,
 ) -> Result<()> {
-    ensure_rolling_source_identity(paths, expected)
+    ensure_development_source_identity(paths, development_cutoff, expected)
 }
 
 const PROXY_CALIBRATION_MAX_STEPS: usize = 3;
@@ -83,6 +93,7 @@ const PROXY_CALIBRATION_MAX_GAME_SECONDS: f64 = 20.0;
 const HARD_MODE_WORD_LENGTH: usize = 5;
 #[derive(Clone, Debug)]
 pub struct Suggestion {
+    pub finite_value: Option<FiniteSearchCandidate>,
     pub word: String,
     pub entropy: f64,
     pub solve_probability: f64,
@@ -112,6 +123,7 @@ pub struct AbsurdleSuggestion {
 
 #[derive(Clone, Debug)]
 pub struct SolveState {
+    pub condition_only: bool,
     pub surviving: Vec<usize>,
     pub fallback_surviving: Vec<usize>,
     pub fallback_active: bool,
@@ -171,6 +183,26 @@ pub struct DetailedSolveStep {
     pub exact_pool_size: usize,
     pub root_candidate_count: usize,
     pub top_suggestions: Vec<SuggestionSnapshot>,
+    pub finite_search: Option<FiniteSearchStepEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FiniteSearchCandidateEvidence {
+    pub word: String,
+    pub quality: String,
+    pub modeled_failure_probability: Option<f64>,
+    pub expected_attempts_remaining: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FiniteSearchStepEvidence {
+    pub turn: u8,
+    pub reason: String,
+    pub nodes_visited: usize,
+    pub work_units: usize,
+    pub proposal_sampled: bool,
+    pub candidate_count: usize,
+    pub top_candidates: Vec<FiniteSearchCandidateEvidence>,
 }
 
 #[derive(Clone, Debug)]
@@ -239,15 +271,19 @@ pub struct ExperimentResult {
     pub average_target_probability: f64,
     pub average_target_rank: f64,
     pub prior_evidence: Option<PriorEvidenceMetrics>,
+    #[serde(default)]
+    pub posterior_calibration: Vec<PosteriorCalibrationSummary>,
     pub execution: ExecutionTelemetry,
     pub failure_penalty_sensitivity: Vec<FailurePenaltyEvidence>,
     pub latency_p95_ms: f64,
-    pub session_fallback_cold_ms: f64,
-    pub session_fallback_warm_ms: f64,
+    pub session_fallback_cold_ms: Option<f64>,
+    pub session_fallback_warm_ms: Option<f64>,
     pub proxy_step_pct: f64,
     pub lookahead_step_pct: f64,
     pub escalated_exact_step_pct: f64,
     pub exact_step_pct: f64,
+    #[serde(default)]
+    pub finite_step_pct: f64,
     pub average_lookahead_pool_ratio: f64,
     pub average_exact_pool_ratio: f64,
     pub games: Vec<ExperimentGameResult>,
@@ -260,6 +296,8 @@ pub struct ExecutionTelemetry {
     pub lookahead_steps: usize,
     pub escalated_exact_steps: usize,
     pub exact_steps: usize,
+    #[serde(default)]
+    pub finite_steps: usize,
     pub danger_escalated_steps: usize,
     pub strict_recovery_steps: usize,
     pub uniform_recovery_steps: usize,
@@ -283,6 +321,35 @@ pub struct ExperimentGameResult {
     pub target: String,
     pub outcome: GameOutcome,
     pub path: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finite_search_steps: Vec<FiniteSearchStepEvidence>,
+    #[serde(default)]
+    pub prior_strata: Option<PriorStrata>,
+    #[serde(default)]
+    pub posterior_calibration: Vec<PosteriorCalibrationObservation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PriorStrata {
+    pub never_used: bool,
+    pub reused: bool,
+    pub historical_only: bool,
+    pub out_of_core: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PosteriorCalibrationObservation {
+    pub turn: u8,
+    pub score: Option<crate::experiments::ProbabilityScore>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PosteriorCalibrationSummary {
+    pub stratum: String,
+    pub turn: u8,
+    pub total_states: usize,
+    pub scored_states: usize,
+    pub mean_score: Option<crate::experiments::ProbabilityScore>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -318,6 +385,18 @@ pub struct PredictiveEvidenceArtifact {
     pub sealed_test_evaluated: bool,
     pub evaluation_from: NaiveDate,
     pub evaluation_to: NaiveDate,
+    #[serde(default)]
+    pub evaluation_selection: String,
+    #[serde(default)]
+    pub selected_ranges: Vec<DateRange>,
+    #[serde(default)]
+    pub matrix_source: String,
+    #[serde(default)]
+    pub matrix_fingerprint: String,
+    #[serde(default)]
+    pub profile_ids: Vec<String>,
+    #[serde(default)]
+    pub reference_profile_id: String,
     pub history_snapshot_start: NaiveDate,
     pub history_snapshot_end: NaiveDate,
     pub code_revision: Option<String>,
@@ -335,7 +414,13 @@ pub struct PredictiveEvidenceArtifact {
     pub limitations: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidenceDateSelection {
+    Range(DateRange),
+    RollingFolds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceResourceBudget {
     pub maximum_seconds: u64,
     pub maximum_memory_mb: u64,
@@ -389,6 +474,7 @@ pub struct RollingConfigEvidence {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RollingComparisonArtifact {
     pub schema_version: u32,
+    pub top: usize,
     pub identity_format: String,
     pub input_fingerprint: String,
     pub evaluation_plan: EvaluationPlan,
@@ -445,12 +531,54 @@ struct SealedTestMarker {
 
 impl PredictiveEvidenceArtifact {
     pub fn validate_identity(&self) -> Result<()> {
-        if self.schema_version != 4
+        if self.schema_version != eval::BENCHMARK_EVIDENCE_SCHEMA_VERSION
             || self.identity_format != crate::identity::IDENTITY_FORMAT
             || !crate::identity::is_tagged_digest(&self.input_fingerprint)
             || !crate::identity::is_tagged_digest(&self.config_fingerprint)
+            || !crate::identity::is_tagged_digest(&self.matrix_fingerprint)
         {
             bail!("benchmark evidence uses an unsupported or mixed identity format; regenerate it");
+        }
+        if self.sealed_test_evaluated {
+            bail!("benchmark evidence must not evaluate the sealed test");
+        }
+        if !matches!(
+            self.evaluation_selection.as_str(),
+            "range" | "rolling_folds"
+        ) || self.matrix_source.trim().is_empty()
+            || self.profile_ids.is_empty()
+            || self.reference_profile_id.trim().is_empty()
+            || self.selected_ranges.is_empty()
+        {
+            bail!("benchmark evidence is missing selection or matrix provenance; regenerate it");
+        }
+        for (index, range) in self.selected_ranges.iter().enumerate() {
+            DateRange::new(range.start, range.end)?;
+            if index > 0 && self.selected_ranges[index - 1].end >= range.start {
+                bail!("benchmark evidence selected ranges must be sorted and non-overlapping");
+            }
+        }
+        let expected_from = self.selected_ranges[0].start;
+        let expected_to = self.selected_ranges.last().expect("non-empty ranges").end;
+        if self.evaluation_from != expected_from || self.evaluation_to != expected_to {
+            bail!("benchmark evidence evaluation span does not match selected ranges");
+        }
+        let baseline_ids = self
+            .baselines
+            .iter()
+            .map(|baseline| baseline.id.as_str())
+            .collect::<Vec<_>>();
+        if baseline_ids.len() != self.profile_ids.len()
+            || !baseline_ids
+                .iter()
+                .zip(&self.profile_ids)
+                .all(|(actual, expected)| *actual == expected)
+            || !self
+                .profile_ids
+                .iter()
+                .any(|profile_id| profile_id == &self.reference_profile_id)
+        {
+            bail!("benchmark evidence profile provenance does not match its baselines");
         }
         let expected = crate::identity::digest_bytes_tagged(
             "maybe-wordle-benchmark-root-config-v1",
@@ -460,16 +588,7 @@ impl PredictiveEvidenceArtifact {
             bail!("benchmark evidence config fingerprint mismatch; regenerate it");
         }
         for baseline in &self.baselines {
-            let expected = crate::identity::digest_bytes_tagged(
-                "maybe-wordle-benchmark-config-v1",
-                baseline.effective_config_toml.as_bytes(),
-            );
-            if baseline.config_fingerprint != expected {
-                bail!(
-                    "benchmark baseline {} config fingerprint mismatch; regenerate it",
-                    baseline.id
-                );
-            }
+            eval::validate_evidence_baseline(baseline)?;
         }
         Ok(())
     }
@@ -477,7 +596,7 @@ impl PredictiveEvidenceArtifact {
 
 impl RollingComparisonArtifact {
     pub fn validate_identity(&self) -> Result<()> {
-        if self.schema_version != 3
+        if self.schema_version != 4
             || self.identity_format != crate::identity::IDENTITY_FORMAT
             || !crate::identity::is_tagged_digest(&self.input_fingerprint)
         {
@@ -649,6 +768,98 @@ pub struct SearchRegretReport {
     pub states: Vec<SearchRegretState>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FiniteSearchRegretValue {
+    pub failure_probability: f64,
+    pub expected_attempts: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FiniteSearchRegretRuntimeChoice {
+    pub word: Option<String>,
+    pub value: Option<FiniteSearchRegretValue>,
+    pub quality: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FiniteSearchRegretReference {
+    pub status: String,
+    pub word: Option<String>,
+    pub value: Option<FiniteSearchRegretValue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FiniteSearchRegretState {
+    pub date: NaiveDate,
+    pub target: String,
+    pub turn: usize,
+    pub horizon: u8,
+    pub surviving_answers: usize,
+    pub hard_mode: bool,
+    pub observations: Vec<SearchRegretObservation>,
+    pub production_regime: String,
+    pub runtime: FiniteSearchRegretRuntimeChoice,
+    pub exact_fixed_root: FiniteSearchRegretReference,
+    pub global_optimum: FiniteSearchRegretReference,
+    pub failure_regret: Option<f64>,
+    pub attempts_regret: Option<f64>,
+    pub matches_optimum: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FiniteSearchRegretSummary {
+    pub states: usize,
+    pub resolved_states: usize,
+    pub unresolved_states: usize,
+    pub failure_regret_states: usize,
+    pub mean_failure_regret: Option<f64>,
+    pub maximum_failure_regret: Option<f64>,
+    pub attempts_regret_states: usize,
+    pub mean_attempts_regret: Option<f64>,
+    pub maximum_attempts_regret: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FiniteSearchRegretRequest {
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+    pub minimum_survivors: usize,
+    pub maximum_survivors: usize,
+    pub maximum_states: usize,
+    pub maximum_seconds: u64,
+    pub hard_mode: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FiniteSearchRegretReport {
+    pub schema_version: u32,
+    pub identity_format: String,
+    pub input_fingerprint: String,
+    pub config_fingerprint: String,
+    pub code_revision: Option<String>,
+    pub code_dirty: Option<bool>,
+    pub evaluation_from: NaiveDate,
+    pub evaluation_to: NaiveDate,
+    pub state_path_policy: String,
+    pub reference_kernel: String,
+    pub independent_cross_check: String,
+    pub rules: String,
+    pub search_policy_mode: String,
+    pub hard_mode: bool,
+    pub minimum_survivors: usize,
+    pub maximum_survivors: usize,
+    pub maximum_states: usize,
+    pub maximum_seconds: u64,
+    pub historical_games: usize,
+    pub scanned_games: usize,
+    pub available_states: usize,
+    pub sampled_states: usize,
+    pub generation_elapsed_ms: u64,
+    pub summary: FiniteSearchRegretSummary,
+    pub states: Vec<FiniteSearchRegretState>,
+}
+
 #[derive(Clone, Debug)]
 pub struct HardCaseResult {
     pub label: String,
@@ -678,6 +889,7 @@ pub struct TuningEvaluation {
     pub lookahead_step_pct: f64,
     pub escalated_exact_step_pct: f64,
     pub exact_step_pct: f64,
+    pub finite_step_pct: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -779,6 +991,43 @@ pub struct FourGuessOpenerReport {
 pub struct PredictiveAblationResult {
     pub label: String,
     pub result: ExperimentResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PredictivePriorAblationFold {
+    pub fold_index: usize,
+    pub validation: DateRange,
+    pub scheduled_games: usize,
+    pub measured_games: usize,
+    pub coverage_gaps: usize,
+    pub average_log_loss: f64,
+    pub average_brier: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PredictivePriorAblationProfile {
+    pub label: String,
+    pub mode: WeightMode,
+    pub variant: ModelVariant,
+    pub config_fingerprint: String,
+    pub scheduled_games: usize,
+    pub measured_games: usize,
+    pub coverage_gaps: usize,
+    pub average_log_loss: f64,
+    pub average_brier: f64,
+    pub folds: Vec<PredictivePriorAblationFold>,
+    pub promotable: bool,
+    pub promotion_blockers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PredictivePriorAblationReport {
+    pub schema_version: u32,
+    pub input_fingerprint: String,
+    pub matrix_fingerprint: String,
+    pub evaluation_plan: EvaluationPlan,
+    pub profiles: Vec<PredictivePriorAblationProfile>,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -935,7 +1184,6 @@ pub struct Solver {
     pub answers: Vec<AnswerRecord>,
     pub primary_answer_count: usize,
     pub history_dates: Vec<NytDailyEntry>,
-    exact_small_state_table: SmallStateTable,
     pattern_table: PatternTable,
     guess_index: HashMap<String, usize>,
     artifact_dir: PathBuf,
@@ -1014,7 +1262,6 @@ struct LookaheadCostContext<'a> {
 struct ExactCostContext<'a> {
     subset: &'a [usize],
     weights: &'a [f64],
-    small_state_table: &'a SmallStateTable,
     memo: &'a mut PredictiveMemoMap<ExactSubsetKey, f64>,
     best_bound: f64,
     scratch: &'a mut ExactSearchScratch,
@@ -1058,6 +1305,7 @@ impl ProxyRowStats {
 
 #[derive(Clone, Debug)]
 struct SuggestionBatch {
+    finite_search: Option<FiniteSearchResult>,
     suggestions: Vec<Suggestion>,
     promoted_word: Option<String>,
     promotion_source: Option<PredictivePromotionSource>,
@@ -1073,6 +1321,7 @@ struct SuggestionBatch {
 
 #[derive(Clone, Copy, Debug)]
 struct PredictiveContext<'a> {
+    hard_mode: bool,
     as_of: NaiveDate,
     observations: &'a [(String, u8)],
 }
@@ -1085,9 +1334,10 @@ enum PredictiveBookUsage {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SolveExecutionPolicy {
+struct SolveExecutionPolicy<'a> {
     book_usage: PredictiveBookUsage,
     search_mode: Option<PredictiveSearchMode>,
+    forced: &'a [(String, u8)],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1190,7 +1440,6 @@ struct GuessMetricScratch {
     masses: [f64; PATTERN_SPACE],
     largest_weights: [f64; PATTERN_SPACE],
     counts: [usize; PATTERN_SPACE],
-    weighted_log_sums: [f64; PATTERN_SPACE],
     touched_patterns: Vec<u8>,
 }
 
@@ -1202,7 +1451,6 @@ impl GuessMetricScratch {
             masses: [0.0; PATTERN_SPACE],
             largest_weights: [0.0; PATTERN_SPACE],
             counts: [0; PATTERN_SPACE],
-            weighted_log_sums: [0.0; PATTERN_SPACE],
             touched_patterns: Vec::with_capacity(PATTERN_SPACE),
         }
     }
@@ -1212,7 +1460,6 @@ impl GuessMetricScratch {
             self.masses[pattern as usize] = 0.0;
             self.largest_weights[pattern as usize] = 0.0;
             self.counts[pattern as usize] = 0;
-            self.weighted_log_sums[pattern as usize] = 0.0;
         }
     }
 }
@@ -1276,12 +1523,6 @@ impl Solver {
             answers: model.answers,
             primary_answer_count: model.primary_answer_count,
             history_dates: model.history,
-            exact_small_state_table: SmallStateTable::build(
-                config
-                    .exact_exhaustive_threshold
-                    .max(config.proxy_small_state_lower_bound_threshold)
-                    .max(2),
-            ),
             pattern_table,
             guess_index,
             artifact_dir: paths.derived_predictive.clone(),
@@ -1304,31 +1545,31 @@ struct PriorMetrics {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::{collections::HashMap, fs, path::PathBuf};
 
     use chrono::NaiveDate;
 
     use crate::{
-        config::PriorConfig,
-        data::NytDailyEntry,
+        config::{PriorConfig, SearchPolicyMode},
+        data::{NytDailyEntry, ProjectPaths},
+        experiments::DateRange,
         model::{AnswerRecord, ModelVariant, WeightMode},
         pattern_table::PatternTable,
         predictive::{PredictiveSuggestRequest, PredictiveSuggestionMode, RecoveryMode},
         scoring::{ALL_GREEN_PATTERN, format_feedback_letters, score_guess},
-        small_state::SmallStateTable,
     };
 
     use super::{
-        AbsurdleSuggestion, ExactSearchScratch, ExactSubsetKey, ExactSubsetStorage,
-        ExactSuggestionMode, ForcedOpenerEvaluation, GuessMetrics, PredictiveBookUsage,
-        PredictiveMemoMap, PredictiveOpenerArtifact, PredictiveReplyBookArtifact,
-        PredictiveReplyEntry, PredictiveSearchMode, PredictiveThirdReplyEntry, Solver,
-        StateDangerAssessment, Suggestion, compare_absurdle_suggestions, compare_exact_costs,
-        compare_final_turn, compare_forced_openers, compare_guess_metrics,
-        compare_guess_metrics_for_state, compare_lookahead, compare_suggestions,
-        compare_suggestions_for_state, count_masked_letters, exact_suggestion_mode,
-        hard_mode_violation, known_absent_letter_mask, predictive_search_mode,
-        should_replace_forced_opener, should_use_final_turn_objective,
+        AbsurdleSuggestion, EvidenceDateSelection, EvidenceResourceBudget, ExactSearchScratch,
+        ExactSubsetKey, ExactSubsetStorage, ExactSuggestionMode, ForcedOpenerEvaluation,
+        GuessMetrics, PredictiveBookUsage, PredictiveMemoMap, PredictiveOpenerArtifact,
+        PredictiveReplyBookArtifact, PredictiveReplyEntry, PredictiveSearchMode,
+        PredictiveThirdReplyEntry, Solver, StateDangerAssessment, Suggestion,
+        compare_absurdle_suggestions, compare_exact_costs, compare_final_turn,
+        compare_forced_openers, compare_guess_metrics, compare_guess_metrics_for_state,
+        compare_lookahead, compare_suggestions, compare_suggestions_for_state,
+        count_masked_letters, exact_suggestion_mode, hard_mode_violation, known_absent_letter_mask,
+        predictive_search_mode, should_replace_forced_opener, should_use_final_turn_objective,
         should_use_second_guess_coverage,
     };
 
@@ -1375,7 +1616,6 @@ mod tests {
             answers,
             primary_answer_count: answer_count,
             history_dates: Vec::new(),
-            exact_small_state_table: SmallStateTable::build(4),
             pattern_table,
             guess_index: guesses
                 .iter()
@@ -1387,6 +1627,147 @@ mod tests {
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    fn finite_fast_dynamic_mode() -> SearchPolicyMode {
+        serde_json::from_str(r#""finite_fast_dynamic""#)
+            .expect("deserialize finite_fast_dynamic mode")
+    }
+
+    #[test]
+    fn finite_fast_dynamic_has_dynamic_root_belief() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let mode = finite_fast_dynamic_mode();
+        assert_eq!(mode.label(), "finite_fast_dynamic");
+        assert!(mode.is_finite());
+        assert!(!mode.uses_fixed_belief());
+        solver.config.search_policy_mode = mode;
+
+        let state = solver.initial_state(NaiveDate::from_ymd_opt(2026, 1, 1).expect("date"));
+
+        assert!(!state.condition_only);
+    }
+
+    #[test]
+    fn finite_fast_dynamic_suggestions_report_dynamic_finite_results() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        solver.config.search_policy_mode = finite_fast_dynamic_mode();
+        let observations = Vec::new();
+        let request = PredictiveSuggestRequest {
+            puzzle_date: NaiveDate::from_ymd_opt(2026, 1, 1).expect("date"),
+            observations: &observations,
+            top: 2,
+            hard_mode: false,
+            force_in_two_only: false,
+            mode: PredictiveSuggestionMode::LiveOnly,
+        };
+
+        let response = solver.suggest_predictive(request).expect("suggestions");
+
+        assert_eq!(response.model_version, "predictive-finite-dynamic-v1");
+        assert!(
+            response
+                .suggestions
+                .first()
+                .and_then(|suggestion| suggestion.finite_value.as_ref())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn finite_fast_keeps_fixed_root_belief_and_model_identity() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        solver.config.search_policy_mode = SearchPolicyMode::FiniteFast;
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).expect("date");
+        assert!(solver.initial_state(date).condition_only);
+        let observations = Vec::new();
+        let response = solver
+            .suggest_predictive(PredictiveSuggestRequest {
+                puzzle_date: date,
+                observations: &observations,
+                top: 1,
+                hard_mode: false,
+                force_in_two_only: false,
+                mode: PredictiveSuggestionMode::LiveOnly,
+            })
+            .expect("suggestions");
+        assert_eq!(response.model_version, "predictive-finite-v1");
+    }
+
+    #[test]
+    fn finite_backtests_do_not_share_deadlines_across_parallel_games() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        solver.config.search_policy_mode = crate::config::SearchPolicyMode::FiniteFast;
+        let start = NaiveDate::from_ymd_opt(2024, 1, 4).unwrap();
+        let games = solver
+            .answers
+            .iter()
+            .enumerate()
+            .map(|(index, answer)| NytDailyEntry {
+                id: None,
+                solution: answer.word.clone(),
+                print_date: start + chrono::Days::new(index as u64),
+                days_since_launch: None,
+                editor: None,
+            })
+            .collect::<Vec<_>>();
+        let caller = std::thread::current().id();
+        let progress = |_, _| assert_eq!(std::thread::current().id(), caller);
+        let report = solver
+            .backtest_selected_games_with_progress(
+                &games.iter().collect::<Vec<_>>(),
+                1,
+                PredictiveBookUsage::None,
+                Some(&progress),
+            )
+            .unwrap();
+        assert_eq!(report.runs.len(), games.len());
+        for run in &report.runs {
+            assert!(!run.steps.is_empty());
+            for (index, step) in run.steps.iter().enumerate() {
+                let trace = step.finite_search.as_ref().expect("finite step trace");
+                assert_eq!(trace.turn, (index + 1) as u8);
+                assert!(trace.work_units > 0);
+                assert!(trace.candidate_count > 0);
+                assert_eq!(trace.top_candidates[0].word, step.guess);
+            }
+        }
+        solver.history_dates = games;
+        let artifact = solver
+            .experiment_report(start, start, 1)
+            .expect("finite experiment evidence");
+        assert_eq!(artifact.games.len(), 1);
+        assert_eq!(
+            artifact.games[0].finite_search_steps.len(),
+            artifact.games[0].path.len()
+        );
+        let json = serde_json::to_string(&artifact.games[0]).expect("serializable trace");
+        assert!(json.contains("finite_search_steps"));
+    }
+
+    #[test]
+    fn evaluation_diagnostics_use_the_supplied_puzzle_date() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        solver.config.search_policy_mode = crate::config::SearchPolicyMode::ProxyOnly;
+        let date = NaiveDate::from_ymd_opt(2024, 1, 4).unwrap();
+        assert!(
+            solver
+                .benchmark_predictive_latency(date, 1)
+                .unwrap()
+                .is_finite()
+        );
+        // MIN cannot have a preceding history cutoff. A hidden today() would
+        // incorrectly make both diagnostics succeed instead of rejecting it.
+        assert!(
+            solver
+                .benchmark_predictive_latency(NaiveDate::MIN, 1)
+                .is_err()
+        );
+        assert!(
+            solver
+                .hard_case_report_with_book_usage(NaiveDate::MIN, 5, PredictiveBookUsage::None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1456,7 +1837,7 @@ mod tests {
         solver.config.exact_candidate_pool = 4;
         let observations = Vec::new();
         let request = PredictiveSuggestRequest {
-            as_of: NaiveDate::from_ymd_opt(2026, 1, 1).expect("date"),
+            puzzle_date: NaiveDate::from_ymd_opt(2026, 1, 1).expect("date"),
             observations: &observations,
             top: 5,
             hard_mode: false,
@@ -1907,6 +2288,10 @@ mod tests {
         let config = PriorConfig {
             cooldown_days: 365,
             cooldown_floor: 0.0,
+            recovery: crate::predictive::RecoveryPolicy {
+                mode: RecoveryMode::EpsilonRepair,
+                ..crate::predictive::RecoveryPolicy::default()
+            },
             ..PriorConfig::default()
         };
         let solver = Solver {
@@ -1917,7 +2302,6 @@ mod tests {
             answers,
             primary_answer_count: guesses.len(),
             history_dates: Vec::new(),
-            exact_small_state_table: SmallStateTable::build(4),
             pattern_table,
             guess_index: guesses
                 .iter()
@@ -1937,9 +2321,221 @@ mod tests {
     }
 
     #[test]
+    fn solve_by_three_coverage_counts_green_and_one_final_guess_per_bucket() {
+        let solver = test_solver(&["cigar", "rebut", "adieu"]);
+        let weights = [0.5, 0.5, 0.0];
+        for guess in 0..3 {
+            let coverage = solver
+                .three_solve_coverage_for_guess(guess, &[0, 1], &weights, 1.0)
+                .expect("coverage");
+            assert_eq!(coverage.mass, 1.0);
+        }
+        let cluster = test_solver(&["bound", "hound", "mound", "pound", "wound", "whomp"]);
+        let weights = [0.8, 0.05, 0.05, 0.05, 0.05, 0.0];
+        let subset = [0, 1, 2, 3, 4];
+        let answer = cluster
+            .three_solve_coverage_for_guess(0, &subset, &weights, 1.0)
+            .expect("answer");
+        let probe = cluster
+            .three_solve_coverage_for_guess(5, &subset, &weights, 1.0)
+            .expect("probe");
+        assert!((answer.mass - 0.85).abs() < 1e-12);
+        assert!((probe.mass - 1.0).abs() < 1e-12);
+        assert_eq!(answer.uncovered_answers, 3);
+        assert_eq!(probe.uncovered_answers, 0);
+    }
+
+    #[test]
+    fn fixed_posterior_conditions_without_repair_or_tail_activation() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy"]);
+        solver.primary_answer_count = 1;
+        solver.config.fallback_prior_mass = 0.2;
+        let date = NaiveDate::from_ymd_opt(2026, 3, 10).expect("date");
+        let initial = solver.fixed_posterior_state(date).expect("posterior");
+        assert_eq!(initial.surviving, vec![0, 1, 2]);
+        assert_eq!(initial.weights, vec![0.8, 0.1, 0.1]);
+        assert!(initial.fallback_surviving.is_empty());
+        for target in ["rebut", "sissy"] {
+            let mut state = initial.clone();
+            solver
+                .apply_feedback(&mut state, "cigar", score_guess("cigar", target))
+                .expect("condition");
+            assert_eq!(state.weights, initial.weights);
+            assert_eq!(state.recovery_mode_used, None);
+            assert!(
+                (state.total_weight
+                    - state
+                        .surviving
+                        .iter()
+                        .map(|index| initial.weights[*index])
+                        .sum::<f64>())
+                .abs()
+                    < 1e-12
+            );
+        }
+        solver.mode = WeightMode::EmpiricalFrequency;
+        let empty_core = solver.fixed_posterior_state(date).expect("empty core");
+        assert!(
+            empty_core
+                .weights
+                .iter()
+                .all(|weight| (*weight - 1.0 / 3.0).abs() < 1e-12)
+        );
+        solver.mode = WeightMode::Weighted;
+        solver.answers[0].manual_weight = 0.0;
+        let manual_zero = solver
+            .fixed_posterior_state(date)
+            .expect("manual zero becomes tail");
+        assert!(manual_zero.weights.iter().all(|weight| *weight > 0.0));
+        let mut invalid = initial.clone();
+        assert!(solver.apply_feedback(&mut invalid, "cigar", 243).is_err());
+        assert_eq!(invalid.surviving, initial.surviving);
+    }
+
+    #[test]
+    fn forced_prefix_and_normal_simulation_share_dormant_support_and_turn_limit() {
+        let mut solver = test_solver(&["cigar", "rebut"]);
+        solver.primary_answer_count = 1;
+        let date = NaiveDate::from_ymd_opt(2026, 3, 11).expect("date");
+        let as_of = date.pred_opt().expect("cutoff");
+        let forced = [("cigar".to_string(), 0)];
+        let detailed = solver
+            .solve_target_with_forced_prefix("rebut", as_of, date, &forced, 1)
+            .expect("detailed");
+        let score = solver
+            .score_target_with_forced_prefix("rebut", as_of, date, &forced)
+            .expect("score");
+        assert!(detailed.solved);
+        assert_eq!(
+            detailed
+                .steps
+                .iter()
+                .map(|step| step.guess.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cigar", "rebut"]
+        );
+        assert_eq!(score.guesses, detailed.steps.len());
+        assert_eq!(score.solved, detailed.solved);
+        let ordinary = solver
+            .solve_target_from_state_detailed(
+                "rebut",
+                as_of,
+                date,
+                1,
+                super::PredictiveBookUsage::None,
+            )
+            .expect("ordinary");
+        let empty_prefix = solver
+            .solve_target_with_forced_prefix("rebut", as_of, date, &[], 1)
+            .expect("empty prefix");
+        assert_eq!(
+            ordinary
+                .steps
+                .iter()
+                .map(|step| &step.guess)
+                .collect::<Vec<_>>(),
+            empty_prefix
+                .steps
+                .iter()
+                .map(|step| &step.guess)
+                .collect::<Vec<_>>()
+        );
+        let opening = solver
+            .solve_target_with_forced_opening("rebut", as_of, date, "cigar", 1)
+            .expect("forced opening");
+        assert_eq!(opening.solved, detailed.solved);
+        assert_eq!(opening.steps.len(), detailed.steps.len());
+        let exhausted = solver
+            .solve_target_with_forced_prefix(
+                "rebut",
+                as_of,
+                date,
+                &vec![("cigar".to_string(), 0); 6],
+                1,
+            )
+            .expect("six forced attempts");
+        assert!(!exhausted.solved);
+        assert_eq!(exhausted.steps.len(), 6);
+        let gap = solver
+            .solve_target_with_forced_prefix("humph", as_of, date, &[], 1)
+            .expect("uncovered answer");
+        assert!(gap.steps.is_empty() && !gap.solved);
+        let runs = [
+            &ordinary,
+            &empty_prefix,
+            &detailed,
+            &opening,
+            &exhausted,
+            &gap,
+        ];
+        let outcomes = runs
+            .iter()
+            .map(|run| {
+                if run.steps.is_empty() {
+                    crate::experiments::GameOutcome::coverage_gap(run.date)
+                } else if run.solved {
+                    crate::experiments::GameOutcome::solved(run.date, run.steps.len())
+                } else {
+                    crate::experiments::GameOutcome::unsolved(run.date, run.steps.len())
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut counts = (0, 0, 0);
+        let mut penalized_total = 0.0;
+        // These are different policies on one date, not a chronological game series.
+        for (run, outcome) in runs.iter().zip(&outcomes) {
+            let metrics = crate::experiments::summarize_predictive_outcomes(
+                std::slice::from_ref(outcome),
+                7.0,
+                crate::experiments::BootstrapConfig {
+                    resamples: 16,
+                    block_length: 1,
+                    seed: 7,
+                },
+            )
+            .expect("one simulation's outcome totals");
+            assert_eq!(metrics.scheduled_games, 1);
+            assert_eq!(metrics.solved_games, usize::from(run.solved));
+            assert_eq!(metrics.coverage_gaps, usize::from(run.steps.is_empty()));
+            assert_eq!(
+                metrics.unsolved_games,
+                usize::from(!run.solved && !run.steps.is_empty())
+            );
+            assert_eq!(
+                metrics.solved_in_guess_counts.iter().sum::<usize>(),
+                metrics.solved_games
+            );
+            counts.0 += metrics.solved_games;
+            counts.1 += metrics.unsolved_games;
+            counts.2 += metrics.coverage_gaps;
+            penalized_total += metrics.all_game_penalized_mean_guesses;
+        }
+        assert_eq!(counts, (4, 1, 1));
+        assert_eq!(counts.0 + counts.1 + counts.2, runs.len());
+        let solved_attempts = runs
+            .iter()
+            .filter(|run| run.solved)
+            .map(|run| run.steps.len())
+            .sum::<usize>();
+        assert_eq!(penalized_total, (solved_attempts + 14) as f64);
+        assert!(
+            solver
+                .solve_target_with_forced_prefix(
+                    "rebut",
+                    as_of,
+                    date,
+                    &vec![("cigar".to_string(), 0); 7],
+                    1
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn mixed_support_feedback_can_recover_a_zero_mass_candidate() {
         let as_of = NaiveDate::from_ymd_opt(2026, 3, 10).expect("date");
         let mut solver = test_solver(&["cigar", "rebut"]);
+        solver.config.recovery.mode = RecoveryMode::EpsilonRepair;
         solver.mode = WeightMode::Weighted;
         solver.config.cooldown_floor = 0.0;
         solver.config.cooldown_days = 365;
@@ -1994,7 +2590,10 @@ mod tests {
             .expect("activate fallback");
         assert_eq!(state.surviving, vec![1]);
         assert!(state.fallback_surviving.is_empty());
-        assert_eq!(state.recovery_mode_used, Some(RecoveryMode::EpsilonRepair));
+        assert_eq!(
+            state.recovery_mode_used,
+            Some(RecoveryMode::UniformOverSupport)
+        );
         assert!(state.total_weight > 0.0);
     }
 
@@ -2010,6 +2609,35 @@ mod tests {
         assert_eq!(state.surviving, vec![0]);
         assert_eq!(state.fallback_surviving, vec![1]);
         assert_eq!(state.modeled_weights[1], 0.0);
+    }
+
+    #[test]
+    fn dormant_primary_and_secondary_answers_remain_index_sorted() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 3, 10).expect("date");
+        let mut solver = test_solver(&["cigar", "rebut", "sissy"]);
+        solver.primary_answer_count = 2;
+        solver.answers[0].in_seed = false;
+
+        let state = solver.initial_state(as_of);
+
+        assert_eq!(state.surviving, vec![1]);
+        assert_eq!(state.fallback_surviving, vec![0, 2]);
+    }
+
+    #[test]
+    fn empirical_frequency_keeps_unseen_seed_answers_in_recoverable_support() {
+        let mut solver = test_solver(&["cigar", "rebut"]);
+        solver.mode = WeightMode::EmpiricalFrequency;
+
+        let state = solver.initial_state(NaiveDate::from_ymd_opt(2026, 3, 10).expect("date"));
+
+        assert_eq!(state.surviving, vec![0, 1]);
+        assert!(state.fallback_surviving.is_empty());
+        assert_eq!(
+            state.recovery_mode_used,
+            Some(RecoveryMode::UniformOverSupport)
+        );
+        assert!(state.total_weight > 0.0);
     }
 
     #[test]
@@ -2082,6 +2710,7 @@ mod tests {
                 .expect("pattern table");
         let config = PriorConfig {
             session_window_days: 1,
+            search_policy_mode: SearchPolicyMode::ProxyOnly,
             ..PriorConfig::default()
         };
         let as_of = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
@@ -2099,7 +2728,6 @@ mod tests {
                 days_since_launch: Some(1),
                 editor: None,
             }],
-            exact_small_state_table: SmallStateTable::build(4),
             pattern_table,
             guess_index: guesses
                 .iter()
@@ -2164,7 +2792,10 @@ mod tests {
                 .expect("pattern table");
         let as_of = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
         let solver = Solver {
-            config: PriorConfig::default(),
+            config: PriorConfig {
+                search_policy_mode: SearchPolicyMode::ProxyOnly,
+                ..PriorConfig::default()
+            },
             mode: WeightMode::Weighted,
             variant: ModelVariant::SeedPlusHistory,
             guesses: guesses.clone(),
@@ -2177,7 +2808,6 @@ mod tests {
                 days_since_launch: Some(1),
                 editor: None,
             }],
-            exact_small_state_table: SmallStateTable::build(4),
             pattern_table,
             guess_index: guesses
                 .iter()
@@ -2236,7 +2866,10 @@ mod tests {
                 .expect("pattern table");
         let as_of = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
         let solver = Solver {
-            config: PriorConfig::default(),
+            config: PriorConfig {
+                search_policy_mode: SearchPolicyMode::ProxyOnly,
+                ..PriorConfig::default()
+            },
             mode: WeightMode::Weighted,
             variant: ModelVariant::SeedPlusHistory,
             guesses: guesses.clone(),
@@ -2249,7 +2882,6 @@ mod tests {
                 days_since_launch: Some(1),
                 editor: None,
             }],
-            exact_small_state_table: SmallStateTable::build(4),
             pattern_table,
             guess_index: guesses
                 .iter()
@@ -2560,6 +3192,7 @@ mod tests {
     #[test]
     fn force_in_two_wins_proxy_ties_only() {
         let force = Suggestion {
+            finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
             solve_probability: 0.1,
@@ -2578,6 +3211,7 @@ mod tests {
             exact_cost: None,
         };
         let non_force = Suggestion {
+            finite_value: None,
             word: "bravo".into(),
             entropy: 3.0,
             solve_probability: 0.1,
@@ -2601,6 +3235,7 @@ mod tests {
         );
 
         let clearly_better = Suggestion {
+            finite_value: None,
             proxy_cost: Some(1.9),
             ..non_force.clone()
         };
@@ -2613,6 +3248,7 @@ mod tests {
     #[test]
     fn force_in_two_breaks_exact_cost_ties_only() {
         let force = Suggestion {
+            finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
             solve_probability: 0.1,
@@ -2631,6 +3267,7 @@ mod tests {
             exact_cost: Some(3.0),
         };
         let non_force = Suggestion {
+            finite_value: None,
             word: "bravo".into(),
             force_in_two: false,
             ..force.clone()
@@ -2647,6 +3284,7 @@ mod tests {
         );
 
         let better_exact = Suggestion {
+            finite_value: None,
             exact_cost: Some(2.5),
             ..non_force.clone()
         };
@@ -2665,6 +3303,7 @@ mod tests {
     #[test]
     fn force_in_two_does_not_beat_better_lookahead_score() {
         let force = Suggestion {
+            finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
             solve_probability: 0.1,
@@ -2683,6 +3322,7 @@ mod tests {
             exact_cost: None,
         };
         let better = Suggestion {
+            finite_value: None,
             word: "bravo".into(),
             force_in_two: false,
             lookahead_cost: Some(2.5),
@@ -2697,6 +3337,7 @@ mod tests {
     #[test]
     fn final_turn_prefers_immediate_solve_probability_over_future_information() {
         let informative = Suggestion {
+            finite_value: None,
             word: "alpha".into(),
             entropy: 4.0,
             solve_probability: 0.0,
@@ -2715,6 +3356,7 @@ mod tests {
             exact_cost: Some(1.0),
         };
         let likely_answer = Suggestion {
+            finite_value: None,
             word: "bravo".into(),
             entropy: 0.1,
             solve_probability: 0.6,
@@ -2734,6 +3376,232 @@ mod tests {
         assert!(!should_use_final_turn_objective(4));
         assert!(should_use_final_turn_objective(5));
         assert!(should_use_final_turn_objective(6));
+    }
+
+    #[test]
+    fn two_turn_ranking_prefers_a_guaranteed_probe_over_unbounded_exact_cost() {
+        let solver = test_solver_with_answer_count(
+            &[
+                "cajon", "capon", "canon", "fanon", "junco", "olate", "vroom", "axion", "bagsy",
+            ],
+            4,
+        );
+        let weights = vec![0.18, 0.18, 0.46, 0.18];
+        let state = super::SolveState {
+            condition_only: false,
+            surviving: vec![0, 1, 2, 3],
+            fallback_surviving: Vec::new(),
+            fallback_active: false,
+            modeled_weights: weights.clone(),
+            recovery_weights: weights.clone(),
+            weights,
+            modeled_total_weight: 1.0,
+            total_weight: 1.0,
+            recovery_mode_used: None,
+        };
+        let observations = vec![
+            (
+                "olate".to_string(),
+                crate::scoring::parse_feedback("10100").unwrap(),
+            ),
+            (
+                "vroom".to_string(),
+                crate::scoring::parse_feedback("00020").unwrap(),
+            ),
+            (
+                "axion".to_string(),
+                crate::scoring::parse_feedback("10022").unwrap(),
+            ),
+            (
+                "bagsy".to_string(),
+                crate::scoring::parse_feedback("02000").unwrap(),
+            ),
+        ];
+        let batch = solver
+            .suggestion_batch_internal_with_search_mode_controlled(
+                &state,
+                solver.guesses.len(),
+                Some(super::PredictiveContext {
+                    hard_mode: false,
+                    as_of: chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+                    observations: &observations,
+                }),
+                PredictiveBookUsage::None,
+                Some(PredictiveSearchMode::Exact(ExactSuggestionMode::Exhaustive)),
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(batch.suggestions[0].word, "junco");
+        assert!(batch.suggestions[0].force_in_two);
+    }
+
+    #[test]
+    fn two_turn_success_metric_matches_feedback_bucket_oracle() {
+        let mut solver =
+            test_solver_with_answer_count(&["cajon", "capon", "canon", "fanon", "junco"], 4);
+        solver.answers.push(AnswerRecord {
+            word: "zzzzz".to_string(),
+            in_seed: false,
+            manual_entry: true,
+            manual_weight: 1.0,
+            history_dates: Vec::new(),
+        });
+        let weights = vec![0.16, 0.16, 0.32, 0.16, 0.20];
+        let state = super::SolveState {
+            condition_only: false,
+            surviving: vec![0, 1, 2, 3, 4],
+            fallback_surviving: Vec::new(),
+            fallback_active: false,
+            modeled_weights: weights.clone(),
+            recovery_weights: weights.clone(),
+            weights: weights.clone(),
+            modeled_total_weight: 1.0,
+            total_weight: 1.0,
+            recovery_mode_used: None,
+        };
+        let scores = solver
+            .two_turn_success_by_guess_controlled(&state, &|| false)
+            .unwrap();
+        assert!(!solver.guess_index.contains_key("zzzzz"));
+
+        for (guess_index, guess) in solver.guesses.iter().enumerate() {
+            let mut best_by_feedback = std::collections::HashMap::<u8, f64>::new();
+            for (answer_index, weight) in weights.iter().enumerate() {
+                if !solver
+                    .guess_index
+                    .contains_key(&solver.answers[answer_index].word)
+                {
+                    continue;
+                }
+                let feedback = score_guess(guess, &solver.answers[answer_index].word);
+                best_by_feedback
+                    .entry(feedback)
+                    .and_modify(|best| *best = best.max(*weight))
+                    .or_insert(*weight);
+            }
+            let expected = best_by_feedback.values().sum::<f64>();
+            assert!(
+                (scores[guess_index] - expected).abs() < 1e-12,
+                "{guess}: computed {} versus oracle {expected}",
+                scores[guess_index]
+            );
+        }
+        assert!((scores[solver.guess_index["junco"]] - 0.8).abs() < 1e-12);
+
+        let observations = vec![("olate".to_string(), 0); 4];
+        let batch = solver
+            .suggestion_batch_internal_with_search_mode_controlled(
+                &state,
+                solver.guesses.len(),
+                Some(super::PredictiveContext {
+                    hard_mode: false,
+                    as_of: chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+                    observations: &observations,
+                }),
+                PredictiveBookUsage::None,
+                Some(PredictiveSearchMode::ProxyOnly),
+                &|| false,
+            )
+            .unwrap();
+        assert!(
+            batch
+                .suggestions
+                .iter()
+                .all(|suggestion| !suggestion.force_in_two)
+        );
+        let finite = solver
+            .finite_suggestion_batch(
+                &state,
+                solver.guesses.len(),
+                Some(super::PredictiveContext {
+                    hard_mode: false,
+                    as_of: chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+                    observations: &observations,
+                }),
+                super::FiniteSearchOptions::fast_fixed_work(),
+                &|| false,
+            )
+            .unwrap();
+        assert!(!finite.suggestions.is_empty());
+        assert!(
+            finite
+                .suggestions
+                .iter()
+                .all(|suggestion| !suggestion.force_in_two)
+        );
+    }
+
+    #[test]
+    fn surviving_answers_are_legal_final_hard_mode_replies() {
+        let solver = test_solver_with_answer_count(
+            &[
+                "dread", "added", "tread", "cajon", "capon", "canon", "fanon", "junco", "olate",
+                "caper",
+            ],
+            8,
+        );
+        let observations = vec![("olate".to_string(), score_guess("olate", "dread"))];
+        let surviving = (0..solver.answers.len())
+            .filter(|answer_index| {
+                score_guess("olate", &solver.answers[*answer_index].word) == observations[0].1
+            })
+            .collect::<Vec<_>>();
+        assert!(surviving.len() >= 2, "exercise a nontrivial final choice");
+        assert!(surviving.contains(&solver.guess_index["dread"]));
+        assert!(surviving.contains(&solver.guess_index["added"]));
+        assert!(hard_mode_violation(&observations, "caper").is_none());
+        let weights = (0..solver.answers.len())
+            .map(|answer_index| {
+                if surviving.contains(&answer_index) {
+                    (answer_index + 1) as f64
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let total_weight = surviving.iter().map(|index| weights[*index]).sum::<f64>();
+        let state = super::SolveState {
+            condition_only: false,
+            surviving: surviving.clone(),
+            fallback_surviving: Vec::new(),
+            fallback_active: false,
+            modeled_weights: weights.clone(),
+            recovery_weights: weights.clone(),
+            weights: weights.clone(),
+            modeled_total_weight: total_weight,
+            total_weight,
+            recovery_mode_used: None,
+        };
+        let scores = solver
+            .two_turn_success_by_guess_controlled(&state, &|| false)
+            .unwrap();
+
+        for (guess_index, guess) in solver.guesses.iter().enumerate() {
+            if hard_mode_violation(&observations, guess).is_some() {
+                continue;
+            }
+            let mut best_by_feedback = std::collections::HashMap::<u8, f64>::new();
+            for answer_index in &surviving {
+                let answer = &solver.answers[*answer_index].word;
+                let pattern = score_guess(guess, answer);
+                let mut child_observations = observations.clone();
+                child_observations.push((guess.clone(), pattern));
+                assert!(
+                    hard_mode_violation(&child_observations, answer).is_none(),
+                    "{answer} must remain a legal final reply after {guess}"
+                );
+                best_by_feedback
+                    .entry(pattern)
+                    .and_modify(|best| *best = best.max(weights[*answer_index]))
+                    .or_insert(weights[*answer_index]);
+            }
+            let expected = best_by_feedback.values().sum::<f64>() / total_weight;
+            assert!(
+                (scores[guess_index] - expected).abs() < 1e-12,
+                "{guess}: computed {} versus hard-mode oracle {expected}",
+                scores[guess_index]
+            );
+        }
     }
 
     #[test]
@@ -2780,6 +3648,7 @@ mod tests {
             std::cmp::Ordering::Less
         );
         let safer_suggestion = Suggestion {
+            finite_value: None,
             word: "alpha".into(),
             entropy: safer_split.entropy,
             solve_probability: safer_split.solve_probability,
@@ -2798,6 +3667,7 @@ mod tests {
             exact_cost: None,
         };
         let gambler_suggestion = Suggestion {
+            finite_value: None,
             word: "bravo".into(),
             entropy: gambler.entropy,
             solve_probability: gambler.solve_probability,
@@ -2930,6 +3800,7 @@ mod tests {
         let guess_index =
             HashMap::from([("alpha".to_string(), 0usize), ("bravo".to_string(), 1usize)]);
         let better_coverage = Suggestion {
+            finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
             solve_probability: 0.1,
@@ -2948,6 +3819,7 @@ mod tests {
             exact_cost: None,
         };
         let stronger_proxy = Suggestion {
+            finite_value: None,
             word: "bravo".into(),
             proxy_cost: Some(1.8),
             lookahead_cost: Some(2.8),
@@ -2969,6 +3841,7 @@ mod tests {
     fn pooled_exact_candidates_keep_surviving_answers() {
         let solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake", "blush"]);
         let state = super::SolveState {
+            condition_only: false,
             surviving: vec![0, 1],
             fallback_surviving: Vec::new(),
             fallback_active: false,
@@ -2981,6 +3854,7 @@ mod tests {
         };
         let suggestions = vec![
             super::Suggestion {
+                finite_value: None,
                 word: "humph".into(),
                 entropy: 5.0,
                 solve_probability: 0.0,
@@ -2999,6 +3873,7 @@ mod tests {
                 exact_cost: None,
             },
             super::Suggestion {
+                finite_value: None,
                 word: "awake".into(),
                 entropy: 4.0,
                 solve_probability: 0.0,
@@ -3039,6 +3914,7 @@ mod tests {
     fn pooled_exact_candidates_include_force_and_worst_bucket_guesses() {
         let solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake", "blush"]);
         let state = super::SolveState {
+            condition_only: false,
             surviving: vec![0, 1],
             fallback_surviving: Vec::new(),
             fallback_active: false,
@@ -3051,6 +3927,7 @@ mod tests {
         };
         let suggestions = vec![
             Suggestion {
+                finite_value: None,
                 word: "humph".into(),
                 entropy: 5.0,
                 solve_probability: 0.0,
@@ -3069,6 +3946,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                finite_value: None,
                 word: "awake".into(),
                 entropy: 4.0,
                 solve_probability: 0.0,
@@ -3087,6 +3965,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                finite_value: None,
                 word: "blush".into(),
                 entropy: 3.0,
                 solve_probability: 0.0,
@@ -3152,7 +4031,6 @@ mod tests {
             .exact_best_cost(
                 &subset,
                 &weights,
-                &solver.exact_small_state_table,
                 &mut PredictiveMemoMap::default(),
                 &mut ExactSearchScratch::new(),
                 0,
@@ -3178,7 +4056,6 @@ mod tests {
                         super::ExactCostContext {
                             subset: &subset,
                             weights: &weights,
-                            small_state_table: &solver.exact_small_state_table,
                             memo: &mut PredictiveMemoMap::default(),
                             best_bound: f64::INFINITY,
                             scratch: &mut ExactSearchScratch::new(),
@@ -3189,7 +4066,8 @@ mod tests {
             );
         }
         let exhaustive = root_costs.iter().copied().fold(f64::INFINITY, f64::min);
-        let old_uniform_count_bound = solver.exact_small_state_table.lower_bound(subset.len());
+        let old_uniform_count_bound =
+            crate::small_state::SmallStateTable::build(subset.len()).lower_bound(subset.len());
         assert!(root_costs[0] <= old_uniform_count_bound);
         assert!(root_costs[0] > exhaustive);
 
@@ -3199,13 +4077,80 @@ mod tests {
             .exact_best_cost(
                 &subset,
                 &weights,
-                &solver.exact_small_state_table,
                 &mut PredictiveMemoMap::default(),
                 &mut ExactSearchScratch::new(),
                 0,
             )
             .expect("exact value");
         assert!((exact - exhaustive).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn exact_root_bucket_bound_is_admissible_with_skewed_and_zero_mass() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph", "eerie", "alley"]);
+        solver.config.exact_threshold = solver.answers.len();
+        solver.config.exact_exhaustive_threshold = solver.answers.len();
+        let subset = (0..solver.answers.len()).collect::<Vec<_>>();
+        for weights in [vec![1.0; 6], vec![0.5, 0.2, 0.1, 0.0, 0.05, 0.15]] {
+            for guess_index in 0..solver.guesses.len() {
+                let lower = solver
+                    .exact_root_cost_lower_bound(guess_index, &subset, &weights)
+                    .expect("root lower bound");
+                let exact = solver
+                    .exact_cost_for_guess(
+                        guess_index,
+                        super::ExactCostContext {
+                            subset: &subset,
+                            weights: &weights,
+                            memo: &mut PredictiveMemoMap::default(),
+                            best_bound: f64::INFINITY,
+                            scratch: &mut ExactSearchScratch::new(),
+                            depth: 0,
+                        },
+                    )
+                    .expect("root exact cost");
+                assert!(
+                    lower <= exact + 1e-10,
+                    "{}: lower={lower} exact={exact}",
+                    solver.guesses[guess_index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_root_bucket_bound_stays_finite_at_large_valid_mass() {
+        let solver = test_solver(&["cigar", "rebut", "sissy", "humph", "eerie", "alley"]);
+        let weights = vec![f64::MAX * 0.75, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let guess_index = solver.guess_index["alley"];
+        let lower = solver
+            .exact_root_cost_lower_bound(guess_index, &[0, 1], &weights)
+            .expect("valid-mass lower bound");
+        assert!(lower.is_finite());
+        assert!((1.0..=3.0).contains(&lower));
+    }
+
+    #[test]
+    fn pooled_exact_root_bound_preserves_requested_ranked_prefix() {
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake", "blush"]);
+        solver.config.exact_threshold = 6;
+        solver.config.exact_exhaustive_threshold = 2;
+        let date = NaiveDate::from_ymd_opt(2026, 3, 9).expect("date");
+        for weights in [[1.0; 6], [10.0, 1.0, 2.0, 0.5, 1.0, 3.0]] {
+            let mut state = solver.initial_state(date);
+            state.weights.copy_from_slice(&weights);
+            state.total_weight = weights.iter().sum();
+            let all = solver
+                .suggestions(&state, solver.guesses.len())
+                .expect("full exact list");
+            for top in [1, 2, 3] {
+                let bounded = solver.suggestions(&state, top).expect("bounded exact list");
+                for (actual, expected) in bounded.iter().zip(all.iter()) {
+                    assert_eq!(actual.word, expected.word);
+                    assert_eq!(actual.exact_cost, expected.exact_cost);
+                }
+            }
+        }
     }
 
     #[test]
@@ -3273,7 +4218,6 @@ mod tests {
                     .exact_best_cost(
                         &subset,
                         &weights,
-                        &solver.exact_small_state_table,
                         &mut PredictiveMemoMap::default(),
                         &mut ExactSearchScratch::new(),
                         0,
@@ -3406,7 +4350,6 @@ mod tests {
             .exact_best_cost(
                 &subset,
                 &weights,
-                &solver.exact_small_state_table,
                 &mut PredictiveMemoMap::default(),
                 &mut ExactSearchScratch::new(),
                 0,
@@ -3435,6 +4378,7 @@ mod tests {
         let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
         let suggestions = vec![
             Suggestion {
+                finite_value: None,
                 word: "cigar".into(),
                 entropy: 3.0,
                 solve_probability: 0.0,
@@ -3453,6 +4397,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                finite_value: None,
                 word: "rebut".into(),
                 entropy: 5.0,
                 solve_probability: 0.0,
@@ -3471,6 +4416,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                finite_value: None,
                 word: "sissy".into(),
                 entropy: 2.5,
                 solve_probability: 0.0,
@@ -3489,6 +4435,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                finite_value: None,
                 word: "humph".into(),
                 entropy: 2.0,
                 solve_probability: 0.0,
@@ -3520,6 +4467,7 @@ mod tests {
     #[test]
     fn suggestion_tie_breaks_keep_trap_signals() {
         let safer = Suggestion {
+            finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
             solve_probability: 0.0,
@@ -3538,6 +4486,7 @@ mod tests {
             exact_cost: Some(3.0),
         };
         let trap_heavier = Suggestion {
+            finite_value: None,
             word: "bravo".into(),
             large_non_green_bucket_count: 3,
             dangerous_mass_bucket_count: 2,
@@ -3611,11 +4560,7 @@ mod tests {
         let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
         let subset = vec![0, 1, 2, 3];
         let weights = vec![0.4, 0.3, 0.2, 0.1];
-        let mut metrics = solver.score_guess_metrics_for_subset(
-            &subset,
-            &weights,
-            &solver.exact_small_state_table,
-        );
+        let mut metrics = solver.score_guess_metrics_for_subset(&subset, &weights);
         metrics[0].force_in_two = false;
         metrics[1].force_in_two = false;
         metrics[0].largest_non_green_bucket_mass = 0.20;
@@ -3728,11 +4673,7 @@ mod tests {
         solver.config.second_guess_coverage_pool = 2;
         let subset = (0..solver.answers.len()).collect::<Vec<_>>();
         let weights = vec![1.0; solver.answers.len()];
-        let metrics = solver.score_guess_metrics_for_subset(
-            &subset,
-            &weights,
-            &solver.exact_small_state_table,
-        );
+        let metrics = solver.score_guess_metrics_for_subset(&subset, &weights);
         assert!(metrics.len() > solver.config.second_guess_coverage_pool);
         let coverage = solver
             .medium_second_guess_coverage(&subset, &weights, &metrics)
@@ -3742,9 +4683,10 @@ mod tests {
 
     #[test]
     fn pool_expansion_only_applies_when_enabled() {
-        let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
         let suggestions = vec![
             Suggestion {
+                finite_value: None,
                 word: "cigar".into(),
                 entropy: 3.2,
                 solve_probability: 0.0,
@@ -3763,6 +4705,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                finite_value: None,
                 word: "rebut".into(),
                 entropy: 3.1,
                 solve_probability: 0.0,
@@ -3781,6 +4724,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                finite_value: None,
                 word: "sissy".into(),
                 entropy: 3.0,
                 solve_probability: 0.0,
@@ -3799,6 +4743,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                finite_value: None,
                 word: "humph".into(),
                 entropy: 2.9,
                 solve_probability: 0.0,
@@ -3828,6 +4773,32 @@ mod tests {
             2
         );
         assert!(solver.expanded_pool_size(&suggestions, 2, true, true, assessment) > 2);
+        let safe = StateDangerAssessment {
+            danger_score: 0.0,
+            dangerous_lookahead: false,
+            dangerous_exact: false,
+        };
+        let mut scaled = suggestions.clone();
+        for (index, suggestion) in scaled.iter_mut().enumerate() {
+            suggestion.large_state_score = suggestion.large_state_score.map(|score| score * 100.0);
+            suggestion.proxy_cost = Some(1.0 + index as f64 * 0.2);
+        }
+        assert_eq!(
+            solver.expanded_pool_size(&suggestions, 2, true, true, safe),
+            4
+        );
+        assert_eq!(solver.expanded_pool_size(&scaled, 2, true, true, safe), 2);
+        assert_eq!(solver.expanded_pool_size(&scaled, 2, false, true, safe), 2);
+        scaled.sort_by(|left, right| super::compare_suggestions_for_state(left, right, true));
+        assert_eq!(
+            scaled.iter().map(|row| &row.word).collect::<Vec<_>>(),
+            suggestions.iter().map(|row| &row.word).collect::<Vec<_>>()
+        );
+        solver.config.pool_tight_gap_threshold *= 100.0;
+        solver.config.pool_medium_gap_threshold *= 100.0;
+        assert_eq!(solver.expanded_pool_size(&scaled, 2, true, true, safe), 4);
+        // Restoring the split-score expansion also changes the unscaled proxy-cost branch.
+        assert_eq!(solver.expanded_pool_size(&scaled, 2, false, true, safe), 4);
     }
 
     #[test]
@@ -3835,11 +4806,7 @@ mod tests {
         let solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake", "blush"]);
         let subset = (0..solver.answers.len()).collect::<Vec<_>>();
         let weights = vec![1.0; solver.answers.len()];
-        let metrics = solver.score_guess_metrics_for_subset(
-            &subset,
-            &weights,
-            &solver.exact_small_state_table,
-        );
+        let metrics = solver.score_guess_metrics_for_subset(&subset, &weights);
         assert!(
             metrics.iter().any(|metric| metric.force_in_two),
             "expected at least one force-in-two witness"
@@ -3851,11 +4818,7 @@ mod tests {
         let solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake", "blush"]);
         let subset = (0..solver.answers.len()).collect::<Vec<_>>();
         let weights = vec![1.0; solver.answers.len()];
-        let metrics = solver.score_guess_metrics_for_subset(
-            &subset,
-            &weights,
-            &solver.exact_small_state_table,
-        );
+        let metrics = solver.score_guess_metrics_for_subset(&subset, &weights);
         assert!(
             metrics.iter().any(|metric| !metric.force_in_two),
             "expected at least one non-force-in-two witness"
@@ -3928,16 +4891,8 @@ mod tests {
         let solver = test_solver(&["cigar", "rebut", "sissy"]);
         assert_ne!(score_guess("cigar", "rebut"), score_guess("cigar", "sissy"));
         let weights = vec![1.0, 1.0, 0.0];
-        let positive_only = solver.score_guess_metrics_for_subset(
-            &[0, 1],
-            &weights,
-            &solver.exact_small_state_table,
-        );
-        let with_zero_mass_bucket = solver.score_guess_metrics_for_subset(
-            &[0, 1, 2],
-            &weights,
-            &solver.exact_small_state_table,
-        );
+        let positive_only = solver.score_guess_metrics_for_subset(&[0, 1], &weights);
+        let with_zero_mass_bucket = solver.score_guess_metrics_for_subset(&[0, 1, 2], &weights);
         assert_eq!(
             positive_only[0].smoothness_penalty,
             with_zero_mass_bucket[0].smoothness_penalty
@@ -3963,7 +4918,7 @@ mod tests {
         let subset = (0..solver.answers.len()).collect::<Vec<_>>();
         let weights = vec![1.0; solver.answers.len()];
         let metric = solver
-            .score_guess_metrics_for_subset(&subset, &weights, &solver.exact_small_state_table)
+            .score_guess_metrics_for_subset(&subset, &weights)
             .into_iter()
             .next()
             .expect("metric");
@@ -3984,17 +4939,9 @@ mod tests {
         let weights = vec![0.60, 0.10, 0.10, 0.10, 0.10];
 
         solver.config.ambiguous_mass_threshold = 0.10;
-        let low_threshold = solver.score_guess_metrics_for_subset(
-            &subset,
-            &weights,
-            &solver.exact_small_state_table,
-        );
+        let low_threshold = solver.score_guess_metrics_for_subset(&subset, &weights);
         solver.config.ambiguous_mass_threshold = 0.50;
-        let high_threshold = solver.score_guess_metrics_for_subset(
-            &subset,
-            &weights,
-            &solver.exact_small_state_table,
-        );
+        let high_threshold = solver.score_guess_metrics_for_subset(&subset, &weights);
 
         assert!(
             low_threshold[0].high_mass_ambiguous_bucket_count
@@ -4007,11 +4954,7 @@ mod tests {
         let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph", "awake"]);
         let state =
             solver.initial_state(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("date"));
-        let metrics = solver.score_guess_metrics_for_subset(
-            &state.surviving,
-            &state.weights,
-            &solver.exact_small_state_table,
-        );
+        let metrics = solver.score_guess_metrics_for_subset(&state.surviving, &state.weights);
         let baseline = solver.assess_state_danger(&state, &metrics).danger_score;
         solver.config.danger_top_concentration_w *= 2.0;
         solver.config.danger_bucket_mass_w *= 2.0;
@@ -4038,7 +4981,7 @@ mod tests {
         let subset = (0..solver.answers.len()).collect::<Vec<_>>();
         let weights = vec![1.0; solver.answers.len()];
         let expected = solver
-            .score_guess_metrics_for_subset(&subset, &weights, &solver.exact_small_state_table)
+            .score_guess_metrics_for_subset(&subset, &weights)
             .into_iter()
             .filter(|metric| super::search::reply_guess_makes_progress(metric, subset.len()))
             .map(|metric| metric.proxy_cost)
@@ -4076,11 +5019,7 @@ mod tests {
 
         let subset = (0..solver.answers.len()).collect::<Vec<_>>();
         let weights = vec![1.0; solver.answers.len()];
-        let metrics = solver.score_guess_metrics_for_subset(
-            &subset,
-            &weights,
-            &solver.exact_small_state_table,
-        );
+        let metrics = solver.score_guess_metrics_for_subset(&subset, &weights);
         let inert = metrics
             .iter()
             .find(|metric| solver.guesses[metric.guess_index] == "zzzzz")
@@ -4223,6 +5162,288 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_evidence_fresh_resume_reuses_profiles_and_rejects_matrix_changes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "maybe-wordle-evidence-resume-test-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let paths = ProjectPaths::new(&root);
+        paths.ensure_layout().expect("fixture layout");
+        fs::write(&paths.seed_guesses, "cigar\nrebut\nsissy\nhumph\n").expect("guesses");
+        fs::write(&paths.seed_answers, "cigar\nrebut\nsissy\nhumph\n").expect("answers");
+        fs::write(&paths.seed_reference_answers, "").expect("reference answers");
+        fs::write(&paths.seed_sources, "").expect("seed sources");
+        fs::write(&paths.manual_additions, "").expect("manual additions");
+        fs::write(
+            root.join("config/evaluation.toml"),
+            "format_version = 1\ndevelopment_cutoff = \"2025-01-05\"\n\n[sealed_test]\nstart = \"2025-01-06\"\nend = \"2025-01-06\"\n",
+        )
+        .expect("evaluation policy");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"evidence-fixture\"\n",
+        )
+        .expect("manifest");
+        fs::write(root.join("Cargo.lock"), "").expect("lockfile");
+
+        let solutions = ["cigar", "rebut", "sissy", "humph", "cigar"];
+        let mut history = String::new();
+        for (index, solution) in solutions.iter().enumerate() {
+            let entry = NytDailyEntry {
+                id: Some(index as u32 + 1),
+                solution: (*solution).to_string(),
+                print_date: NaiveDate::from_ymd_opt(2025, 1, index as u32 + 1)
+                    .expect("history date"),
+                days_since_launch: None,
+                editor: None,
+            };
+            history.push_str(&serde_json::to_string(&entry).expect("history entry"));
+            history.push('\n');
+        }
+        fs::write(&paths.raw_history, history).expect("history");
+
+        let matrix_path = root.join("evidence-matrix.json");
+        let matrix = r#"{
+  "format_version": 1,
+  "name": "toy-finite-evidence",
+  "profiles": [
+    {
+      "id": "uniform",
+      "description": "Uniform finite toy profile",
+      "weight_mode": "uniform",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled"
+    },
+    {
+      "id": "weighted",
+      "description": "Weighted finite toy profile",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled"
+    }
+  ]
+}"#;
+        fs::write(&matrix_path, matrix).expect("matrix");
+
+        let config = PriorConfig {
+            search_policy_mode: crate::config::SearchPolicyMode::FiniteFast,
+            ..PriorConfig::default()
+        };
+        let selection = EvidenceDateSelection::Range(
+            DateRange::new(
+                NaiveDate::from_ymd_opt(2025, 1, 2).expect("date"),
+                NaiveDate::from_ymd_opt(2025, 1, 3).expect("date"),
+            )
+            .expect("selection"),
+        );
+        let selected_date_count = match selection {
+            EvidenceDateSelection::Range(range) => range.days() as usize,
+            EvidenceDateSelection::RollingFolds => unreachable!("fixture uses a range"),
+        };
+        let budget = EvidenceResourceBudget {
+            maximum_seconds: 60,
+            maximum_memory_mb: 4_096,
+        };
+        let checkpoint_path = root.join("evidence-checkpoint.json");
+        let first = Solver::build_development_evidence_with_selection(
+            &paths,
+            &config,
+            selection,
+            1,
+            budget,
+            Some(&matrix_path),
+            Some(&checkpoint_path),
+        )
+        .expect("fresh evidence run");
+        first
+            .validate_identity()
+            .expect("complete evidence validation");
+        let markdown =
+            Solver::render_development_evidence_markdown(&first).expect("render evidence");
+        assert!(markdown.contains("--evidence <source-json>"));
+        assert!(!markdown.contains("development-2026-06-17.json"));
+        assert!(!markdown.contains("docs/generated/predictive-evidence.md"));
+        assert!(
+            first.baselines.iter().all(|baseline| {
+                baseline.result.session_fallback_cold_ms.is_none()
+                    && baseline.result.session_fallback_warm_ms.is_none()
+            }),
+            "artifact-free finite profiles must not benchmark unused session books"
+        );
+        let mut corrupt = first.clone();
+        corrupt.baselines[0].result.posterior_calibration[0].total_states += 1;
+        assert!(corrupt.validate_identity().is_err());
+        let mut obsolete = first.clone();
+        obsolete.schema_version -= 1;
+        assert!(obsolete.validate_identity().is_err());
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&fs::read(&checkpoint_path).expect("checkpoint bytes"))
+                .expect("checkpoint JSON");
+        assert_eq!(
+            checkpoint["baselines"]
+                .as_array()
+                .expect("checkpoint baselines")
+                .len(),
+            2,
+            "fresh run must persist every completed profile"
+        );
+
+        let resumed = Solver::build_development_evidence_with_selection(
+            &paths,
+            &config,
+            selection,
+            1,
+            budget,
+            Some(&matrix_path),
+            Some(&checkpoint_path),
+        )
+        .expect("resumed evidence run");
+        assert_eq!(first.selected_ranges, resumed.selected_ranges);
+        assert_eq!(first.evaluation_selection, resumed.evaluation_selection);
+        assert_eq!(first.matrix_source, resumed.matrix_source);
+        assert_eq!(first.matrix_fingerprint, resumed.matrix_fingerprint);
+        assert_eq!(first.profile_ids, resumed.profile_ids);
+        assert_eq!(
+            first.reference_profile_id, resumed.reference_profile_id,
+            "reference profile must survive resume"
+        );
+        assert_eq!(
+            serde_json::to_value(&first.baselines).expect("fresh baselines JSON"),
+            serde_json::to_value(&resumed.baselines).expect("resumed baselines JSON"),
+            "resume must preserve per-profile configs, outcomes, and metrics"
+        );
+        let expected_total_games = first.profile_ids.len() * selected_date_count;
+        let observed_total_games = resumed
+            .baselines
+            .iter()
+            .map(|baseline| baseline.result.backtest.canonical.scheduled_games)
+            .sum::<usize>();
+        assert_eq!(observed_total_games, expected_total_games);
+
+        let mut partial_checkpoint = checkpoint.clone();
+        partial_checkpoint["baselines"]
+            .as_array_mut()
+            .expect("checkpoint baselines")
+            .truncate(1);
+        fs::write(
+            &checkpoint_path,
+            serde_json::to_vec(&partial_checkpoint).expect("partial checkpoint JSON"),
+        )
+        .expect("partial checkpoint");
+        let partial_resumed = Solver::build_development_evidence_with_selection(
+            &paths,
+            &config,
+            selection,
+            1,
+            budget,
+            Some(&matrix_path),
+            Some(&checkpoint_path),
+        )
+        .expect("resume unfinished matrix");
+        assert_eq!(partial_resumed.baselines.len(), first.baselines.len());
+        assert_eq!(
+            serde_json::to_value(&partial_resumed.baselines[0]).expect("retained profile"),
+            serde_json::to_value(&first.baselines[0]).expect("original profile"),
+            "partial resume must retain the completed profile, including timings"
+        );
+        for (expected, actual) in first.baselines.iter().zip(&partial_resumed.baselines) {
+            assert_eq!(expected.config_fingerprint, actual.config_fingerprint);
+            assert_eq!(
+                expected.result.backtest.canonical,
+                actual.result.backtest.canonical
+            );
+            assert_eq!(
+                expected
+                    .result
+                    .games
+                    .iter()
+                    .map(|game| game.outcome)
+                    .collect::<Vec<_>>(),
+                actual
+                    .result
+                    .games
+                    .iter()
+                    .map(|game| game.outcome)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let mut standalone_matrix: serde_json::Value =
+            serde_json::from_str(matrix).expect("matrix JSON");
+        standalone_matrix["profiles"]
+            .as_array_mut()
+            .expect("profiles")
+            .truncate(1);
+        let standalone_path = root.join("evidence-matrix-uniform.json");
+        fs::write(
+            &standalone_path,
+            serde_json::to_vec(&standalone_matrix).expect("standalone matrix JSON"),
+        )
+        .expect("standalone matrix");
+        let standalone = Solver::build_development_evidence_with_selection(
+            &paths,
+            &config,
+            selection,
+            1,
+            budget,
+            Some(&standalone_path),
+            None,
+        )
+        .expect("standalone profile run");
+        let combined = &first.baselines[0];
+        let isolated = &standalone.baselines[0];
+        assert_eq!(
+            combined.effective_config_toml,
+            isolated.effective_config_toml
+        );
+        assert_eq!(combined.config_fingerprint, isolated.config_fingerprint);
+        assert_eq!(
+            combined.result.backtest.canonical,
+            isolated.result.backtest.canonical
+        );
+        assert_eq!(
+            combined
+                .result
+                .games
+                .iter()
+                .map(|game| game.outcome)
+                .collect::<Vec<_>>(),
+            isolated
+                .result
+                .games
+                .iter()
+                .map(|game| game.outcome)
+                .collect::<Vec<_>>()
+        );
+
+        let changed_matrix =
+            matrix.replace("Weighted finite toy profile", "Changed finite toy profile");
+        fs::write(&matrix_path, changed_matrix).expect("changed matrix");
+        let error = Solver::build_development_evidence_with_selection(
+            &paths,
+            &config,
+            selection,
+            1,
+            budget,
+            Some(&matrix_path),
+            Some(&checkpoint_path),
+        )
+        .expect_err("changed matrix must invalidate the checkpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("different source, config, plan, or matrix inputs"),
+            "unexpected matrix identity error: {error:#}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn exact_search_errors_when_no_guess_shrinks_subset() {
         let corpus = ["cigar", "rebut", "sissy", "humph", "awake", "blush"];
         let mut witness = None;
@@ -4274,7 +5495,6 @@ mod tests {
             answers,
             primary_answer_count: guesses.len(),
             history_dates: Vec::new(),
-            exact_small_state_table: SmallStateTable::build(2),
             pattern_table,
             guess_index: guesses
                 .iter()
@@ -4289,14 +5509,7 @@ mod tests {
         let mut memo = PredictiveMemoMap::default();
         let mut scratch = ExactSearchScratch::new();
         let error = solver
-            .exact_best_cost(
-                &[0, 1],
-                &[1.0, 1.0],
-                &solver.exact_small_state_table,
-                &mut memo,
-                &mut scratch,
-                0,
-            )
+            .exact_best_cost(&[0, 1], &[1.0, 1.0], &mut memo, &mut scratch, 0)
             .expect_err("no shrinking guess should error");
         assert!(error.to_string().contains("no valid exact guess found"));
         assert!(memo.is_empty());

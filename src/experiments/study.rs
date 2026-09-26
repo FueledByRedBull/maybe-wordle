@@ -12,10 +12,10 @@ use crate::{atomic_file::atomic_write, config::PriorConfig};
 
 use super::{
     EvaluationPlan, ParameterCohort, ParameterDefinition, ParameterKind, ParameterRegistry,
-    ParameterScale, ParameterValue,
+    ParameterScale, ParameterValue, PredictiveMetrics,
 };
 
-pub const STUDY_FORMAT_VERSION: u32 = 16;
+pub const STUDY_FORMAT_VERSION: u32 = 18;
 
 fn default_maximum_validation_folds() -> usize {
     12
@@ -327,13 +327,7 @@ impl StudyCandidate {
     pub fn equivalent_to(&self, other: &Self) -> bool {
         self.number == other.number
             && self.seed == other.seed
-            && self.parameters.len() == other.parameters.len()
-            && self.parameters.iter().all(|(name, left)| {
-                other
-                    .parameters
-                    .get(name)
-                    .is_some_and(|right| parameter_values_equivalent(left, right))
-            })
+            && parameter_set_key(&self.parameters) == parameter_set_key(&other.parameters)
     }
 
     pub fn identity(&self, spec: &StudySpec, provenance: &StudyProvenance) -> Result<String> {
@@ -383,13 +377,7 @@ impl StudyCandidate {
 
 fn canonical_parameter_value(value: &ParameterValue) -> String {
     match value {
-        ParameterValue::Float(value) => {
-            let stable = serde_json::to_string(value)
-                .ok()
-                .and_then(|encoded| serde_json::from_str::<f64>(&encoded).ok())
-                .unwrap_or(*value);
-            format!("float:{:016x}", stable.to_bits())
-        }
+        ParameterValue::Float(value) => format!("float:{:016x}", value.to_bits()),
         ParameterValue::Integer(value) => format!("integer:{value}"),
         ParameterValue::Categorical(value) => format!("categorical:{value}"),
         ParameterValue::FloatMap => "float_map".to_string(),
@@ -409,6 +397,30 @@ fn parameter_set_key(parameters: &BTreeMap<String, ParameterValue>) -> String {
         })
         .collect::<Vec<_>>()
         .join("|")
+}
+
+fn effective_parameter_set_key(
+    dimensions: &[&ParameterDefinition],
+    parameters: &BTreeMap<String, ParameterValue>,
+) -> String {
+    let mut effective = dimensions
+        .iter()
+        .map(|definition| {
+            (
+                definition.name.clone(),
+                parameters
+                    .get(&definition.name)
+                    .cloned()
+                    .unwrap_or_else(|| definition.default.clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (name, value) in parameters {
+        effective
+            .entry(name.clone())
+            .or_insert_with(|| value.clone());
+    }
+    parameter_set_key(&effective)
 }
 
 fn parameter_values_equivalent(left: &ParameterValue, right: &ParameterValue) -> bool {
@@ -450,17 +462,40 @@ pub struct StudyMeasurement {
     pub log_loss_sum: f64,
     pub brier_score_sum: f64,
     pub all_game_penalized_mean_guesses: Option<f64>,
+    /// Mean over solved games only, unlike the backtest's modeled-game mean.
     pub conditional_mean_guesses: Option<f64>,
     pub average_log_loss: Option<f64>,
     pub average_brier_score: Option<f64>,
     pub latency_p95_ms: Option<f64>,
+    /// Shared process-lifetime peak: a budget diagnostic, not a candidate objective.
     pub peak_memory_bytes: Option<u64>,
 }
 
 impl StudyMeasurement {
+    pub fn record_solve_metrics(&mut self, metrics: &PredictiveMetrics) {
+        self.solve_metrics_recorded = true;
+        self.scheduled_games = metrics.scheduled_games;
+        self.solved_games = metrics.solved_games;
+        self.failures = metrics.unsolved_games;
+        self.coverage_gaps = metrics.coverage_gaps;
+        self.solved_guess_sum = metrics
+            .solved_in_guess_counts
+            .iter()
+            .enumerate()
+            .map(|(index, count)| (index + 1) * count)
+            .sum::<usize>() as f64;
+        self.penalized_guess_sum = self.solved_guess_sum
+            + (self.failures + self.coverage_gaps) as f64 * metrics.failure_penalty_guesses;
+        self.refresh_derived();
+    }
+
     pub fn merge_fold(&mut self, fold: &Self) -> Result<()> {
         if fold.validation_fold_indices.is_empty() {
             bail!("study fold measurement must identify at least one validation fold");
+        }
+        let unique = fold.validation_fold_indices.iter().collect::<HashSet<_>>();
+        if unique.len() != fold.validation_fold_indices.len() {
+            bail!("study fold measurement contains duplicate validation folds");
         }
         if fold
             .validation_fold_indices
@@ -515,7 +550,6 @@ impl StudyMeasurement {
             .then_with(|| compare_optional(self.average_log_loss, other.average_log_loss))
             .then_with(|| compare_optional(self.average_brier_score, other.average_brier_score))
             .then_with(|| compare_optional(self.latency_p95_ms, other.latency_p95_ms))
-            .then_with(|| compare_optional_u64(self.peak_memory_bytes, other.peak_memory_bytes))
     }
 }
 
@@ -585,7 +619,15 @@ impl StudyState {
             bail!("optimizer state must not contain sealed-test evaluation");
         }
         let mut identities = HashSet::new();
+        let permitted_folds = self.spec.fidelity_fold_indices(
+            self.evaluation_plan.folds.len(),
+            self.spec.maximum_validation_folds,
+        )?;
+        let mut trial_numbers = HashSet::new();
         for trial in &self.trials {
+            if !trial_numbers.insert(trial.candidate.number) {
+                bail!("duplicate trial number");
+            }
             if !identities.insert(trial.identity.as_str()) {
                 bail!("duplicate trial identity");
             }
@@ -611,6 +653,75 @@ impl StudyState {
             }
             if trial.pareto_rank.is_some() && trial.measurement.is_none() {
                 bail!("Pareto-ranked trial is missing its measurement");
+            }
+            if let Some(measurement) = &trial.measurement {
+                let folds = measurement
+                    .validation_fold_indices
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                if folds.len() != measurement.validation_fold_indices.len()
+                    || folds.iter().any(|index| !permitted_folds.contains(index))
+                {
+                    bail!("study measurement contains duplicate or unplanned validation folds");
+                }
+                if trial.status == TrialStatus::Complete
+                    && folds.len() != self.spec.maximum_validation_folds
+                {
+                    bail!("completed trial does not contain every required validation fold");
+                }
+                let maximum_games = self
+                    .evaluation_plan
+                    .folds
+                    .iter()
+                    .filter(|fold| folds.contains(&fold.index))
+                    .map(|fold| fold.validation.days() as usize)
+                    .sum::<usize>();
+                if measurement.scheduled_games > maximum_games
+                    || measurement.measured_prior_games > measurement.scheduled_games
+                    || (measurement.solve_metrics_recorded
+                        && measurement
+                            .solved_games
+                            .checked_add(measurement.failures)
+                            .and_then(|count| count.checked_add(measurement.coverage_gaps))
+                            != Some(measurement.scheduled_games))
+                {
+                    bail!("study measurement game counts are inconsistent");
+                }
+                let sums = [
+                    measurement.penalized_guess_sum,
+                    measurement.solved_guess_sum,
+                    measurement.log_loss_sum,
+                    measurement.brier_score_sum,
+                ];
+                if sums.iter().any(|value| !value.is_finite() || *value < 0.0) {
+                    bail!("study measurement contains invalid metric sums");
+                }
+                let mut derived = measurement.clone();
+                derived.refresh_derived();
+                for (stored, expected) in [
+                    (
+                        measurement.all_game_penalized_mean_guesses,
+                        derived.all_game_penalized_mean_guesses,
+                    ),
+                    (
+                        measurement.conditional_mean_guesses,
+                        derived.conditional_mean_guesses,
+                    ),
+                    (measurement.average_log_loss, derived.average_log_loss),
+                    (measurement.average_brier_score, derived.average_brier_score),
+                ] {
+                    let agrees = match (stored, expected) {
+                        (Some(left), Some(right)) => {
+                            left.is_finite() && (left - right).abs() <= 1e-10 * right.abs().max(1.0)
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !agrees {
+                        bail!("study measurement derived metrics disagree with additive totals");
+                    }
+                }
             }
             for violation in &trial.hard_constraint_violations {
                 if violation.constraint.trim().is_empty()
@@ -659,7 +770,7 @@ impl StudyState {
             .with_context(|| format!("failed to parse {}", path.display()))?;
         if state.format_version < STUDY_FORMAT_VERSION {
             bail!(
-                "study state format {} lacks complete provenance; start a new format-v{} state instead of resuming it",
+                "study state format {} uses obsolete provenance or measurement semantics; start a new format-v{} state instead of resuming it",
                 state.format_version,
                 STUDY_FORMAT_VERSION
             );
@@ -781,10 +892,6 @@ fn measurement_dominates(left: &StudyMeasurement, right: &StudyMeasurement) -> b
         (left.average_log_loss, right.average_log_loss),
         (left.average_brier_score, right.average_brier_score),
         (left.latency_p95_ms, right.latency_p95_ms),
-        (
-            left.peak_memory_bytes.map(|value| value as f64),
-            right.peak_memory_bytes.map(|value| value as f64),
-        ),
     ] {
         if let (Some(left), Some(right)) = (left, right) {
             let ordering = left.total_cmp(&right);
@@ -831,18 +938,49 @@ pub fn successive_halving_survivors(
         .take(survivor_count)
         .map(|trial| trial.candidate.number)
         .collect::<HashSet<_>>();
-    if let Some(baseline) = eligible.iter().find(|trial| trial.candidate.number == 0)
-        && !survivors.contains(&0)
-        && let Some(worst) = eligible
-            .iter()
-            .take(survivor_count)
-            .next_back()
-            .map(|trial| trial.candidate.number)
-    {
-        survivors.remove(&worst);
+    if let Some(baseline) = eligible.iter().find(|trial| trial.candidate.number == 0) {
         survivors.insert(baseline.candidate.number);
     }
     survivors
+}
+
+fn study_parameters(
+    registry: &ParameterRegistry,
+    base: &PriorConfig,
+    stage: StudyStage,
+) -> Vec<ParameterDefinition> {
+    registry
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.tunable() && stage.includes(parameter.cohort))
+        .filter(|parameter| {
+            !base.search_policy_mode.is_finite()
+                || parameter.cohort == ParameterCohort::PriorCalibration
+                || (parameter.name.starts_with("proxy_weights.")
+                    && parameter.name != "proxy_weights.gray_reuse_w")
+                || matches!(
+                    parameter.name.as_str(),
+                    "fallback_prior_mass"
+                        | "search_policy_mode"
+                        | "proxy_small_state_lower_bound_threshold"
+                        | "trap_size_threshold"
+                        | "trap_mass_threshold"
+                        | "ambiguous_mass_threshold"
+                )
+        })
+        .cloned()
+        .map(|mut parameter| {
+            if parameter.name == "search_policy_mode"
+                && let ParameterKind::Categorical { choices } = &mut parameter.kind
+            {
+                choices.retain(|choice| {
+                    choice != "finite_baseline"
+                        && choice.starts_with("finite_") == base.search_policy_mode.is_finite()
+                });
+            }
+            parameter
+        })
+        .collect()
 }
 
 pub fn generate_candidates(
@@ -855,11 +993,8 @@ pub fn generate_candidates(
     if spec.strategy == StudySearchStrategy::ModelBased {
         bail!("model-based candidates require completed observations from the study runner");
     }
-    let dimensions = registry
-        .parameters
-        .iter()
-        .filter(|parameter| parameter.tunable() && spec.stage.includes(parameter.cohort))
-        .collect::<Vec<_>>();
+    let definitions = study_parameters(registry, base, spec.stage);
+    let dimensions = definitions.iter().collect::<Vec<_>>();
     if dimensions.is_empty() {
         bail!("study stage contains no tunable parameters");
     }
@@ -875,7 +1010,8 @@ pub fn generate_candidates(
     }
 
     let mut candidates = Vec::with_capacity(spec.trial_count);
-    let mut seen_parameters = HashSet::from([String::new()]);
+    let mut seen_parameters =
+        HashSet::from([effective_parameter_set_key(&dimensions, &BTreeMap::new())]);
     candidates.push((
         StudyCandidate {
             number: 0,
@@ -887,7 +1023,7 @@ pub fn generate_candidates(
     if spec.stage.requires_complete_one_factor_sweep() {
         for definition in &dimensions {
             let (parameters, config) = valid_one_factor_candidate(registry, base, definition)?;
-            seen_parameters.insert(parameter_set_key(&parameters));
+            seen_parameters.insert(effective_parameter_set_key(&dimensions, &parameters));
             let number = candidates.len();
             candidates.push((
                 StudyCandidate {
@@ -903,7 +1039,7 @@ pub fn generate_candidates(
     let attempt_limit = spec.trial_count.saturating_mul(200).max(200);
     while candidates.len() < spec.trial_count && attempt <= attempt_limit {
         let parameters = sample_parameters(&dimensions, spec, attempt);
-        let parameter_key = parameter_set_key(&parameters);
+        let parameter_key = effective_parameter_set_key(&dimensions, &parameters);
         if seen_parameters.insert(parameter_key)
             && let Ok(config) = registry.apply_tunable_values(base, &parameters)
         {
@@ -940,11 +1076,8 @@ pub fn generate_model_based_candidate(
     if trials.len() >= spec.trial_count {
         bail!("the requested model-based study already has every candidate");
     }
-    let dimensions = registry
-        .parameters
-        .iter()
-        .filter(|parameter| parameter.tunable() && spec.stage.includes(parameter.cohort))
-        .collect::<Vec<_>>();
+    let definitions = study_parameters(registry, base, spec.stage);
+    let dimensions = definitions.iter().collect::<Vec<_>>();
     if dimensions.is_empty() {
         bail!("study stage contains no tunable parameters");
     }
@@ -991,13 +1124,13 @@ pub fn generate_model_based_candidate(
     }
     let seen = trials
         .iter()
-        .map(|trial| parameter_set_key(&trial.candidate.parameters))
+        .map(|trial| effective_parameter_set_key(&dimensions, &trial.candidate.parameters))
         .collect::<HashSet<_>>();
     let observations = trials
         .iter()
         .filter(|trial| trial.status == TrialStatus::Complete && trial.measurement.is_some())
         .collect::<Vec<_>>();
-    let startup_trials = spec.trial_count.saturating_sub(1).min(8);
+    let startup_trials = spec.trial_count.saturating_sub(1).clamp(2, 8);
     let attempt_limit = spec.trial_count.saturating_mul(200).max(200);
     for attempt in 1..=attempt_limit {
         let parameters = if observations.len() < startup_trials {
@@ -1009,7 +1142,7 @@ pub fn generate_model_based_candidate(
         } else {
             sample_tpe_parameters(&dimensions, spec.seed, number, attempt, &observations)
         };
-        if seen.contains(&parameter_set_key(&parameters)) {
+        if seen.contains(&effective_parameter_set_key(&dimensions, &parameters)) {
             continue;
         }
         if let Ok(config) = registry.apply_tunable_values(base, &parameters) {
@@ -1073,7 +1206,9 @@ fn sample_tpe_parameters(
     });
     let elite_count = ranked.len().div_ceil(4).max(2).min(ranked.len() - 1);
     let (elite, remainder) = ranked.split_at(elite_count);
-    let width = (1 + (number.saturating_sub(1) / dimensions.len())).min(4);
+    let width = (1 + (number.saturating_sub(1) / dimensions.len()))
+        .min(4)
+        .min(dimensions.len());
     let proposal_count = 64usize;
     (0..proposal_count)
         .map(|proposal| {
@@ -1082,32 +1217,31 @@ fn sample_tpe_parameters(
                 (attempt.saturating_mul(proposal_count) + proposal) as u64,
             );
             let first = proposal_seed as usize % dimensions.len();
+            let parent = elite[proposal_seed as usize % elite.len()];
             let mut score = 0.0;
-            let parameters = (0..width)
-                .map(|offset| {
-                    let index = (first + offset * 17) % dimensions.len();
-                    let definition = dimensions[index];
-                    let center_trial = elite[(proposal_seed as usize + offset) % elite.len()];
-                    let center = trial_parameter_unit(center_trial, definition);
-                    let left = mix_seed(proposal_seed ^ index as u64, offset as u64);
-                    let right = mix_seed(left, (proposal + 1) as u64);
-                    let left_unit = (left >> 11) as f64 / ((1u64 << 53) as f64);
-                    let right_unit = (right >> 11) as f64 / ((1u64 << 53) as f64);
-                    let bandwidth = (0.30 / (elite.len() as f64).sqrt()).clamp(0.05, 0.20);
-                    let unit = (center + (left_unit - right_unit) * bandwidth).clamp(0.0, 1.0);
-                    let elite_units = elite
-                        .iter()
-                        .map(|trial| trial_parameter_unit(trial, definition))
-                        .collect::<Vec<_>>();
-                    let remainder_units = remainder
-                        .iter()
-                        .map(|trial| trial_parameter_unit(trial, definition))
-                        .collect::<Vec<_>>();
-                    score += (kernel_density(unit, &elite_units, bandwidth) + 1e-12).ln()
-                        - (kernel_density(unit, &remainder_units, bandwidth) + 1e-12).ln();
-                    (definition.name.clone(), sample_value(definition, unit))
-                })
-                .collect::<BTreeMap<_, _>>();
+            let mut parameters = parent.candidate.parameters.clone();
+            for offset in 0..width {
+                let index = (first + offset) % dimensions.len();
+                let definition = dimensions[index];
+                let center = trial_parameter_unit(parent, definition);
+                let left = mix_seed(proposal_seed ^ index as u64, offset as u64);
+                let right = mix_seed(left, (proposal + 1) as u64);
+                let left_unit = (left >> 11) as f64 / ((1u64 << 53) as f64);
+                let right_unit = (right >> 11) as f64 / ((1u64 << 53) as f64);
+                let bandwidth = (0.30 / (elite.len() as f64).sqrt()).clamp(0.05, 0.20);
+                let unit = (center + (left_unit - right_unit) * bandwidth).clamp(0.0, 1.0);
+                let elite_units = elite
+                    .iter()
+                    .map(|trial| trial_parameter_unit(trial, definition))
+                    .collect::<Vec<_>>();
+                let remainder_units = remainder
+                    .iter()
+                    .map(|trial| trial_parameter_unit(trial, definition))
+                    .collect::<Vec<_>>();
+                score += (kernel_density(unit, &elite_units, bandwidth) + 1e-12).ln()
+                    - (kernel_density(unit, &remainder_units, bandwidth) + 1e-12).ln();
+                parameters.insert(definition.name.clone(), sample_value(definition, unit));
+            }
             (score, proposal, parameters)
         })
         .max_by(|left, right| {
@@ -1166,11 +1300,11 @@ fn sample_grid(
     let zero_based = attempt - 1;
     let first = zero_based % dimension_count;
     let level = LEVELS[(zero_based / dimension_count) % LEVELS.len()];
-    let width = 1 + (zero_based / (dimension_count * LEVELS.len())).min(2);
+    let width = (1 + (zero_based / (dimension_count * LEVELS.len())).min(2)).min(dimension_count);
     (0..width)
         .map(|offset| {
-            let index = (first + offset * 17) % dimension_count;
-            let shifted = (level + offset as f64 / LEVELS.len() as f64).fract();
+            let index = (first + offset) % dimension_count;
+            let shifted = (level + offset as f64 / LEVELS.len() as f64).min(1.0);
             (
                 dimensions[index].name.clone(),
                 sample_value(dimensions[index], shifted),
@@ -1189,7 +1323,7 @@ fn sample_random(
     let first = mix_seed(seed, attempt as u64) as usize % dimension_count;
     (0..width)
         .map(|offset| {
-            let index = (first + offset * 17) % dimension_count;
+            let index = (first + offset) % dimension_count;
             let bits = mix_seed(seed ^ index as u64, (attempt + offset) as u64);
             let unit = (bits >> 11) as f64 / ((1u64 << 53) as f64);
             (
@@ -1261,7 +1395,7 @@ fn sample_neighborhood(
     };
     (0..width)
         .map(|offset| {
-            let index = (first + offset * 17) % dimension_count;
+            let index = (first + offset) % dimension_count;
             let definition = dimensions[index];
             let unit = radical_inverse((round + offset + 1) as u64, prime(index));
             (definition.name.clone(), sample_value(definition, unit))
@@ -1306,15 +1440,6 @@ fn sample_value(definition: &ParameterDefinition, unit: f64) -> ParameterValue {
 fn compare_optional(left: Option<f64>, right: Option<f64>) -> Ordering {
     match (left, right) {
         (Some(left), Some(right)) => left.total_cmp(&right),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
-}
-
-fn compare_optional_u64(left: Option<u64>, right: Option<u64>) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => left.cmp(&right),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
@@ -1556,12 +1681,12 @@ mod tests {
     fn granular_studies_reject_partial_budgets_and_model_based_startup_covers_every_knob() {
         let base = PriorConfig::default();
         let registry = predictive_parameter_registry(&base);
-        let too_small = spec(StudyStage::SearchCoverage, 4);
+        let too_small = spec(StudyStage::SearchCoverage, 3);
         assert!(
             generate_candidates(&registry, &base, &too_small)
-                .expect_err("four knobs plus a baseline require five trials")
+                .expect_err("three knobs plus a baseline require four trials")
                 .to_string()
-                .contains("requires at least 5 trials")
+                .contains("requires at least 4 trials")
         );
 
         let mut study = spec(StudyStage::SearchCoverage, 5);
@@ -1596,7 +1721,6 @@ mod tests {
                 "second_guess_coverage_min_survivors",
                 "second_guess_coverage_max_survivors",
                 "second_guess_coverage_pool",
-                "second_guess_coverage_child_cap",
             ])
         );
     }
@@ -1619,6 +1743,61 @@ mod tests {
                         })
                 })
         }));
+    }
+
+    #[test]
+    fn finite_studies_exclude_inactive_books_recovery_and_legacy_search() {
+        let base = PriorConfig {
+            search_policy_mode: crate::config::SearchPolicyMode::FiniteFast,
+            ..PriorConfig::default()
+        };
+        let registry = predictive_parameter_registry(&base);
+        let parameters = super::study_parameters(&registry, &base, StudyStage::Joint);
+        let calibration = super::study_parameters(&registry, &base, StudyStage::Calibration);
+        assert_eq!(calibration.len(), 7);
+        assert!(
+            calibration
+                .iter()
+                .any(|parameter| parameter.name == "fallback_prior_mass"
+                    && parameter.cohort == ParameterCohort::PriorCalibration)
+        );
+        assert!(super::study_parameters(&registry, &base, StudyStage::CoverageRecovery).is_empty());
+        assert!(
+            !parameters
+                .iter()
+                .any(|parameter| parameter.name == "proxy_weights.gray_reuse_w")
+        );
+        for active in [
+            "proxy_small_state_lower_bound_threshold",
+            "trap_size_threshold",
+            "trap_mass_threshold",
+            "ambiguous_mass_threshold",
+        ] {
+            assert!(
+                parameters.iter().any(|parameter| parameter.name == active),
+                "missing active finite parameter {active}"
+            );
+        }
+        assert!(
+            parameters
+                .iter()
+                .all(|parameter| !parameter.name.starts_with("session_")
+                    && !parameter.name.starts_with("recovery.")
+                    && !parameter.name.starts_with("second_guess_")
+                    && !parameter.name.starts_with("danger_")
+                    && parameter.name != "fallback_activation_threshold")
+        );
+        let candidates = generate_candidates(&registry, &base, &spec(StudyStage::SearchRouting, 2))
+            .expect("finite routing candidates");
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|(_, config)| config.search_policy_mode.is_finite()
+                    && config.search_policy_mode
+                        != crate::config::SearchPolicyMode::FiniteBaseline)
+        );
+        assert!(generate_candidates(&registry, &base, &spec(StudyStage::BookPolicy, 2)).is_err());
     }
 
     #[test]
@@ -1677,6 +1856,156 @@ mod tests {
                 .map(|(candidate, _)| parameter_set_key(&candidate.parameters))
                 .collect::<HashSet<_>>();
             assert_eq!(keys.len(), left.len(), "strategy {strategy:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_samplers_keep_dimensions_unique() {
+        let registry = predictive_parameter_registry(&PriorConfig::default());
+        let dimensions = registry
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.tunable())
+            .take(17)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sample_grid(&dimensions, 86).len(), 2);
+        assert_eq!(sample_random(&dimensions, 42, 18).len(), 2);
+        assert_eq!(sample_neighborhood(&dimensions, 35).len(), 2);
+    }
+
+    #[test]
+    fn grid_sampler_retains_the_upper_endpoint() {
+        let registry = predictive_parameter_registry(&PriorConfig::default());
+        let definition = registry
+            .get("base_seed_weight")
+            .expect("base seed weight definition");
+        let dimensions = vec![definition];
+        let parameters = sample_grid(&dimensions, 5);
+        assert_eq!(
+            value_to_unit(
+                definition,
+                parameters.get(&definition.name).expect("sample")
+            ),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn effective_parameter_deduplication_ignores_explicit_defaults() {
+        let registry = predictive_parameter_registry(&PriorConfig::default());
+        let definition = registry
+            .get("base_seed_weight")
+            .expect("base seed weight definition");
+        let dimensions = vec![definition];
+        let explicit_default =
+            BTreeMap::from([(definition.name.clone(), definition.default.clone())]);
+        assert_eq!(
+            effective_parameter_set_key(&dimensions, &BTreeMap::new()),
+            effective_parameter_set_key(&dimensions, &explicit_default)
+        );
+    }
+
+    #[test]
+    fn tpe_refinement_retains_one_elite_full_effective_configuration() {
+        let base = PriorConfig::default();
+        let registry = predictive_parameter_registry(&base);
+        let study = spec(StudyStage::ProxyRanker, 12);
+        let dimensions = registry
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.tunable() && study.stage.includes(parameter.cohort))
+            .take(5)
+            .collect::<Vec<_>>();
+        let trials = (0..4)
+            .map(|number| StudyTrial {
+                candidate: StudyCandidate {
+                    number,
+                    seed: number as u64,
+                    parameters: dimensions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, definition)| {
+                            (
+                                definition.name.clone(),
+                                sample_value(
+                                    definition,
+                                    0.1 + number as f64 * 0.1 + index as f64 * 0.01,
+                                ),
+                            )
+                        })
+                        .collect(),
+                },
+                identity: number.to_string(),
+                status: TrialStatus::Complete,
+                measurement: Some(StudyMeasurement {
+                    validation_fold_indices: (0..12).collect(),
+                    all_game_penalized_mean_guesses: Some(number as f64),
+                    ..StudyMeasurement::default()
+                }),
+                reason: None,
+                elapsed_ms: Some(1),
+                pareto_rank: None,
+                hard_constraint_violations: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let observations = trials.iter().collect::<Vec<_>>();
+        let parameters = sample_tpe_parameters(&dimensions, 42, 10, 1, &observations);
+
+        assert_eq!(parameters.len(), dimensions.len());
+        assert!(trials.iter().take(2).any(|parent| {
+            dimensions
+                .iter()
+                .filter(|definition| {
+                    parent.candidate.parameters.get(&definition.name)
+                        == parameters.get(&definition.name)
+                })
+                .count()
+                >= dimensions.len() - 2
+        }));
+        registry
+            .apply_tunable_values(&base, &parameters)
+            .expect("full elite configuration remains valid");
+    }
+
+    #[test]
+    fn two_trial_model_based_studies_use_random_startup_with_one_observation() {
+        let base = PriorConfig::default();
+        let registry = predictive_parameter_registry(&base);
+        for stage in [
+            StudyStage::ProxyRanker,
+            StudyStage::SolvePolicy,
+            StudyStage::Joint,
+        ] {
+            let mut study = spec(stage, 2);
+            study.strategy = StudySearchStrategy::ModelBased;
+            let (baseline, _) =
+                generate_model_based_candidate(&registry, &base, &study, &[]).expect("baseline");
+            let trials = vec![StudyTrial {
+                candidate: baseline,
+                identity: "baseline".to_string(),
+                status: TrialStatus::Complete,
+                measurement: Some(StudyMeasurement::default()),
+                reason: None,
+                elapsed_ms: Some(1),
+                pareto_rank: None,
+                hard_constraint_violations: Vec::new(),
+            }];
+            let (candidate, config) =
+                generate_model_based_candidate(&registry, &base, &study, &trials)
+                    .expect("second candidate with only one observation");
+            assert_eq!(candidate.number, 1);
+            assert!(!candidate.parameters.is_empty());
+            assert_ne!(
+                toml::to_string(&config).unwrap(),
+                toml::to_string(&base).unwrap()
+            );
+            assert_eq!(
+                candidate,
+                generate_model_based_candidate(&registry, &base, &study, &trials)
+                    .expect("deterministic replay")
+                    .0
+            );
         }
     }
 
@@ -1817,7 +2146,38 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let survivors = successive_halving_survivors(&trials, 3, 2);
-        assert_eq!(survivors, HashSet::from([0, 1]));
+        assert_eq!(survivors, HashSet::from([0, 1, 2]));
+    }
+
+    #[test]
+    fn successive_halving_does_not_replace_the_only_finalist_with_the_baseline() {
+        let trial = |number, mean| StudyTrial {
+            candidate: StudyCandidate {
+                number,
+                seed: number as u64,
+                parameters: BTreeMap::new(),
+            },
+            identity: number.to_string(),
+            status: TrialStatus::Running,
+            measurement: Some(StudyMeasurement {
+                validation_fold_indices: vec![0],
+                solve_metrics_recorded: true,
+                scheduled_games: 30,
+                solved_games: 30,
+                all_game_penalized_mean_guesses: Some(mean),
+                ..StudyMeasurement::default()
+            }),
+            reason: None,
+            elapsed_ms: Some(1),
+            pareto_rank: None,
+            hard_constraint_violations: Vec::new(),
+        };
+        let trials = [trial(0, 3.1667), trial(1, 3.1333)];
+
+        assert_eq!(
+            successive_halving_survivors(&trials, 1, 3),
+            HashSet::from([0, 1])
+        );
     }
 
     #[test]
@@ -1835,15 +2195,60 @@ mod tests {
             complete.compare_guarded(&lower_mean_with_gap),
             Ordering::Less
         );
+    }
 
+    #[test]
+    fn shared_process_memory_cannot_rank_or_dominate_candidates() {
         let measured_memory = StudyMeasurement {
             peak_memory_bytes: Some(100),
             ..StudyMeasurement::default()
         };
+        let later_measurement = StudyMeasurement {
+            peak_memory_bytes: Some(200),
+            ..StudyMeasurement::default()
+        };
         assert_eq!(
             measured_memory.compare_guarded(&StudyMeasurement::default()),
-            Ordering::Less
+            Ordering::Equal
         );
+        assert_eq!(
+            measured_memory.compare_guarded(&later_measurement),
+            Ordering::Equal
+        );
+        assert!(!measurement_dominates(&measured_memory, &later_measurement));
+        assert!(!measurement_dominates(&later_measurement, &measured_memory));
+    }
+
+    #[test]
+    fn solve_totals_exclude_failures_and_penalize_every_unsolved_game() {
+        use super::super::{BootstrapConfig, GameOutcome, summarize_predictive_outcomes};
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let outcomes = [
+            GameOutcome::solved(date, 2),
+            GameOutcome::solved(date + chrono::Days::new(1), 4),
+            GameOutcome::unsolved(date + chrono::Days::new(2), 6),
+            GameOutcome::coverage_gap(date + chrono::Days::new(3)),
+        ];
+        let metrics = summarize_predictive_outcomes(
+            &outcomes,
+            7.0,
+            BootstrapConfig {
+                resamples: 10,
+                ..BootstrapConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(metrics.conditional_mean_guesses, 4.0);
+        let mut measurement = StudyMeasurement::default();
+        measurement.record_solve_metrics(&metrics);
+        assert_eq!(measurement.scheduled_games, 4);
+        assert_eq!(measurement.solved_games, 2);
+        assert_eq!(measurement.failures, 1);
+        assert_eq!(measurement.coverage_gaps, 1);
+        assert_eq!(measurement.solved_guess_sum, 6.0);
+        assert_eq!(measurement.conditional_mean_guesses, Some(3.0));
+        assert_eq!(measurement.penalized_guess_sum, 20.0);
+        assert_eq!(measurement.all_game_penalized_mean_guesses, Some(5.0));
     }
 
     #[test]
@@ -2004,7 +2409,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_equivalence_accepts_json_round_trip_float_drift() {
+    fn candidate_identity_preserves_json_floats_without_aliasing_neighbors() {
         let left = StudyCandidate {
             number: 4,
             seed: 7,
@@ -2020,8 +2425,12 @@ mod tests {
             )]),
             ..left.clone()
         };
-        assert!(left.equivalent_to(&right));
-        assert_eq!(
+        let decoded: StudyCandidate =
+            serde_json::from_slice(&serde_json::to_vec(&left).unwrap()).unwrap();
+        assert!(left.equivalent_to(&decoded));
+        assert_eq!(left, decoded);
+        assert!(!left.equivalent_to(&right));
+        assert_ne!(
             left.identity(&spec(StudyStage::Calibration, 5), &provenance())
                 .expect("left"),
             right
@@ -2041,7 +2450,20 @@ mod tests {
             RollingOriginConfig::default(),
         )
         .expect("plan");
-        let spec = spec(StudyStage::Calibration, 2);
+        let mut spec = spec(StudyStage::Calibration, 2);
+        spec.maximum_validation_folds = evaluation_plan.folds.len();
+        spec.initial_validation_folds = spec
+            .initial_validation_folds
+            .min(spec.maximum_validation_folds);
+        let mut measurement = StudyMeasurement {
+            validation_fold_indices: (0..evaluation_plan.folds.len()).collect(),
+            scheduled_games: evaluation_plan.folds.len() * 30,
+            measured_prior_games: evaluation_plan.folds.len() * 30,
+            log_loss_sum: evaluation_plan.folds.len() as f64 * 60.0,
+            brier_score_sum: evaluation_plan.folds.len() as f64 * 15.0,
+            ..StudyMeasurement::default()
+        };
+        measurement.refresh_derived();
         let provenance = provenance();
         let mut state =
             StudyState::new(spec.clone(), evaluation_plan, provenance.clone()).expect("state");
@@ -2054,14 +2476,42 @@ mod tests {
             identity: candidate.identity(&spec, &provenance).expect("identity"),
             candidate,
             status: TrialStatus::Complete,
-            measurement: Some(StudyMeasurement::default()),
+            measurement: Some(measurement),
             reason: None,
             elapsed_ms: Some(1),
             pareto_rank: None,
             hard_constraint_violations: Vec::new(),
         });
         state.validate().expect("valid state");
+        let encoded = serde_json::to_string(&state).expect("serialize checkpoint");
+        let restored: StudyState = serde_json::from_str(&encoded).expect("restore checkpoint");
+        restored.validate().expect("restored valid checkpoint");
+        assert_eq!(state, restored);
+        for bad_folds in [vec![0, 0], vec![usize::MAX], vec![0]] {
+            let mut invalid = restored.clone();
+            invalid.trials[0]
+                .measurement
+                .as_mut()
+                .unwrap()
+                .validation_fold_indices = bad_folds;
+            assert!(invalid.validate().is_err());
+        }
+        let mut invalid = restored;
+        invalid.trials[0]
+            .measurement
+            .as_mut()
+            .unwrap()
+            .average_log_loss = Some(0.1);
+        assert!(invalid.validate().is_err());
         assert!(!state.sealed_test_evaluated);
         assert_eq!(state.best_completed().expect("best").candidate.number, 0);
+        state.format_version = 17;
+        assert!(
+            state
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported study format")
+        );
     }
 }

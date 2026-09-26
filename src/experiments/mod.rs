@@ -13,7 +13,9 @@ pub use diagnostic::{
     default_diagnostic_suite,
 };
 pub use folds::{
-    DateRange, EvaluationPlan, RollingOriginConfig, RollingOriginFold, build_rolling_origin_plan,
+    DateRange, EVALUATION_POLICY_FORMAT_VERSION, EvaluationPlan, EvaluationPolicy,
+    RollingOriginConfig, RollingOriginFold, build_declared_rolling_origin_plan,
+    build_rolling_origin_plan,
 };
 pub use matrix::{
     EXPERIMENT_MATRIX_FORMAT_VERSION, ExperimentArtifactMode, PredictiveExperimentMatrix,

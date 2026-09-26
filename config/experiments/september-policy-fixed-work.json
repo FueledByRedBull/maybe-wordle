@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "september-fixed-work-diagnostic",
+  "profiles": [
+    {
+      "id": "finite_fast_250ms",
+      "description": "Existing finite Fast policy with a 250 ms cooperative deadline",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "finite_fast" }
+      }
+    },
+    {
+      "id": "finite_fast_fixed_work",
+      "description": "Same search geometry; four million cooperative work units, with a five-second safety deadline",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "finite_fast_fixed_work" }
+      }
+    }
+  ]
+}

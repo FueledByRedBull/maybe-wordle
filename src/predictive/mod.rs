@@ -14,5 +14,5 @@ pub use search::PredictiveRegime;
 pub use state::{PredictiveArtifactState, PredictiveStateSummary};
 pub use types::{
     PredictiveCandidateSummary, PredictiveSuggestRequest, PredictiveSuggestResponse,
-    PredictiveSuggestionMode,
+    PredictiveSuggestionMode, history_cutoff,
 };

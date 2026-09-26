@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "name": "september-v19b-staged-screen",
+  "profiles": [
+    {
+      "id": "selected_staged",
+      "description": "Selected staged configuration, without predictive artifacts",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml"
+    },
+    {
+      "id": "v19b_staged",
+      "description": "Exploratory staged higher-entropy coefficient, without predictive artifacts",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/candidates/v19b-coverage-recovery-20260726.toml"
+    }
+  ]
+}

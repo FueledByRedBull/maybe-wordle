@@ -87,7 +87,10 @@
       "description": "Weighted prior with staged lookahead/exact search and no predictive books",
       "weight_mode": "weighted",
       "model_variant": "seed_plus_history",
-      "artifact_mode": "disabled"
+      "artifact_mode": "disabled",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "staged" }
+      }
     },
     {
       "id": "selected_default_disk_artifacts",

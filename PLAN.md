@@ -1,5 +1,80 @@
 # Maybe Wordle Implementation Plan
 
+> 2026-09-26 [pre-validator-build development replay table](docs/generated/september-post-layout-tests-rolling-v1.md):
+> selected staged solved 360/360 allowed development games at 3.1944 guesses;
+> exploratory v19b solved 360/360 at 3.1917. All 720 paths matched the prior
+> replay; the run took 508 seconds, but the paired interval still crosses zero.
+> A reproducible
+> dynamic-belief finite comparison (`benchmarks/predictive/september-dynamic-finite-30day-v1.json`)
+> solved 30/30 at 3.4000 versus staged's 3.3333, with much higher latency;
+> it remains opt-in. These are retrospective development results, not a
+> flat-three or prospective claim. The release ledger and TODO own current gates.
+
+> Earlier terminal-rule development checkpoint (`benchmarks/predictive/september-v19b-staged-terminal-legal-current-binary-v1.json`):
+> the selected staged policy scored 3.1944
+> with 360/360 solves on the allowed 12 development folds after a direct
+> two-turn terminal correction. The exploratory v19b entropy weight scores
+> 3.1917 with 360/360, but its paired interval crosses zero; neither result
+> is prospective or demonstrates a flat-three mean. An earlier-build finite
+> Fast screen scored 3.5556/3.5639 on repeated runs despite 360/360 solves.
+> Production configuration remains v20. The rebuilt GUI passes draft
+> and applied first-row tile-boundary tests; the verified GUI has replaced the
+> older `dist` build and passed a startup/accessibility-tree smoke. A locked
+> desktop prevented pixel and keyboard acceptance, which remains open. See the
+> [September release ledger](docs/SEPTEMBER_RELEASE.md) for identities,
+> intervals, and remaining gates. The older checkpoints below are historical.
+
+> A later diagnostic-only binary added matched-belief modes without changing
+> selected staged. On July 28-August 26, a repeated matched-posterior replay
+> scored staged 3.2000 versus finite fixed-work 3.5000, both 30/30 solved.
+> A separate frozen-versus-dynamic staged ablation had an inconclusive paired
+> mean and worse frozen-prior calibration and latency. A subsequent 12-fold
+> current-binary replay reproduced all 720 selected/challenger development
+> paths exactly; no consumed or reserved dates were evaluated. No candidate
+> was promoted.
+
+> 2026-09-07: [The September acceptance plan](docs/SEPTEMBER_RELEASE.md) is the active
+> implementation plan. Correctness, shared six-turn semantics and bounded rollout precede
+> further tuning. The notes below remain historical; their completion statements do not
+> establish correctness of the September changes.
+
+> 2026-09-08: the finite kernel, independent oracle, state-local rollout comparison,
+> bounded fixed-state profiles and exact-fold matrix runner are implemented. Prior-family
+> evaluation completed in 18 minutes 45 seconds and retained logistic. Final conditional
+> studies and seven-profile evidence remain pending. Both development executables are
+> rebuilt and verified in `dist`; native/platform acceptance and cleanup remain open. Production is
+> not promoted. The acceptance plan records current evidence and dependency triage.
+
+> Conditional small-state/risk screens and a two-seed joint follow-up are recorded in
+> the September plan. The provisional risk finalist repeats near 3.54 with zero
+> failures. Its fresh paired delta interval includes zero; isolated Fast resource
+> measurements remain about 261 ms / 115 MiB. Promotion and the full release matrix
+> remain pending. The completed-study replay defect is fixed and regression-tested.
+
+> The 30-game July 28-August 26 comparison completed in 111.5 seconds: finite
+> solved 30/30 at 3.4667 versus staged 28/30 at a penalty-seven mean of 3.4000.
+> Paired delta +0.0667 has interval [-0.4333, +0.5333]; this does not justify a
+> lower-mean claim or promotion. Keep the incumbent and defer the longer matrix.
+> Both measured hard-mode regret cases are repaired; all six audited roots match
+> the reference. The guarded debug cleanup was rejected before execution.
+
+> 2026-09-26 continuation: optional per-move finite traces preserve deadline
+> status, work units and ranked candidates. Review follow-up validates every
+> completed candidate before truncation and rejects missing/misaligned steps.
+> The final-source identical-input 30-game pair scored finite 3.6000 and
+> 3.6667 versus staged 3.4000; eight finite paths changed at deadline-limited
+> moves. A four-million-unit diagnostic then reproduced all 30 game paths and
+> finite traces twice, scoring 3.5000 versus timed finite Fast's 3.6333/3.6667.
+> Its paired interval includes zero and staged remains lower; no promotion.
+> A same-executable staged-versus-fixed pair then repeated 3.4000 versus
+> 3.5000 across the 30 development games. Fixed solved two more but had worse
+> initial-state probability scores and p95 latency. Effective priors differ
+> across modes despite one TOML; a pure search comparison remains open.
+> Earlier traced runs and individual divergent moves remain in the September
+> acceptance plan.
+
+> 2026-08-30 measurement audit: the next release is unfinished and production remains v20. Development is frozen through August 26; August 28–September 26 is the new untouched seal. Study format v17 computes solved-only totals from the solved histogram and excludes shared process peak memory from candidate ordering/Pareto ranks. Earlier August v16 screens remain historical, not current promotion evidence. New studies, isolated finalist memory validation, profile-matrix evidence, and release checks are still required; see `TODO.md`.
+
 > Status: historical planning notes. The current user-facing behavior, commands, and artifact layout are documented in `README.md`; this file preserves the original implementation rationale and may describe phases that are already complete or superseded.
 >
 > 2026-07-26 release checkpoint: `selected-predictive-v20` is frozen and shipped in `config/prior.toml`. It solved all 360 development games at `3.1778` guesses versus `3.3000` and two failures for the previous default; paired delta `-0.1222`, interval `[-0.1722, -0.0722]`, W/T/L `69/265/26`. The once-only sealed evaluation solved `30/30` at `3.3000`, interval `[3.1333, 3.4667]`, with no gaps or failures. This is evidence of an improvement, not a flat-three result. Further tuning requires a new future holdout.
@@ -45,7 +120,7 @@ The solver should:
 
 ## Historical product decision
 
-The original plan deliberately started with a Rust CLI so data, scoring, backtesting, and performance could be validated first. That milestone is complete. The current product includes an `eframe`/`egui` desktop workspace and treats predictive GUI use as the primary workflow; formal mode is secondary. The predictive-first redesign, missing-data setup/recovery surface, replaceable dual-worker queue, responsive layouts, diagnostics, keyboard workflow, and native usability pass are complete.
+The original plan deliberately started with a Rust CLI so data, scoring, backtesting, and performance could be validated first. That milestone is complete. The current product includes an `eframe`/`egui` desktop workspace and treats predictive GUI use as the primary workflow; formal mode is secondary. The predictive-first redesign, missing-data setup/recovery surface, replaceable dual-worker queue, responsive layouts, diagnostics, and keyboard workflow are implemented. An earlier native usability pass was completed, but the rebuilt September Windows GUI still needs visual and keyboard acceptance on an unlocked desktop.
 
 ## What Changes From The Original Draft
 

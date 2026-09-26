@@ -12,9 +12,10 @@ pub struct SmallStateTable {
 }
 
 impl SmallStateTable {
-    // This is an admissible lower bound table, not a retrograde exact-value table.
-    // It minimizes over abstract partition-size distributions and therefore may
-    // assume a split that no real guess can realize for a given state.
+    // Historical formal-artifact metadata, not an admissible Wordle bound:
+    // this recurrence charges a continuation even for an immediately solved answer.
+    // Keep the serialized values stable for existing formal artifact identities.
+    // Predictive search must not use this table for pruning or value estimates.
     pub fn build(max_size: usize) -> Self {
         let mut expected_lower_bound_by_size = vec![0.0; max_size + 1];
         if max_size >= 1 {

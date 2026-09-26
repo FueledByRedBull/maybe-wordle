@@ -1,5 +1,14 @@
 use super::*;
 
+pub(crate) fn check_predictive_search_cancelled(
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<()> {
+    if cancelled() {
+        bail!("predictive search cancelled");
+    }
+    Ok(())
+}
+
 impl Solver {
     pub(super) fn suggestion_batch_for_history(
         &self,
@@ -13,6 +22,7 @@ impl Solver {
             state,
             top,
             Some(PredictiveContext {
+                hard_mode: false,
                 as_of,
                 observations,
             }),
@@ -20,29 +30,35 @@ impl Solver {
         )
     }
 
-    pub(super) fn filtered_suggestion_batch_for_history_with_search_mode(
+    pub(super) fn filtered_suggestion_batch_for_history_with_search_mode_controlled(
         &self,
         as_of: NaiveDate,
         observations: &[(String, u8)],
         top: usize,
         filters: PredictiveSuggestionFilters,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<SuggestionBatch> {
+        check_predictive_search_cancelled(cancelled)?;
         let state = self.apply_history(as_of, observations)?;
+        check_predictive_search_cancelled(cancelled)?;
         let limit = if filters.hard_mode || filters.force_in_two_only {
             self.guesses.len()
         } else {
             top
         };
-        let mut batch = self.suggestion_batch_internal_with_search_mode(
+        let mut batch = self.suggestion_batch_internal_with_search_mode_controlled(
             &state,
             limit,
             Some(PredictiveContext {
+                hard_mode: filters.hard_mode,
                 as_of,
                 observations,
             }),
             book_usage_for_mode(filters.mode),
             filters.forced_search_mode,
+            cancelled,
         )?;
+        check_predictive_search_cancelled(cancelled)?;
         if filters.hard_mode {
             batch.suggestions.retain(|suggestion| {
                 self.hard_mode_violation(observations, &suggestion.word)
@@ -65,7 +81,14 @@ impl Solver {
         context: Option<PredictiveContext<'_>>,
         book_usage: PredictiveBookUsage,
     ) -> Result<SuggestionBatch> {
-        self.suggestion_batch_internal_with_search_mode(state, top, context, book_usage, None)
+        self.suggestion_batch_internal_with_search_mode_controlled(
+            state,
+            top,
+            context,
+            book_usage,
+            None,
+            &|| false,
+        )
     }
 
     pub(super) fn suggestion_batch_internal_with_search_mode(
@@ -76,11 +99,40 @@ impl Solver {
         book_usage: PredictiveBookUsage,
         forced_search_mode: Option<PredictiveSearchMode>,
     ) -> Result<SuggestionBatch> {
+        self.suggestion_batch_internal_with_search_mode_controlled(
+            state,
+            top,
+            context,
+            book_usage,
+            forced_search_mode,
+            &|| false,
+        )
+    }
+
+    pub(super) fn suggestion_batch_internal_with_search_mode_controlled(
+        &self,
+        state: &SolveState,
+        top: usize,
+        context: Option<PredictiveContext<'_>>,
+        book_usage: PredictiveBookUsage,
+        forced_search_mode: Option<PredictiveSearchMode>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<SuggestionBatch> {
+        check_predictive_search_cancelled(cancelled)?;
         if state.surviving.is_empty() {
             bail!("cannot score guesses with an empty state");
         }
         if state.total_weight <= 0.0 {
             bail!("cannot score guesses when no positive answer mass remains");
+        }
+        if self.config.search_policy_mode.is_finite() && forced_search_mode.is_none() {
+            return self.finite_suggestion_batch(
+                state,
+                top,
+                context,
+                self.finite_search_options(),
+                cancelled,
+            );
         }
         let split_first = state.surviving.len() > self.config.large_state_split_threshold;
         let use_second_guess_coverage = should_use_second_guess_coverage(
@@ -92,11 +144,21 @@ impl Solver {
             .as_ref()
             .map(|context| known_absent_letter_mask(context.observations))
             .unwrap_or(0);
-        let mut metrics = self.score_guess_metrics_for_subset(
+        let mut metrics = self.score_guess_metrics_for_subset_controlled(
             &state.surviving,
             &state.weights,
-            &self.exact_small_state_table,
-        );
+            cancelled,
+        )?;
+        check_predictive_search_cancelled(cancelled)?;
+        if state.surviving.iter().any(|answer_index| {
+            !self
+                .guess_index
+                .contains_key(&self.answers[*answer_index].word)
+        }) {
+            for metric in &mut metrics {
+                metric.force_in_two = false;
+            }
+        }
         if known_absent_mask != 0 {
             for metric in &mut metrics {
                 metric.known_absent_letter_hits =
@@ -111,7 +173,14 @@ impl Solver {
             compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
         });
         let three_solve_coverage = if use_second_guess_coverage {
-            Some(self.medium_second_guess_coverage(&state.surviving, &state.weights, &metrics)?)
+            let coverage = self.medium_second_guess_coverage_controlled(
+                &state.surviving,
+                &state.weights,
+                &metrics,
+                cancelled,
+            )?;
+            check_predictive_search_cancelled(cancelled)?;
+            Some(coverage)
         } else {
             None
         };
@@ -130,9 +199,18 @@ impl Solver {
         let search_mode = forced_search_mode.unwrap_or_else(|| {
             predictive_search_mode(&self.config, state.surviving.len(), assessment)
         });
+        let two_turn_success = if context
+            .as_ref()
+            .is_some_and(|context| context.observations.len() == 4)
+        {
+            Some(self.two_turn_success_by_guess_controlled(state, cancelled)?)
+        } else {
+            None
+        };
         let mut suggestions = metrics
             .into_iter()
             .map(|metric| Suggestion {
+                finite_value: None,
                 word: self.guesses[metric.guess_index].clone(),
                 entropy: metric.entropy,
                 solve_probability: metric.solve_probability,
@@ -179,12 +257,14 @@ impl Solver {
         let mut root_candidate_count = 0usize;
 
         if let PredictiveSearchMode::Lookahead = search_mode {
+            check_predictive_search_cancelled(cancelled)?;
             let root_candidates = self.collect_lookahead_candidates(
                 &suggestions,
                 state.surviving.len(),
                 assessment.dangerous_lookahead,
                 lookahead_pool,
             )?;
+            check_predictive_search_cancelled(cancelled)?;
             root_candidate_count = root_candidates.len();
             let mut exact_memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
@@ -192,17 +272,17 @@ impl Solver {
             let mut lookahead_costs = vec![None; self.guesses.len()];
 
             for guess_index in root_candidates {
-                let cost = self.lookahead_cost_for_guess(
-                    guess_index,
-                    LookaheadCostContext {
-                        subset: &state.surviving,
-                        weights: &state.weights,
-                        expanded: assessment.dangerous_lookahead,
-                        exact_memo: &mut exact_memo,
-                        exact_scratch: &mut exact_scratch,
-                        lookahead_memo: &mut lookahead_memo,
-                    },
-                )?;
+                check_predictive_search_cancelled(cancelled)?;
+                let context = LookaheadCostContext {
+                    subset: &state.surviving,
+                    weights: &state.weights,
+                    expanded: assessment.dangerous_lookahead,
+                    exact_memo: &mut exact_memo,
+                    exact_scratch: &mut exact_scratch,
+                    lookahead_memo: &mut lookahead_memo,
+                };
+                let cost =
+                    self.lookahead_cost_for_guess_controlled(guess_index, context, cancelled)?;
                 lookahead_costs[guess_index] = Some(cost);
             }
 
@@ -229,31 +309,63 @@ impl Solver {
         }
 
         if let PredictiveSearchMode::Exact(exact_mode) = search_mode {
+            check_predictive_search_cancelled(cancelled)?;
             let exact_candidates = match exact_mode {
                 ExactSuggestionMode::Exhaustive => (0..self.guesses.len()).collect::<Vec<_>>(),
                 ExactSuggestionMode::Pooled => {
                     self.collect_exact_candidates(state, &suggestions, exact_pool)?
                 }
             };
+            check_predictive_search_cancelled(cancelled)?;
             root_candidate_count = exact_candidates.len();
             let mut memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
             let mut exact_costs = vec![None; self.guesses.len()];
+            // Coverage is the primary ranking key when active, so a cost-only
+            // bound must not skip any of its candidates.
+            let bound_ranked_prefix = exact_mode == ExactSuggestionMode::Pooled
+                && three_solve_coverage.is_none()
+                && top > 0
+                && top < exact_candidates.len();
+            let mut ordered_candidates = exact_candidates
+                .into_iter()
+                .map(|guess_index| (guess_index, 0.0))
+                .collect::<Vec<_>>();
+            if bound_ranked_prefix {
+                for (guess_index, bound) in &mut ordered_candidates {
+                    *bound = self.exact_root_cost_lower_bound(
+                        *guess_index,
+                        &state.surviving,
+                        &state.weights,
+                    )?;
+                }
+                ordered_candidates.sort_by(|left, right| left.1.total_cmp(&right.1));
+            }
+            let mut best_exact_costs = Vec::with_capacity(top.min(ordered_candidates.len()));
 
-            for guess_index in exact_candidates {
-                let cost = self.exact_cost_for_guess(
-                    guess_index,
-                    ExactCostContext {
-                        subset: &state.surviving,
-                        weights: &state.weights,
-                        small_state_table: &self.exact_small_state_table,
-                        memo: &mut memo,
-                        best_bound: f64::INFINITY,
-                        scratch: &mut exact_scratch,
-                        depth: 0,
-                    },
-                )?;
+            for (guess_index, lower_bound) in ordered_candidates {
+                check_predictive_search_cancelled(cancelled)?;
+                if bound_ranked_prefix
+                    && best_exact_costs.len() == top
+                    && lower_bound > best_exact_costs[top - 1] + 1e-10
+                {
+                    break;
+                }
+                let context = ExactCostContext {
+                    subset: &state.surviving,
+                    weights: &state.weights,
+                    memo: &mut memo,
+                    best_bound: f64::INFINITY,
+                    scratch: &mut exact_scratch,
+                    depth: 0,
+                };
+                let cost = self.exact_cost_for_guess_controlled(guess_index, context, cancelled)?;
                 exact_costs[guess_index] = Some(cost);
+                if bound_ranked_prefix {
+                    best_exact_costs.push(cost);
+                    best_exact_costs.sort_by(f64::total_cmp);
+                    best_exact_costs.truncate(top);
+                }
             }
 
             match exact_mode {
@@ -315,29 +427,29 @@ impl Solver {
         }
 
         if let PredictiveSearchMode::EscalatedExact = search_mode {
+            check_predictive_search_cancelled(cancelled)?;
             let exact_candidates = self.collect_exact_candidates(
                 state,
                 &suggestions,
                 self.config.danger_exact_root_pool.max(1).max(exact_pool),
             )?;
+            check_predictive_search_cancelled(cancelled)?;
             root_candidate_count = exact_candidates.len();
             let mut memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
             let mut exact_costs = vec![None; self.guesses.len()];
 
             for guess_index in exact_candidates {
-                let cost = self.exact_cost_for_guess(
-                    guess_index,
-                    ExactCostContext {
-                        subset: &state.surviving,
-                        weights: &state.weights,
-                        small_state_table: &self.exact_small_state_table,
-                        memo: &mut memo,
-                        best_bound: f64::INFINITY,
-                        scratch: &mut exact_scratch,
-                        depth: 0,
-                    },
-                )?;
+                check_predictive_search_cancelled(cancelled)?;
+                let context = ExactCostContext {
+                    subset: &state.surviving,
+                    weights: &state.weights,
+                    memo: &mut memo,
+                    best_bound: f64::INFINITY,
+                    scratch: &mut exact_scratch,
+                    depth: 0,
+                };
+                let cost = self.exact_cost_for_guess_controlled(guess_index, context, cancelled)?;
                 exact_costs[guess_index] = Some(cost);
             }
 
@@ -373,14 +485,28 @@ impl Solver {
             });
         }
 
+        if let Some(success) = two_turn_success.as_ref() {
+            check_predictive_search_cancelled(cancelled)?;
+            suggestions.sort_by(|left, right| {
+                compare_two_turn(
+                    left,
+                    right,
+                    success[self.guess_index[&left.word]],
+                    success[self.guess_index[&right.word]],
+                )
+            });
+        }
+
         if context
             .is_some_and(|context| should_use_final_turn_objective(context.observations.len()))
         {
+            check_predictive_search_cancelled(cancelled)?;
             suggestions.sort_by(compare_final_turn);
         }
 
         let mut promoted_word = None;
         let mut promotion_source = None;
+        check_predictive_search_cancelled(cancelled)?;
         if book_usage != PredictiveBookUsage::None
             && let Some(context) = context
             && let Some(choice) = self.cached_predictive_choice(
@@ -394,8 +520,10 @@ impl Solver {
             promotion_source = Some(choice.source);
         }
 
+        check_predictive_search_cancelled(cancelled)?;
         suggestions.truncate(top);
         Ok(SuggestionBatch {
+            finite_search: None,
             suggestions,
             promoted_word,
             promotion_source,
@@ -643,10 +771,11 @@ impl Solver {
         Ok(candidate_indexes)
     }
 
-    pub(super) fn lookahead_cost_for_guess(
+    fn lookahead_cost_for_guess_controlled(
         &self,
         guess_index: usize,
         context: LookaheadCostContext<'_>,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<f64> {
         let LookaheadCostContext {
             subset,
@@ -656,6 +785,7 @@ impl Solver {
             exact_scratch,
             lookahead_memo,
         } = context;
+        check_predictive_search_cancelled(cancelled)?;
         let (total_weight, _) = validated_subset_mass(subset, weights)?;
 
         let mut ordered_patterns = [0u8; PATTERN_SPACE];
@@ -680,6 +810,7 @@ impl Solver {
         let mut dangerous_mass_bucket_count = 0usize;
         let mut non_green_mass_in_large_buckets = 0.0_f64;
         for pattern in ordered_patterns[..ordered_len].iter().copied() {
+            check_predictive_search_cancelled(cancelled)?;
             let mass = exact_scratch.frames[0].masses[pattern as usize];
             let probability = mass / total_weight;
             let child_len = exact_scratch.frames[0].child_subsets[pattern as usize].len();
@@ -690,19 +821,20 @@ impl Solver {
                     std::mem::take(&mut exact_scratch.frames[0].child_subsets[pattern as usize]);
                 let result =
                     if child_subset.len() == subset.len() && child_subset.as_slice() == subset {
-                        f64::INFINITY
+                        Ok(f64::INFINITY)
                     } else {
-                        self.lookahead_child_value(
+                        self.lookahead_child_value_controlled(
                             &child_subset,
                             weights,
                             expanded,
                             exact_memo,
                             exact_scratch,
                             lookahead_memo,
-                        )?
+                            cancelled,
+                        )
                     };
                 exact_scratch.frames[0].child_subsets[pattern as usize] = child_subset;
-                result
+                result?
             };
             total_cost += probability * child_value;
             if pattern != ALL_GREEN_PATTERN {
@@ -716,6 +848,7 @@ impl Solver {
                 }
             }
         }
+        check_predictive_search_cancelled(cancelled)?;
         Ok(total_cost
             + self.aggregate_lookahead_trap_penalty(
                 worst_child_probability,
@@ -725,7 +858,11 @@ impl Solver {
             ))
     }
 
-    pub(super) fn lookahead_child_value(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit existing recursion state plus cooperative cancellation"
+    )]
+    fn lookahead_child_value_controlled(
         &self,
         subset: &[usize],
         weights: &[f64],
@@ -733,18 +870,20 @@ impl Solver {
         exact_memo: &mut PredictiveMemoMap<ExactSubsetKey, f64>,
         exact_scratch: &mut ExactSearchScratch,
         lookahead_memo: &mut PredictiveMemoMap<ExactSubsetKey, f64>,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<f64> {
+        check_predictive_search_cancelled(cancelled)?;
         if subset.is_empty() {
             return Ok(0.0);
         }
         if subset.len() <= self.config.exact_exhaustive_threshold {
-            return self.exact_best_cost(
+            return self.exact_best_cost_controlled(
                 subset,
                 weights,
-                &self.exact_small_state_table,
                 exact_memo,
                 exact_scratch,
                 1,
+                cancelled,
             );
         }
 
@@ -754,7 +893,7 @@ impl Solver {
         }
 
         let mut metrics =
-            self.score_guess_metrics_for_subset(subset, weights, &self.exact_small_state_table);
+            self.score_guess_metrics_for_subset_controlled(subset, weights, cancelled)?;
         metrics.retain(|metric| reply_guess_makes_progress(metric, subset.len()));
         if metrics.is_empty() {
             bail!("bounded lookahead found no progressing reply guess");
@@ -774,6 +913,7 @@ impl Solver {
         let mut reply_candidates = Vec::new();
         let mut seen = HashSet::new();
         for metric in metrics.iter().take(reply_pool) {
+            check_predictive_search_cancelled(cancelled)?;
             if seen.insert(metric.guess_index) {
                 reply_candidates.push(*metric);
             }
@@ -785,6 +925,7 @@ impl Solver {
                 .then_with(|| compare_guess_metrics(left, right, &self.guesses))
         });
         for metric in by_worst_bucket.into_iter().take(reply_pool) {
+            check_predictive_search_cancelled(cancelled)?;
             if seen.insert(metric.guess_index) {
                 reply_candidates.push(*metric);
             }
@@ -796,20 +937,301 @@ impl Solver {
                 .then_with(|| compare_guess_metrics(left, right, &self.guesses))
         });
         for metric in by_mass_reducer.into_iter().take(reply_pool) {
+            check_predictive_search_cancelled(cancelled)?;
             if seen.insert(metric.guess_index) {
                 reply_candidates.push(*metric);
             }
         }
-        let best_reply = reply_candidates
-            .into_iter()
-            .map(|metric| metric.proxy_cost + self.lookahead_reply_penalty(&metric, subset.len()))
-            .fold(f64::INFINITY, f64::min);
+        let mut best_reply = f64::INFINITY;
+        for metric in reply_candidates {
+            check_predictive_search_cancelled(cancelled)?;
+            best_reply = best_reply
+                .min(metric.proxy_cost + self.lookahead_reply_penalty(&metric, subset.len()));
+        }
         // `proxy_cost` already includes the reply guess (`1 + E[child]`).
         // Adding another unit here would count that reply twice and make the
         // heuristic branch discontinuous with the exact branch above.
-        let child_value = best_reply;
-        lookahead_memo.insert(key, child_value);
-        Ok(child_value)
+        check_predictive_search_cancelled(cancelled)?;
+        lookahead_memo.insert(key, best_reply);
+        Ok(best_reply)
+    }
+
+    pub(super) fn exact_root_cost_lower_bound(
+        &self,
+        guess_index: usize,
+        subset: &[usize],
+        weights: &[f64],
+    ) -> Result<f64> {
+        if subset.is_empty() {
+            return Ok(0.0);
+        }
+        let (total_weight, _) = validated_subset_mass(subset, weights)?;
+        let mut masses = [0.0; PATTERN_SPACE];
+        let mut largest_weights = [0.0_f64; PATTERN_SPACE];
+        for answer_index in subset {
+            let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
+            let weight = weights[*answer_index];
+            masses[pattern] += weight;
+            largest_weights[pattern] = largest_weights[pattern].max(weight);
+        }
+        // Each non-green child needs at least one reply; all its mass except
+        // the heaviest answer needs at least one further guess after that.
+        // Normalize before summing so valid masses near f64::MAX cannot overflow.
+        let remaining_cost = (0..PATTERN_SPACE)
+            .filter(|pattern| *pattern != ALL_GREEN_PATTERN as usize)
+            .map(|pattern| {
+                masses[pattern] / total_weight
+                    + (masses[pattern] - largest_weights[pattern]) / total_weight
+            })
+            .sum::<f64>();
+        Ok(1.0 + remaining_cost)
+    }
+
+    fn exact_cost_for_guess_controlled(
+        &self,
+        guess_index: usize,
+        context: ExactCostContext<'_>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<f64> {
+        let ExactCostContext {
+            subset,
+            weights,
+            memo,
+            best_bound,
+            scratch,
+            depth,
+        } = context;
+        check_predictive_search_cancelled(cancelled)?;
+        if subset.is_empty() {
+            return Ok(0.0);
+        }
+        if subset.len() == 1 && self.guesses[guess_index] == self.answers[subset[0]].word {
+            return Ok(1.0);
+        }
+
+        let (total_weight, _) = validated_subset_mass(subset, weights)?;
+        let mut ordered_patterns = [0u8; PATTERN_SPACE];
+        let ordered_len = {
+            let frame = scratch.frame_mut(depth);
+            for answer_index in subset {
+                let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
+                if frame.child_subsets[pattern].is_empty() {
+                    frame.touched_patterns.push(pattern as u8);
+                }
+                frame.masses[pattern] += weights[*answer_index];
+                frame.child_subsets[pattern].push(*answer_index);
+            }
+            let len = frame.touched_patterns.len();
+            ordered_patterns[..len].copy_from_slice(&frame.touched_patterns);
+            let masses = &frame.masses;
+            ordered_patterns[..len]
+                .sort_by(|left, right| masses[*right as usize].total_cmp(&masses[*left as usize]));
+            len
+        };
+
+        let mut cost = 1.0;
+        for pattern in ordered_patterns[..ordered_len].iter().copied() {
+            check_predictive_search_cancelled(cancelled)?;
+            let mass = scratch.frames[depth].masses[pattern as usize];
+            if mass == 0.0 {
+                continue;
+            }
+            let branch_probability = mass / total_weight;
+            let child_cost = if pattern == ALL_GREEN_PATTERN {
+                0.0
+            } else {
+                let child_subset =
+                    std::mem::take(&mut scratch.frames[depth].child_subsets[pattern as usize]);
+                let result =
+                    if child_subset.len() == subset.len() && child_subset.as_slice() == subset {
+                        Ok(f64::INFINITY)
+                    } else {
+                        self.exact_best_cost_controlled(
+                            &child_subset,
+                            weights,
+                            memo,
+                            scratch,
+                            depth + 1,
+                            cancelled,
+                        )
+                    };
+                scratch.frames[depth].child_subsets[pattern as usize] = child_subset;
+                result?
+            };
+            cost += branch_probability * child_cost;
+            if cost >= best_bound {
+                return Ok(cost);
+            }
+        }
+
+        check_predictive_search_cancelled(cancelled)?;
+        Ok(cost)
+    }
+
+    fn exact_best_cost_controlled(
+        &self,
+        subset: &[usize],
+        weights: &[f64],
+        memo: &mut PredictiveMemoMap<ExactSubsetKey, f64>,
+        scratch: &mut ExactSearchScratch,
+        depth: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<f64> {
+        check_predictive_search_cancelled(cancelled)?;
+        if subset.is_empty() {
+            return Ok(0.0);
+        }
+        if subset.len() == 1 {
+            return Ok(1.0);
+        }
+
+        let key = ExactSubsetKey::from_sorted_subset(subset);
+        if let Some(cached) = memo.get(&key) {
+            return Ok(*cached);
+        }
+
+        let suggestion_mode = exact_suggestion_mode(&self.config, subset.len());
+        let scores = match suggestion_mode {
+            Some(ExactSuggestionMode::Exhaustive) => (0..self.guesses.len()).collect::<Vec<_>>(),
+            Some(ExactSuggestionMode::Pooled) | None => self
+                .top_guess_indexes_for_subset_controlled(
+                    subset,
+                    weights,
+                    self.config.exact_candidate_pool,
+                    cancelled,
+                )?,
+        };
+        let lower_bound = weighted_exact_lower_bound(subset, weights)?;
+        for answer_index in subset {
+            debug_assert!(u16::try_from(*answer_index).is_ok());
+        }
+        let mut best_cost = f64::INFINITY;
+        for guess_index in scores.iter().copied() {
+            check_predictive_search_cancelled(cancelled)?;
+            let cost = self.exact_cost_for_guess_controlled(
+                guess_index,
+                ExactCostContext {
+                    subset,
+                    weights,
+                    memo,
+                    best_bound: best_cost,
+                    scratch,
+                    depth,
+                },
+                cancelled,
+            )?;
+            if cost < best_cost {
+                best_cost = cost;
+                if best_cost <= lower_bound {
+                    break;
+                }
+            }
+        }
+        if !best_cost.is_finite()
+            && matches!(suggestion_mode, Some(ExactSuggestionMode::Pooled) | None)
+        {
+            let shortlisted = scores.into_iter().collect::<HashSet<_>>();
+            for guess_index in 0..self.guesses.len() {
+                check_predictive_search_cancelled(cancelled)?;
+                if shortlisted.contains(&guess_index) {
+                    continue;
+                }
+                let cost = self.exact_cost_for_guess_controlled(
+                    guess_index,
+                    ExactCostContext {
+                        subset,
+                        weights,
+                        memo,
+                        best_bound: best_cost,
+                        scratch,
+                        depth,
+                    },
+                    cancelled,
+                )?;
+                if cost < best_cost {
+                    best_cost = cost;
+                    if best_cost <= lower_bound {
+                        break;
+                    }
+                }
+            }
+        }
+        if !best_cost.is_finite() {
+            bail!(
+                "no valid exact guess found for subset of size {}",
+                subset.len()
+            );
+        }
+        check_predictive_search_cancelled(cancelled)?;
+        memo.insert(key, best_cost);
+        Ok(best_cost)
+    }
+
+    fn top_guess_indexes_for_subset_controlled(
+        &self,
+        subset: &[usize],
+        weights: &[f64],
+        count: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<usize>> {
+        let mut metrics =
+            self.score_guess_metrics_for_subset_controlled(subset, weights, cancelled)?;
+        let split_first = subset.len() > self.config.large_state_split_threshold;
+        metrics.sort_by(|left, right| {
+            compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
+        });
+        let surviving_guess_indexes = subset
+            .iter()
+            .filter_map(|answer_index| self.guess_index.get(&self.answers[*answer_index].word))
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut selected = Vec::new();
+        let mut seen = HashSet::new();
+        for metric in metrics.iter().take(count) {
+            check_predictive_search_cancelled(cancelled)?;
+            if seen.insert(metric.guess_index) {
+                selected.push(metric.guess_index);
+            }
+        }
+        for metric in metrics.into_iter().skip(count) {
+            check_predictive_search_cancelled(cancelled)?;
+            if surviving_guess_indexes.contains(&metric.guess_index)
+                && seen.insert(metric.guess_index)
+            {
+                selected.push(metric.guess_index);
+            }
+        }
+        Ok(selected)
+    }
+
+    #[cfg(test)]
+    pub(super) fn lookahead_cost_for_guess(
+        &self,
+        guess_index: usize,
+        context: LookaheadCostContext<'_>,
+    ) -> Result<f64> {
+        self.lookahead_cost_for_guess_controlled(guess_index, context, &|| false)
+    }
+
+    #[cfg(test)]
+    pub(super) fn lookahead_child_value(
+        &self,
+        subset: &[usize],
+        weights: &[f64],
+        expanded: bool,
+        exact_memo: &mut PredictiveMemoMap<ExactSubsetKey, f64>,
+        exact_scratch: &mut ExactSearchScratch,
+        lookahead_memo: &mut PredictiveMemoMap<ExactSubsetKey, f64>,
+    ) -> Result<f64> {
+        self.lookahead_child_value_controlled(
+            subset,
+            weights,
+            expanded,
+            exact_memo,
+            exact_scratch,
+            lookahead_memo,
+            &|| false,
+        )
     }
 
     pub(super) fn aggregate_lookahead_trap_penalty(
@@ -962,202 +1384,30 @@ impl Solver {
         guess_index: usize,
         context: ExactCostContext<'_>,
     ) -> Result<f64> {
-        let ExactCostContext {
-            subset,
-            weights,
-            small_state_table,
-            memo,
-            best_bound,
-            scratch,
-            depth,
-        } = context;
-        if subset.is_empty() {
-            return Ok(0.0);
-        }
-        if subset.len() == 1 && self.guesses[guess_index] == self.answers[subset[0]].word {
-            return Ok(1.0);
-        }
-
-        let (total_weight, _) = validated_subset_mass(subset, weights)?;
-        let mut ordered_patterns = [0u8; PATTERN_SPACE];
-        let ordered_len = {
-            let frame = scratch.frame_mut(depth);
-            for answer_index in subset {
-                let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
-                if frame.child_subsets[pattern].is_empty() {
-                    frame.touched_patterns.push(pattern as u8);
-                }
-                frame.masses[pattern] += weights[*answer_index];
-                frame.child_subsets[pattern].push(*answer_index);
-            }
-            let len = frame.touched_patterns.len();
-            ordered_patterns[..len].copy_from_slice(&frame.touched_patterns);
-            let masses = &frame.masses;
-            ordered_patterns[..len]
-                .sort_by(|left, right| masses[*right as usize].total_cmp(&masses[*left as usize]));
-            len
-        };
-
-        let mut cost = 1.0;
-        for pattern in ordered_patterns[..ordered_len].iter().copied() {
-            let mass = scratch.frames[depth].masses[pattern as usize];
-            if mass == 0.0 {
-                continue;
-            }
-            let branch_probability = mass / total_weight;
-            let child_cost = if pattern == ALL_GREEN_PATTERN {
-                0.0
-            } else {
-                let child_subset =
-                    std::mem::take(&mut scratch.frames[depth].child_subsets[pattern as usize]);
-                let result =
-                    if child_subset.len() == subset.len() && child_subset.as_slice() == subset {
-                        f64::INFINITY
-                    } else {
-                        self.exact_best_cost(
-                            &child_subset,
-                            weights,
-                            small_state_table,
-                            memo,
-                            scratch,
-                            depth + 1,
-                        )?
-                    };
-                scratch.frames[depth].child_subsets[pattern as usize] = child_subset;
-                result
-            };
-            cost += branch_probability * child_cost;
-            if cost >= best_bound {
-                return Ok(cost);
-            }
-        }
-
-        Ok(cost)
+        self.exact_cost_for_guess_controlled(guess_index, context, &|| false)
     }
 
+    #[cfg(test)]
     pub(super) fn exact_best_cost(
         &self,
         subset: &[usize],
         weights: &[f64],
-        small_state_table: &SmallStateTable,
         memo: &mut PredictiveMemoMap<ExactSubsetKey, f64>,
         scratch: &mut ExactSearchScratch,
         depth: usize,
     ) -> Result<f64> {
-        if subset.is_empty() {
-            return Ok(0.0);
-        }
-        if subset.len() == 1 {
-            return Ok(1.0);
-        }
-
-        let key = ExactSubsetKey::from_sorted_subset(subset);
-        if let Some(cached) = memo.get(&key) {
-            return Ok(*cached);
-        }
-
-        let suggestion_mode = exact_suggestion_mode(&self.config, subset.len());
-        let scores = match suggestion_mode {
-            Some(ExactSuggestionMode::Exhaustive) => (0..self.guesses.len()).collect::<Vec<_>>(),
-            Some(ExactSuggestionMode::Pooled) | None => {
-                self.top_guess_indexes_for_subset(subset, weights, self.config.exact_candidate_pool)
-            }
-        };
-        let lower_bound = weighted_exact_lower_bound(subset, weights)?;
-        for answer_index in subset {
-            debug_assert!(u16::try_from(*answer_index).is_ok());
-        }
-        let mut best_cost = f64::INFINITY;
-        for guess_index in scores.iter().copied() {
-            let cost = self.exact_cost_for_guess(
-                guess_index,
-                ExactCostContext {
-                    subset,
-                    weights,
-                    small_state_table,
-                    memo,
-                    best_bound: best_cost,
-                    scratch,
-                    depth,
-                },
-            )?;
-            if cost < best_cost {
-                best_cost = cost;
-                if best_cost <= lower_bound {
-                    break;
-                }
-            }
-        }
-        if !best_cost.is_finite()
-            && matches!(suggestion_mode, Some(ExactSuggestionMode::Pooled) | None)
-        {
-            let shortlisted = scores.into_iter().collect::<HashSet<_>>();
-            for guess_index in 0..self.guesses.len() {
-                if shortlisted.contains(&guess_index) {
-                    continue;
-                }
-                let cost = self.exact_cost_for_guess(
-                    guess_index,
-                    ExactCostContext {
-                        subset,
-                        weights,
-                        small_state_table,
-                        memo,
-                        best_bound: best_cost,
-                        scratch,
-                        depth,
-                    },
-                )?;
-                if cost < best_cost {
-                    best_cost = cost;
-                    if best_cost <= lower_bound {
-                        break;
-                    }
-                }
-            }
-        }
-        if !best_cost.is_finite() {
-            bail!(
-                "no valid exact guess found for subset of size {}",
-                subset.len()
-            );
-        }
-        memo.insert(key, best_cost);
-        Ok(best_cost)
+        self.exact_best_cost_controlled(subset, weights, memo, scratch, depth, &|| false)
     }
 
+    #[cfg(test)]
     pub(super) fn top_guess_indexes_for_subset(
         &self,
         subset: &[usize],
         weights: &[f64],
         count: usize,
     ) -> Vec<usize> {
-        let mut metrics =
-            self.score_guess_metrics_for_subset(subset, weights, &self.exact_small_state_table);
-        let split_first = subset.len() > self.config.large_state_split_threshold;
-        metrics.sort_by(|left, right| {
-            compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
-        });
-        let surviving_guess_indexes = subset
-            .iter()
-            .filter_map(|answer_index| self.guess_index.get(&self.answers[*answer_index].word))
-            .copied()
-            .collect::<HashSet<_>>();
-        let mut selected = Vec::new();
-        let mut seen = HashSet::new();
-        for metric in metrics.iter().take(count) {
-            if seen.insert(metric.guess_index) {
-                selected.push(metric.guess_index);
-            }
-        }
-        for metric in metrics.into_iter().skip(count) {
-            if surviving_guess_indexes.contains(&metric.guess_index)
-                && seen.insert(metric.guess_index)
-            {
-                selected.push(metric.guess_index);
-            }
-        }
-        selected
+        self.top_guess_indexes_for_subset_controlled(subset, weights, count, &|| false)
+            .expect("non-cancellable subset ranking cannot fail")
     }
 }
 
@@ -1255,7 +1505,15 @@ pub(super) fn predictive_search_mode(
                 .map(PredictiveSearchMode::Exact)
                 .unwrap_or(PredictiveSearchMode::ProxyOnly);
         }
-        crate::config::SearchPolicyMode::Staged => {}
+        crate::config::SearchPolicyMode::Staged
+        | crate::config::SearchPolicyMode::StagedFixedBelief => {}
+        crate::config::SearchPolicyMode::FiniteFast
+        | crate::config::SearchPolicyMode::FiniteFastDynamic
+        | crate::config::SearchPolicyMode::FiniteFastFixedWork
+        | crate::config::SearchPolicyMode::FiniteBaseline
+        | crate::config::SearchPolicyMode::FiniteStrong => {
+            return PredictiveSearchMode::Lookahead;
+        }
     }
     if let Some(mode) = exact_suggestion_mode(config, surviving_answers) {
         PredictiveSearchMode::Exact(mode)

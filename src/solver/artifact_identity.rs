@@ -7,7 +7,7 @@ impl Solver {
             toml::to_string(&self.config).expect("predictive config serialization must succeed");
         let model_manifest_hash = self.predictive_model_manifest_hash(as_of, &config_toml);
         let mut fingerprint =
-            crate::identity::CanonicalSha256::new("maybe-wordle-predictive-book-config-v2");
+            crate::identity::CanonicalSha256::new("maybe-wordle-predictive-book-config-v3");
         fingerprint
             .field(model_manifest_hash.as_bytes())
             .field(policy.policy_id.as_bytes())
@@ -27,7 +27,7 @@ impl Solver {
     }
 
     fn predictive_model_manifest_hash(&self, as_of: NaiveDate, config_toml: &str) -> String {
-        let mut hash = crate::identity::CanonicalSha256::new("maybe-wordle-predictive-model-v2");
+        let mut hash = crate::identity::CanonicalSha256::new("maybe-wordle-predictive-model-v3");
         hash.field(self.mode.label().as_bytes())
             .field(self.variant.label().as_bytes())
             .field(as_of.to_string().as_bytes())
@@ -35,19 +35,30 @@ impl Solver {
         for guess in &self.guesses {
             hash.field(guess.as_bytes());
         }
-        for answer in &self.answers {
+        // Future history can move a word from the tail into the stored primary list.
+        // Hash date-eligible content in word order, not storage/index order.
+        let mut answers = self.answers.iter().collect::<Vec<_>>();
+        answers.sort_unstable_by(|left, right| left.word.cmp(&right.word));
+        for answer in answers {
+            let snapshot = weight_snapshot_for_mode(answer, &self.config, as_of, self.mode);
+            if snapshot.base_weight == 0.0 && !self.guess_index.contains_key(&answer.word) {
+                continue;
+            }
             hash.field(answer.word.as_bytes())
                 .field(&[answer.in_seed as u8, answer.manual_entry as u8])
                 .field(&answer.manual_weight.to_bits().to_le_bytes());
-            for date in &answer.history_dates {
+            for date in answer.history_dates.iter().filter(|date| **date <= as_of) {
                 hash.field(date.to_string().as_bytes());
             }
-            let snapshot = weight_snapshot_for_mode(answer, &self.config, as_of, self.mode);
             hash.field(&snapshot.base_weight.to_bits().to_le_bytes())
                 .field(&snapshot.recency_weight.to_bits().to_le_bytes())
                 .field(&snapshot.final_weight.to_bits().to_le_bytes());
         }
-        for entry in &self.history_dates {
+        for entry in self
+            .history_dates
+            .iter()
+            .filter(|entry| entry.print_date <= as_of)
+        {
             hash.field(entry.print_date.to_string().as_bytes())
                 .field(entry.solution.as_bytes())
                 .field(&entry.id.unwrap_or_default().to_le_bytes())

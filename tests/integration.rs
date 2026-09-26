@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use chrono::NaiveDate;
+use chrono::{Days, NaiveDate};
 use maybe_wordle::{
-    config::PriorConfig,
+    config::{PriorConfig, SearchPolicyMode},
     data::{NytDailyEntry, ProjectPaths, write_history_jsonl},
     experiments::{
         StudyFoldSelection, StudySearchStrategy, StudySpec, StudyStage, StudyState, TrialStatus,
@@ -38,6 +38,10 @@ fn write_fixture(path: &Path, contents: &str) {
 }
 
 fn write_predictive_fixture(paths: &ProjectPaths) {
+    write_fixture(
+        &paths.root.join("config/evaluation.toml"),
+        "format_version = 1\ndevelopment_cutoff = '2024-01-03'\n[sealed_test]\nstart = '2024-01-04'\nend = '2024-01-04'\n",
+    );
     write_fixture(
         &paths.seed_guesses,
         "cigar\nrebut\nsissy\nhumph\nawake\nblush\nfocal\nevade\nnaval\nserve\nheath\ndwarf\nmodel\nkarma\nstink\ngrade\n",
@@ -83,6 +87,27 @@ fn write_predictive_fixture(paths: &ProjectPaths) {
         ],
     )
     .expect("history");
+}
+
+fn write_multi_fold_predictive_fixture(paths: &ProjectPaths) {
+    write_predictive_fixture(paths);
+    write_fixture(
+        &paths.root.join("config/evaluation.toml"),
+        "format_version = 1\ndevelopment_cutoff = '2024-02-29'\n[sealed_test]\nstart = '2024-03-01'\nend = '2024-03-30'\n",
+    );
+    let start = NaiveDate::from_ymd_opt(2023, 1, 1).expect("date");
+    let history = (0..455)
+        .map(|offset| NytDailyEntry {
+            id: Some(offset + 1),
+            solution: "cigar".into(),
+            print_date: start
+                .checked_add_days(Days::new(u64::from(offset)))
+                .expect("date"),
+            days_since_launch: None,
+            editor: None,
+        })
+        .collect::<Vec<_>>();
+    write_history_jsonl(&paths.raw_history, &history).expect("history");
 }
 
 #[test]
@@ -173,6 +198,8 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
         WeightMode::Uniform,
         WeightMode::CooldownOnly,
         WeightMode::Weighted,
+        WeightMode::EmpiricalFrequency,
+        WeightMode::RegularizedFrequency,
     ] {
         for variant in [ModelVariant::SeedOnly, ModelVariant::SeedPlusHistory] {
             let solver =
@@ -220,7 +247,7 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
         5,
     )
     .expect_err("live-config evaluation must not reach the sealed test");
-    assert!(format!("{sealed_live_config_error:#}").contains("reaches the sealed test"));
+    assert!(format!("{sealed_live_config_error:#}").contains("outside declared development"));
     assert!(
         summary
             .replacement_toml
@@ -240,7 +267,7 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
         stage: StudyStage::Calibration,
         seed: 17,
         trial_count: 7,
-        parallelism: 2,
+        parallelism: 1,
         strategy: StudySearchStrategy::Random,
         maximum_validation_folds: 1,
         initial_validation_folds: 1,
@@ -296,7 +323,7 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
             stage: StudyStage::ProxyRanker,
             seed: 23,
             trial_count: 2,
-            parallelism: 2,
+            parallelism: 1,
             strategy: StudySearchStrategy::LowDiscrepancy,
             maximum_validation_folds: 1,
             initial_validation_folds: 1,
@@ -408,6 +435,10 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
     );
 
     let model_based_path = root.join("model-based-study-state.json");
+    let parallel_config = PriorConfig {
+        search_policy_mode: SearchPolicyMode::ProxyOnly,
+        ..config.clone()
+    };
     let model_based_spec = StudySpec {
         name: "toy-model-based".to_string(),
         stage: StudyStage::Calibration,
@@ -424,7 +455,7 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
     };
     let model_based = Solver::run_predictive_study(
         &paths,
-        &config,
+        &parallel_config,
         model_based_spec.clone(),
         &model_based_path,
         5,
@@ -437,7 +468,7 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
     let first_model_state = StudyState::load(&model_based_path).expect("model state");
     let resumed_model_based = Solver::run_predictive_study(
         &paths,
-        &config,
+        &parallel_config,
         model_based_spec,
         &model_based_path,
         5,
@@ -456,7 +487,7 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
         &paths,
         &config,
         NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"),
-        NaiveDate::from_ymd_opt(2024, 1, 4).expect("date"),
+        NaiveDate::from_ymd_opt(2024, 1, 3).expect("date"),
         5,
     )
     .expect("ablations");
@@ -466,11 +497,11 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
         &paths,
         &config,
         NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"),
-        NaiveDate::from_ymd_opt(2024, 1, 4).expect("date"),
+        NaiveDate::from_ymd_opt(2024, 1, 3).expect("date"),
         5,
     )
     .expect("three guess gap");
-    assert_eq!(three_guess_gap.games, 4);
+    assert_eq!(three_guess_gap.games, 3);
     assert!(three_guess_gap.base_four_guess_cases >= three_guess_gap.converted_by_aggressive);
     assert!(three_guess_gap.base_four_guess_cases >= three_guess_gap.converted_by_targeted_search);
     assert_eq!(
@@ -479,24 +510,100 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
     );
 
     let as_of = NaiveDate::from_ymd_opt(2024, 1, 5).expect("date");
-    let opener = solver
+    let legacy_solver = Solver::from_paths(&paths, &parallel_config).expect("legacy book solver");
+    let opener = legacy_solver
         .build_predictive_opener_cache(as_of)
         .expect("build opener");
-    let root_suggestions = solver
+    let root_suggestions = legacy_solver
         .suggestions_for_history(as_of, &[], 1)
         .expect("root suggestions");
     assert_eq!(root_suggestions[0].word, opener.opener);
 
-    let replies = solver
+    let replies = legacy_solver
         .build_predictive_reply_book(as_of)
         .expect("build replies");
-    let target = solver.answers[0].word.clone();
+    let target = legacy_solver.answers[0].word.clone();
     let first_feedback = score_guess(&opener.opener, &target);
     if replies.reply_count > 0 && first_feedback != parse_feedback("22222").expect("green") {
-        let second_move = solver
+        let second_move = legacy_solver
             .suggestions_for_history(as_of, &[(opener.opener.clone(), first_feedback)], 1)
             .expect("second move");
         assert!(!second_move.is_empty());
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn completed_multi_rung_static_study_replay_preserves_state_and_summary() {
+    let root = std::env::temp_dir().join("maybe-wordle-integration-study-replay");
+    let _ = std::fs::remove_dir_all(&root);
+    let paths = ProjectPaths::new(&root);
+    paths.ensure_layout().expect("layout");
+    write_multi_fold_predictive_fixture(&paths);
+
+    let config = PriorConfig::default();
+    let study_spec = StudySpec {
+        name: "multi-rung-replay".to_string(),
+        stage: StudyStage::Calibration,
+        seed: 17,
+        trial_count: 7,
+        parallelism: 1,
+        strategy: StudySearchStrategy::Random,
+        maximum_validation_folds: 2,
+        initial_validation_folds: 1,
+        reduction_factor: 2,
+        fold_selection: StudyFoldSelection::NestedTimeSpread,
+        maximum_trial_seconds: 60,
+        maximum_memory_mb: 4_096,
+    };
+    let state_path = root.join("multi-rung-replay-state.json");
+    let first =
+        Solver::run_predictive_study(&paths, &config, study_spec.clone(), &state_path, 5, None)
+            .expect("initial multi-rung study");
+    assert!(first.completed_trials > 0);
+    let first_state = StudyState::load(&state_path).expect("initial state");
+    assert!(
+        first_state
+            .trials
+            .iter()
+            .all(|trial| trial.status == TrialStatus::Complete
+                || trial.status == TrialStatus::Pruned)
+    );
+    assert!(
+        first_state
+            .trials
+            .iter()
+            .any(|trial| trial.status == TrialStatus::Complete)
+    );
+
+    let replay = Solver::run_predictive_study(&paths, &config, study_spec, &state_path, 5, None)
+        .expect("replayed multi-rung study");
+    let replay_state = StudyState::load(&state_path).expect("replayed state");
+
+    assert_eq!(replay.state_path, first.state_path);
+    assert_eq!(replay.requested_parallelism, first.requested_parallelism);
+    assert_eq!(replay.effective_parallelism, first.effective_parallelism);
+    assert_eq!(replay.compute_threads, first.compute_threads);
+    assert_eq!(replay.completed_trials, first.completed_trials);
+    assert_eq!(replay.pending_trials, first.pending_trials);
+    assert_eq!(replay.running_trials, first.running_trials);
+    assert_eq!(replay.pruned_trials, first.pruned_trials);
+    assert_eq!(replay.rejected_trials, first.rejected_trials);
+    assert_eq!(replay.failed_trials, first.failed_trials);
+    assert_eq!(replay.best_trial_number, first.best_trial_number);
+    assert_eq!(replay.best_measurement, first.best_measurement);
+    assert_eq!(replay.sealed_test_evaluated, first.sealed_test_evaluated);
+    assert_eq!(
+        replay
+            .best_config
+            .as_ref()
+            .map(|config| toml::to_string(config).expect("serialize config")),
+        first
+            .best_config
+            .as_ref()
+            .map(|config| toml::to_string(config).expect("serialize config")),
+    );
+    assert_eq!(replay_state.trials, first_state.trials);
+
     let _ = std::fs::remove_dir_all(&root);
 }

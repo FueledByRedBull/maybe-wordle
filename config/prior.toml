@@ -22,7 +22,6 @@ medium_state_lookahead_threshold = 80
 second_guess_coverage_min_survivors = 65
 second_guess_coverage_max_survivors = 80
 second_guess_coverage_pool = 24
-second_guess_coverage_child_cap = 24
 lookahead_candidate_pool = 24
 medium_state_lookahead_candidate_pool = 48
 lookahead_reply_pool = 12

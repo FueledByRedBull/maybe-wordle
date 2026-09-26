@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "development-matched-fixed-belief-policy-comparison",
+  "profiles": [
+    {
+      "id": "staged_fixed_belief",
+      "description": "Staged ranking on the frozen core/tail posterior",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "staged_fixed_belief" }
+      }
+    },
+    {
+      "id": "finite_fixed_work",
+      "description": "Finite fixed-work search on the same frozen core/tail posterior",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/prior.toml",
+      "parameters": {
+        "search_policy_mode": { "type": "categorical", "value": "finite_fast_fixed_work" }
+      }
+    }
+  ]
+}

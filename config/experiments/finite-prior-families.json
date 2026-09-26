@@ -1,0 +1,46 @@
+{
+  "format_version": 1,
+  "name": "finite-prior-family-comparison",
+  "profiles": [
+    {
+      "id": "logistic_prior",
+      "description": "Weighted logistic prior; reference under the common artifact-free finite Fast policy",
+      "weight_mode": "weighted",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/candidates/september-finite-fast.toml"
+    },
+    {
+      "id": "uniform_prior",
+      "description": "Uniform core prior under the common finite Fast policy and fixed tail mixture",
+      "weight_mode": "uniform",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/candidates/september-finite-fast.toml"
+    },
+    {
+      "id": "used_unused_prior",
+      "description": "Never-used versus previously-used prior under the common finite Fast policy",
+      "weight_mode": "used_unused",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/candidates/september-finite-fast.toml"
+    },
+    {
+      "id": "recency_buckets_prior",
+      "description": "Prespecified monotone recency buckets under the common finite Fast policy",
+      "weight_mode": "recency_buckets",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/candidates/september-finite-fast.toml"
+    },
+    {
+      "id": "regularized_frequency_prior",
+      "description": "Additive-one historical frequency prior under the common finite Fast policy",
+      "weight_mode": "regularized_frequency",
+      "model_variant": "seed_plus_history",
+      "artifact_mode": "disabled",
+      "base_config_path": "config/candidates/september-finite-fast.toml"
+    }
+  ]
+}

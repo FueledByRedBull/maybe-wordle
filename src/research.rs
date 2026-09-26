@@ -11,7 +11,7 @@ use crate::{
     config::PriorConfig,
     data::{NytDailyEntry, ProjectPaths, read_history_jsonl, read_word_list},
     experiments::{
-        DateRange, EvaluationPlan, RollingOriginConfig, build_rolling_origin_plan,
+        DateRange, EvaluationPlan,
         exhaustive_cost::{DatasetSplit, ExhaustiveCostDatasetArtifact},
     },
     predictive::learned_proxy::{
@@ -290,7 +290,6 @@ pub fn run_survival_experiment(
     solver: &Solver,
 ) -> Result<SurvivalExperimentReport> {
     let started = Instant::now();
-    let source_identity = crate::solver::predictive_source_identity(paths)?;
     let executable_fingerprint = crate::solver::predictive_executable_fingerprint()?;
     let mut history = read_history_jsonl(&paths.raw_history)?;
     history.sort_by_key(|entry| entry.print_date);
@@ -298,11 +297,16 @@ pub fn run_survival_experiment(
         !history.is_empty(),
         "survival experiment requires synced history"
     );
+    let evaluation_plan = Solver::development_evaluation_plan(paths)?;
+    history.retain(|entry| entry.print_date <= evaluation_plan.development.end);
     let history_range = DateRange::new(
         history.first().expect("non-empty").print_date,
         history.last().expect("non-empty").print_date,
     )?;
-    let evaluation_plan = build_rolling_origin_plan(history_range, RollingOriginConfig::default())?;
+    let source_identity = crate::solver::predictive_development_source_identity(
+        paths,
+        evaluation_plan.development.end,
+    )?;
     let support = read_word_list(&paths.seed_answers)?;
     ensure!(
         !support.is_empty(),
@@ -443,7 +447,11 @@ pub fn run_survival_experiment(
         "The sealed 2026-06-18 through 2026-07-17 outcomes remain excluded from tuning."
             .to_string(),
     );
-    crate::solver::ensure_predictive_source_identity(paths, &source_identity)?;
+    crate::solver::ensure_predictive_development_source_identity(
+        paths,
+        evaluation_plan.development.end,
+        &source_identity,
+    )?;
     Ok(SurvivalExperimentReport {
         schema_version: SURVIVAL_EXPERIMENT_VERSION,
         input_identity,
