@@ -2112,3 +2112,30 @@ smoke pass. This is not a native visual/keyboard acceptance test, and no new
 gameplay replay was run after the dependency-only change. The selected policy
 and development scores are unchanged; neither production promotion nor a
 three-guess claim follows from this build.
+
+### September 27 clean-checkout CI correction and native interaction
+
+The first integration push (`7d799719`) passed the macOS native memory job,
+but its Windows CI job failed only at the predictive documentation verifier:
+the checked-out Markdown used CRLF while the generated fragment used LF. The
+rolling verifier already normalized this platform difference. The predictive
+verifier now does the same for both its generated fragment and README check,
+with regression tests for equivalent CRLF/LF text and genuinely stale content.
+Rust 1.97 formatting, warnings-denied Clippy, all-target tests, public
+redaction, and both source-backed documentation verifiers passed locally after
+the correction. The next clean-checkout CI result is the remote acceptance
+check; the initial failure is not erased by the local pass. The Dependabot API
+reported zero open alerts after the first push.
+
+An unlocked-desktop pass of the earlier, behavior-identical GUI build showed
+first-row draft and applied tiles inside the board column at about 1180px,
+beside visible recommendations. Enter-to-apply, Undo, Hard Mode, suggestion
+inspection, and Reset worked. This does not establish narrow-window or
+enlarged-text native behavior, nor a timed first-feedback latency result. The
+verifier-only source correction was rebuilt into ignored local `dist/`; GUI
+and CLI SHA-256 are respectively
+`0653CF34922CA765ECE19E9EF46DD9B621A214BE270CD6E069F92A60BE9F5750`
+and `42D3FB6846CF7ECB22647F7692109AABE9678040644870A015B2ACF13CC37D81`.
+Both copied hashes matched the release outputs, CLI help passed, and the GUI
+remained running through a three-second startup smoke. No candidate policy,
+score, or prospective-validation claim changed.

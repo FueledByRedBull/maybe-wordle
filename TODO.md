@@ -164,31 +164,27 @@ Historical production scores (12-fold development mean 3.1778; once-only sealed 
   pass. Rust 1.97 formatting, warnings-denied Clippy, and all-target tests
   pass after the added first-guess cases.
   The reported wide-window overlap is not reproduced by geometry tests.
-  A fresh native launch exposed the rebuilt window, but the Windows UI helper
-  again failed to activate it twice on September 26, so native visual/keyboard acceptance is
-  still open. The desktop was locked; `PrintWindow` and accessibility bounds
-  cannot establish what the eframe GPU surface painted or verify keyboard
-  interaction in that session. Retry the native pass only on an unlocked desktop.
-  Do not mark native
-  verification complete from geometry tests alone.
-- [ ] Obtain native macOS memory-sampler evidence from CI after an authorized
-  push before claiming platform validation. The last recorded remote check
-  found seven Dependabot alerts against the pushed lockfile; the uncommitted
-  lockfile meets their reported patched versions. The approved `eframe` 0.32.3
-  update also removes the vulnerable `quick-xml` 0.30.0 Linux accessibility
-  chain; a local advisory scan now passes with two unmaintained warnings.
-  Recheck alert status and macOS CI after push, and assess those warnings
-  separately.
-- [ ] Finish the final whole-repository diff, proposed release file-scope and
-  hygiene review after any remaining implementation changes. Current
+  On September 27 an unlocked-desktop native pass showed the first-guess draft
+  and applied tiles beside recommendations without overlap at about 1180px;
+  Enter, Undo, Hard Mode, suggestion inspection, and Reset worked. A narrow
+  native window and enlarged text were not verified. Keep this gate open for
+  those cases and accessibility acceptance; geometry tests alone are not enough.
+- [x] Obtain native macOS memory-sampler evidence from CI. The September 27
+  `macos-memory` job passed. After the integration push, the Dependabot API
+  reported zero open alerts; the approved `eframe` 0.32.3 update removed the
+  vulnerable `quick-xml` 0.30.0 Linux accessibility chain. A local advisory
+  scan passed with two unmaintained warnings (`paste`, `ttf-parser`), which
+  remain maintenance items rather than cleared warnings.
+- [x] Finish the whole-repository diff, proposed release file-scope and
+  hygiene review for the integration push. Current
   release-decision arithmetic, generated-doc check, local links and historical
   archive pass; do not treat older artifacts as changed-code validation.
-  Recheck Rust 1.97 format, warnings-denied Clippy and all-target tests after
-  any source change. Both retained `dist` executables now match the latest
-  uncommitted source build and are runnable; the GUI passed a startup smoke,
-  but not native interaction. Keep `dist` runnable and retain evidence
+  Rust 1.97 format, warnings-denied Clippy and all-target tests were rerun
+  after the CI correction; review its small final diff before repushing.
+  Both retained `dist` executables are runnable, and the GUI passed the
+  unlocked-desktop interaction subset above. Keep `dist` and evidence
   checkpoints.
-- [ ] Resolve evidence publication before staging: the new benchmark JSON
+- [x] Resolve evidence publication for the integration push: the new benchmark JSON
   contains per-game target and path words; some already-tracked historical JSON
   has the same issue. Local public copies of the current selected-policy and
   earlier rolling artifacts now replace each game target/path word with a
@@ -197,24 +193,24 @@ Historical production scores (12-fold development mean 3.1778; once-only sealed 
   locally; CI now invokes those source-backed checks, and README's generated
   predictive table presents the current 3.1944/3.1917 development comparison.
   This validates internal arithmetic and presentation, not replay from raw
-  history or rights to publish the word-bearing sources. Include the two
-  public JSONs, redaction script, and current generated fragment in the
-  reviewed release scope. Historical links to untracked raw predictive JSON
-  are now plain local-only paths. Include the linked aggregate generated
-  summaries, release ledger, and experiment configs deliberately as one docs
-  bundle so a clean checkout does not have broken links. Also include untracked
-  `src/solver/finite.rs` and `src/solver/online.rs`; omitting them breaks
-  compilation. Do not blanket-stage
-  private raw JSON or assume redaction establishes source authenticity.
+  history or rights to publish the word-bearing sources. The two public JSONs,
+  redaction script, current generated fragment, linked aggregate summaries,
+  release ledger, experiment configs, and required solver modules were included
+  in the reviewed push. Historical links to untracked raw predictive JSON are
+  plain local-only paths. Private raw JSON remains untracked; redaction does
+  not establish source authenticity.
 - [ ] Clarify whether the consumed June 18-July 17 window is excluded only
   from new validation/tuning targets or also from later-date supervised model
   fitting. The survival experiment uses it as chronological training history
   for later folds but never as their validation target. Do not change model
   semantics or claim a leak resolution until that policy decision is explicit.
-- [ ] After the authorized `master` push, inspect CI and dependency-alert
-  results. Keep any remaining native GUI, prospective, and seven-profile
-  validation gates open rather than treating the integration push as release
-  acceptance.
+- [x] Inspect the integration push's CI and dependency-alert results. The
+  macOS job passed and no Dependabot alerts remained open, but Windows CI
+  exposed a CRLF-only predictive documentation comparison. The narrow
+  verifier correction and regression tests pass locally; its new CI run must
+  pass before calling the push green. Keep native GUI, prospective, and
+  seven-profile validation gates open rather than treating the integration
+  push as release acceptance.
 
 Formal expansion remains conditional on a concrete feasibility improvement;
 it is not a prerequisite for a useful predictive release.

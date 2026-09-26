@@ -2100,18 +2100,13 @@ fn run() -> Result<()> {
             } else {
                 let existing_markdown = std::fs::read_to_string(&markdown_output)
                     .with_context(|| format!("failed to read {}", markdown_output.display()))?;
-                if existing_markdown != generated {
-                    bail!(
-                        "generated evidence fragment is stale: run benchmark-evidence-docs --evidence {} --update",
-                        evidence.display()
-                    );
-                }
-                if updated_readme != readme_text {
-                    bail!(
-                        "README evidence fragment is stale: run benchmark-evidence-docs --evidence {} --update",
-                        evidence.display()
-                    );
-                }
+                verify_predictive_evidence_docs(
+                    &existing_markdown,
+                    &generated,
+                    &readme_text,
+                    &updated_readme,
+                    &evidence,
+                )?;
                 println!("predictive evidence documentation is current");
             }
         }
@@ -2344,6 +2339,28 @@ fn replace_generated_rolling_evidence(readme: &str, generated: &str) -> Result<S
 
 fn canonical_newlines(text: &str) -> String {
     text.replace("\r\n", "\n")
+}
+
+fn verify_predictive_evidence_docs(
+    existing_markdown: &str,
+    generated: &str,
+    readme_text: &str,
+    updated_readme: &str,
+    evidence: &Path,
+) -> Result<()> {
+    if canonical_newlines(existing_markdown) != canonical_newlines(generated) {
+        bail!(
+            "generated evidence fragment is stale: run benchmark-evidence-docs --evidence {} --update",
+            evidence.display()
+        );
+    }
+    if canonical_newlines(updated_readme) != canonical_newlines(readme_text) {
+        bail!(
+            "README evidence fragment is stale: run benchmark-evidence-docs --evidence {} --update",
+            evidence.display()
+        );
+    }
+    Ok(())
 }
 
 fn warn_predictive_history_range(paths: &ProjectPaths, puzzle_date: NaiveDate) -> Result<()> {
@@ -2663,7 +2680,10 @@ fn parse_model_variant(raw: &str) -> Result<ModelVariant> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use anyhow::anyhow;
     use chrono::NaiveDate;
@@ -2727,6 +2747,51 @@ mod tests {
         assert_ne!(
             canonical_newlines("alpha\r\nbeta\r\n"),
             canonical_newlines("alpha\ngamma\n")
+        );
+    }
+
+    #[test]
+    fn predictive_docs_verification_accepts_crlf_checkout() {
+        assert!(
+            super::verify_predictive_evidence_docs(
+                "score 3.1944\r\n",
+                "score 3.1944\n",
+                "before\r\nscore 3.1944\r\n",
+                "before\nscore 3.1944\n",
+                Path::new("evidence.json"),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn predictive_docs_verification_rejects_stale_content() {
+        let fragment_error = super::verify_predictive_evidence_docs(
+            "score 3.0000\r\n",
+            "score 3.1944\n",
+            "before\r\nscore 3.1944\r\n",
+            "before\nscore 3.1944\n",
+            Path::new("evidence.json"),
+        )
+        .expect_err("stale fragment");
+        assert!(
+            fragment_error
+                .to_string()
+                .contains("generated evidence fragment is stale")
+        );
+
+        let readme_error = super::verify_predictive_evidence_docs(
+            "score 3.1944\r\n",
+            "score 3.1944\n",
+            "before\r\nscore 3.0000\r\n",
+            "before\nscore 3.1944\n",
+            Path::new("evidence.json"),
+        )
+        .expect_err("stale README");
+        assert!(
+            readme_error
+                .to_string()
+                .contains("README evidence fragment is stale")
         );
     }
 
