@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub const DIAGNOSTIC_SUITE_FORMAT_VERSION: u32 = 1;
+pub const DIAGNOSTIC_SUITE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThreeGuessDiagnosticSpec {
@@ -30,11 +30,6 @@ pub struct LatencyDiagnosticSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BookDiagnosticSpec {
-    pub forced_suggestion_top: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticExperimentSuite {
     pub format_version: u32,
     pub name: String,
@@ -42,7 +37,6 @@ pub struct DiagnosticExperimentSuite {
     pub default_four_guess_openers: Vec<String>,
     pub hard_cases: HardCaseDiagnosticSpec,
     pub latency: LatencyDiagnosticSpec,
-    pub book_build: BookDiagnosticSpec,
 }
 
 impl DiagnosticExperimentSuite {
@@ -93,10 +87,6 @@ impl DiagnosticExperimentSuite {
             ("latency.evaluation_runs", self.latency.evaluation_runs),
             ("latency.study_runs", self.latency.study_runs),
             ("latency.top_suggestions", self.latency.top_suggestions),
-            (
-                "book_build.forced_suggestion_top",
-                self.book_build.forced_suggestion_top,
-            ),
         ] {
             if value == 0 {
                 bail!("{name} must be greater than zero");
@@ -155,5 +145,15 @@ mod tests {
         let mut suite = default_diagnostic_suite().expect("suite");
         suite.latency.study_runs = 0;
         assert!(suite.validate().is_err());
+    }
+
+    #[test]
+    fn current_suite_has_no_inert_forced_top_setting() {
+        let suite = default_diagnostic_suite().unwrap();
+        let value = serde_json::to_value(&suite).unwrap();
+        assert!(value.get("book_build").is_none());
+        let mut old = suite;
+        old.format_version = 1;
+        assert!(old.validate().is_err());
     }
 }

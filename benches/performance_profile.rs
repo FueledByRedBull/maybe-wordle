@@ -13,8 +13,9 @@ use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
 use maybe_wordle::{
     atomic_file::atomic_write,
-    config::PriorConfig,
+    config::{PriorConfig, SearchPolicyMode},
     data::ProjectPaths,
+    experiments::{DateRange, EvaluationPolicy},
     identity::{CanonicalSha256, IDENTITY_FORMAT},
     predictive::{PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode},
     scoring::{ALL_GREEN_PATTERN, format_feedback_trits, parse_feedback, score_guess},
@@ -28,6 +29,8 @@ const PROFILE_DATE: NaiveDate = match NaiveDate::from_ymd_opt(2026, 8, 1) {
 };
 const PROFILE_SAMPLES: usize = 3;
 const PREVIEW_BUDGET: Duration = Duration::from_millis(30);
+const STAGED_AUDIT_DEADLINE: Duration = Duration::from_secs(10);
+const STAGED_CANCEL_AFTER: Duration = Duration::from_millis(10);
 const SYNTHETIC_GUESSES: &[&str] = &[
     "olate", "embar", "crane", "slate", "audio", "raise", "adieu", "arose", "stare", "charm",
     "rebut", "nymph", "cloud", "pious", "reply", "ought", "tears", "soare", "cigar", "fuzzy",
@@ -78,7 +81,7 @@ fn count_allocation(bytes: usize) {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 struct ProcessSnapshot {
     cpu_100ns: Option<u64>,
     cycles: Option<u64>,
@@ -153,6 +156,7 @@ enum ProfilePhaseSelection {
     Fast,
     Strong,
     Baseline,
+    StagedAudit,
 }
 
 impl ProfilePhaseSelection {
@@ -163,6 +167,7 @@ impl ProfilePhaseSelection {
             Self::Fast => "fast",
             Self::Strong => "strong",
             Self::Baseline => "baseline",
+            Self::StagedAudit => "staged-audit",
         }
     }
 }
@@ -204,7 +209,43 @@ struct PerformanceProfile {
     sample_runs_per_phase: usize,
     selected_phase: String,
     workloads: Vec<ProfileWorkload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staged_audit: Option<StagedAudit>,
     limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditMeasurement {
+    wall_ms: f64,
+    allocation_calls: u64,
+    allocated_bytes: u64,
+    process_before: ProcessSnapshot,
+    process_after: ProcessSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct StagedAuditCall {
+    cache_state: &'static str,
+    top: usize,
+    cooperative_deadline_ms: u64,
+    cancellation_observed: bool,
+    cancellation_overshoot_ms: Option<f64>,
+    status: &'static str,
+    execution: Option<String>,
+    selected_word: Option<String>,
+    suggestions_returned: Option<usize>,
+    measurement: AuditMeasurement,
+}
+
+#[derive(Debug, Serialize)]
+struct StagedAudit {
+    puzzle_date: NaiveDate,
+    observations: Vec<String>,
+    config_fingerprint: String,
+    surviving_answers: usize,
+    solver_load: AuditMeasurement,
+    solver_clones: Vec<AuditMeasurement>,
+    calls: Vec<StagedAuditCall>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,8 +263,9 @@ fn parse_profile_phase(value: Option<&str>) -> Result<ProfilePhaseSelection> {
         Some("fast") => Ok(ProfilePhaseSelection::Fast),
         Some("strong") => Ok(ProfilePhaseSelection::Strong),
         Some("baseline") => Ok(ProfilePhaseSelection::Baseline),
+        Some("staged-audit") => Ok(ProfilePhaseSelection::StagedAudit),
         Some(value) => Err(anyhow!(
-            "invalid MAYBE_WORDLE_PROFILE_PHASE {value:?}; expected preview, fast, strong, or baseline"
+            "invalid MAYBE_WORDLE_PROFILE_PHASE {value:?}; expected preview, fast, strong, baseline, or staged-audit"
         )),
     }
 }
@@ -258,12 +300,19 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let selected_phase = profile_phase_from_env()?;
+    let is_staged_audit = selected_phase == ProfilePhaseSelection::StagedAudit;
     let config_path = std::env::var_os("MAYBE_WORDLE_PROFILE_CONFIG")
         .map(|path| root.join(PathBuf::from(path)))
         .unwrap_or_else(|| paths.config_prior.clone());
-    let output = explicit_output
-        .unwrap_or_else(|| root.join("benchmarks/predictive/release-gameplay-latency-v1.json"));
-    let declared_inputs = [
+    let output = explicit_output.unwrap_or_else(|| {
+        root.join(if is_staged_audit {
+            "target/audit-work/staged-gameplay-profile-v1.json"
+        } else {
+            "benchmarks/predictive/release-gameplay-latency-v1.json"
+        })
+    });
+    let evaluation_path = root.join("config/evaluation.toml");
+    let mut declared_inputs = vec![
         config_path.as_path(),
         paths.raw_history.as_path(),
         paths.seed_guesses.as_path(),
@@ -271,6 +320,11 @@ fn run() -> Result<()> {
         paths.seed_reference_answers.as_path(),
         paths.manual_additions.as_path(),
     ];
+    if is_staged_audit {
+        EvaluationPolicy::load(&evaluation_path)?
+            .validate_development_target_range(DateRange::new(PROFILE_DATE, PROFILE_DATE)?)?;
+        declared_inputs.push(evaluation_path.as_path());
+    }
     let capture_inputs = || {
         declared_inputs
             .iter()
@@ -281,7 +335,22 @@ fn run() -> Result<()> {
     };
     let mut inputs = capture_inputs()?;
     let base = PriorConfig::load(&config_path)?;
-    let solver = Solver::from_paths(&paths, &base)?;
+    if is_staged_audit
+        && !matches!(
+            base.search_policy_mode,
+            SearchPolicyMode::Staged | SearchPolicyMode::StagedFixedBelief
+        )
+    {
+        return Err(anyhow!(
+            "staged-audit requires the configured staged policy; it does not substitute another policy"
+        ));
+    }
+    let (solver, solver_load) = if is_staged_audit {
+        let (solver, measurement) = measure_once(|| Solver::from_paths(&paths, &base));
+        (solver?, Some(measurement))
+    } else {
+        (Solver::from_paths(&paths, &base)?, None)
+    };
     if capture_inputs()? != inputs {
         return Err(anyhow!(
             "profile inputs changed while loading the solver; restart"
@@ -294,7 +363,14 @@ fn run() -> Result<()> {
         "maybe-wordle-gameplay-latency-config-v2",
         config_toml.as_bytes(),
     );
-    let specs = fixed_workloads(&solver, PROFILE_DATE)?;
+    let staged_audit = solver_load
+        .map(|solver_load| profile_staged_audit(&solver, config_fingerprint.clone(), solver_load))
+        .transpose()?;
+    let specs = if is_staged_audit {
+        Vec::new()
+    } else {
+        fixed_workloads(&solver, PROFILE_DATE)?
+    };
     let total_workloads = specs.len();
     let profile_started = Instant::now();
     let mut workloads = Vec::with_capacity(total_workloads);
@@ -335,10 +411,10 @@ fn run() -> Result<()> {
     }
     let (code_revision, code_dirty) = git_provenance(&root);
     let report = PerformanceProfile {
-        schema_version: 3,
+        schema_version: if is_staged_audit { 4 } else { 3 },
         identity_format: IDENTITY_FORMAT.to_string(),
-        suite_id: "fixed-reachable-gameplay-latency-v1".to_string(),
-        scope: "fixed-date bounded gameplay latency profile; no sealed-test evaluation".to_string(),
+        suite_id: if is_staged_audit { "staged-first-feedback-audit-v1" } else { "fixed-reachable-gameplay-latency-v1" }.to_string(),
+        scope: if is_staged_audit { "fixed-date staged LiveOnly OLATE/10001 single-call allocation/latency audit; no sealed-test evaluation" } else { "fixed-date bounded gameplay latency profile; no sealed-test evaluation" }.to_string(),
         build_command: "cargo bench --bench performance_profile".to_string(),
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         cpu: std::env::var("PROCESSOR_IDENTIFIER").ok(),
@@ -349,17 +425,24 @@ fn run() -> Result<()> {
             &executable,
         )?,
         inputs,
-        sample_runs_per_phase: PROFILE_SAMPLES,
+        sample_runs_per_phase: if is_staged_audit { 1 } else { PROFILE_SAMPLES },
         selected_phase: selected_phase.label().to_string(),
         workloads,
-        limitations: vec![
+        staged_audit,
+        limitations: if is_staged_audit { vec![
+            "Single calls are diagnostics, not distribution estimates or solve-quality scores. A cancelled call is not a completed latency sample.".to_string(),
+            "Cold means a fresh Solver clone with empty application caches; immutable inputs and OS caches remain shared/warm. Warm is the next call on that clone, even if the cold request was cancelled.".to_string(),
+            "Clone allocation/time is measured separately before requests. Solver load includes existing-cache loading or cache generation, not a controlled cold-disk startup; construction is not cooperatively cancellable.".to_string(),
+            "The 10-second request and 10-ms cancellation limits are cooperative, not hard preemption. Reported overshoot includes time to the next cancellation boundary and return.".to_string(),
+            "System allocator counters and process snapshots are process-wide diagnostics; atomic counting overhead is included. Working-set peaks are cumulative within this process, not per-request memory usage.".to_string(),
+        ] } else { vec![
             "Allocation counts use a System-allocator wrapper in this dedicated benchmark executable; relaxed atomic counters add measurement overhead.".to_string(),
             "Process CPU time and cycle counts include Rayon worker threads and are process-wide.".to_string(),
             "Cold/warm ratios and page faults characterize application/data-cache behavior; hardware L1/L2/LLC miss counters were unavailable in the installed Windows profiling toolchain.".to_string(),
             "Working-set values are process-lifetime high-water marks shared by the fixed suite; candidate-specific memory comparisons require isolated matched processes.".to_string(),
             "The reported three-sample p95 is the maximum of three samples, not a population p95 or gameplay-distribution estimate.".to_string(),
             "Synthetic observations are generated from supported candidate words and validated as reachable states; they are not held-out answer outcomes.".to_string(),
-        ],
+        ] },
     };
     let encoded =
         serde_json::to_vec_pretty(&report).context("failed to encode performance profile")?;
@@ -370,6 +453,137 @@ fn run() -> Result<()> {
         report.workloads.len()
     );
     Ok(())
+}
+
+fn measure_once<T>(operation: impl FnOnce() -> T) -> (T, AuditMeasurement) {
+    struct AllocationWindow;
+    impl Drop for AllocationWindow {
+        fn drop(&mut self) {
+            COUNT_ALLOCATIONS.store(false, Ordering::SeqCst);
+        }
+    }
+    let before = process_snapshot();
+    ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    COUNT_ALLOCATIONS.store(true, Ordering::SeqCst);
+    let counting = AllocationWindow;
+    let started = Instant::now();
+    let result = operation();
+    let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    drop(counting);
+    let measurement = AuditMeasurement {
+        wall_ms,
+        allocation_calls: ALLOCATION_CALLS.load(Ordering::Relaxed),
+        allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
+        process_before: before,
+        process_after: process_snapshot(),
+    };
+    (result, measurement)
+}
+
+fn measure_staged_call(
+    cache_state: &'static str,
+    top: usize,
+    deadline: Duration,
+    operation: impl FnOnce(&(dyn Fn() -> bool + Sync)) -> Result<PredictiveSuggestResponse>,
+) -> Result<StagedAuditCall> {
+    let cancellation_observed = AtomicBool::new(false);
+    let (response, measurement) = measure_once(|| {
+        let started = Instant::now();
+        operation(&|| {
+            let expired = started.elapsed() >= deadline;
+            if expired {
+                cancellation_observed.store(true, Ordering::Relaxed);
+            }
+            expired
+        })
+    });
+    let cancellation_observed = cancellation_observed.load(Ordering::Relaxed);
+    let (status, response) = match response {
+        Ok(response) => ("completed", Some(response)),
+        Err(error)
+            if cancellation_observed
+                && error
+                    .chain()
+                    .any(|cause| cause.to_string() == "predictive search cancelled") =>
+        {
+            ("cancelled", None)
+        }
+        Err(error) => {
+            return Err(error).context("staged audit request failed; not a cancellation sample");
+        }
+    };
+    Ok(StagedAuditCall {
+        cache_state,
+        top,
+        cooperative_deadline_ms: deadline.as_millis() as u64,
+        cancellation_observed,
+        cancellation_overshoot_ms: cancellation_observed
+            .then(|| (measurement.wall_ms - deadline.as_secs_f64() * 1_000.0).max(0.0)),
+        status,
+        execution: response
+            .as_ref()
+            .map(|response| response.execution.summary()),
+        selected_word: response
+            .as_ref()
+            .and_then(|response| response.suggestions.first().map(|row| row.word.clone())),
+        suggestions_returned: response.as_ref().map(|response| response.suggestions.len()),
+        measurement,
+    })
+}
+
+fn profile_staged_audit(
+    solver: &Solver,
+    config_fingerprint: String,
+    solver_load: AuditMeasurement,
+) -> Result<StagedAudit> {
+    let observations = vec![("olate".to_string(), parse_feedback("10001")?)];
+    let state = solver
+        .validate_game_history(PROFILE_DATE, &observations, false)
+        .context("OLATE/10001 must be reachable at the permitted profile date")?;
+    let mut solver_clones = Vec::with_capacity(3);
+    let mut calls = Vec::with_capacity(7);
+    for top in [1, 5, 10] {
+        let (cloned, measurement) = measure_once(|| black_box(solver.clone()));
+        solver_clones.push(measurement);
+        let request = PredictiveSuggestRequest {
+            puzzle_date: PROFILE_DATE,
+            observations: &observations,
+            top,
+            hard_mode: false,
+            force_in_two_only: false,
+            mode: PredictiveSuggestionMode::LiveOnly,
+        };
+        for (cache_state, deadline) in [
+            ("fresh-clone", STAGED_AUDIT_DEADLINE),
+            ("warm", STAGED_AUDIT_DEADLINE),
+        ]
+        .into_iter()
+        .chain((top == 10).then_some(("warm-cancellation-probe", STAGED_CANCEL_AFTER)))
+        {
+            println!(
+                "performance_profile staged_audit_start top={top} cache={cache_state} deadline_ms={}",
+                deadline.as_millis()
+            );
+            let sample = measure_staged_call(cache_state, top, deadline, |cancelled| {
+                cloned.suggest_predictive_cancellable(request, cancelled)
+            })?;
+            println!(
+                "performance_profile staged_audit_complete top={top} cache={cache_state} status={} wall_ms={:.3} allocated_bytes={}",
+                sample.status, sample.measurement.wall_ms, sample.measurement.allocated_bytes
+            );
+            calls.push(sample);
+        }
+    }
+    Ok(StagedAudit {
+        puzzle_date: PROFILE_DATE,
+        observations: format_observations(&observations),
+        config_fingerprint,
+        surviving_answers: state.surviving.len(),
+        solver_load,
+        solver_clones,
+        calls,
+    })
 }
 
 fn profile_workload(
@@ -398,6 +612,11 @@ fn profile_workload(
         ProfilePhaseSelection::Fast => vec![("fast", FiniteSearchOptions::fast())],
         ProfilePhaseSelection::Strong => vec![("strong", FiniteSearchOptions::strong())],
         ProfilePhaseSelection::Baseline => vec![("baseline", baseline_options)],
+        ProfilePhaseSelection::StagedAudit => {
+            return Err(anyhow!(
+                "staged-audit is measured by bounded single calls, not finite phases"
+            ));
+        }
     };
     let mut preview = None;
     let mut fast = None;
@@ -1036,6 +1255,55 @@ fn process_snapshot() -> ProcessSnapshot {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn staged_audit_phase_is_opt_in_and_distinct_from_finite_profiles() {
+        let phase = super::parse_profile_phase(Some("staged-audit")).expect("audit phase");
+        assert_eq!(phase.label(), "staged-audit");
+        assert_eq!(super::parse_profile_phase(None).unwrap().label(), "all");
+    }
+
+    #[test]
+    fn staged_audit_cancellation_and_allocation_window_are_truthful() {
+        let sample =
+            super::measure_staged_call("test", 10, std::time::Duration::ZERO, |cancelled| {
+                assert!(cancelled());
+                Err(anyhow::anyhow!("predictive search cancelled"))
+            })
+            .unwrap();
+        assert_eq!(sample.status, "cancelled");
+        assert!(sample.cancellation_observed);
+        assert!(sample.execution.is_none());
+        assert!(sample.selected_word.is_none());
+        assert!(sample.suggestions_returned.is_none());
+        assert!(sample.measurement.wall_ms.is_finite());
+        let json = serde_json::to_value(&sample).unwrap();
+        assert!(json["execution"].is_null());
+        assert!(json["suggestions_returned"].is_null());
+        assert_eq!(json["status"], "cancelled");
+
+        let error = super::measure_staged_call("test", 1, std::time::Duration::ZERO, |cancelled| {
+            assert!(cancelled());
+            Err(anyhow::anyhow!("invalid state"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("not a cancellation sample"));
+        assert!(
+            super::measure_staged_call("test", 1, std::time::Duration::ZERO, |_| {
+                Err(anyhow::anyhow!("predictive search cancelled"))
+            })
+            .is_err()
+        );
+        let (allocation, sample) = super::measure_once(|| std::hint::black_box(vec![0u8; 4096]));
+        assert_eq!(allocation.len(), 4096);
+        assert!(sample.allocated_bytes >= 4096);
+        assert!(sample.allocation_calls >= 1);
+        assert!(!super::COUNT_ALLOCATIONS.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            std::panic::catch_unwind(|| super::measure_once(|| panic!("test operation"))).is_err()
+        );
+        assert!(!super::COUNT_ALLOCATIONS.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[test]
     fn profile_input_digest_detects_same_length_mutation() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -5,11 +5,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Days, NaiveDate};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -24,12 +23,11 @@ use crate::{
     },
     experiments::{
         BootstrapConfig, DateRange, EvaluationPlan, ExperimentArtifactMode, GameOutcome,
-        PairedDifference, ParameterRegistry, PredictiveConfigProfile, PredictiveExperimentMatrix,
-        PredictiveMetrics, PriorEvidenceMetrics, RankedProbabilityObservation, RollingOriginConfig,
-        StudyMeasurement, StudyProvenance, StudySearchStrategy, StudySpec, StudyStage, StudyState,
-        StudyTrial, TrialStatus, default_diagnostic_suite, generate_candidates,
-        predictive_parameter_registry, score_multiclass_probabilities,
-        summarize_predictive_outcomes, summarize_ranked_probability_observations,
+        PairedDifference, PredictiveConfigProfile, PredictiveExperimentMatrix, PredictiveMetrics,
+        PriorEvidenceMetrics, RankedProbabilityObservation, RollingOriginConfig, StudyMeasurement,
+        StudySpec, StudyStage, default_diagnostic_suite, predictive_parameter_registry,
+        score_multiclass_probabilities, summarize_predictive_outcomes,
+        summarize_ranked_probability_observations,
     },
     model::{
         AnswerRecord, ModelVariant, WeightMode, load_model, load_model_with_variant,
@@ -50,6 +48,7 @@ use crate::{
 mod artifact_identity;
 mod books;
 mod eval;
+mod exhaustive_teacher;
 mod finite;
 mod online;
 mod ranking;
@@ -86,13 +85,10 @@ pub(crate) fn ensure_predictive_development_source_identity(
     ensure_development_source_identity(paths, development_cutoff, expected)
 }
 
-const PROXY_CALIBRATION_MAX_STEPS: usize = 3;
-const PROXY_CALIBRATION_MAX_CANDIDATES_PER_STATE: usize = 10;
-const PROXY_CALIBRATION_MAX_SURVIVORS_FOR_FORCED_ROWS: usize = 192;
-const PROXY_CALIBRATION_MAX_GAME_SECONDS: f64 = 20.0;
 const HARD_MODE_WORD_LENGTH: usize = 5;
 #[derive(Clone, Debug)]
 pub struct Suggestion {
+    pub value_kind: crate::predictive::types::SuggestionValueKind,
     pub finite_value: Option<FiniteSearchCandidate>,
     pub word: String,
     pub entropy: f64,
@@ -237,12 +233,12 @@ pub struct BacktestStats {
     /// Compatibility alias for `canonical.scheduled_games`.
     pub games: usize,
     /// Compatibility alias for `canonical.conditional_mean_guesses`.
-    pub average_guesses: f64,
-    pub p95_guesses: usize,
-    pub max_guesses: usize,
+    pub average_guesses: Option<f64>,
+    pub p95_guesses: Option<usize>,
+    pub max_guesses: Option<usize>,
     pub failures: usize,
     pub coverage_gaps: usize,
-    pub average_guesses_ci95: (f64, f64),
+    pub average_guesses_ci95: Option<(f64, f64)>,
     pub failure_rate_ci95: (f64, f64),
 }
 
@@ -266,10 +262,10 @@ pub struct ExperimentResult {
     pub mode: WeightMode,
     pub variant: ModelVariant,
     pub backtest: BacktestStats,
-    pub average_log_loss: f64,
-    pub average_brier: f64,
-    pub average_target_probability: f64,
-    pub average_target_rank: f64,
+    pub average_log_loss: Option<f64>,
+    pub average_brier: Option<f64>,
+    pub average_target_probability: Option<f64>,
+    pub average_target_rank: Option<f64>,
     pub prior_evidence: Option<PriorEvidenceMetrics>,
     #[serde(default)]
     pub posterior_calibration: Vec<PosteriorCalibrationSummary>,
@@ -284,6 +280,7 @@ pub struct ExperimentResult {
     pub exact_step_pct: f64,
     #[serde(default)]
     pub finite_step_pct: f64,
+    pub terminal_step_pct: f64,
     pub average_lookahead_pool_ratio: f64,
     pub average_exact_pool_ratio: f64,
     pub games: Vec<ExperimentGameResult>,
@@ -298,6 +295,7 @@ pub struct ExecutionTelemetry {
     pub exact_steps: usize,
     #[serde(default)]
     pub finite_steps: usize,
+    pub terminal_steps: usize,
     pub danger_escalated_steps: usize,
     pub strict_recovery_steps: usize,
     pub uniform_recovery_steps: usize,
@@ -504,6 +502,40 @@ pub struct FrozenPredictiveCandidate {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProspectiveFrozenCandidate {
+    pub schema_version: u32,
+    pub identity_format: String,
+    pub frozen: FrozenPredictiveCandidate,
+    pub frozen_at_utc: DateTime<Utc>,
+    pub window: DateRange,
+    pub pre_window_history_fingerprint: String,
+    pub window_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProspectiveEvaluationReport {
+    pub schema_version: u32,
+    pub identity_format: String,
+    pub freeze_fingerprint: String,
+    pub input_fingerprint: String,
+    pub config_fingerprint: String,
+    pub window_fingerprint: String,
+    pub pre_window_history_fingerprint: String,
+    pub window: DateRange,
+    pub frozen_at_utc: DateTime<Utc>,
+    pub consumed_at_utc: DateTime<Utc>,
+    pub evaluation_artifact_policy: String,
+    pub prospective_evaluated: bool,
+    pub evaluated_once: bool,
+    pub window_data_fingerprint: String,
+    pub metrics: PredictiveMetrics,
+    pub prior_evidence: Option<PriorEvidenceMetrics>,
+    pub execution: ExecutionTelemetry,
+    pub games: Vec<ExperimentGameResult>,
+    pub latency_p95_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SealedTestReport {
     pub schema_version: u32,
     pub identity_format: String,
@@ -524,6 +556,9 @@ pub struct SealedTestReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SealedTestMarker {
     schema_version: u32,
+    window: DateRange,
+    evaluation_contract_fingerprint: String,
+    window_data_fingerprint: String,
     freeze_fingerprint: String,
     output_path: String,
     status: String,
@@ -596,7 +631,7 @@ impl PredictiveEvidenceArtifact {
 
 impl RollingComparisonArtifact {
     pub fn validate_identity(&self) -> Result<()> {
-        if self.schema_version != 4
+        if self.schema_version != 5
             || self.identity_format != crate::identity::IDENTITY_FORMAT
             || !crate::identity::is_tagged_digest(&self.input_fingerprint)
         {
@@ -620,7 +655,7 @@ impl RollingComparisonArtifact {
 
 impl FrozenPredictiveCandidate {
     pub fn validate_identity(&self) -> Result<()> {
-        if self.schema_version != 1
+        if self.schema_version != 2
             || self.identity_format != crate::identity::IDENTITY_FORMAT
             || !crate::identity::is_tagged_digest(&self.input_fingerprint)
             || !crate::identity::is_tagged_digest(&self.freeze_fingerprint)
@@ -716,8 +751,8 @@ pub struct SearchRegretSummary {
     pub states: usize,
     pub exact_matches: usize,
     pub positive_regret_states: usize,
-    pub mean_regret: f64,
-    pub maximum_regret: f64,
+    pub mean_regret: Option<f64>,
+    pub maximum_regret: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -760,7 +795,10 @@ pub struct SearchRegretReport {
     pub historical_games: usize,
     pub scanned_games: usize,
     pub available_states: usize,
+    pub planned_states: usize,
     pub sampled_states: usize,
+    pub complete: bool,
+    pub stop_reason: Option<String>,
     pub generation_elapsed_ms: u64,
     pub production: SearchRegretSummary,
     pub proxy: SearchRegretSummary,
@@ -860,6 +898,96 @@ pub struct FiniteSearchRegretReport {
     pub states: Vec<FiniteSearchRegretState>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SameStateDynamicRegretRuntime {
+    pub value: Option<FiniteSearchRegretValue>,
+    pub quality: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SameStateDynamicRegretChoice {
+    pub runtime: SameStateDynamicRegretRuntime,
+    pub reference_status: String,
+    pub failure_regret: Option<f64>,
+    pub attempts_regret: Option<f64>,
+    pub matches_optimum: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SameStateDynamicRegretReport {
+    pub schema_version: u32,
+    pub identity_format: String,
+    pub input_fingerprint: String,
+    pub config_fingerprint: String,
+    pub code_revision: Option<String>,
+    pub code_dirty: Option<bool>,
+    pub date: NaiveDate,
+    pub turn: usize,
+    pub horizon: u8,
+    pub state_path_policy: String,
+    pub state_identity: String,
+    pub active_survivors: usize,
+    pub dormant_fallback_survivors: usize,
+    pub reference_support_limit: usize,
+    pub staged_search_policy_mode: String,
+    pub choices_differ: Option<bool>,
+    pub reference_status: String,
+    pub reference_value: Option<FiniteSearchRegretValue>,
+    pub legal_root_count: usize,
+    pub maximum_seconds: u64,
+    pub generation_elapsed_ms: u64,
+    pub staged: SameStateDynamicRegretChoice,
+    pub finite_fast_dynamic: SameStateDynamicRegretChoice,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StagedZeroFailureCertificateRequest {
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+    pub maximum_states: usize,
+    pub maximum_seconds: u64,
+    pub hard_mode: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StagedZeroFailureCertificateReport {
+    pub schema_version: u32,
+    pub identity_format: String,
+    pub input_fingerprint: String,
+    pub config_fingerprint: String,
+    pub code_revision: Option<String>,
+    pub code_dirty: Option<bool>,
+    pub evaluation_from: NaiveDate,
+    pub evaluation_to: NaiveDate,
+    pub state_path_policy: String,
+    pub certificate_scope: String,
+    pub hard_mode: bool,
+    pub maximum_states: usize,
+    pub maximum_seconds: u64,
+    pub scheduled_days: u64,
+    pub historical_games: usize,
+    pub coverage_gaps: u64,
+    pub duplicate_history_dates: usize,
+    pub scanned_games: usize,
+    pub unsupported_target_games: usize,
+    pub replayed_games: usize,
+    pub path_replay_failures: usize,
+    pub selected_roots: usize,
+    pub evaluated_roots: usize,
+    pub certified_roots: usize,
+    pub bucket_cardinality_rejections: usize,
+    pub dormant_support_rejections: usize,
+    pub unstable_modeled_support_rejections: usize,
+    pub missing_dictionary_rejections: usize,
+    pub hard_mode_rejections: usize,
+    pub transition_rejections: usize,
+    pub state_cap_reached: bool,
+    pub deadline_reached: bool,
+    pub complete: bool,
+    pub generation_elapsed_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct HardCaseResult {
     pub label: String,
@@ -876,12 +1004,14 @@ pub struct HardCaseReport {
 #[derive(Clone, Debug)]
 pub struct TuningEvaluation {
     pub config: PriorConfig,
-    pub average_guesses: f64,
+    pub scheduled_games: usize,
+    pub measured_prior_games: usize,
+    pub average_guesses: Option<f64>,
     pub all_game_penalized_mean_guesses: f64,
     pub failures: usize,
     pub coverage_gaps: usize,
-    pub average_log_loss: f64,
-    pub average_target_rank: f64,
+    pub average_log_loss: Option<f64>,
+    pub average_target_rank: Option<f64>,
     pub latency_p95_ms: f64,
     pub hard_case_average_guesses: f64,
     pub hard_case_failures: usize,
@@ -890,6 +1020,7 @@ pub struct TuningEvaluation {
     pub escalated_exact_step_pct: f64,
     pub exact_step_pct: f64,
     pub finite_step_pct: f64,
+    pub terminal_step_pct: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -910,7 +1041,7 @@ pub struct TunePriorSummary {
 pub struct LiveConfigEvaluation {
     pub config: PriorConfig,
     pub predictive_metrics: PredictiveMetrics,
-    pub average_guesses: f64,
+    pub average_guesses: Option<f64>,
     pub all_game_penalized_mean_guesses: f64,
     pub failures: usize,
     pub coverage_gaps: usize,
@@ -954,7 +1085,7 @@ pub struct ThreeGuessGapCase {
 #[derive(Clone, Debug)]
 pub struct ThreeGuessGapReport {
     pub games: usize,
-    pub base_average_guesses: f64,
+    pub base_average_guesses: Option<f64>,
     pub aggressive_case_average_guesses: f64,
     pub base_four_guess_cases: usize,
     pub aggressive_four_guess_cases: usize,
@@ -1000,8 +1131,8 @@ pub struct PredictivePriorAblationFold {
     pub scheduled_games: usize,
     pub measured_games: usize,
     pub coverage_gaps: usize,
-    pub average_log_loss: f64,
-    pub average_brier: f64,
+    pub average_log_loss: Option<f64>,
+    pub average_brier: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1013,8 +1144,8 @@ pub struct PredictivePriorAblationProfile {
     pub scheduled_games: usize,
     pub measured_games: usize,
     pub coverage_gaps: usize,
-    pub average_log_loss: f64,
-    pub average_brier: f64,
+    pub average_log_loss: Option<f64>,
+    pub average_brier: Option<f64>,
     pub folds: Vec<PredictivePriorAblationFold>,
     pub promotable: bool,
     pub promotion_blockers: Vec<String>,
@@ -1153,43 +1284,64 @@ struct ForcedSolveScore {
     solved: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct ProxyCalibrationRow {
-    pub state_id: String,
-    pub date: NaiveDate,
-    pub step_index: usize,
-    pub surviving_answers: usize,
-    pub guess: String,
-    pub entropy: f64,
-    pub largest_non_green_bucket_mass: f64,
-    pub worst_non_green_bucket_size: usize,
-    pub high_mass_ambiguous_bucket_count: usize,
-    pub proxy_cost: f64,
-    pub solve_probability: f64,
-    pub posterior_answer_probability: f64,
-    pub smoothness_penalty: f64,
-    pub known_absent_letter_hits: usize,
-    pub large_non_green_bucket_count: usize,
-    pub dangerous_mass_bucket_count: usize,
-    pub non_green_mass_in_large_buckets: f64,
-    pub realized_cost: f64,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Solver {
     pub config: PriorConfig,
     pub mode: WeightMode,
     pub variant: ModelVariant,
+    data: Arc<SolverData>,
+    artifact_dir: PathBuf,
+    session_opener_cache: Arc<Mutex<HashMap<PredictiveBookIdentity, Option<String>>>>,
+    session_reply_cache: SessionReplyCache,
+    session_third_cache: SessionThirdCache,
+    identity_cache: Mutex<artifact_identity::PredictiveIdentityCache>,
+    #[cfg(test)]
+    test_fixture: Option<Arc<crate::test_support::TestDirectory>>,
+}
+
+impl Clone for Solver {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            mode: self.mode,
+            variant: self.variant,
+            data: Arc::clone(&self.data),
+            artifact_dir: self.artifact_dir.clone(),
+            session_opener_cache: Arc::new(Mutex::new(HashMap::new())),
+            session_reply_cache: Arc::new(Mutex::new(HashMap::new())),
+            session_third_cache: Arc::new(Mutex::new(HashMap::new())),
+            identity_cache: Default::default(),
+            #[cfg(test)]
+            test_fixture: self.test_fixture.clone(),
+        }
+    }
+}
+
+/// Immutable model input shared by the UI, workers and configured solver clones.
+#[derive(Clone, Debug)]
+pub struct SolverData {
     pub guesses: Vec<String>,
     pub answers: Vec<AnswerRecord>,
     pub primary_answer_count: usize,
     pub history_dates: Vec<NytDailyEntry>,
     pattern_table: PatternTable,
     guess_index: HashMap<String, usize>,
-    artifact_dir: PathBuf,
-    session_opener_cache: Arc<Mutex<HashMap<PredictiveBookIdentity, Option<String>>>>,
-    session_reply_cache: SessionReplyCache,
-    session_third_cache: SessionThirdCache,
+}
+
+impl std::ops::Deref for Solver {
+    type Target = SolverData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+#[cfg(test)]
+impl Solver {
+    fn data_mut(&mut self) -> &mut SolverData {
+        *self.identity_cache.get_mut().expect("test identity cache") = Default::default();
+        Arc::make_mut(&mut self.data)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1305,10 +1457,12 @@ impl ProxyRowStats {
 
 #[derive(Clone, Debug)]
 struct SuggestionBatch {
+    execution: crate::predictive::types::SearchExecution,
     finite_search: Option<FiniteSearchResult>,
     suggestions: Vec<Suggestion>,
     promoted_word: Option<String>,
     promotion_source: Option<PredictivePromotionSource>,
+    promoted_artifact_date: Option<NaiveDate>,
     danger_score: f64,
     danger_escalated: bool,
     regime_used: PredictiveRegime,
@@ -1333,11 +1487,12 @@ enum PredictiveBookUsage {
     Full,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 struct SolveExecutionPolicy<'a> {
     book_usage: PredictiveBookUsage,
     search_mode: Option<PredictiveSearchMode>,
     forced: &'a [(String, u8)],
+    cancelled: &'a (dyn Fn() -> bool + Sync),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1354,6 +1509,7 @@ const EXACT_SUBSET_INLINE_CAPACITY: usize = 16;
 struct PromotedPredictiveChoice {
     word: String,
     source: PredictivePromotionSource,
+    artifact_date: Option<NaiveDate>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1419,11 +1575,16 @@ impl ExactPartitionFrame {
 
 struct ExactSearchScratch {
     frames: Vec<ExactPartitionFrame>,
+    // Sticky with the shared memo: a later memo hit may reuse a pooled continuation.
+    used_candidate_pool: bool,
 }
 
 impl ExactSearchScratch {
     fn new() -> Self {
-        Self { frames: Vec::new() }
+        Self {
+            frames: Vec::new(),
+            used_candidate_pool: false,
+        }
     }
 
     fn frame_mut(&mut self, depth: usize) -> &mut ExactPartitionFrame {
@@ -1519,16 +1680,21 @@ impl Solver {
             config: config.clone(),
             mode,
             variant: model.variant,
-            guesses: model.guesses,
-            answers: model.answers,
-            primary_answer_count: model.primary_answer_count,
-            history_dates: model.history,
-            pattern_table,
-            guess_index,
+            data: std::sync::Arc::new(crate::solver::SolverData {
+                guesses: model.guesses,
+                answers: model.answers,
+                primary_answer_count: model.primary_answer_count,
+                history_dates: model.history,
+                pattern_table,
+                guess_index,
+            }),
             artifact_dir: paths.derived_predictive.clone(),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity_cache: Default::default(),
+            #[cfg(test)]
+            test_fixture: None,
         })
     }
 }
@@ -1545,7 +1711,7 @@ struct PriorMetrics {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs, path::PathBuf};
+    use std::{collections::HashMap, fs};
 
     use chrono::NaiveDate;
 
@@ -1575,11 +1741,11 @@ mod tests {
 
     use super::books::write_predictive_artifact;
 
-    fn test_solver(words: &[&str]) -> Solver {
+    pub(super) fn test_solver(words: &[&str]) -> Solver {
         test_solver_with_answer_count(words, words.len())
     }
 
-    fn test_solver_with_answer_count(words: &[&str], answer_count: usize) -> Solver {
+    pub(super) fn test_solver_with_answer_count(words: &[&str], answer_count: usize) -> Solver {
         assert!(answer_count > 0 && answer_count <= words.len());
         let guesses = words
             .iter()
@@ -1595,14 +1761,8 @@ mod tests {
                 history_dates: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let pattern_root: PathBuf = std::env::temp_dir().join(format!(
-            "maybe-wordle-solver-test-{}-{unique}",
-            words.join("-")
-        ));
+        let fixture = crate::test_support::TestDirectory::new("solver-fixture");
+        let pattern_root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&pattern_root);
         std::fs::create_dir_all(&pattern_root).expect("pattern root");
         let pattern_table =
@@ -1612,26 +1772,137 @@ mod tests {
             config: PriorConfig::default(),
             mode: WeightMode::Uniform,
             variant: ModelVariant::SeedPlusHistory,
-            guesses: guesses.clone(),
-            answers,
-            primary_answer_count: answer_count,
-            history_dates: Vec::new(),
-            pattern_table,
-            guess_index: guesses
-                .iter()
-                .enumerate()
-                .map(|(index, guess)| (guess.clone(), index))
-                .collect::<HashMap<_, _>>(),
+            data: std::sync::Arc::new(crate::solver::SolverData {
+                guesses: guesses.clone(),
+                answers,
+                primary_answer_count: answer_count,
+                history_dates: Vec::new(),
+                pattern_table,
+                guess_index: guesses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, guess)| (guess.clone(), index))
+                    .collect::<HashMap<_, _>>(),
+            }),
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity_cache: Default::default(),
+            test_fixture: Some(std::sync::Arc::new(fixture)),
         }
     }
 
     fn finite_fast_dynamic_mode() -> SearchPolicyMode {
         serde_json::from_str(r#""finite_fast_dynamic""#)
             .expect("deserialize finite_fast_dynamic mode")
+    }
+
+    #[test]
+    fn solver_clones_share_immutable_inputs_but_keep_game_state_independent() {
+        let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let cloned = solver.clone();
+        assert_eq!(solver.guesses.as_ptr(), cloned.guesses.as_ptr());
+        assert_eq!(solver.answers.as_ptr(), cloned.answers.as_ptr());
+        assert_eq!(solver.history_dates.as_ptr(), cloned.history_dates.as_ptr());
+        assert!(std::ptr::eq(&solver.pattern_table, &cloned.pattern_table));
+        assert!(std::ptr::eq(&solver.guess_index, &cloned.guess_index));
+        assert!(!std::sync::Arc::ptr_eq(
+            &solver.session_opener_cache,
+            &cloned.session_opener_cache
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &solver.session_reply_cache,
+            &cloned.session_reply_cache
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &solver.session_third_cache,
+            &cloned.session_third_cache
+        ));
+        let date = NaiveDate::from_ymd_opt(2026, 3, 9).unwrap();
+        let original = solver.initial_state(date);
+        let mut changed = cloned.initial_state(date);
+        cloned
+            .apply_feedback(&mut changed, "cigar", ALL_GREEN_PATTERN)
+            .unwrap();
+        assert_eq!(original.surviving.len(), 4);
+        assert_eq!(changed.surviving.len(), 1);
+    }
+
+    #[test]
+    fn cloned_test_solver_retains_its_owned_fixture_until_the_last_drop() {
+        let solver = test_solver(&["cigar", "rebut"]);
+        let root = solver.test_fixture.as_ref().unwrap().path().to_owned();
+        let cloned = solver.clone();
+        assert!(root.is_dir());
+        drop(solver);
+        assert!(root.is_dir());
+        assert_eq!(cloned.guesses.len(), 2);
+        drop(cloned);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn absurdle_cancellation_is_explicit_and_does_not_change_later_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
+        let expected = solver.absurdle_suggestions(&[], 4).expect("baseline");
+        assert!(
+            solver
+                .absurdle_suggestions_cancellable(&[], 4, &|| true)
+                .is_err()
+        );
+        let calls = AtomicUsize::new(0);
+        let error = solver
+            .absurdle_suggestions_cancellable(&[], 4, &|| {
+                calls.fetch_add(1, Ordering::Relaxed) >= 3
+            })
+            .expect_err("cancel mid-scan");
+        assert!(error.to_string().contains("cancel"));
+        let actual = solver
+            .absurdle_suggestions_cancellable(&[], 4, &|| false)
+            .expect("retry");
+        assert_eq!(
+            expected.iter().map(|row| &row.word).collect::<Vec<_>>(),
+            actual.iter().map(|row| &row.word).collect::<Vec<_>>()
+        );
+        for (left, right) in expected.iter().zip(&actual) {
+            assert_eq!(left.entropy, right.entropy);
+            assert_eq!(left.largest_bucket_size, right.largest_bucket_size);
+        }
+        assert!(
+            solver
+                .absurdle_suggestions(&[("cigar".into(), ALL_GREEN_PATTERN)], 4)
+                .expect("solved")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shared_history_transition_checks_vocabulary_clues_and_hard_mode() {
+        use crate::game::{GameRules, try_append_observation};
+        let solver = test_solver(&["allee", "llama", "apple", "ample"]);
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let history = vec![("allee".into(), score_guess("allee", "llama"))];
+        for (guess, feedback, hard) in [
+            ("zzzzz", "00000", false),
+            ("llama", "00000", false),
+            ("apple", "00000", true),
+        ] {
+            assert!(
+                try_append_observation(&history, guess, feedback, GameRules::Wordle, |next| solver
+                    .validate_game_history(date, next, hard)
+                    .map(|_| ()))
+                .is_err()
+            );
+            assert_eq!(history.len(), 1);
+        }
+        let next = try_append_observation(&history, "llama", "22222", GameRules::Wordle, |next| {
+            solver.validate_game_history(date, next, true).map(|_| ())
+        })
+        .expect("duplicate clues respected");
+        assert_eq!(next.len(), 2);
+        assert_eq!(history.len(), 1);
     }
 
     #[test]
@@ -1732,7 +2003,7 @@ mod tests {
                 assert_eq!(trace.top_candidates[0].word, step.guess);
             }
         }
-        solver.history_dates = games;
+        solver.data_mut().history_dates = games;
         let artifact = solver
             .experiment_report(start, start, 1)
             .expect("finite experiment evidence");
@@ -2274,12 +2545,8 @@ mod tests {
             manual_weight: 1.0,
             history_dates: vec![NaiveDate::from_ymd_opt(2025, 9, 14).expect("valid")],
         }];
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let pattern_root: PathBuf =
-            std::env::temp_dir().join(format!("maybe-wordle-zero-weight-test-{unique}"));
+        let fixture = crate::test_support::TestDirectory::new("solver-fixture");
+        let pattern_root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&pattern_root);
         std::fs::create_dir_all(&pattern_root).expect("pattern root");
         let pattern_table =
@@ -2298,20 +2565,24 @@ mod tests {
             config,
             mode: WeightMode::Weighted,
             variant: ModelVariant::SeedPlusHistory,
-            guesses: guesses.clone(),
-            answers,
-            primary_answer_count: guesses.len(),
-            history_dates: Vec::new(),
-            pattern_table,
-            guess_index: guesses
-                .iter()
-                .enumerate()
-                .map(|(index, guess)| (guess.clone(), index))
-                .collect::<HashMap<_, _>>(),
+            data: std::sync::Arc::new(crate::solver::SolverData {
+                guesses: guesses.clone(),
+                answers,
+                primary_answer_count: guesses.len(),
+                history_dates: Vec::new(),
+                pattern_table,
+                guess_index: guesses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, guess)| (guess.clone(), index))
+                    .collect::<HashMap<_, _>>(),
+            }),
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity_cache: Default::default(),
+            test_fixture: Some(std::sync::Arc::new(fixture)),
         };
         let state = solver.initial_state(NaiveDate::from_ymd_opt(2026, 3, 10).expect("valid"));
         assert_eq!(state.surviving.len(), 1);
@@ -2348,7 +2619,7 @@ mod tests {
     #[test]
     fn fixed_posterior_conditions_without_repair_or_tail_activation() {
         let mut solver = test_solver(&["cigar", "rebut", "sissy"]);
-        solver.primary_answer_count = 1;
+        solver.data_mut().primary_answer_count = 1;
         solver.config.fallback_prior_mass = 0.2;
         let date = NaiveDate::from_ymd_opt(2026, 3, 10).expect("date");
         let initial = solver.fixed_posterior_state(date).expect("posterior");
@@ -2382,7 +2653,7 @@ mod tests {
                 .all(|weight| (*weight - 1.0 / 3.0).abs() < 1e-12)
         );
         solver.mode = WeightMode::Weighted;
-        solver.answers[0].manual_weight = 0.0;
+        solver.data_mut().answers[0].manual_weight = 0.0;
         let manual_zero = solver
             .fixed_posterior_state(date)
             .expect("manual zero becomes tail");
@@ -2395,7 +2666,7 @@ mod tests {
     #[test]
     fn forced_prefix_and_normal_simulation_share_dormant_support_and_turn_limit() {
         let mut solver = test_solver(&["cigar", "rebut"]);
-        solver.primary_answer_count = 1;
+        solver.data_mut().primary_answer_count = 1;
         let date = NaiveDate::from_ymd_opt(2026, 3, 11).expect("date");
         let as_of = date.pred_opt().expect("cutoff");
         let forced = [("cigar".to_string(), 0)];
@@ -2539,7 +2810,7 @@ mod tests {
         solver.mode = WeightMode::Weighted;
         solver.config.cooldown_floor = 0.0;
         solver.config.cooldown_days = 365;
-        solver.answers[0].history_dates = vec![as_of];
+        solver.data_mut().answers[0].history_dates = vec![as_of];
 
         let initial = solver.initial_state(as_of);
         assert_eq!(initial.surviving.len(), 2);
@@ -2580,7 +2851,7 @@ mod tests {
     fn inconsistent_primary_feedback_activates_dormant_fallback_support() {
         let as_of = NaiveDate::from_ymd_opt(2026, 3, 10).expect("date");
         let mut solver = test_solver(&["cigar", "rebut"]);
-        solver.primary_answer_count = 1;
+        solver.data_mut().primary_answer_count = 1;
         let mut state = solver.initial_state(as_of);
         assert_eq!(state.surviving, vec![0]);
         assert_eq!(state.fallback_surviving, vec![1]);
@@ -2601,8 +2872,8 @@ mod tests {
     fn future_history_only_primary_answer_is_dormant_support_before_first_seen() {
         let as_of = NaiveDate::from_ymd_opt(2026, 3, 10).expect("date");
         let mut solver = test_solver(&["cigar", "rebut"]);
-        solver.answers[1].in_seed = false;
-        solver.answers[1].history_dates =
+        solver.data_mut().answers[1].in_seed = false;
+        solver.data_mut().answers[1].history_dates =
             vec![NaiveDate::from_ymd_opt(2026, 3, 11).expect("future date")];
 
         let state = solver.initial_state(as_of);
@@ -2615,8 +2886,8 @@ mod tests {
     fn dormant_primary_and_secondary_answers_remain_index_sorted() {
         let as_of = NaiveDate::from_ymd_opt(2026, 3, 10).expect("date");
         let mut solver = test_solver(&["cigar", "rebut", "sissy"]);
-        solver.primary_answer_count = 2;
-        solver.answers[0].in_seed = false;
+        solver.data_mut().primary_answer_count = 2;
+        solver.data_mut().answers[0].in_seed = false;
 
         let state = solver.initial_state(as_of);
 
@@ -2647,7 +2918,7 @@ mod tests {
         let base_identity = base.predictive_book_identity(as_of);
 
         let mut changed_guess = base.clone();
-        changed_guess.guesses[0] = "humph".to_string();
+        changed_guess.data_mut().guesses[0] = "humph".to_string();
         assert_ne!(
             base_identity.model_manifest_hash,
             changed_guess
@@ -2656,7 +2927,7 @@ mod tests {
         );
 
         let mut changed_answer = base.clone();
-        changed_answer.answers[0].word = "humph".to_string();
+        changed_answer.data_mut().answers[0].word = "humph".to_string();
         assert_ne!(
             base_identity.model_manifest_hash,
             changed_answer
@@ -2665,13 +2936,16 @@ mod tests {
         );
 
         let mut changed_history = base;
-        changed_history.history_dates.push(NytDailyEntry {
-            id: Some(99),
-            solution: "cigar".to_string(),
-            print_date: as_of,
-            days_since_launch: Some(99),
-            editor: Some("fixture".to_string()),
-        });
+        changed_history
+            .data_mut()
+            .history_dates
+            .push(NytDailyEntry {
+                id: Some(99),
+                solution: "cigar".to_string(),
+                print_date: as_of,
+                days_since_launch: Some(99),
+                editor: Some("fixture".to_string()),
+            });
         assert_ne!(
             base_identity.model_manifest_hash,
             changed_history
@@ -2697,12 +2971,8 @@ mod tests {
                 history_dates: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let pattern_root =
-            std::env::temp_dir().join(format!("maybe-wordle-session-cache-test-{unique}"));
+        let fixture = crate::test_support::TestDirectory::new("solver-fixture");
+        let pattern_root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&pattern_root);
         std::fs::create_dir_all(&pattern_root).expect("pattern root");
         let pattern_table =
@@ -2718,26 +2988,30 @@ mod tests {
             config,
             mode: WeightMode::Weighted,
             variant: ModelVariant::SeedPlusHistory,
-            guesses: guesses.clone(),
-            answers,
-            primary_answer_count: guesses.len(),
-            history_dates: vec![NytDailyEntry {
-                id: Some(1),
-                solution: "cigar".to_string(),
-                print_date: as_of,
-                days_since_launch: Some(1),
-                editor: None,
-            }],
-            pattern_table,
-            guess_index: guesses
-                .iter()
-                .enumerate()
-                .map(|(index, guess)| (guess.clone(), index))
-                .collect::<HashMap<_, _>>(),
+            data: std::sync::Arc::new(crate::solver::SolverData {
+                guesses: guesses.clone(),
+                answers,
+                primary_answer_count: guesses.len(),
+                history_dates: vec![NytDailyEntry {
+                    id: Some(1),
+                    solution: "cigar".to_string(),
+                    print_date: as_of,
+                    days_since_launch: Some(1),
+                    editor: None,
+                }],
+                pattern_table,
+                guess_index: guesses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, guess)| (guess.clone(), index))
+                    .collect::<HashMap<_, _>>(),
+            }),
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity_cache: Default::default(),
+            test_fixture: Some(std::sync::Arc::new(fixture)),
         };
         assert_eq!(
             solver
@@ -2779,12 +3053,8 @@ mod tests {
                 history_dates: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let pattern_root =
-            std::env::temp_dir().join(format!("maybe-wordle-session-reply-cache-test-{unique}"));
+        let fixture = crate::test_support::TestDirectory::new("solver-fixture");
+        let pattern_root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&pattern_root);
         std::fs::create_dir_all(&pattern_root).expect("pattern root");
         let pattern_table =
@@ -2798,26 +3068,30 @@ mod tests {
             },
             mode: WeightMode::Weighted,
             variant: ModelVariant::SeedPlusHistory,
-            guesses: guesses.clone(),
-            answers,
-            primary_answer_count: guesses.len(),
-            history_dates: vec![NytDailyEntry {
-                id: Some(1),
-                solution: "rebut".to_string(),
-                print_date: as_of,
-                days_since_launch: Some(1),
-                editor: None,
-            }],
-            pattern_table,
-            guess_index: guesses
-                .iter()
-                .enumerate()
-                .map(|(index, guess)| (guess.clone(), index))
-                .collect::<HashMap<_, _>>(),
+            data: std::sync::Arc::new(crate::solver::SolverData {
+                guesses: guesses.clone(),
+                answers,
+                primary_answer_count: guesses.len(),
+                history_dates: vec![NytDailyEntry {
+                    id: Some(1),
+                    solution: "rebut".to_string(),
+                    print_date: as_of,
+                    days_since_launch: Some(1),
+                    editor: None,
+                }],
+                pattern_table,
+                guess_index: guesses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, guess)| (guess.clone(), index))
+                    .collect::<HashMap<_, _>>(),
+            }),
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity_cache: Default::default(),
+            test_fixture: Some(std::sync::Arc::new(fixture)),
         };
         let feedback = score_guess("cigar", "rebut");
         let suggestions = solver
@@ -2853,12 +3127,8 @@ mod tests {
                 history_dates: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let pattern_root =
-            std::env::temp_dir().join(format!("maybe-wordle-session-third-cache-test-{unique}"));
+        let fixture = crate::test_support::TestDirectory::new("solver-fixture");
+        let pattern_root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&pattern_root);
         std::fs::create_dir_all(&pattern_root).expect("pattern root");
         let pattern_table =
@@ -2872,26 +3142,30 @@ mod tests {
             },
             mode: WeightMode::Weighted,
             variant: ModelVariant::SeedPlusHistory,
-            guesses: guesses.clone(),
-            answers,
-            primary_answer_count: guesses.len(),
-            history_dates: vec![NytDailyEntry {
-                id: Some(1),
-                solution: "humph".to_string(),
-                print_date: as_of,
-                days_since_launch: Some(1),
-                editor: None,
-            }],
-            pattern_table,
-            guess_index: guesses
-                .iter()
-                .enumerate()
-                .map(|(index, guess)| (guess.clone(), index))
-                .collect::<HashMap<_, _>>(),
+            data: std::sync::Arc::new(crate::solver::SolverData {
+                guesses: guesses.clone(),
+                answers,
+                primary_answer_count: guesses.len(),
+                history_dates: vec![NytDailyEntry {
+                    id: Some(1),
+                    solution: "humph".to_string(),
+                    print_date: as_of,
+                    days_since_launch: Some(1),
+                    editor: None,
+                }],
+                pattern_table,
+                guess_index: guesses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, guess)| (guess.clone(), index))
+                    .collect::<HashMap<_, _>>(),
+            }),
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity_cache: Default::default(),
+            test_fixture: Some(std::sync::Arc::new(fixture)),
         };
         let first_feedback = score_guess("cigar", "humph");
         let second_feedback = score_guess("rebut", "humph");
@@ -2952,8 +3226,12 @@ mod tests {
                 ("rebut".to_string(), reply_pattern),
             ],
             false,
+            &|| false,
         );
-        assert_eq!(choice.map(|choice| choice.word), Some("sissy".to_string()));
+        assert_eq!(
+            choice.unwrap().map(|choice| choice.word),
+            Some("sissy".to_string())
+        );
     }
 
     #[test]
@@ -2990,8 +3268,12 @@ mod tests {
             request_date,
             &[("cigar".to_string(), opener_pattern)],
             false,
+            &|| false,
         );
-        assert_eq!(reply.map(|choice| choice.word), Some("rebut".to_string()));
+        assert_eq!(
+            reply.unwrap().map(|choice| choice.word),
+            Some("rebut".to_string())
+        );
         let third = solver.cached_predictive_choice(
             request_date,
             &[
@@ -2999,8 +3281,12 @@ mod tests {
                 ("rebut".to_string(), reply_pattern),
             ],
             false,
+            &|| false,
         );
-        assert_eq!(third.map(|choice| choice.word), Some("sissy".to_string()));
+        assert_eq!(
+            third.unwrap().map(|choice| choice.word),
+            Some("sissy".to_string())
+        );
     }
 
     #[test]
@@ -3030,8 +3316,11 @@ mod tests {
         write_predictive_artifact(&solver.opener_artifact_path(artifact_date), &artifact)
             .expect("write opener artifact");
 
-        let choice = solver.cached_predictive_choice(request_date, &[], false);
-        assert_eq!(choice.map(|choice| choice.word), Some("cigar".to_string()));
+        let choice = solver.cached_predictive_choice(request_date, &[], false, &|| false);
+        assert_eq!(
+            choice.unwrap().map(|choice| choice.word),
+            Some("cigar".to_string())
+        );
     }
 
     #[test]
@@ -3082,15 +3371,18 @@ mod tests {
         write_predictive_artifact(&solver.opener_artifact_path(exact_date), &exact)
             .expect("write exact opener artifact");
 
-        let choice = solver.cached_predictive_choice(exact_date, &[], false);
-        assert_eq!(choice.map(|choice| choice.word), Some("rebut".to_string()));
+        let choice = solver.cached_predictive_choice(exact_date, &[], false, &|| false);
+        assert_eq!(
+            choice.unwrap().map(|choice| choice.word),
+            Some("rebut".to_string())
+        );
     }
 
     #[test]
     fn live_backtest_works_without_disk_books() {
         let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
         let date = NaiveDate::from_ymd_opt(2026, 3, 9).expect("valid");
-        solver.history_dates = vec![NytDailyEntry {
+        solver.data_mut().history_dates = vec![NytDailyEntry {
             id: Some(1),
             solution: "cigar".to_string(),
             print_date: date,
@@ -3192,6 +3484,7 @@ mod tests {
     #[test]
     fn force_in_two_wins_proxy_ties_only() {
         let force = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
@@ -3211,6 +3504,7 @@ mod tests {
             exact_cost: None,
         };
         let non_force = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "bravo".into(),
             entropy: 3.0,
@@ -3235,6 +3529,7 @@ mod tests {
         );
 
         let clearly_better = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             proxy_cost: Some(1.9),
             ..non_force.clone()
@@ -3248,6 +3543,7 @@ mod tests {
     #[test]
     fn force_in_two_breaks_exact_cost_ties_only() {
         let force = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
@@ -3267,6 +3563,7 @@ mod tests {
             exact_cost: Some(3.0),
         };
         let non_force = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "bravo".into(),
             force_in_two: false,
@@ -3284,6 +3581,7 @@ mod tests {
         );
 
         let better_exact = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             exact_cost: Some(2.5),
             ..non_force.clone()
@@ -3303,6 +3601,7 @@ mod tests {
     #[test]
     fn force_in_two_does_not_beat_better_lookahead_score() {
         let force = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
@@ -3322,6 +3621,7 @@ mod tests {
             exact_cost: None,
         };
         let better = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "bravo".into(),
             force_in_two: false,
@@ -3337,6 +3637,7 @@ mod tests {
     #[test]
     fn final_turn_prefers_immediate_solve_probability_over_future_information() {
         let informative = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "alpha".into(),
             entropy: 4.0,
@@ -3356,6 +3657,7 @@ mod tests {
             exact_cost: Some(1.0),
         };
         let likely_answer = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "bravo".into(),
             entropy: 0.1,
@@ -3439,7 +3741,7 @@ mod tests {
     fn two_turn_success_metric_matches_feedback_bucket_oracle() {
         let mut solver =
             test_solver_with_answer_count(&["cajon", "capon", "canon", "fanon", "junco"], 4);
-        solver.answers.push(AnswerRecord {
+        solver.data_mut().answers.push(AnswerRecord {
             word: "zzzzz".to_string(),
             in_seed: false,
             manual_entry: true,
@@ -3489,26 +3791,19 @@ mod tests {
         assert!((scores[solver.guess_index["junco"]] - 0.8).abs() < 1e-12);
 
         let observations = vec![("olate".to_string(), 0); 4];
-        let batch = solver
-            .suggestion_batch_internal_with_search_mode_controlled(
-                &state,
-                solver.guesses.len(),
-                Some(super::PredictiveContext {
-                    hard_mode: false,
-                    as_of: chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
-                    observations: &observations,
-                }),
-                PredictiveBookUsage::None,
-                Some(PredictiveSearchMode::ProxyOnly),
-                &|| false,
-            )
-            .unwrap();
-        assert!(
-            batch
-                .suggestions
-                .iter()
-                .all(|suggestion| !suggestion.force_in_two)
+        let result = solver.suggestion_batch_internal_with_search_mode_controlled(
+            &state,
+            solver.guesses.len(),
+            Some(super::PredictiveContext {
+                hard_mode: false,
+                as_of: chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+                observations: &observations,
+            }),
+            PredictiveBookUsage::None,
+            Some(PredictiveSearchMode::ProxyOnly),
+            &|| false,
         );
+        assert!(result.unwrap_err().to_string().contains("guess"));
         let finite = solver
             .finite_suggestion_batch(
                 &state,
@@ -3648,6 +3943,7 @@ mod tests {
             std::cmp::Ordering::Less
         );
         let safer_suggestion = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "alpha".into(),
             entropy: safer_split.entropy,
@@ -3667,6 +3963,7 @@ mod tests {
             exact_cost: None,
         };
         let gambler_suggestion = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "bravo".into(),
             entropy: gambler.entropy,
@@ -3800,6 +4097,7 @@ mod tests {
         let guess_index =
             HashMap::from([("alpha".to_string(), 0usize), ("bravo".to_string(), 1usize)]);
         let better_coverage = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
@@ -3819,6 +4117,7 @@ mod tests {
             exact_cost: None,
         };
         let stronger_proxy = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "bravo".into(),
             proxy_cost: Some(1.8),
@@ -3854,6 +4153,7 @@ mod tests {
         };
         let suggestions = vec![
             super::Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "humph".into(),
                 entropy: 5.0,
@@ -3873,6 +4173,7 @@ mod tests {
                 exact_cost: None,
             },
             super::Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "awake".into(),
                 entropy: 4.0,
@@ -3927,6 +4228,7 @@ mod tests {
         };
         let suggestions = vec![
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "humph".into(),
                 entropy: 5.0,
@@ -3946,6 +4248,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "awake".into(),
                 entropy: 4.0,
@@ -3965,6 +4268,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "blush".into(),
                 entropy: 3.0,
@@ -4378,6 +4682,7 @@ mod tests {
         let solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
         let suggestions = vec![
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "cigar".into(),
                 entropy: 3.0,
@@ -4397,6 +4702,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "rebut".into(),
                 entropy: 5.0,
@@ -4416,6 +4722,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "sissy".into(),
                 entropy: 2.5,
@@ -4435,6 +4742,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "humph".into(),
                 entropy: 2.0,
@@ -4467,6 +4775,7 @@ mod tests {
     #[test]
     fn suggestion_tie_breaks_keep_trap_signals() {
         let safer = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "alpha".into(),
             entropy: 3.0,
@@ -4486,6 +4795,7 @@ mod tests {
             exact_cost: Some(3.0),
         };
         let trap_heavier = Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
             finite_value: None,
             word: "bravo".into(),
             large_non_green_bucket_count: 3,
@@ -4686,6 +4996,7 @@ mod tests {
         let mut solver = test_solver(&["cigar", "rebut", "sissy", "humph"]);
         let suggestions = vec![
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "cigar".into(),
                 entropy: 3.2,
@@ -4705,6 +5016,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "rebut".into(),
                 entropy: 3.1,
@@ -4724,6 +5036,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "sissy".into(),
                 entropy: 3.0,
@@ -4743,6 +5056,7 @@ mod tests {
                 exact_cost: None,
             },
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: "humph".into(),
                 entropy: 2.9,
@@ -5163,14 +5477,8 @@ mod tests {
 
     #[test]
     fn benchmark_evidence_fresh_resume_reuses_profiles_and_rejects_matrix_changes() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "maybe-wordle-evidence-resume-test-{}-{unique}",
-            std::process::id()
-        ));
+        let fixture = crate::test_support::TestDirectory::new("evidence-resume");
+        let root = fixture.path().to_path_buf();
         let _ = fs::remove_dir_all(&root);
         let paths = ProjectPaths::new(&root);
         paths.ensure_layout().expect("fixture layout");
@@ -5481,7 +5789,8 @@ mod tests {
                 history_dates: Vec::new(),
             },
         ];
-        let pattern_root: PathBuf = std::env::temp_dir().join("maybe-wordle-exact-no-shrink");
+        let fixture = crate::test_support::TestDirectory::new("solver-fixture");
+        let pattern_root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&pattern_root);
         std::fs::create_dir_all(&pattern_root).expect("pattern root");
         let pattern_table =
@@ -5491,20 +5800,24 @@ mod tests {
             config: PriorConfig::default(),
             mode: WeightMode::Uniform,
             variant: ModelVariant::SeedPlusHistory,
-            guesses: guesses.clone(),
-            answers,
-            primary_answer_count: guesses.len(),
-            history_dates: Vec::new(),
-            pattern_table,
-            guess_index: guesses
-                .iter()
-                .enumerate()
-                .map(|(index, guess)| (guess.clone(), index))
-                .collect::<HashMap<_, _>>(),
+            data: std::sync::Arc::new(crate::solver::SolverData {
+                guesses: guesses.clone(),
+                answers,
+                primary_answer_count: guesses.len(),
+                history_dates: Vec::new(),
+                pattern_table,
+                guess_index: guesses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, guess)| (guess.clone(), index))
+                    .collect::<HashMap<_, _>>(),
+            }),
             artifact_dir: pattern_root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity_cache: Default::default(),
+            test_fixture: Some(std::sync::Arc::new(fixture)),
         };
         let mut memo = PredictiveMemoMap::default();
         let mut scratch = ExactSearchScratch::new();

@@ -5,6 +5,7 @@ pub enum PredictiveRegime {
     EscalatedExact,
     Exact,
     Finite,
+    Terminal,
 }
 
 impl PredictiveRegime {
@@ -15,6 +16,7 @@ impl PredictiveRegime {
             Self::EscalatedExact => "escalated_exact",
             Self::Exact => "exact",
             Self::Finite => "finite",
+            Self::Terminal => "terminal",
         }
     }
 }

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     atomic_file::atomic_write,
-    data::{ProjectPaths, read_word_list},
+    data::{ProjectPaths, read_word_list_from, validate_answer_universe},
     identity::{CanonicalSha256, digest_bytes_tagged, tag},
     model::AnswerRecord,
     pattern_table::{PatternTable, hash_word_list},
@@ -22,6 +22,14 @@ use crate::{
     small_state::{SMALL_STATE_TABLE_VERSION, SmallStateTable},
 };
 
+#[cfg(test)]
+mod artifact_tests;
+mod generation;
+#[cfg(test)]
+mod horizon_tests;
+mod parsing;
+#[cfg(test)]
+mod runtime_tests;
 mod scale;
 mod verifier;
 
@@ -32,6 +40,7 @@ pub use scale::{
 
 pub const DEFAULT_FORMAL_MODEL_ID: &str = "formal-v1";
 pub const DEFAULT_EXPECTED_ONLY_MODEL_ID: &str = "formal-expected-v1";
+pub const DEFAULT_FORMAL_ALTERNATIVE_PARTITIONS: usize = 10_000;
 const PRIOR_SPEC_NAME: &str = "prior.toml";
 const MANIFEST_NAME: &str = "manifest.json";
 const VALUES_NAME: &str = "state_values.bin";
@@ -40,15 +49,18 @@ const METADATA_NAME: &str = "proof_metadata.json";
 const CERTIFICATE_NAME: &str = "proof_certificate.json";
 const SMALL_STATE_TABLE_NAME: &str = "small_state_table.json";
 const FORMAL_PATTERN_TABLE_NAME: &str = "pattern_table.bin";
-const POLICY_MAGIC: &[u8; 8] = b"MWORDPV2";
-const VALUES_MAGIC: &[u8; 8] = b"MWORDVV2";
+const POLICY_MAGIC: &[u8; 8] = b"MWORDPV3";
+const VALUES_MAGIC: &[u8; 8] = b"MWORDVV3";
 const TAGGED_DIGEST_LENGTH: usize = 74;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
-const OBJECTIVE_VERSION: u32 = 2;
-const STATE_FORMAT_VERSION: u32 = 2;
+const OBJECTIVE_VERSION: u32 = 3;
+const STATE_FORMAT_VERSION: u32 = 3;
 const AUX_TABLE_VERSION: u32 = 4;
-const CERTIFICATE_FORMAT_VERSION: u32 = 7;
+const CERTIFICATE_FORMAT_VERSION: u32 = 8;
 const SMALL_STATE_LIMIT: usize = 12;
+const MAX_FORMAL_STATES: usize = 100_000;
+const MAX_FORMAL_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+const BINARY_HEADER_BYTES: u64 = 8 + TAGGED_DIGEST_LENGTH as u64 + 8 + 4;
 
 type AnswerId = u16;
 const INLINE_STATE_THRESHOLD: usize = 30;
@@ -59,8 +71,9 @@ const HOT_TT_ASSOCIATIVITY: usize = 4;
 const STATE_TAG_INLINE: u8 = 0;
 const STATE_TAG_BITSET: u8 = 1;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FormalObjectiveKind {
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FormalObjectiveKind {
     Lexicographic,
     ExpectedOnly,
 }
@@ -81,9 +94,12 @@ pub enum FormalVerificationMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedCertificateState {
     state_id: u32,
+    #[serde(deserialize_with = "parsing::bounded_vec::<_, _, { parsing::MAX_WORDS }>")]
     answer_indices: Vec<AnswerId>,
+    horizon: Option<u8>,
     best_guess: usize,
     best_objective: PolicyObjective,
+    #[serde(deserialize_with = "parsing::bounded_vec::<_, _, { parsing::MAX_WORDS }>")]
     candidates: Vec<PersistedCertificateCandidate>,
 }
 
@@ -96,6 +112,7 @@ struct PersistedCertificateCandidate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PersistedCandidateWitness {
+    Infeasible,
     NonProgress {
         pattern: u8,
     },
@@ -104,6 +121,7 @@ enum PersistedCandidateWitness {
     },
     Exact {
         objective: PolicyObjective,
+        #[serde(deserialize_with = "parsing::bounded_vec::<_, _, PATTERN_SPACE>")]
         children: Vec<PersistedCertificateChild>,
     },
 }
@@ -119,6 +137,7 @@ struct PersistedCertificateChild {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FormalManifest {
     pub model_id: String,
+    pub objective_kind: FormalObjectiveKind,
     pub objective_id: String,
     pub objective: String,
     pub objective_version: u32,
@@ -158,7 +177,10 @@ pub struct ProofMetadata {
     pub bound_hits: u64,
     pub root_refinement_pruned: u64,
     pub local_refinement_pruned: u64,
-    pub build_millis: u128,
+    pub solve_millis: u128,
+    pub certificate_millis: u128,
+    /// Elapsed time sampled before writing metadata and publishing the generation pointer.
+    pub pre_publish_millis: u128,
     pub root_objective: PolicyObjective,
 }
 
@@ -172,6 +194,9 @@ pub struct BuildOptimalSummary {
     pub root_refinement_pruned: u64,
     pub local_refinement_pruned: u64,
     pub build_millis: u128,
+    pub solve_millis: u128,
+    pub certificate_millis: u128,
+    pub persistence_millis: u128,
     pub root_best_guess: String,
     pub root_objective: PolicyObjective,
 }
@@ -201,6 +226,7 @@ pub struct ProofCertificate {
     pub policy_state_count: usize,
     pub state_count: usize,
     pub root_state_id: u32,
+    #[serde(deserialize_with = "parsing::bounded_vec::<_, _, MAX_FORMAL_STATES>")]
     states: Vec<PersistedCertificateState>,
 }
 
@@ -213,7 +239,32 @@ pub struct FormalStateExplanation {
     pub objective: PolicyObjective,
     pub bucket_sizes: Vec<usize>,
     pub tied_moves: Vec<FormalSuggestion>,
+    pub alternatives_status: FormalAlternativesStatus,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FormalAlternativesStatus {
+    NotRequested,
+    Complete,
+    WorkLimitReached,
+}
+
+#[derive(Debug)]
+enum FormalSearchStop {
+    Cancelled,
+    WorkLimit,
+}
+
+impl std::fmt::Display for FormalSearchStop {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Cancelled => "formal search cancelled",
+            Self::WorkLimit => "formal search partition budget exhausted",
+        })
+    }
+}
+
+impl std::error::Error for FormalSearchStop {}
 
 #[derive(Clone, Debug)]
 pub struct PolicyArtifactSet {
@@ -231,6 +282,10 @@ pub struct PolicyArtifactSet {
 impl PolicyArtifactSet {
     pub fn for_model(paths: &ProjectPaths, model_id: &str) -> Self {
         let model_dir = paths.root.join("data/formal").join(model_id);
+        Self::in_directory(model_dir)
+    }
+
+    fn in_directory(model_dir: PathBuf) -> Self {
         Self {
             prior_spec: model_dir.join(PRIOR_SPEC_NAME),
             manifest: model_dir.join(MANIFEST_NAME),
@@ -242,6 +297,11 @@ impl PolicyArtifactSet {
             pattern_table: model_dir.join(FORMAL_PATTERN_TABLE_NAME),
             model_dir,
         }
+    }
+
+    /// Resolve and validate one immutable generation. Old flat artifacts require rebuilding.
+    pub fn published(paths: &ProjectPaths, model_id: &str) -> Result<Self> {
+        generation::resolve(paths, model_id)
     }
 
     pub fn exists(&self) -> bool {
@@ -263,6 +323,13 @@ enum FormalPriorSpec {
     Explicit { weights: HashMap<String, f64> },
 }
 
+#[derive(Deserialize)]
+struct FormalConfig {
+    objective: Option<FormalObjectiveKind>,
+    #[serde(flatten)]
+    prior: FormalPriorSpec,
+}
+
 #[derive(Clone, Debug)]
 pub struct FormalModel {
     pub manifest: FormalManifest,
@@ -274,15 +341,18 @@ pub struct FormalModel {
     objective_spec: FormalObjectiveSpec,
     pattern_table: PatternTable,
     guess_index: HashMap<String, usize>,
+    raw_prior: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FormalPolicyRuntime {
     model: FormalModel,
     policy: HashMap<StateKey, StoredState>,
+    root_state: StateKey,
     ordered_states: Vec<StateKey>,
     state_ids: HashMap<StateKey, u32>,
     metadata: ProofMetadata,
+    artifacts: PolicyArtifactSet,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -290,6 +360,8 @@ pub struct StateKey {
     storage: StateStorage,
     count: usize,
     hash: u64,
+    // None is unconstrained expected cost; Some(d) is E(S, d).
+    horizon: Option<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,6 +377,7 @@ impl Hash for StateKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.hash);
         state.write_usize(self.count);
+        self.horizon.hash(state);
     }
 }
 
@@ -338,8 +411,8 @@ struct StoredState {
     best_guess: usize,
 }
 
-#[derive(Clone, Debug)]
-struct FormalPolicyBuilder {
+#[derive(Clone)]
+struct FormalPolicyBuilder<'a> {
     model: FormalModel,
     memo: HashMap<StateKey, StoredState>,
     hot_tt: HotTranspositionTable,
@@ -351,6 +424,7 @@ struct FormalPolicyBuilder {
     quick_plan_calls: u64,
     started: Instant,
     last_progress: Instant,
+    cancelled: Option<&'a (dyn Fn() -> bool + Sync)>,
 }
 
 #[derive(Clone, Debug)]
@@ -404,11 +478,14 @@ struct HotTtEntry {
     generation: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct IndependentExactSolver<'a> {
     model: &'a FormalModel,
     local_memo: HashMap<StateKey, StoredState>,
+    infeasible: HashSet<StateKey>,
     scratch: PartitionScratch,
+    cancelled: Option<&'a dyn Fn() -> bool>,
+    remaining_partitions: Option<usize>,
 }
 
 impl HotTranspositionTable {
@@ -492,18 +569,60 @@ impl<'a> IndependentExactSolver<'a> {
         Self {
             model,
             local_memo: HashMap::new(),
+            infeasible: HashSet::new(),
             scratch: PartitionScratch::default(),
+            cancelled: None,
+            remaining_partitions: None,
         }
     }
 
+    fn check_cancelled(&self) -> Result<()> {
+        if self.cancelled.is_some_and(|cancelled| cancelled()) {
+            return Err(FormalSearchStop::Cancelled.into());
+        }
+        Ok(())
+    }
+
+    fn consume_partition(&mut self) -> Result<()> {
+        self.check_cancelled()?;
+        if let Some(remaining) = &mut self.remaining_partitions {
+            if *remaining == 0 {
+                return Err(FormalSearchStop::WorkLimit.into());
+            }
+            *remaining -= 1;
+        }
+        Ok(())
+    }
+
     fn solve(&mut self, state: &StateKey) -> Result<StoredState> {
+        if state.horizon.is_none()
+            && self.model.objective_spec.kind == FormalObjectiveKind::Lexicographic
+        {
+            for horizon in 1..=u8::MAX {
+                if let Some(best) = self.solve_conditioned(&state.with_horizon(Some(horizon)))? {
+                    return Ok(best);
+                }
+            }
+            bail!("state exceeds the representable formal depth");
+        }
+        self.solve_conditioned(state)?
+            .ok_or_else(|| anyhow!("state has no policy within its remaining horizon"))
+    }
+
+    fn solve_conditioned(&mut self, state: &StateKey) -> Result<Option<StoredState>> {
+        #[cfg(test)]
+        runtime_tests::SOLVE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        self.check_cancelled()?;
+        if state.horizon == Some(0) || self.infeasible.contains(state) {
+            return Ok(None);
+        }
         if let Some(existing) = self.local_memo.get(state) {
-            return Ok(existing.clone());
+            return Ok(Some(existing.clone()));
         }
         if state.count() == 1 {
             let stored = singleton_state_for_model(self.model, state)?;
             self.local_memo.insert(state.clone(), stored.clone());
-            return Ok(stored);
+            return Ok(Some(stored));
         }
 
         let state_indices = state.indices();
@@ -513,6 +632,7 @@ impl<'a> IndependentExactSolver<'a> {
             .sum::<f64>();
         let mut best: Option<StoredState> = None;
         for guess_index in 0..self.model.guesses.len() {
+            self.consume_partition()?;
             let buckets = partition_guess_with_scratch(
                 self.model.answers.len(),
                 state,
@@ -524,19 +644,33 @@ impl<'a> IndependentExactSolver<'a> {
             )?;
             if buckets
                 .iter()
-                .any(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.state == *state)
+                .any(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.count == state.count())
             {
                 continue;
             }
             let mut worst_case = 1u8;
             let mut expected = 1.0;
+            let mut feasible = true;
             for bucket in buckets {
                 if bucket.pattern == ALL_GREEN_PATTERN {
                     continue;
                 }
-                let child = self.solve(&bucket.state)?;
-                worst_case = worst_case.max(1 + child.objective.worst_case_depth);
+                let child_state = bucket.state.with_horizon(state.child_horizon());
+                let Some(child) = self.solve_conditioned(&child_state)? else {
+                    feasible = false;
+                    break;
+                };
+                worst_case = worst_case.max(
+                    child
+                        .objective
+                        .worst_case_depth
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("formal depth exceeds u8 representation"))?,
+                );
                 expected += (bucket.mass / total_mass) * child.objective.expected_guesses;
+            }
+            if !feasible {
+                continue;
             }
             let candidate = StoredState {
                 objective: PolicyObjective {
@@ -550,22 +684,42 @@ impl<'a> IndependentExactSolver<'a> {
                     &candidate,
                     current,
                     &self.model.guesses,
-                    self.model.objective_spec.kind,
+                    FormalObjectiveKind::ExpectedOnly,
                 )
                 .is_lt()
             }) {
                 best = Some(candidate);
             }
         }
-        let best = best
-            .ok_or_else(|| anyhow!("state {} had no independent candidates", state.state_hash()))?;
-        self.local_memo.insert(state.clone(), best.clone());
+        if let Some(stored) = &best {
+            self.local_memo.insert(state.clone(), stored.clone());
+        } else {
+            self.infeasible.insert(state.clone());
+        }
         Ok(best)
     }
 }
 
 pub fn build_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<BuildOptimalSummary> {
+    build_optimal_policy_controlled(paths, model_id, &|| false)
+}
+
+fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<()> {
+    if cancelled() {
+        return Err(FormalSearchStop::Cancelled.into());
+    }
+    Ok(())
+}
+
+fn build_optimal_policy_controlled(
+    paths: &ProjectPaths,
+    model_id: &str,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<BuildOptimalSummary> {
+    let total_started = Instant::now();
+    check_cancelled(cancelled)?;
     let model = FormalModel::load(paths, model_id)?;
+    check_cancelled(cancelled)?;
     let root = StateKey::full(model.answers.len(), &model.zobrist);
     let started = Instant::now();
     let mut builder = FormalPolicyBuilder {
@@ -580,8 +734,13 @@ pub fn build_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<Buil
         quick_plan_calls: 0,
         started,
         last_progress: started,
+        cancelled: Some(cancelled),
     };
-    let _ = builder.solve_state(&root)?;
+    let root_decision = builder.solve_state(&root)?;
+    let root = root.with_horizon(match builder.model.objective_spec.kind {
+        FormalObjectiveKind::Lexicographic => Some(root_decision.objective.worst_case_depth),
+        FormalObjectiveKind::ExpectedOnly => None,
+    });
     builder.force_report_progress("root_complete");
     builder.materialize_policy_reachable_states(&root)?;
     builder.force_report_progress("policy_materialized");
@@ -590,7 +749,10 @@ pub fn build_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<Buil
         .get(&root)
         .cloned()
         .ok_or_else(|| anyhow!("root state missing after materialization"))?;
-    let build_millis = started.elapsed().as_millis();
+    let solve_millis = started.elapsed().as_millis();
+    let certificate_started = Instant::now();
+    let certificate = build_exhaustive_proof_certificate(&builder.model, &builder.memo, cancelled)?;
+    let certificate_millis = certificate_started.elapsed().as_millis();
     let metadata = ProofMetadata {
         model_id: builder.model.manifest.model_id.clone(),
         manifest_hash: builder.model.manifest.manifest_hash.clone(),
@@ -599,10 +761,22 @@ pub fn build_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<Buil
         bound_hits: builder.bound_hits,
         root_refinement_pruned: builder.root_refinement_pruned,
         local_refinement_pruned: builder.local_refinement_pruned,
-        build_millis,
+        solve_millis,
+        certificate_millis,
+        pre_publish_millis: total_started.elapsed().as_millis(),
         root_objective: root_state.objective.clone(),
     };
-    persist_policy(&builder.model, &builder.memo, &metadata, paths)?;
+    let persistence_started = Instant::now();
+    generation::publish(
+        &builder.model,
+        &builder.memo,
+        metadata,
+        &certificate,
+        paths,
+        total_started,
+        cancelled,
+    )?;
+    let persistence_millis = persistence_started.elapsed().as_millis();
     Ok(BuildOptimalSummary {
         model_id: builder.model.manifest.model_id.clone(),
         manifest_hash: builder.model.manifest.manifest_hash.clone(),
@@ -611,7 +785,10 @@ pub fn build_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<Buil
         bound_hits: builder.bound_hits,
         root_refinement_pruned: builder.root_refinement_pruned,
         local_refinement_pruned: builder.local_refinement_pruned,
-        build_millis,
+        build_millis: total_started.elapsed().as_millis(),
+        solve_millis,
+        certificate_millis,
+        persistence_millis,
         root_best_guess: builder.model.guesses[root_state.best_guess].clone(),
         root_objective: root_state.objective,
     })
@@ -626,8 +803,22 @@ pub fn verify_optimal_policy_with_mode(
     model_id: &str,
     mode: FormalVerificationMode,
 ) -> Result<VerifySummary> {
+    verify_optimal_policy_controlled(paths, model_id, mode, &|| false)
+}
+
+fn verify_optimal_policy_controlled(
+    paths: &ProjectPaths,
+    model_id: &str,
+    mode: FormalVerificationMode,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<VerifySummary> {
+    check_cancelled(cancelled)?;
     let runtime = FormalPolicyRuntime::load(paths, model_id)?;
-    let certificate = read_proof_certificate(paths, model_id)?;
+    check_cancelled(cancelled)?;
+    let certificate: ProofCertificate = parsing::read_json(
+        &runtime.artifacts.certificate,
+        parsing::MAX_CERTIFICATE_BYTES,
+    )?;
     if certificate.manifest_hash != runtime.model.manifest.manifest_hash {
         bail!(
             "proof certificate is stale for {}: expected manifest {}, found {}",
@@ -652,13 +843,14 @@ pub fn verify_optimal_policy_with_mode(
     }
     let mut cached_states = 0usize;
     if mode == FormalVerificationMode::Certificate {
-        verify_certificate(&runtime, &certificate)?;
+        verifier::verify_certificate_witnesses_controlled(&runtime, &certificate, cancelled)?;
         cached_states = runtime.policy.len();
     }
     let mut small_states = 0usize;
     let mut medium_states = 0usize;
     if mode == FormalVerificationMode::Oracle {
         for (state, stored) in &runtime.policy {
+            check_cancelled(cancelled)?;
             let cached = runtime.evaluate_state_exact(state)?;
             if !same_decision(&cached, stored) {
                 bail!(
@@ -705,11 +897,29 @@ pub fn verify_optimal_policy_with_mode(
 }
 
 pub fn artifacts_exist(paths: &ProjectPaths, model_id: &str) -> bool {
-    PolicyArtifactSet::for_model(paths, model_id).exists()
+    if parsing::validate_component(model_id).is_err() {
+        return false;
+    }
+    let artifacts = PolicyArtifactSet::for_model(paths, model_id);
+    let present = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    present(&artifacts.model_dir.join("current.json"))
+        || [
+            &artifacts.manifest,
+            &artifacts.values,
+            &artifacts.policy,
+            &artifacts.metadata,
+            &artifacts.certificate,
+            &artifacts.small_state_table,
+        ]
+        .iter()
+        .any(|path| present(path))
 }
 
-fn objective_spec_for_model(model_id: &str) -> FormalObjectiveSpec {
-    if model_id.contains("expected") {
+fn objective_spec(kind: FormalObjectiveKind) -> FormalObjectiveSpec {
+    if kind == FormalObjectiveKind::ExpectedOnly {
         FormalObjectiveSpec {
             id: "expected_guesses_only",
             kind: FormalObjectiveKind::ExpectedOnly,
@@ -727,32 +937,77 @@ fn objective_spec_for_model(model_id: &str) -> FormalObjectiveSpec {
 impl FormalModel {
     pub fn load(paths: &ProjectPaths, model_id: &str) -> Result<Self> {
         let artifacts = PolicyArtifactSet::for_model(paths, model_id);
-        if let Some(parent) = artifacts.prior_spec.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+        Self::load_artifacts(paths, model_id, &artifacts, false)
+    }
+
+    fn load_artifacts(
+        paths: &ProjectPaths,
+        model_id: &str,
+        artifacts: &PolicyArtifactSet,
+        immutable: bool,
+    ) -> Result<Self> {
+        parsing::validate_component(model_id)?;
+        let guesses = read_word_list_from(
+            std::io::Cursor::new(parsing::read_bounded(
+                &paths.seed_guesses,
+                parsing::MAX_INPUT_BYTES,
+            )?),
+            &paths.seed_guesses,
+        )
+        .with_context(|| format!("failed to load {}", paths.seed_guesses.display()))?;
+        let answers = read_word_list_from(
+            std::io::Cursor::new(parsing::read_bounded(
+                &paths.seed_answers,
+                parsing::MAX_INPUT_BYTES,
+            )?),
+            &paths.seed_answers,
+        )
+        .with_context(|| format!("failed to load {}", paths.seed_answers.display()))?;
+        validate_answer_universe(&guesses, answers.iter().map(String::as_str))
+            .context("invalid formal answer universe")?;
+        if guesses.len() > parsing::MAX_WORDS
+            || answers.len() > parsing::MAX_WORDS
+            || guesses
+                .len()
+                .checked_mul(answers.len())
+                .is_none_or(|cells| cells > parsing::MAX_PATTERN_CELLS)
+        {
+            bail!("formal model exceeds word-id or pattern-cell resource limits");
         }
-        let guesses = read_word_list(&paths.seed_guesses)
-            .with_context(|| format!("failed to load {}", paths.seed_guesses.display()))?;
-        let answers = read_word_list(&paths.seed_answers)
-            .with_context(|| format!("failed to load {}", paths.seed_answers.display()))?;
-        let raw_prior = fs::read(&artifacts.prior_spec)
-            .with_context(|| format!("failed to read {}", artifacts.prior_spec.display()))?;
-        let prior_spec: FormalPriorSpec = toml::from_str(
+        let raw_prior = parsing::read_bounded(&artifacts.prior_spec, parsing::MAX_INPUT_BYTES)?;
+        if immutable
+            && raw_prior
+                != parsing::read_bounded(
+                    &PolicyArtifactSet::for_model(paths, model_id).prior_spec,
+                    parsing::MAX_INPUT_BYTES,
+                )?
+        {
+            bail!(
+                "published formal prior differs from current prior.toml; rebuild formal artifacts"
+            );
+        }
+        let config: FormalConfig = toml::from_str(
             std::str::from_utf8(&raw_prior).context("formal prior spec must be valid UTF-8")?,
         )
         .with_context(|| format!("failed to parse {}", artifacts.prior_spec.display()))?;
         let guess_hash = tag(&hash_word_list(guesses.iter().map(String::as_str)));
         let answer_hash = tag(&hash_word_list(answers.iter().map(String::as_str)));
         let prior_hash = digest_bytes_tagged("maybe-wordle-formal-prior-v2", &raw_prior);
-        let objective_spec = objective_spec_for_model(model_id);
+        // Only the two historical built-ins have an unambiguous migration.
+        let kind = match config.objective {
+            Some(kind) => kind,
+            None => match model_id {
+                DEFAULT_FORMAL_MODEL_ID => FormalObjectiveKind::Lexicographic,
+                DEFAULT_EXPECTED_ONLY_MODEL_ID => FormalObjectiveKind::ExpectedOnly,
+                _ => bail!(
+                    "custom formal model {model_id} requires an explicit objective in prior.toml"
+                ),
+            },
+        };
+        let objective_spec = objective_spec(kind);
         let canonical_small_state_table = SmallStateTable::build(SMALL_STATE_LIMIT);
-        if artifacts.small_state_table.exists() {
-            let raw = fs::read(&artifacts.small_state_table).with_context(|| {
-                format!("failed to read {}", artifacts.small_state_table.display())
-            })?;
-            let persisted: SmallStateTable = serde_json::from_slice(&raw).with_context(|| {
-                format!("failed to parse {}", artifacts.small_state_table.display())
-            })?;
+        if immutable {
+            let persisted = parsing::read_small_table(&artifacts.small_state_table)?;
             validate_small_state_table(&persisted, &canonical_small_state_table)?;
         }
         let small_state_table = canonical_small_state_table;
@@ -766,6 +1021,7 @@ impl FormalModel {
         );
         let manifest = FormalManifest {
             model_id: model_id.to_string(),
+            objective_kind: kind,
             objective_id: objective_spec.id.to_string(),
             objective: objective_spec.id.to_string(),
             objective_version: objective_spec.version,
@@ -782,7 +1038,7 @@ impl FormalModel {
             small_state_table_hash,
             manifest_hash,
         };
-        let prior = build_prior(&answers, prior_spec)?;
+        let prior = build_prior(&answers, config.prior)?;
         let answer_records = answers
             .iter()
             .map(|word| AnswerRecord {
@@ -793,8 +1049,11 @@ impl FormalModel {
                 history_dates: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let pattern_table =
-            PatternTable::load_or_build_at(&artifacts.pattern_table, &guesses, &answer_records)?;
+        let pattern_table = if immutable {
+            PatternTable::load_existing_at(&artifacts.pattern_table, &guesses, &answer_records)?
+        } else {
+            PatternTable::load_or_build_at(&artifacts.pattern_table, &guesses, &answer_records)?
+        };
         let guess_index = guesses
             .iter()
             .enumerate()
@@ -812,26 +1071,26 @@ impl FormalModel {
             objective_spec,
             pattern_table,
             guess_index,
+            raw_prior,
         })
     }
 }
 
 impl FormalPolicyRuntime {
     pub fn load(paths: &ProjectPaths, model_id: &str) -> Result<Self> {
-        let model = FormalModel::load(paths, model_id)?;
-        let artifacts = PolicyArtifactSet::for_model(paths, model_id);
-        let manifest: FormalManifest = serde_json::from_reader(BufReader::new(
-            File::open(&artifacts.manifest)
-                .with_context(|| format!("failed to open {}", artifacts.manifest.display()))?,
-        ))
-        .with_context(|| {
-            format!(
-                "failed to parse {}; rebuild formal artifacts to migrate to {}",
-                artifacts.manifest.display(),
-                crate::identity::IDENTITY_FORMAT
-            )
-        })?;
-        if manifest.manifest_hash != model.manifest.manifest_hash {
+        let artifacts = PolicyArtifactSet::published(paths, model_id)?;
+        Self::load_generation(paths, model_id, artifacts)
+    }
+
+    fn load_generation(
+        paths: &ProjectPaths,
+        model_id: &str,
+        artifacts: PolicyArtifactSet,
+    ) -> Result<Self> {
+        let model = FormalModel::load_artifacts(paths, model_id, &artifacts, true)?;
+        let manifest: FormalManifest =
+            parsing::read_json(&artifacts.manifest, parsing::MAX_JSON_BYTES)?;
+        if serde_json::to_value(&manifest)? != serde_json::to_value(&model.manifest)? {
             bail!(
                 "formal artifacts are stale for {}: expected manifest {}, found {}",
                 model_id,
@@ -839,13 +1098,13 @@ impl FormalPolicyRuntime {
                 manifest.manifest_hash
             );
         }
-        let metadata: ProofMetadata = serde_json::from_reader(BufReader::new(
-            File::open(&artifacts.metadata)
-                .with_context(|| format!("failed to open {}", artifacts.metadata.display()))?,
-        ))
-        .with_context(|| format!("failed to parse {}", artifacts.metadata.display()))?;
+        let metadata: ProofMetadata =
+            parsing::read_json(&artifacts.metadata, parsing::MAX_JSON_BYTES)?;
         let values = read_values(&artifacts.values, &model)?;
         let policies = read_policy(&artifacts.policy, &model)?;
+        if values.len() != policies.len() {
+            bail!("formal values and policy tables have different state counts");
+        }
         let mut ordered_states = values.keys().cloned().collect::<Vec<_>>();
         ordered_states.sort_by(|left, right| {
             left.state_hash()
@@ -872,17 +1131,63 @@ impl FormalPolicyRuntime {
             );
         }
 
-        Ok(Self {
+        let full = StateKey::full(model.answers.len(), &model.zobrist);
+        let mut roots = policy
+            .keys()
+            .filter(|state| state.with_horizon(None) == full);
+        let root_state = roots
+            .next()
+            .cloned()
+            .ok_or_else(|| anyhow!("formal policy has no complete root state"))?;
+        if roots.next().is_some() {
+            bail!("formal policy has multiple root horizons");
+        }
+        let runtime = Self {
             model,
             policy,
+            root_state,
             ordered_states,
             state_ids,
             metadata,
-        })
+            artifacts,
+        };
+        runtime.validate_metadata()?;
+        let certificate = parsing::read_json(
+            &runtime.artifacts.certificate,
+            parsing::MAX_CERTIFICATE_BYTES,
+        )?;
+        verifier::validate_structure(&runtime, &certificate)?;
+        Ok(runtime)
     }
 
     pub fn initial_state(&self) -> StateKey {
-        StateKey::full(self.model.answers.len(), &self.model.zobrist)
+        self.root_state.clone()
+    }
+
+    fn validate_metadata(&self) -> Result<()> {
+        let root = self
+            .policy
+            .get(&self.root_state)
+            .ok_or_else(|| anyhow!("formal root decision is missing"))?;
+        let expected_horizon = match self.model.objective_spec.kind {
+            FormalObjectiveKind::Lexicographic => Some(root.objective.worst_case_depth),
+            FormalObjectiveKind::ExpectedOnly => None,
+        };
+        if self.root_state.horizon != expected_horizon
+            || root.objective.worst_case_depth == 0
+            || !root.objective.expected_guesses.is_finite()
+            || root.objective.expected_guesses < 1.0
+        {
+            bail!("formal root decision has an invalid objective or horizon");
+        }
+        if self.metadata.model_id != self.model.manifest.model_id
+            || self.metadata.manifest_hash != self.model.manifest.manifest_hash
+            || self.metadata.solved_states != self.policy.len()
+            || !same_objective(&self.metadata.root_objective, &root.objective)
+        {
+            bail!("formal proof metadata disagrees with the persisted policy");
+        }
+        Ok(())
     }
 
     pub fn apply_history(&self, observations: &[(String, u8)]) -> Result<StateKey> {
@@ -914,7 +1219,7 @@ impl FormalPolicyRuntime {
                 format_feedback_letters(pattern)
             );
         }
-        Ok(next)
+        Ok(next.with_horizon(state.child_horizon()))
     }
 
     pub fn has_guess(&self, guess: &str) -> bool {
@@ -923,26 +1228,91 @@ impl FormalPolicyRuntime {
             .contains_key(&guess.to_ascii_lowercase())
     }
 
+    /// Returns the exact primary suggestion even if bounded alternative ranking
+    /// stops early; use [`Self::explain_state`] to inspect completion status.
     pub fn suggest(&self, state: &StateKey, top: usize) -> Result<Vec<FormalSuggestion>> {
-        let mut evaluations = self.evaluate_state_ranked(state)?;
-        evaluations.truncate(top);
-        Ok(evaluations
-            .into_iter()
-            .map(|evaluation| FormalSuggestion {
-                word: self.model.guesses[evaluation.guess_index].clone(),
-                objective: evaluation.objective,
-                bucket_sizes: evaluation.bucket_sizes,
-            })
-            .collect())
+        if top == 0 {
+            return Ok(Vec::new());
+        }
+        let explanation = self.explain_state(state, top)?;
+        Ok(explanation.tied_moves)
     }
 
+    /// Uses the default work limit. Interactive callers should supply cancellation
+    /// and consume this single response for both explanation and suggestions.
     pub fn explain_state(&self, state: &StateKey, top: usize) -> Result<FormalStateExplanation> {
-        let ranked = self.evaluate_state_ranked(state)?;
-        let best = ranked
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow!("state {} is missing evaluations", state.state_hash()))?;
-        let tied_moves = ranked.into_iter().take(top).collect::<Vec<_>>();
+        self.explain_state_cancellable(state, top, DEFAULT_FORMAL_ALTERNATIVE_PARTITIONS, &|| false)
+    }
+
+    /// The work limit bounds additional partitions, including any uncached
+    /// primary search. A stored primary costs one partition and no recursion.
+    /// Incomplete alternatives are discarded, leaving only the exact primary.
+    pub fn explain_state_cancellable(
+        &self,
+        state: &StateKey,
+        top: usize,
+        maximum_partitions: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<FormalStateExplanation> {
+        let mut solver = IndependentExactSolver::new(&self.model);
+        solver.cancelled = Some(cancelled);
+        solver.remaining_partitions = Some(maximum_partitions);
+        solver.check_cancelled()?;
+        let stored = match self.policy.get(state) {
+            Some(stored) => stored.clone(),
+            None => solver.solve(state)?,
+        };
+        let state = if state.horizon.is_none()
+            && self.model.objective_spec.kind == FormalObjectiveKind::Lexicographic
+        {
+            state.with_horizon(Some(stored.objective.worst_case_depth))
+        } else {
+            state.clone()
+        };
+        let buckets = partition_guess_with_scratch(
+            self.model.answers.len(),
+            &state,
+            stored.best_guess,
+            &self.model.pattern_table,
+            &self.model.prior,
+            &self.model.zobrist,
+            &mut solver.scratch,
+        )?;
+        solver.check_cancelled()?;
+        let mut bucket_sizes = buckets
+            .iter()
+            .map(|bucket| bucket.count)
+            .collect::<Vec<_>>();
+        bucket_sizes.sort_unstable_by(|left, right| right.cmp(left));
+        let best = GuessEvaluation {
+            guess_index: stored.best_guess,
+            objective: stored.objective,
+            bucket_sizes,
+        };
+        let (ranked, alternatives_status) = if top <= 1 {
+            (vec![best.clone()], FormalAlternativesStatus::NotRequested)
+        } else {
+            match self.evaluate_state_ranked_with_solver(
+                &state,
+                &mut solver,
+                Some((best.clone(), buckets)),
+            ) {
+                Ok(ranked) => (ranked, FormalAlternativesStatus::Complete),
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<FormalSearchStop>(),
+                        Some(FormalSearchStop::WorkLimit)
+                    ) =>
+                {
+                    (
+                        vec![best.clone()],
+                        FormalAlternativesStatus::WorkLimitReached,
+                    )
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        solver.check_cancelled()?;
         Ok(FormalStateExplanation {
             model_id: self.model.manifest.model_id.clone(),
             manifest_hash: self.model.manifest.manifest_hash.clone(),
@@ -950,14 +1320,16 @@ impl FormalPolicyRuntime {
             best_guess: self.model.guesses[best.guess_index].clone(),
             objective: best.objective.clone(),
             bucket_sizes: best.bucket_sizes.clone(),
-            tied_moves: tied_moves
+            tied_moves: ranked
                 .into_iter()
+                .take(top)
                 .map(|candidate| FormalSuggestion {
                     word: self.model.guesses[candidate.guess_index].clone(),
                     objective: candidate.objective,
                     bucket_sizes: candidate.bucket_sizes,
                 })
                 .collect(),
+            alternatives_status,
         })
     }
 
@@ -970,15 +1342,50 @@ impl FormalPolicyRuntime {
     }
 
     fn evaluate_state_ranked(&self, state: &StateKey) -> Result<Vec<GuessEvaluation>> {
-        let total_mass = self.state_mass(state);
+        let mut solver = IndependentExactSolver::new(&self.model);
+        self.evaluate_state_ranked_with_solver(state, &mut solver, None)
+    }
+
+    fn evaluate_state_ranked_with_solver(
+        &self,
+        state: &StateKey,
+        solver: &mut IndependentExactSolver<'_>,
+        primary: Option<(GuessEvaluation, Vec<PartitionBucket>)>,
+    ) -> Result<Vec<GuessEvaluation>> {
+        let state = if state.horizon.is_none()
+            && self.model.objective_spec.kind == FormalObjectiveKind::Lexicographic
+        {
+            let solved = solver.solve(state)?;
+            state.with_horizon(Some(solved.objective.worst_case_depth))
+        } else {
+            state.clone()
+        };
+        if state.horizon == Some(0) {
+            bail!("formal policy has exhausted its remaining horizon");
+        }
+        let total_mass = self.state_mass(&state);
         let mut scratch = PartitionScratch::default();
         let mut signature_map: HashMap<PartitionFingerprint, Vec<usize>> = HashMap::new();
         let mut evaluations = Vec::new();
         let mut evaluation_buckets: Vec<Vec<PartitionBucket>> = Vec::new();
-        for guess_index in 0..self.model.guesses.len() {
+        let primary_guess = primary
+            .as_ref()
+            .map(|(evaluation, _)| evaluation.guess_index);
+        if let Some((evaluation, buckets)) = primary {
+            signature_map.insert(partition_fingerprint_from_buckets(&buckets), vec![0]);
+            evaluations.push(evaluation);
+            evaluation_buckets.push(buckets);
+        }
+        let mut guess_indices = (0..self.model.guesses.len()).collect::<Vec<_>>();
+        guess_indices.sort_unstable_by_key(|index| &self.model.guesses[*index]);
+        for guess_index in guess_indices {
+            if Some(guess_index) == primary_guess {
+                continue;
+            }
+            solver.consume_partition()?;
             let buckets = partition_guess_with_scratch(
                 self.model.answers.len(),
-                state,
+                &state,
                 guess_index,
                 &self.model.pattern_table,
                 &self.model.prior,
@@ -995,7 +1402,7 @@ impl FormalPolicyRuntime {
                 continue;
             }
             let Some(built) =
-                self.build_guess_evaluation(state, guess_index, total_mass, &buckets, false)?
+                self.build_guess_evaluation(&state, guess_index, total_mass, &buckets, solver)?
             else {
                 continue;
             };
@@ -1006,12 +1413,12 @@ impl FormalPolicyRuntime {
             evaluation_buckets.push(buckets);
             evaluations.push(built);
         }
-        evaluations.sort_by(|left, right| {
+        evaluations[usize::from(primary_guess.is_some())..].sort_by(|left, right| {
             compare_evaluations_with_kind(
                 left,
                 right,
                 &self.model.guesses,
-                self.model.objective_spec.kind,
+                FormalObjectiveKind::ExpectedOnly,
             )
         });
         Ok(evaluations)
@@ -1038,11 +1445,11 @@ impl FormalPolicyRuntime {
         guess_index: usize,
         total_mass: f64,
         buckets: &[PartitionBucket],
-        use_cache_only: bool,
+        solver: &mut IndependentExactSolver<'_>,
     ) -> Result<Option<GuessEvaluation>> {
         if buckets
             .iter()
-            .any(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.state == *state)
+            .any(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.count == state.count())
         {
             return Ok(None);
         }
@@ -1057,15 +1464,22 @@ impl FormalPolicyRuntime {
             if bucket.pattern == ALL_GREEN_PATTERN {
                 continue;
             }
-            let stored = if use_cache_only {
-                match self.policy.get(&bucket.state).cloned() {
-                    Some(stored) => stored,
-                    None => return Ok(None),
-                }
+            let child_state = bucket.state.with_horizon(state.child_horizon());
+            let stored = if let Some(stored) = self.policy.get(&child_state) {
+                stored.clone()
             } else {
-                self.solve_state_independent(&bucket.state)?
+                let Some(stored) = solver.solve_conditioned(&child_state)? else {
+                    return Ok(None);
+                };
+                stored
             };
-            worst_case = worst_case.max(1 + stored.objective.worst_case_depth);
+            worst_case = worst_case.max(
+                stored
+                    .objective
+                    .worst_case_depth
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("formal depth exceeds u8 representation"))?,
+            );
             expected += (bucket.mass / total_mass) * stored.objective.expected_guesses;
         }
 
@@ -1086,116 +1500,71 @@ impl FormalPolicyRuntime {
     }
 }
 
-impl FormalPolicyBuilder {
+impl FormalPolicyBuilder<'_> {
+    fn check_cancelled(&self) -> Result<()> {
+        if let Some(cancelled) = self.cancelled {
+            check_cancelled(cancelled)?;
+        }
+        Ok(())
+    }
     fn solve_state(&mut self, state: &StateKey) -> Result<StoredState> {
-        if let Some(existing) = self.memo.get(state) {
-            return Ok(existing.clone());
-        }
-        let quick_plans = self.collect_quick_plans_for_state(state)?;
-        let lower_bound = quick_plans
-            .first()
-            .map(|plan| plan.lower_bound)
-            .unwrap_or(1);
-        for target_depth in lower_bound..=u8::MAX {
-            let upper = PolicyObjective {
-                worst_case_depth: target_depth,
-                expected_guesses: f64::INFINITY,
-            };
-            if let Some(best) = self.solve_state_with_bound(state, &quick_plans, &upper)? {
-                return Ok(best);
+        if state.horizon.is_none()
+            && self.model.objective_spec.kind == FormalObjectiveKind::Lexicographic
+        {
+            for horizon in 1..=u8::MAX {
+                if let Some(best) = self.solve_conditioned(&state.with_horizon(Some(horizon)))? {
+                    return Ok(best);
+                }
             }
+            bail!("state exceeds the representable formal depth");
         }
-        bail!("state {} exceeded bounded depth search", state.state_hash())
+        self.solve_conditioned(state)?
+            .ok_or_else(|| anyhow!("state has no policy within its remaining horizon"))
     }
 
-    fn solve_state_with_upper(
-        &mut self,
-        state: &StateKey,
-        upper: &PolicyObjective,
-    ) -> Result<Option<StoredState>> {
+    fn solve_conditioned(&mut self, state: &StateKey) -> Result<Option<StoredState>> {
+        self.check_cancelled()?;
+        if state.horizon == Some(0) {
+            return Ok(None);
+        }
         if let Some(existing) = self.memo.get(state) {
-            return Ok(
-                objective_le(&existing.objective, upper, self.model.objective_spec.kind)
-                    .then_some(existing.clone()),
-            );
+            return Ok(Some(existing.clone()));
         }
         if let Some(existing) = self.hot_tt.get(state) {
-            return Ok(
-                objective_le(&existing.objective, upper, self.model.objective_spec.kind)
-                    .then_some(existing),
-            );
-        }
-        let quick_plans = self.collect_quick_plans_for_state(state)?;
-        self.solve_state_with_bound(state, &quick_plans, upper)
-    }
-
-    fn solve_state_with_bound(
-        &mut self,
-        state: &StateKey,
-        quick_plans: &[GuessQuickPlan],
-        upper: &PolicyObjective,
-    ) -> Result<Option<StoredState>> {
-        if let Some(existing) = self.memo.get(state) {
-            return Ok(
-                objective_le(&existing.objective, upper, self.model.objective_spec.kind)
-                    .then_some(existing.clone()),
-            );
-        }
-        if let Some(existing) = self.hot_tt.get(state) {
-            return Ok(
-                objective_le(&existing.objective, upper, self.model.objective_spec.kind)
-                    .then_some(existing),
-            );
+            return Ok(Some(existing));
         }
         if state.count() == 1 {
             let stored = singleton_state_for_model(&self.model, state)?;
             self.hot_tt.insert(state.clone(), stored.clone());
-            return Ok(
-                objective_le(&stored.objective, upper, self.model.objective_spec.kind)
-                    .then_some(stored),
-            );
+            return Ok(Some(stored));
         }
         if state.count() <= self.model.small_state_table.max_size {
-            let exact = self.solve_small_state_exact(state)?;
-            self.hot_tt.insert(state.clone(), exact.clone());
-            return Ok(
-                objective_le(&exact.objective, upper, self.model.objective_spec.kind)
-                    .then_some(exact),
-            );
+            let mut solver = IndependentExactSolver::new(&self.model);
+            solver.cancelled = self.cancelled.map(|callback| callback as &dyn Fn() -> bool);
+            let exact = solver.solve_conditioned(state)?;
+            if let Some(stored) = &exact {
+                self.hot_tt.insert(state.clone(), stored.clone());
+            }
+            return Ok(exact);
         }
 
-        let state_lower_bound = quick_plans
-            .first()
-            .map(|plan| plan.lower_bound)
-            .unwrap_or(1);
-        if state_lower_bound > upper.worst_case_depth {
-            self.bound_hits += 1;
-            return Ok(None);
-        }
+        let quick_plans = self.collect_quick_plans_for_state(state)?;
         let total_mass = self.state_mass(state);
         let mut best: Option<StoredState> = None;
-        for plan in quick_plans {
-            let effective_upper = best
-                .as_ref()
-                .map(|stored| {
-                    min_objective(upper, &stored.objective, self.model.objective_spec.kind)
-                })
-                .unwrap_or_else(|| upper.clone());
-            if plan.lower_bound > effective_upper.worst_case_depth {
+        for plan in &quick_plans {
+            self.check_cancelled()?;
+            if state
+                .horizon
+                .is_some_and(|horizon| plan.lower_bound > horizon)
+            {
                 self.bound_hits += 1;
                 continue;
             }
             let expected_lower_bound =
                 guess_expected_lower_bound(&plan.buckets, total_mass, PATTERN_SPACE as f64);
-            let lower_objective = PolicyObjective {
-                worst_case_depth: plan.lower_bound,
-                expected_guesses: expected_lower_bound,
-            };
-            if objective_ge(
-                &lower_objective,
-                &effective_upper,
-                self.model.objective_spec.kind,
-            ) {
+            if best.as_ref().is_some_and(|stored| {
+                expected_lower_bound > stored.objective.expected_guesses + 1e-12
+            }) {
                 self.bound_hits += 1;
                 continue;
             }
@@ -1222,25 +1591,23 @@ impl FormalPolicyBuilder {
                 let probability = bucket.mass / total_mass;
                 remaining_lower -=
                     probability * child_expected_lower_bound(&bucket, PATTERN_SPACE as f64);
-                let child_upper = PolicyObjective {
-                    worst_case_depth: effective_upper.worst_case_depth.saturating_sub(1),
-                    expected_guesses: f64::INFINITY,
-                };
-                let Some(child) = self.solve_state_with_upper(&bucket.state, &child_upper)? else {
+                let child_state = bucket.state.with_horizon(state.child_horizon());
+                let Some(child) = self.solve_conditioned(&child_state)? else {
                     valid = false;
                     self.bound_hits += 1;
                     break;
                 };
-                worst_case = worst_case.max(1 + child.objective.worst_case_depth);
-                if worst_case > effective_upper.worst_case_depth {
-                    valid = false;
-                    self.bound_hits += 1;
-                    break;
-                }
+                worst_case = worst_case.max(
+                    child
+                        .objective
+                        .worst_case_depth
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("formal depth exceeds u8 representation"))?,
+                );
                 expected += probability * child.objective.expected_guesses;
-                if worst_case == effective_upper.worst_case_depth
-                    && expected + remaining_lower >= effective_upper.expected_guesses
-                {
+                if best.as_ref().is_some_and(|stored| {
+                    expected + remaining_lower > stored.objective.expected_guesses + 1e-12
+                }) {
                     valid = false;
                     self.bound_hits += 1;
                     break;
@@ -1261,31 +1628,24 @@ impl FormalPolicyBuilder {
                     &candidate,
                     current,
                     &self.model.guesses,
-                    self.model.objective_spec.kind,
+                    FormalObjectiveKind::ExpectedOnly,
                 )
                 .is_lt()
             }) {
                 best = Some(candidate);
             }
         }
-        if let Some(stored) = best {
+        if let Some(stored) = &best {
             self.hot_tt.insert(state.clone(), stored.clone());
-            return Ok(
-                objective_le(&stored.objective, upper, self.model.objective_spec.kind)
-                    .then_some(stored),
-            );
         }
-        Ok(None)
-    }
-
-    fn solve_small_state_exact(&mut self, state: &StateKey) -> Result<StoredState> {
-        IndependentExactSolver::new(&self.model).solve(state)
+        Ok(best)
     }
 
     fn materialize_policy_reachable_states(&mut self, root: &StateKey) -> Result<()> {
         let mut frontier = vec![root.clone()];
         let mut seen = HashSet::new();
         while let Some(state) = frontier.pop() {
+            self.check_cancelled()?;
             if !seen.insert(state.clone()) || self.memo.contains_key(&state) {
                 continue;
             }
@@ -1295,7 +1655,7 @@ impl FormalPolicyBuilder {
             let buckets = self.partition_guess(&state, stored.best_guess)?;
             for bucket in buckets {
                 if bucket.pattern != ALL_GREEN_PATTERN {
-                    frontier.push(bucket.state);
+                    frontier.push(bucket.state.with_horizon(state.child_horizon()));
                 }
             }
         }
@@ -1306,11 +1666,12 @@ impl FormalPolicyBuilder {
         self.quick_plan_calls += 1;
         self.maybe_report_progress("search");
         let total_mass = self.state_mass(state);
-        let raw_plans = (0..self.model.guesses.len())
+        let mut raw_plans = (0..self.model.guesses.len())
             .into_par_iter()
             .map_init(
                 PartitionScratch::default,
                 |scratch, guess_index| -> Result<Option<(GuessQuickPlan, PartitionFingerprint)>> {
+                    self.check_cancelled()?;
                     let buckets = partition_guess_with_scratch(
                         self.model.answers.len(),
                         state,
@@ -1320,10 +1681,9 @@ impl FormalPolicyBuilder {
                         &self.model.zobrist,
                         scratch,
                     )?;
-                    if buckets
-                        .iter()
-                        .any(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.state == *state)
-                    {
+                    if buckets.iter().any(|bucket| {
+                        bucket.pattern != ALL_GREEN_PATTERN && bucket.count == state.count()
+                    }) {
                         return Ok(None);
                     }
                     let max_bucket = buckets
@@ -1363,6 +1723,15 @@ impl FormalPolicyBuilder {
                 },
             )
             .collect::<Result<Vec<_>>>()?;
+        raw_plans.sort_by(|left, right| {
+            left.as_ref()
+                .map(|(plan, _)| &self.model.guesses[plan.guess_index])
+                .cmp(
+                    &right
+                        .as_ref()
+                        .map(|(plan, _)| &self.model.guesses[plan.guess_index]),
+                )
+        });
         let mut signatures: HashMap<PartitionFingerprint, Vec<usize>> = HashMap::new();
         let mut plans = Vec::new();
         self.partition_calls += self.model.guesses.len() as u64;
@@ -1395,6 +1764,7 @@ impl FormalPolicyBuilder {
         state: &StateKey,
         guess_index: usize,
     ) -> Result<Vec<PartitionBucket>> {
+        self.check_cancelled()?;
         self.partition_calls += 1;
         let mut scratch = PartitionScratch::default();
         partition_guess_with_scratch(
@@ -1451,6 +1821,17 @@ fn progress_enabled() -> bool {
 }
 
 impl StateKey {
+    fn with_horizon(&self, horizon: Option<u8>) -> Self {
+        Self {
+            horizon,
+            ..self.clone()
+        }
+    }
+
+    fn child_horizon(&self) -> Option<u8> {
+        self.horizon.map(|horizon| horizon.saturating_sub(1))
+    }
+
     fn full(answer_count: usize, zobrist: &[u64]) -> Self {
         Self::from_indices_with_tokens(answer_count, 0..answer_count, zobrist)
     }
@@ -1482,6 +1863,7 @@ impl StateKey {
                 },
                 count: collected.len(),
                 hash,
+                horizon: None,
             }
         } else {
             let mut words = vec![0u64; answer_count.div_ceil(64)];
@@ -1495,6 +1877,7 @@ impl StateKey {
                 storage: StateStorage::Bitset(words.into_boxed_slice()),
                 count,
                 hash,
+                horizon: None,
             }
         }
     }
@@ -1526,6 +1909,7 @@ impl StateKey {
                 },
                 count,
                 hash,
+                horizon: None,
             }
         } else {
             let mut hash = 0u64;
@@ -1541,6 +1925,7 @@ impl StateKey {
                 storage: StateStorage::Bitset(words.into_boxed_slice()),
                 count,
                 hash,
+                horizon: None,
             }
         }
     }
@@ -1598,6 +1983,13 @@ impl StateKey {
     }
 
     fn write_tagged(&self, writer: &mut impl Write, answer_count: usize) -> Result<()> {
+        writer.write_all(
+            &self
+                .horizon
+                .map(u16::from)
+                .unwrap_or(u16::MAX)
+                .to_le_bytes(),
+        )?;
         match &self.storage {
             StateStorage::Inline { len, indices } => {
                 writer.write_all(&[STATE_TAG_INLINE])?;
@@ -1618,19 +2010,32 @@ impl StateKey {
     }
 
     fn read_tagged(reader: &mut impl Read, answer_count: usize, zobrist: &[u64]) -> Result<Self> {
+        if answer_count == 0 || answer_count > u16::MAX as usize || zobrist.len() != answer_count {
+            bail!("unsupported formal answer dimensions");
+        }
+        let horizon = match read_u16(reader)? {
+            u16::MAX => None,
+            value if value > 0 && value <= u8::MAX as u16 => Some(value as u8),
+            _ => bail!("invalid formal state horizon"),
+        };
         let tag = read_u8(reader)?;
-        match tag {
+        let state = match tag {
             STATE_TAG_INLINE => {
                 let len = read_u16(reader)? as usize;
+                if len == 0 || len > INLINE_STATE_THRESHOLD || len > answer_count {
+                    bail!("invalid inline formal state length");
+                }
                 let mut indices = Vec::with_capacity(len);
                 for _ in 0..len {
-                    indices.push(read_u16(reader)? as usize);
+                    let index = read_u16(reader)? as usize;
+                    if index >= answer_count
+                        || indices.last().is_some_and(|previous| *previous >= index)
+                    {
+                        bail!("formal state IDs must be in-range, unique and ordered");
+                    }
+                    indices.push(index);
                 }
-                Ok(Self::from_indices_with_tokens(
-                    answer_count,
-                    indices,
-                    zobrist,
-                ))
+                Self::from_indices_with_tokens(answer_count, indices, zobrist)
             }
             STATE_TAG_BITSET => {
                 let word_count = read_u16(reader)? as usize;
@@ -1638,16 +2043,30 @@ impl StateKey {
                     bail!("unexpected tagged state word count");
                 }
                 let words = read_state_words(reader, word_count)?;
-                Ok(Self::from_words_with_tokens(words, zobrist))
+                let tail_bits = answer_count % 64;
+                if tail_bits != 0 && words.last().is_some_and(|word| *word >> tail_bits != 0) {
+                    bail!("formal bitset contains out-of-range answer IDs");
+                }
+                if words
+                    .iter()
+                    .map(|word| word.count_ones() as usize)
+                    .sum::<usize>()
+                    <= INLINE_STATE_THRESHOLD
+                {
+                    bail!("noncanonical formal bitset; small states require inline encoding");
+                }
+                Self::from_words_with_tokens(words, zobrist)
             }
             _ => bail!("invalid state tag {}", tag),
-        }
+        };
+        Ok(state.with_horizon(horizon))
     }
 
     fn cmp_storage(&self, other: &Self, answer_count: usize) -> std::cmp::Ordering {
         let left = self.as_words(answer_count);
         let right = other.as_words(answer_count);
         left.cmp(&right)
+            .then_with(|| self.horizon.cmp(&other.horizon))
     }
 }
 
@@ -1716,53 +2135,22 @@ fn build_prior(answers: &[String], prior_spec: FormalPriorSpec) -> Result<Vec<f6
     Ok(weights)
 }
 
-fn persist_policy(
-    model: &FormalModel,
-    memo: &HashMap<StateKey, StoredState>,
-    metadata: &ProofMetadata,
-    paths: &ProjectPaths,
-) -> Result<()> {
-    let artifacts = PolicyArtifactSet::for_model(paths, &model.manifest.model_id);
-    fs::create_dir_all(&artifacts.model_dir)
-        .with_context(|| format!("failed to create {}", artifacts.model_dir.display()))?;
-    atomic_write(
-        &artifacts.manifest,
-        &serde_json::to_vec_pretty(&model.manifest).context("serialize formal manifest")?,
-    )?;
-    atomic_write(
-        &artifacts.metadata,
-        &serde_json::to_vec_pretty(metadata).context("serialize proof metadata")?,
-    )?;
-    atomic_write(
-        &artifacts.small_state_table,
-        &serde_json::to_vec_pretty(&model.small_state_table)
-            .context("serialize small-state table")?,
-    )?;
-    let mut entries = memo.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left_key, _), (right_key, _)| {
-        left_key
-            .state_hash()
-            .cmp(&right_key.state_hash())
-            .then_with(|| left_key.cmp_storage(right_key, model.answers.len()))
-    });
-    let certificate = build_exhaustive_proof_certificate(model, memo)?;
-    atomic_write(
-        &artifacts.certificate,
-        &serde_json::to_vec_pretty(&certificate).context("serialize proof certificate")?,
-    )?;
-
-    write_values(&artifacts.values, model, &entries)?;
-    write_policy(&artifacts.policy, model, &entries)?;
-    Ok(())
-}
-
 fn build_exhaustive_proof_certificate(
     model: &FormalModel,
     policy: &HashMap<StateKey, StoredState>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<ProofCertificate> {
     let root = StateKey::full(model.answers.len(), &model.zobrist);
     let mut exhaustive = IndependentExactSolver::new(model);
-    let _ = exhaustive.solve(&root)?;
+    exhaustive.cancelled = Some(cancelled);
+    let root_decision = exhaustive.solve(&root)?;
+    if exhaustive.local_memo.len() > MAX_FORMAL_STATES {
+        bail!("formal certificate closure exceeds the persisted state resource limit");
+    }
+    let root = root.with_horizon(match model.objective_spec.kind {
+        FormalObjectiveKind::Lexicographic => Some(root_decision.objective.worst_case_depth),
+        FormalObjectiveKind::ExpectedOnly => None,
+    });
     let mut proof_entries = exhaustive.local_memo.iter().collect::<Vec<_>>();
     proof_entries.sort_by(|(left_key, _), (right_key, _)| {
         left_key
@@ -1794,12 +2182,14 @@ fn build_exhaustive_proof_certificate(
     let mut scratch = PartitionScratch::default();
     let mut states = Vec::with_capacity(proof_entries.len());
     for (state_id, (state, stored)) in proof_entries.iter().enumerate() {
+        check_cancelled(cancelled)?;
         let total_mass = state_total_mass(state, &model.prior);
         let mut candidates = Vec::with_capacity(model.guesses.len());
         let mut signature_map: HashMap<PartitionFingerprint, Vec<usize>> = HashMap::new();
         let mut representative_guesses = Vec::new();
         let mut representative_buckets: Vec<Vec<PartitionBucket>> = Vec::new();
         for guess_index in 0..model.guesses.len() {
+            check_cancelled(cancelled)?;
             let buckets = partition_guess_with_scratch(
                 model.answers.len(),
                 state,
@@ -1822,11 +2212,18 @@ fn build_exhaustive_proof_certificate(
                 }
             } else if let Some(bucket) = buckets
                 .iter()
-                .find(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.state == **state)
+                .find(|bucket| bucket.pattern != ALL_GREEN_PATTERN && bucket.count == state.count())
             {
                 PersistedCandidateWitness::NonProgress {
                     pattern: bucket.pattern,
                 }
+            } else if buckets.iter().any(|bucket| {
+                bucket.pattern != ALL_GREEN_PATTERN
+                    && !exhaustive
+                        .local_memo
+                        .contains_key(&bucket.state.with_horizon(state.child_horizon()))
+            }) {
+                PersistedCandidateWitness::Infeasible
             } else {
                 let mut objective = PolicyObjective {
                     worst_case_depth: 1,
@@ -1837,7 +2234,8 @@ fn build_exhaustive_proof_certificate(
                     .iter()
                     .filter(|bucket| bucket.pattern != ALL_GREEN_PATTERN)
                 {
-                    let child = exhaustive.local_memo.get(&bucket.state).ok_or_else(|| {
+                    let child_state = bucket.state.with_horizon(state.child_horizon());
+                    let child = exhaustive.local_memo.get(&child_state).ok_or_else(|| {
                         anyhow!(
                             "exact proof closure is missing child state {}",
                             bucket.state.state_hash()
@@ -1850,7 +2248,7 @@ fn build_exhaustive_proof_certificate(
                         (bucket.mass / total_mass) * child.objective.expected_guesses;
                     children.push(PersistedCertificateChild {
                         pattern: bucket.pattern,
-                        child_state_id: state_ids[&bucket.state],
+                        child_state_id: state_ids[&child_state],
                         objective: child.objective.clone(),
                         mass: bucket.mass,
                     });
@@ -1881,6 +2279,7 @@ fn build_exhaustive_proof_certificate(
                 .into_iter()
                 .map(|index| index as AnswerId)
                 .collect(),
+            horizon: state.horizon,
             best_guess: stored.best_guess,
             best_objective: stored.objective.clone(),
             candidates,
@@ -1941,9 +2340,7 @@ fn write_policy(
 }
 
 fn read_values(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, PolicyObjective>> {
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
-    );
+    let (mut reader, file_length) = bounded_binary_reader(path)?;
     let mut header = [0u8; 8];
     reader.read_exact(&mut header)?;
     if &header != VALUES_MAGIC {
@@ -1956,7 +2353,7 @@ fn read_values(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, Pol
     if manifest_hash != model.manifest.manifest_hash {
         bail!("stale values file: {}", path.display());
     }
-    let count = read_u64(&mut reader)? as usize;
+    let count = bounded_record_count(read_u64(&mut reader)?, file_length, 24)?;
     let word_count = read_u32(&mut reader)? as usize;
     if word_count != model.answers.len().div_ceil(64) {
         bail!("unexpected state word count in {}", path.display());
@@ -1967,24 +2364,36 @@ fn read_values(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, Pol
         let state = StateKey::read_tagged(&mut reader, model.answers.len(), &model.zobrist)?;
         let worst_case_depth = read_u8(&mut reader)?;
         let expected_guesses = read_f64(&mut reader)?;
-        if state.state_hash() != state_hash {
-            bail!("state hash mismatch in {}", path.display());
-        }
-        values.insert(
-            state,
-            PolicyObjective {
+        validate_loaded_state(&state, model)?;
+        validate_loaded_objective(
+            &state,
+            &PolicyObjective {
                 worst_case_depth,
                 expected_guesses,
             },
-        );
+        )?;
+        if state.state_hash() != state_hash {
+            bail!("state hash mismatch in {}", path.display());
+        }
+        if values
+            .insert(
+                state,
+                PolicyObjective {
+                    worst_case_depth,
+                    expected_guesses,
+                },
+            )
+            .is_some()
+        {
+            bail!("duplicate formal value state in {}", path.display());
+        }
     }
+    reject_trailing_bytes(&mut reader)?;
     Ok(values)
 }
 
 fn read_policy(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, usize>> {
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
-    );
+    let (mut reader, file_length) = bounded_binary_reader(path)?;
     let mut header = [0u8; 8];
     reader.read_exact(&mut header)?;
     if &header != POLICY_MAGIC {
@@ -1997,7 +2406,7 @@ fn read_policy(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, usi
     if manifest_hash != model.manifest.manifest_hash {
         bail!("stale policy file: {}", path.display());
     }
-    let count = read_u64(&mut reader)? as usize;
+    let count = bounded_record_count(read_u64(&mut reader)?, file_length, 19)?;
     let word_count = read_u32(&mut reader)? as usize;
     if word_count != model.answers.len().div_ceil(64) {
         bail!("unexpected state word count in {}", path.display());
@@ -2006,6 +2415,7 @@ fn read_policy(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, usi
     for _ in 0..count {
         let state_hash = read_u64(&mut reader)?;
         let state = StateKey::read_tagged(&mut reader, model.answers.len(), &model.zobrist)?;
+        validate_loaded_state(&state, model)?;
         let best_guess = read_u32(&mut reader)? as usize;
         if best_guess >= model.guesses.len() {
             bail!(
@@ -2016,9 +2426,67 @@ fn read_policy(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, usi
         if state.state_hash() != state_hash {
             bail!("state hash mismatch in {}", path.display());
         }
-        policies.insert(state, best_guess);
+        if policies.insert(state, best_guess).is_some() {
+            bail!("duplicate formal policy state in {}", path.display());
+        }
     }
+    reject_trailing_bytes(&mut reader)?;
     Ok(policies)
+}
+
+fn bounded_binary_reader(path: &Path) -> Result<(BufReader<std::io::Take<File>>, u64)> {
+    let file = parsing::open_regular_file(path)?;
+    let length = file.metadata()?.len();
+    if !(BINARY_HEADER_BYTES..=MAX_FORMAL_BINARY_BYTES).contains(&length) {
+        bail!(
+            "formal binary length exceeds parser limits: {}; rebuild formal artifacts",
+            path.display()
+        );
+    }
+    Ok((
+        BufReader::new(file.take(MAX_FORMAL_BINARY_BYTES + 1)),
+        length,
+    ))
+}
+
+fn bounded_record_count(count: u64, file_length: u64, minimum_record_bytes: u64) -> Result<usize> {
+    let available = file_length.saturating_sub(BINARY_HEADER_BYTES);
+    if count == 0 || count > MAX_FORMAL_STATES as u64 || count > available / minimum_record_bytes {
+        bail!("formal record count exceeds file length or parser limits; rebuild formal artifacts");
+    }
+    usize::try_from(count).context("formal record count exceeds address space")
+}
+
+fn validate_loaded_state(state: &StateKey, model: &FormalModel) -> Result<()> {
+    if state.horizon == Some(0)
+        || state.horizon.is_some()
+            != (model.objective_spec.kind == FormalObjectiveKind::Lexicographic)
+    {
+        bail!("formal state horizon does not match the declared objective");
+    }
+    Ok(())
+}
+
+fn validate_loaded_objective(state: &StateKey, objective: &PolicyObjective) -> Result<()> {
+    if objective.worst_case_depth == 0
+        || objective.worst_case_depth as usize > state.count()
+        || !objective.expected_guesses.is_finite()
+        || objective.expected_guesses < 1.0
+        || objective.expected_guesses > f64::from(objective.worst_case_depth) + 1e-9
+        || state
+            .horizon
+            .is_some_and(|horizon| objective.worst_case_depth > horizon)
+    {
+        bail!("invalid formal objective; rebuild formal artifacts");
+    }
+    Ok(())
+}
+
+fn reject_trailing_bytes(reader: &mut impl Read) -> Result<()> {
+    if reader.read(&mut [0u8; 1])? != 0 {
+        bail!("formal artifact contains trailing data; rebuild formal artifacts");
+    }
+    Ok(())
 }
 
 fn read_state_words(reader: &mut impl Read, word_count: usize) -> Result<Vec<u64>> {
@@ -2069,21 +2537,13 @@ fn read_f64(reader: &mut impl Read) -> Result<f64> {
     Ok(f64::from_le_bytes(bytes))
 }
 
+#[cfg(test)]
 fn read_proof_certificate(paths: &ProjectPaths, model_id: &str) -> Result<ProofCertificate> {
-    let artifacts = PolicyArtifactSet::for_model(paths, model_id);
-    serde_json::from_reader(BufReader::new(
-        File::open(&artifacts.certificate)
-            .with_context(|| format!("failed to open {}", artifacts.certificate.display()))?,
-    ))
-    .with_context(|| {
-        format!(
-            "failed to parse {}; rebuild formal artifacts to migrate to {}",
-            artifacts.certificate.display(),
-            crate::identity::IDENTITY_FORMAT
-        )
-    })
+    let artifacts = PolicyArtifactSet::published(paths, model_id)?;
+    parsing::read_json(&artifacts.certificate, parsing::MAX_CERTIFICATE_BYTES)
 }
 
+#[cfg(test)]
 fn verify_certificate(runtime: &FormalPolicyRuntime, certificate: &ProofCertificate) -> Result<()> {
     verifier::verify_certificate_witnesses(runtime, certificate)
 }
@@ -2184,6 +2644,8 @@ fn partition_guess_with_scratch(
     zobrist: &[u64],
     scratch: &mut PartitionScratch,
 ) -> Result<Vec<PartitionBucket>> {
+    #[cfg(test)]
+    runtime_tests::PARTITION_CALLS.with(|calls| calls.set(calls.get() + 1));
     scratch.masses.fill(0.0);
     scratch.counts.fill(0);
     scratch.weighted_log_sums.fill(0.0);
@@ -2377,34 +2839,6 @@ fn compare_evaluations_with_kind(
 ) -> std::cmp::Ordering {
     compare_objective_with_kind(&left.objective, &right.objective, kind)
         .then_with(|| guesses[left.guess_index].cmp(&guesses[right.guess_index]))
-}
-
-fn objective_le(
-    left: &PolicyObjective,
-    right: &PolicyObjective,
-    kind: FormalObjectiveKind,
-) -> bool {
-    !compare_objective_with_kind(left, right, kind).is_gt()
-}
-
-fn objective_ge(
-    left: &PolicyObjective,
-    right: &PolicyObjective,
-    kind: FormalObjectiveKind,
-) -> bool {
-    !compare_objective_with_kind(left, right, kind).is_lt()
-}
-
-fn min_objective(
-    left: &PolicyObjective,
-    right: &PolicyObjective,
-    kind: FormalObjectiveKind,
-) -> PolicyObjective {
-    if compare_objective_with_kind(left, right, kind).is_gt() {
-        right.clone()
-    } else {
-        left.clone()
-    }
 }
 
 fn singleton_state_for_model(model: &FormalModel, state: &StateKey) -> Result<StoredState> {
@@ -2669,7 +3103,8 @@ mod tests {
 
     #[test]
     fn reproducible_manifest_hash_uses_same_inputs() {
-        let root = std::env::temp_dir().join("maybe-wordle-formal-manifest");
+        let fixture = crate::test_support::TestDirectory::new("formal-audit");
+        let root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&root);
         let paths = ProjectPaths::new(&root);
         paths.ensure_layout().expect("layout");
@@ -2739,7 +3174,8 @@ mod tests {
         let answer_count = 48;
         let words = synthetic_words(answer_count);
         let answers = synthetic_answers(&words);
-        let root = std::env::temp_dir().join("maybe-wordle-formal-partition-scratch");
+        let fixture = crate::test_support::TestDirectory::new("formal-audit");
+        let root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("partition root");
         let table = PatternTable::load_or_build_at(&root.join("pattern.bin"), &words, &answers)
@@ -2836,7 +3272,8 @@ mod tests {
 
     #[test]
     fn certificate_verification_rejects_tampered_candidate_objective() {
-        let root = std::env::temp_dir().join("maybe-wordle-formal-tampered-certificate");
+        let fixture = crate::test_support::TestDirectory::new("formal-audit");
+        let root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&root);
         let paths = ProjectPaths::new(&root);
         paths.ensure_layout().expect("layout");
@@ -2859,7 +3296,8 @@ mod tests {
             .flat_map(|state| &mut state.candidates)
             .find_map(|candidate| match &mut candidate.witness {
                 PersistedCandidateWitness::Exact { objective, .. } => Some(objective),
-                PersistedCandidateWitness::NonProgress { .. }
+                PersistedCandidateWitness::Infeasible
+                | PersistedCandidateWitness::NonProgress { .. }
                 | PersistedCandidateWitness::Equivalent { .. } => None,
             })
             .expect("exact candidate");
@@ -2871,7 +3309,8 @@ mod tests {
 
     #[test]
     fn certificate_verification_rejects_missing_or_tampered_structure() {
-        let root = std::env::temp_dir().join("maybe-wordle-formal-certificate-structure");
+        let fixture = crate::test_support::TestDirectory::new("formal-audit");
+        let root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&root);
         let paths = ProjectPaths::new(&root);
         paths.ensure_layout().expect("layout");
@@ -3062,7 +3501,8 @@ mod tests {
 
     #[test]
     fn toy_universe_matches_independent_solver() {
-        let root = std::env::temp_dir().join("maybe-wordle-formal-toy");
+        let fixture = crate::test_support::TestDirectory::new("formal-audit");
+        let root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&root);
         let paths = ProjectPaths::new(&root);
         paths.ensure_layout().expect("layout");
@@ -3086,7 +3526,8 @@ mod tests {
 
     #[test]
     fn skewed_explicit_prior_builds_and_matches_independent_solver() {
-        let root = std::env::temp_dir().join("maybe-wordle-formal-skewed-prior");
+        let fixture = crate::test_support::TestDirectory::new("formal-audit");
+        let root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&root);
         let paths = ProjectPaths::new(&root);
         paths.ensure_layout().expect("layout");
@@ -3119,9 +3560,8 @@ mod tests {
             "cigar", "rebut", "sissy", "humph", "awake", "blush", "focal", "evade",
         ];
         for answer_count in 3..=7 {
-            let root = std::env::temp_dir().join(format!(
-                "maybe-wordle-formal-three-way-prefix-{answer_count}"
-            ));
+            let fixture = crate::test_support::TestDirectory::new("formal-audit");
+            let root = fixture.path().to_path_buf();
             let _ = std::fs::remove_dir_all(&root);
             let paths = ProjectPaths::new(&root);
             paths.ensure_layout().expect("layout");
@@ -3155,8 +3595,8 @@ mod tests {
         let words = "cigar rebut sissy humph awake blush focal evade naval serve heath dwarf model karma stink grade quiet bench abate feign major death fresh crust stool colon abase marry react batty pride floss helix croak staff paper unfed whelp trawl outdo adobe";
         let words = words.split_whitespace().collect::<Vec<_>>();
         for answer_count in [13usize, 24, 40] {
-            let root =
-                std::env::temp_dir().join(format!("maybe-wordle-formal-randomized-{answer_count}"));
+            let fixture = crate::test_support::TestDirectory::new("formal-audit");
+            let root = fixture.path().to_path_buf();
             let _ = std::fs::remove_dir_all(&root);
             let paths = ProjectPaths::new(&root);
             paths.ensure_layout().expect("layout");
@@ -3189,6 +3629,7 @@ mod tests {
                 quick_plan_calls: 0,
                 started,
                 last_progress: started,
+                cancelled: None,
             };
             let built = builder.solve_state(&state).expect("builder");
             let exhaustive = IndependentExactSolver::new(&builder.model)
@@ -3209,7 +3650,8 @@ mod tests {
 
     #[test]
     fn apply_history_filters_answers() {
-        let root = std::env::temp_dir().join("maybe-wordle-formal-history");
+        let fixture = crate::test_support::TestDirectory::new("formal-audit");
+        let root = fixture.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&root);
         let paths = ProjectPaths::new(&root);
         paths.ensure_layout().expect("layout");

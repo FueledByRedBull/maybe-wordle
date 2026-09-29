@@ -1,4 +1,60 @@
 use super::*;
+use crate::predictive::types::{
+    SearchActionScope, SearchCandidateScope, SearchExecution, SearchObjective, SuggestionValueKind,
+};
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
+
+#[derive(Default)]
+struct SearchTiming {
+    base_metrics: Duration,
+    second_guess_coverage: Duration,
+    lookahead_root: Duration,
+    lookahead_root_count: usize,
+    exact_child: Duration,
+    exact_child_count: usize,
+    large_child_metric_scan: Duration,
+    large_child_metric_scan_count: usize,
+}
+
+impl SearchTiming {
+    fn from_env() -> Option<Self> {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        ENABLED
+            .get_or_init(|| {
+                matches!(
+                    std::env::var("MAYBE_WORDLE_EVIDENCE_TIMING")
+                        .ok()
+                        .as_deref(),
+                    Some("1" | "true")
+                )
+            })
+            .then_some(Self::default())
+    }
+
+    fn format_line(&self) -> String {
+        format!(
+            "benchmark-evidence search-timing base_ms={} coverage_ms={} lookahead_root_ms={} lookahead_root_count={} exact_child_ms={} exact_child_count={} large_child_metric_scan_ms={} large_child_metric_scan_count={}",
+            self.base_metrics.as_millis().min(u64::MAX as u128),
+            self.second_guess_coverage.as_millis().min(u64::MAX as u128),
+            self.lookahead_root.as_millis().min(u64::MAX as u128),
+            self.lookahead_root_count,
+            self.exact_child.as_millis().min(u64::MAX as u128),
+            self.exact_child_count,
+            self.large_child_metric_scan
+                .as_millis()
+                .min(u64::MAX as u128),
+            self.large_child_metric_scan_count,
+        )
+    }
+
+    fn emit(&self) {
+        eprintln!("{}", self.format_line());
+        let _ = std::io::stderr().flush();
+    }
+}
 
 pub(crate) fn check_predictive_search_cancelled(
     cancelled: &(dyn Fn() -> bool + Sync),
@@ -10,26 +66,6 @@ pub(crate) fn check_predictive_search_cancelled(
 }
 
 impl Solver {
-    pub(super) fn suggestion_batch_for_history(
-        &self,
-        as_of: NaiveDate,
-        observations: &[(String, u8)],
-        state: &SolveState,
-        top: usize,
-        book_usage: PredictiveBookUsage,
-    ) -> Result<SuggestionBatch> {
-        self.suggestion_batch_internal(
-            state,
-            top,
-            Some(PredictiveContext {
-                hard_mode: false,
-                as_of,
-                observations,
-            }),
-            book_usage,
-        )
-    }
-
     pub(super) fn filtered_suggestion_batch_for_history_with_search_mode_controlled(
         &self,
         as_of: NaiveDate,
@@ -69,8 +105,20 @@ impl Solver {
             batch
                 .suggestions
                 .retain(|suggestion| suggestion.force_in_two);
+            batch.execution.root_selection_optimal = false;
         }
         batch.suggestions.truncate(top.min(batch.suggestions.len()));
+        batch.execution.selected_value_kind = batch.suggestions.first().map(|row| row.value_kind);
+        if batch.promoted_word.as_ref().is_some_and(|word| {
+            batch
+                .suggestions
+                .first()
+                .is_none_or(|row| &row.word != word)
+        }) {
+            batch.promoted_word = None;
+            batch.promotion_source = None;
+            batch.promoted_artifact_date = None;
+        }
         Ok(batch)
     }
 
@@ -91,24 +139,6 @@ impl Solver {
         )
     }
 
-    pub(super) fn suggestion_batch_internal_with_search_mode(
-        &self,
-        state: &SolveState,
-        top: usize,
-        context: Option<PredictiveContext<'_>>,
-        book_usage: PredictiveBookUsage,
-        forced_search_mode: Option<PredictiveSearchMode>,
-    ) -> Result<SuggestionBatch> {
-        self.suggestion_batch_internal_with_search_mode_controlled(
-            state,
-            top,
-            context,
-            book_usage,
-            forced_search_mode,
-            &|| false,
-        )
-    }
-
     pub(super) fn suggestion_batch_internal_with_search_mode_controlled(
         &self,
         state: &SolveState,
@@ -125,6 +155,15 @@ impl Solver {
         if state.total_weight <= 0.0 {
             bail!("cannot score guesses when no positive answer mass remains");
         }
+        if let Some(context) = context
+            && (context.observations.len() >= 6
+                || context
+                    .observations
+                    .last()
+                    .is_some_and(|(_, pattern)| *pattern == ALL_GREEN_PATTERN))
+        {
+            return self.terminal_suggestion_batch(state, top, context, cancelled);
+        }
         if self.config.search_policy_mode.is_finite() && forced_search_mode.is_none() {
             return self.finite_suggestion_batch(
                 state,
@@ -134,6 +173,12 @@ impl Solver {
                 cancelled,
             );
         }
+        if let Some(context) = context
+            && context.observations.len() >= 4
+        {
+            return self.terminal_suggestion_batch(state, top, context, cancelled);
+        }
+        let mut search_timing = SearchTiming::from_env();
         let split_first = state.surviving.len() > self.config.large_state_split_threshold;
         let use_second_guess_coverage = should_use_second_guess_coverage(
             &self.config,
@@ -144,11 +189,15 @@ impl Solver {
             .as_ref()
             .map(|context| known_absent_letter_mask(context.observations))
             .unwrap_or(0);
+        let base_metrics_started = search_timing.as_ref().map(|_| Instant::now());
         let mut metrics = self.score_guess_metrics_for_subset_controlled(
             &state.surviving,
             &state.weights,
             cancelled,
         )?;
+        if let (Some(timing), Some(started)) = (search_timing.as_mut(), base_metrics_started) {
+            timing.base_metrics = started.elapsed();
+        }
         check_predictive_search_cancelled(cancelled)?;
         if state.surviving.iter().any(|answer_index| {
             !self
@@ -173,12 +222,16 @@ impl Solver {
             compare_guess_metrics_for_state(left, right, &self.guesses, split_first)
         });
         let three_solve_coverage = if use_second_guess_coverage {
+            let coverage_started = search_timing.as_ref().map(|_| Instant::now());
             let coverage = self.medium_second_guess_coverage_controlled(
                 &state.surviving,
                 &state.weights,
                 &metrics,
                 cancelled,
             )?;
+            if let (Some(timing), Some(started)) = (search_timing.as_mut(), coverage_started) {
+                timing.second_guess_coverage = started.elapsed();
+            }
             check_predictive_search_cancelled(cancelled)?;
             Some(coverage)
         } else {
@@ -199,35 +252,9 @@ impl Solver {
         let search_mode = forced_search_mode.unwrap_or_else(|| {
             predictive_search_mode(&self.config, state.surviving.len(), assessment)
         });
-        let two_turn_success = if context
-            .as_ref()
-            .is_some_and(|context| context.observations.len() == 4)
-        {
-            Some(self.two_turn_success_by_guess_controlled(state, cancelled)?)
-        } else {
-            None
-        };
         let mut suggestions = metrics
             .into_iter()
-            .map(|metric| Suggestion {
-                finite_value: None,
-                word: self.guesses[metric.guess_index].clone(),
-                entropy: metric.entropy,
-                solve_probability: metric.solve_probability,
-                expected_remaining: metric.expected_remaining,
-                force_in_two: metric.force_in_two,
-                known_absent_letter_hits: metric.known_absent_letter_hits,
-                worst_non_green_bucket_size: metric.worst_non_green_bucket_size,
-                largest_non_green_bucket_mass: metric.largest_non_green_bucket_mass,
-                large_non_green_bucket_count: metric.large_non_green_bucket_count,
-                dangerous_mass_bucket_count: metric.dangerous_mass_bucket_count,
-                non_green_mass_in_large_buckets: metric.non_green_mass_in_large_buckets,
-                proxy_cost: Some(metric.proxy_cost),
-                large_state_score: Some(metric.large_state_score),
-                posterior_answer_probability: metric.posterior_answer_probability,
-                lookahead_cost: None,
-                exact_cost: None,
-            })
+            .map(|metric| self.suggestion_from_metric(metric))
             .collect::<Vec<_>>();
         suggestions
             .retain(|suggestion| suggestion.worst_non_green_bucket_size < state.surviving.len());
@@ -255,6 +282,8 @@ impl Solver {
             assessment,
         );
         let mut root_candidate_count = 0usize;
+        let mut roots_evaluated = self.guesses.len();
+        let mut exact_actions = false;
 
         if let PredictiveSearchMode::Lookahead = search_mode {
             check_predictive_search_cancelled(cancelled)?;
@@ -266,6 +295,10 @@ impl Solver {
             )?;
             check_predictive_search_cancelled(cancelled)?;
             root_candidate_count = root_candidates.len();
+            let root_started = search_timing.as_ref().map(|_| Instant::now());
+            if let Some(timing) = search_timing.as_mut() {
+                timing.lookahead_root_count = root_candidate_count;
+            }
             let mut exact_memo = PredictiveMemoMap::default();
             let mut exact_scratch = ExactSearchScratch::new();
             let mut lookahead_memo = PredictiveMemoMap::default();
@@ -281,9 +314,16 @@ impl Solver {
                     exact_scratch: &mut exact_scratch,
                     lookahead_memo: &mut lookahead_memo,
                 };
-                let cost =
-                    self.lookahead_cost_for_guess_controlled(guess_index, context, cancelled)?;
+                let cost = self.lookahead_cost_for_guess_controlled(
+                    guess_index,
+                    context,
+                    search_timing.as_mut().map(|timing| &mut *timing),
+                    cancelled,
+                )?;
                 lookahead_costs[guess_index] = Some(cost);
+            }
+            if let (Some(timing), Some(started)) = (search_timing.as_mut(), root_started) {
+                timing.lookahead_root = started.elapsed();
             }
 
             for suggestion in &mut suggestions {
@@ -291,7 +331,11 @@ impl Solver {
                     .guess_index
                     .get(&suggestion.word)
                     .and_then(|guess_index| lookahead_costs[*guess_index]);
+                if suggestion.lookahead_cost.is_some() {
+                    suggestion.value_kind = SuggestionValueKind::Lookahead;
+                }
             }
+            roots_evaluated = root_candidate_count;
             suggestions.sort_by(|left, right| {
                 if let Some(coverage) = three_solve_coverage.as_ref() {
                     compare_suggestions_with_coverage(
@@ -368,6 +412,8 @@ impl Solver {
                 }
             }
 
+            roots_evaluated = exact_costs.iter().filter(|cost| cost.is_some()).count();
+            exact_actions = !exact_scratch.used_candidate_pool;
             match exact_mode {
                 ExactSuggestionMode::Exhaustive => {
                     for suggestion in &mut suggestions {
@@ -375,6 +421,13 @@ impl Solver {
                             .guess_index
                             .get(&suggestion.word)
                             .and_then(|guess_index| exact_costs[*guess_index]);
+                        if suggestion.exact_cost.is_some() {
+                            suggestion.value_kind = if exact_actions {
+                                SuggestionValueKind::ExactAction
+                            } else {
+                                SuggestionValueKind::ContinuationEstimate
+                            };
+                        }
                     }
                     suggestions.sort_by(|left, right| {
                         if let Some(coverage) = three_solve_coverage.as_ref() {
@@ -397,6 +450,13 @@ impl Solver {
                             .guess_index
                             .get(&suggestion.word)
                             .and_then(|guess_index| exact_costs[*guess_index]);
+                        if suggestion.exact_cost.is_some() {
+                            suggestion.value_kind = if exact_actions {
+                                SuggestionValueKind::ExactAction
+                            } else {
+                                SuggestionValueKind::ContinuationEstimate
+                            };
+                        }
                     }
                     suggestions.sort_by(|left, right| {
                         let left_cost = self
@@ -453,11 +513,20 @@ impl Solver {
                 exact_costs[guess_index] = Some(cost);
             }
 
+            roots_evaluated = exact_costs.iter().filter(|cost| cost.is_some()).count();
+            exact_actions = !exact_scratch.used_candidate_pool;
             for suggestion in &mut suggestions {
                 suggestion.exact_cost = self
                     .guess_index
                     .get(&suggestion.word)
                     .and_then(|guess_index| exact_costs[*guess_index]);
+                if suggestion.exact_cost.is_some() {
+                    suggestion.value_kind = if exact_actions {
+                        SuggestionValueKind::ExactAction
+                    } else {
+                        SuggestionValueKind::ContinuationEstimate
+                    };
+                }
             }
             suggestions.sort_by(|left, right| {
                 let left_cost = self
@@ -485,48 +554,80 @@ impl Solver {
             });
         }
 
-        if let Some(success) = two_turn_success.as_ref() {
-            check_predictive_search_cancelled(cancelled)?;
-            suggestions.sort_by(|left, right| {
-                compare_two_turn(
-                    left,
-                    right,
-                    success[self.guess_index[&left.word]],
-                    success[self.guess_index[&right.word]],
-                )
-            });
-        }
-
-        if context
-            .is_some_and(|context| should_use_final_turn_objective(context.observations.len()))
-        {
-            check_predictive_search_cancelled(cancelled)?;
-            suggestions.sort_by(compare_final_turn);
-        }
-
         let mut promoted_word = None;
         let mut promotion_source = None;
+        let mut promoted_artifact_date = None;
         check_predictive_search_cancelled(cancelled)?;
-        if book_usage != PredictiveBookUsage::None
+        if top > 0
+            && book_usage != PredictiveBookUsage::None
             && let Some(context) = context
             && let Some(choice) = self.cached_predictive_choice(
                 context.as_of,
                 context.observations,
                 book_usage == PredictiveBookUsage::Full,
-            )
+                cancelled,
+            )?
+            && promote_cached_suggestion(&mut suggestions, &choice.word)
         {
-            promote_cached_suggestion(&mut suggestions, &choice.word);
             promoted_word = Some(choice.word);
             promotion_source = Some(choice.source);
+            promoted_artifact_date = choice.artifact_date;
         }
 
         check_predictive_search_cancelled(cancelled)?;
         suggestions.truncate(top);
-        Ok(SuggestionBatch {
+        let execution = SearchExecution {
+            route: regime_from_search_mode(search_mode),
+            objective: if three_solve_coverage.is_some() {
+                SearchObjective::ThreeSolveCoverageThenCost
+            } else if matches!(search_mode, PredictiveSearchMode::ProxyOnly) {
+                SearchObjective::ProxyRanking
+            } else if matches!(search_mode, PredictiveSearchMode::Lookahead) {
+                SearchObjective::PenalizedLookahead
+            } else {
+                SearchObjective::ExpectedGuesses
+            },
+            action_scope: if context.is_some_and(|context| context.hard_mode) {
+                SearchActionScope::HardRootNormalContinuation
+            } else {
+                SearchActionScope::Normal
+            },
+            candidate_scope: match search_mode {
+                PredictiveSearchMode::ProxyOnly
+                | PredictiveSearchMode::Exact(ExactSuggestionMode::Exhaustive) => {
+                    SearchCandidateScope::AllActions
+                }
+                _ => SearchCandidateScope::CandidatePool,
+            },
+            roots_considered: if matches!(search_mode, PredictiveSearchMode::ProxyOnly) {
+                self.guesses.len()
+            } else {
+                root_candidate_count
+            },
+            roots_evaluated,
+            selected_value_kind: suggestions.first().map(|row| row.value_kind),
+            root_selection_optimal: exact_actions
+                && matches!(
+                    search_mode,
+                    PredictiveSearchMode::Exact(ExactSuggestionMode::Exhaustive)
+                )
+                && three_solve_coverage.is_none()
+                && promoted_word.is_none()
+                && !suggestions.is_empty()
+                && !context.is_some_and(|context| context.hard_mode)
+                && state
+                    .surviving
+                    .iter()
+                    .all(|index| self.guess_index.contains_key(&self.answers[*index].word)),
+            stop_reason: None,
+        };
+        let batch = SuggestionBatch {
+            execution,
             finite_search: None,
             suggestions,
             promoted_word,
             promotion_source,
+            promoted_artifact_date,
             danger_score: assessment.danger_score,
             danger_escalated: matches!(search_mode, PredictiveSearchMode::EscalatedExact)
                 || (matches!(search_mode, PredictiveSearchMode::Lookahead)
@@ -537,7 +638,176 @@ impl Solver {
             exact_pool_base: self.config.exact_candidate_pool,
             exact_pool_size: exact_pool,
             root_candidate_count,
-        })
+        };
+        if let Some(timing) = search_timing {
+            timing.emit();
+        }
+        Ok(batch)
+    }
+
+    fn terminal_suggestion_batch(
+        &self,
+        state: &SolveState,
+        top: usize,
+        context: PredictiveContext<'_>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<SuggestionBatch> {
+        let mut batch = SuggestionBatch {
+            execution: SearchExecution {
+                route: PredictiveRegime::Terminal,
+                objective: SearchObjective::TerminalSolveProbability,
+                action_scope: if context.hard_mode {
+                    SearchActionScope::HardRecursive
+                } else {
+                    SearchActionScope::Normal
+                },
+                candidate_scope: SearchCandidateScope::AllActions,
+                roots_considered: 0,
+                roots_evaluated: 0,
+                selected_value_kind: None,
+                root_selection_optimal: false,
+                stop_reason: None,
+            },
+            finite_search: None,
+            suggestions: Vec::new(),
+            promoted_word: None,
+            promotion_source: None,
+            promoted_artifact_date: None,
+            danger_score: 0.0,
+            danger_escalated: false,
+            regime_used: PredictiveRegime::Terminal,
+            lookahead_pool_base: 0,
+            lookahead_pool_size: 0,
+            exact_pool_base: 0,
+            exact_pool_size: 0,
+            root_candidate_count: 0,
+        };
+        let remaining_turns = 6usize.saturating_sub(context.observations.len());
+        if remaining_turns == 0
+            || context
+                .observations
+                .last()
+                .is_some_and(|(_, p)| *p == ALL_GREEN_PATTERN)
+        {
+            return Ok(batch);
+        }
+        if state
+            .surviving
+            .iter()
+            .any(|answer| !self.guess_index.contains_key(&self.answers[*answer].word))
+        {
+            bail!("terminal search requires every surviving answer to be a legal guess");
+        }
+        let absent_mask = known_absent_letter_mask(context.observations);
+        let metrics = self.score_guess_metrics_for_subset_controlled(
+            &state.surviving,
+            &state.weights,
+            cancelled,
+        )?;
+        let mut suggestions = metrics
+            .into_iter()
+            .filter(|metric| {
+                !context.hard_mode
+                    || self
+                        .hard_mode_violation(
+                            context.observations,
+                            &self.guesses[metric.guess_index],
+                        )
+                        .is_none()
+            })
+            .map(|mut metric| {
+                metric.known_absent_letter_hits =
+                    count_masked_letters(&self.guesses[metric.guess_index], absent_mask);
+                let mut row = self.suggestion_from_metric(metric);
+                row.value_kind = SuggestionValueKind::Terminal;
+                row
+            })
+            .collect::<Vec<_>>();
+        if should_use_final_turn_objective(context.observations.len()) {
+            suggestions.sort_by(compare_final_turn);
+        } else {
+            let success = self.terminal_two_turn_success(state, context, cancelled)?;
+            for row in &mut suggestions {
+                row.force_in_two = success[self.guess_index[&row.word]].1;
+            }
+            suggestions.sort_by(|left, right| {
+                compare_two_turn(
+                    left,
+                    right,
+                    success[self.guess_index[&left.word]].0,
+                    success[self.guess_index[&right.word]].0,
+                )
+            });
+        }
+        check_predictive_search_cancelled(cancelled)?;
+        batch.root_candidate_count = suggestions.len();
+        batch.execution.roots_considered = suggestions.len();
+        batch.execution.roots_evaluated = suggestions.len();
+        suggestions.truncate(top);
+        batch.execution.selected_value_kind = suggestions.first().map(|row| row.value_kind);
+        batch.execution.root_selection_optimal = !suggestions.is_empty();
+        batch.suggestions = suggestions;
+        Ok(batch)
+    }
+
+    fn terminal_two_turn_success(
+        &self,
+        state: &SolveState,
+        context: PredictiveContext<'_>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<(f64, bool)>> {
+        // With fixed support, every answer in a feedback bucket is itself a legal
+        // final guess. Dynamic recovery instead requires the actual child belief.
+        if state.condition_only || state.fallback_surviving.is_empty() {
+            let scores = self.two_turn_success_by_guess_controlled(state, cancelled)?;
+            let mut result = Vec::with_capacity(scores.len());
+            for (guess, score) in scores.into_iter().enumerate() {
+                check_predictive_search_cancelled(cancelled)?;
+                let mut counts = [0usize; PATTERN_SPACE];
+                for answer in &state.surviving {
+                    counts[self.answer_pattern(guess, *answer) as usize] += 1;
+                }
+                result.push((score, counts.iter().all(|count| *count <= 1)));
+            }
+            return Ok(result);
+        }
+        let mut scores = vec![(0.0, false); self.guesses.len()];
+        let mut masses = [0.0; PATTERN_SPACE];
+        for (guess_index, guess) in self.guesses.iter().enumerate() {
+            check_predictive_search_cancelled(cancelled)?;
+            if context.hard_mode
+                && self
+                    .hard_mode_violation(context.observations, guess)
+                    .is_some()
+            {
+                continue;
+            }
+            masses.fill(0.0);
+            for answer in &state.surviving {
+                masses[self.answer_pattern(guess_index, *answer) as usize] +=
+                    state.weights[*answer];
+            }
+            let mut success = masses[ALL_GREEN_PATTERN as usize] / state.total_weight;
+            let mut guaranteed = true;
+            for (pattern, mass) in masses
+                .iter()
+                .enumerate()
+                .filter(|(p, mass)| *p != ALL_GREEN_PATTERN as usize && **mass > 0.0)
+            {
+                check_predictive_search_cancelled(cancelled)?;
+                let mut child = state.clone();
+                self.apply_feedback(&mut child, guess, pattern as u8)?;
+                let best_mass = child
+                    .surviving
+                    .iter()
+                    .map(|answer| child.weights[*answer])
+                    .fold(0.0, f64::max);
+                success += mass / state.total_weight * best_mass / child.total_weight;
+                guaranteed &= child.surviving.len() == 1;
+            }
+            scores[guess_index] = (success, guaranteed);
+        }
+        Ok(scores)
     }
 
     pub(super) fn expanded_pool_size(
@@ -775,6 +1045,7 @@ impl Solver {
         &self,
         guess_index: usize,
         context: LookaheadCostContext<'_>,
+        mut timing: Option<&mut SearchTiming>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<f64> {
         let LookaheadCostContext {
@@ -830,6 +1101,7 @@ impl Solver {
                             exact_memo,
                             exact_scratch,
                             lookahead_memo,
+                            timing.as_deref_mut(),
                             cancelled,
                         )
                     };
@@ -870,6 +1142,7 @@ impl Solver {
         exact_memo: &mut PredictiveMemoMap<ExactSubsetKey, f64>,
         exact_scratch: &mut ExactSearchScratch,
         lookahead_memo: &mut PredictiveMemoMap<ExactSubsetKey, f64>,
+        mut timing: Option<&mut SearchTiming>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<f64> {
         check_predictive_search_cancelled(cancelled)?;
@@ -877,7 +1150,8 @@ impl Solver {
             return Ok(0.0);
         }
         if subset.len() <= self.config.exact_exhaustive_threshold {
-            return self.exact_best_cost_controlled(
+            let exact_started = timing.as_ref().map(|_| Instant::now());
+            let result = self.exact_best_cost_controlled(
                 subset,
                 weights,
                 exact_memo,
@@ -885,6 +1159,11 @@ impl Solver {
                 1,
                 cancelled,
             );
+            if let (Some(timing), Some(started)) = (timing.as_mut(), exact_started) {
+                timing.exact_child += started.elapsed();
+                timing.exact_child_count += 1;
+            }
+            return result;
         }
 
         let key = ExactSubsetKey::from_sorted_subset(subset);
@@ -892,8 +1171,14 @@ impl Solver {
             return Ok(*cached);
         }
 
-        let mut metrics =
-            self.score_guess_metrics_for_subset_controlled(subset, weights, cancelled)?;
+        let metric_scan_started = timing.as_ref().map(|_| Instant::now());
+        let metrics_result =
+            self.score_guess_metrics_for_subset_controlled(subset, weights, cancelled);
+        if let (Some(timing), Some(started)) = (timing.as_mut(), metric_scan_started) {
+            timing.large_child_metric_scan += started.elapsed();
+            timing.large_child_metric_scan_count += 1;
+        }
+        let mut metrics = metrics_result?;
         metrics.retain(|metric| reply_guess_makes_progress(metric, subset.len()));
         if metrics.is_empty() {
             bail!("bounded lookahead found no progressing reply guess");
@@ -987,7 +1272,7 @@ impl Solver {
         Ok(1.0 + remaining_cost)
     }
 
-    fn exact_cost_for_guess_controlled(
+    pub(super) fn exact_cost_for_guess_controlled(
         &self,
         guess_index: usize,
         context: ExactCostContext<'_>,
@@ -1092,14 +1377,45 @@ impl Solver {
 
         let suggestion_mode = exact_suggestion_mode(&self.config, subset.len());
         let scores = match suggestion_mode {
-            Some(ExactSuggestionMode::Exhaustive) => (0..self.guesses.len()).collect::<Vec<_>>(),
-            Some(ExactSuggestionMode::Pooled) | None => self
-                .top_guess_indexes_for_subset_controlled(
+            Some(ExactSuggestionMode::Exhaustive) => {
+                let mut scores = (0..self.guesses.len()).collect::<Vec<_>>();
+                // Seed the incumbent with a legal answer guess carrying the most mass.
+                if let Some(guess_index) = subset
+                    .iter()
+                    .copied()
+                    .filter_map(|answer_index| {
+                        let weight = weights.get(answer_index).copied()?;
+                        if !weight.is_finite() || weight <= 0.0 {
+                            return None;
+                        }
+                        let guess_index = self
+                            .answers
+                            .get(answer_index)
+                            .and_then(|answer| self.guess_index.get(&answer.word))
+                            .copied()?;
+                        Some((weight, guess_index))
+                    })
+                    .max_by(|left, right| {
+                        left.0
+                            .total_cmp(&right.0)
+                            .then_with(|| right.1.cmp(&left.1))
+                    })
+                    .map(|(_, guess_index)| guess_index)
+                    && let Some(position) = scores.iter().position(|index| *index == guess_index)
+                {
+                    scores.swap(0, position);
+                }
+                scores
+            }
+            Some(ExactSuggestionMode::Pooled) | None => {
+                scratch.used_candidate_pool = true;
+                self.top_guess_indexes_for_subset_controlled(
                     subset,
                     weights,
                     self.config.exact_candidate_pool,
                     cancelled,
-                )?,
+                )?
+            }
         };
         let lower_bound = weighted_exact_lower_bound(subset, weights)?;
         for answer_index in subset {
@@ -1108,6 +1424,12 @@ impl Solver {
         let mut best_cost = f64::INFINITY;
         for guess_index in scores.iter().copied() {
             check_predictive_search_cancelled(cancelled)?;
+            if best_cost.is_finite()
+                && self.exact_root_cost_lower_bound(guess_index, subset, weights)?
+                    > best_cost + 1e-10
+            {
+                continue;
+            }
             let cost = self.exact_cost_for_guess_controlled(
                 guess_index,
                 ExactCostContext {
@@ -1134,6 +1456,12 @@ impl Solver {
             for guess_index in 0..self.guesses.len() {
                 check_predictive_search_cancelled(cancelled)?;
                 if shortlisted.contains(&guess_index) {
+                    continue;
+                }
+                if best_cost.is_finite()
+                    && self.exact_root_cost_lower_bound(guess_index, subset, weights)?
+                        > best_cost + 1e-10
+                {
                     continue;
                 }
                 let cost = self.exact_cost_for_guess_controlled(
@@ -1210,7 +1538,7 @@ impl Solver {
         guess_index: usize,
         context: LookaheadCostContext<'_>,
     ) -> Result<f64> {
-        self.lookahead_cost_for_guess_controlled(guess_index, context, &|| false)
+        self.lookahead_cost_for_guess_controlled(guess_index, context, None, &|| false)
     }
 
     #[cfg(test)]
@@ -1230,6 +1558,7 @@ impl Solver {
             exact_memo,
             exact_scratch,
             lookahead_memo,
+            None,
             &|| false,
         )
     }
@@ -1379,6 +1708,7 @@ impl Solver {
         Ok(candidates)
     }
 
+    #[cfg(test)]
     pub(super) fn exact_cost_for_guess(
         &self,
         guess_index: usize,
@@ -1531,11 +1861,341 @@ pub(super) fn predictive_search_mode(
     }
 }
 
+#[cfg(test)]
+mod terminal_routing_tests {
+    use super::*;
+
+    #[test]
+    fn last_two_turns_skip_unlimited_horizon_refinement() {
+        let solver =
+            crate::solver::tests::test_solver(&["tower", "power", "bower", "rower", "sower"]);
+        let date = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        let state = solver.initial_state(date);
+        for turns in [1, 2] {
+            let history = vec![("xxxxx".to_owned(), 0); 6 - turns];
+            for hard_mode in [false, true] {
+                let batch = solver
+                    .suggestion_batch_internal_with_search_mode_controlled(
+                        &state,
+                        5,
+                        Some(PredictiveContext {
+                            hard_mode,
+                            as_of: date,
+                            observations: &history,
+                        }),
+                        PredictiveBookUsage::None,
+                        Some(PredictiveSearchMode::Exact(ExactSuggestionMode::Exhaustive)),
+                        &|| false,
+                    )
+                    .unwrap();
+                assert_eq!(batch.suggestions.len(), 5);
+                assert_eq!(batch.root_candidate_count, 5);
+                assert!(
+                    batch
+                        .suggestions
+                        .iter()
+                        .all(|row| row.exact_cost.is_none() && row.lookahead_cost.is_none())
+                );
+                assert_eq!(batch.exact_pool_size, 0);
+                assert_eq!(batch.lookahead_pool_size, 0);
+                assert_eq!(batch.execution.route, PredictiveRegime::Terminal);
+                assert_eq!(
+                    batch.execution.objective,
+                    SearchObjective::TerminalSolveProbability
+                );
+                assert_eq!(
+                    batch.execution.action_scope,
+                    if hard_mode {
+                        SearchActionScope::HardRecursive
+                    } else {
+                        SearchActionScope::Normal
+                    }
+                );
+                assert_eq!(
+                    batch.execution.candidate_scope,
+                    SearchCandidateScope::AllActions
+                );
+                assert_eq!(
+                    batch.execution.selected_value_kind,
+                    Some(SuggestionValueKind::Terminal)
+                );
+                assert!(batch.execution.root_selection_optimal);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_success_matches_dynamic_finite_values_and_is_cancellable() {
+        let mut solver = crate::solver::tests::test_solver_with_answer_count(
+            &["aaaaa", "bbbbb", "cdddd", "cffff", "cgggg", "ccccc"],
+            5,
+        );
+        solver.data_mut().primary_answer_count = 2;
+        solver.config.fallback_activation_threshold = 1;
+        solver.config.fallback_prior_mass = 0.4;
+        let date = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        let state = solver.initial_state(date);
+        let history = vec![("xxxxx".to_owned(), 0); 4];
+        for hard_mode in [false, true] {
+            let context = PredictiveContext {
+                hard_mode,
+                as_of: date,
+                observations: &history,
+            };
+            let scores = solver
+                .terminal_two_turn_success(&state, context, &|| false)
+                .unwrap();
+            let exact = solver
+                .finite_horizon_search_dynamic(
+                    &state,
+                    &history,
+                    2,
+                    hard_mode,
+                    FiniteSearchOptions {
+                        root_shortlist: 6,
+                        reply_shortlist: 6,
+                        exact_state_threshold: 8,
+                        budget: Duration::from_secs(5),
+                        node_limit: None,
+                        baseline_only: false,
+                    },
+                    &|| false,
+                )
+                .unwrap();
+            assert_eq!(exact.reason, FiniteSearchReason::Complete);
+            for row in exact.candidates {
+                assert!(
+                    (scores[row.guess_index].0 - (1.0 - row.failure_probability)).abs() < 1e-12
+                );
+            }
+            assert!(scores[solver.guess_index["aaaaa"]].0 < 1.0);
+            assert!(!scores[solver.guess_index["aaaaa"]].1);
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let error = solver
+                .terminal_two_turn_success(&state, context, &|| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 3
+                })
+                .expect_err("cancel inside the child scan");
+            assert!(error.to_string().contains("cancel"));
+            assert_eq!(
+                scores,
+                solver
+                    .terminal_two_turn_success(&state, context, &|| false)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_search_rejects_unguessable_answers() {
+        let mut solver = crate::solver::tests::test_solver(&["cigar", "rebut"]);
+        solver.data_mut().guess_index.remove("rebut");
+        let date = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        let state = solver.initial_state(date);
+        let history = vec![("xxxxx".to_owned(), 0); 5];
+        let error = solver
+            .terminal_suggestion_batch(
+                &state,
+                2,
+                PredictiveContext {
+                    hard_mode: false,
+                    as_of: date,
+                    observations: &history,
+                },
+                &|| false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("legal guess"));
+    }
+}
+
 pub(super) fn regime_from_search_mode(search_mode: PredictiveSearchMode) -> PredictiveRegime {
     match search_mode {
         PredictiveSearchMode::ProxyOnly => PredictiveRegime::Proxy,
         PredictiveSearchMode::Lookahead => PredictiveRegime::Lookahead,
         PredictiveSearchMode::EscalatedExact => PredictiveRegime::EscalatedExact,
         PredictiveSearchMode::Exact(_) => PredictiveRegime::Exact,
+    }
+}
+
+#[cfg(test)]
+mod execution_metadata_tests {
+    use super::*;
+
+    fn run(
+        solver: &Solver,
+        mode: PredictiveSearchMode,
+        hard: bool,
+        observations: &[(String, u8)],
+    ) -> SuggestionBatch {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        solver
+            .suggestion_batch_internal_with_search_mode_controlled(
+                &solver.initial_state(date),
+                solver.guesses.len(),
+                Some(PredictiveContext {
+                    hard_mode: hard,
+                    as_of: date,
+                    observations,
+                }),
+                PredictiveBookUsage::None,
+                Some(mode),
+                &|| false,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn forced_routes_are_reported_instead_of_inferred_from_small_state_size() {
+        let solver =
+            crate::solver::tests::test_solver(&["tower", "power", "bower", "rower", "sower"]);
+        for (mode, route, objective, kind, scope, optimal) in [
+            (
+                PredictiveSearchMode::ProxyOnly,
+                PredictiveRegime::Proxy,
+                SearchObjective::ProxyRanking,
+                SuggestionValueKind::Proxy,
+                SearchCandidateScope::AllActions,
+                false,
+            ),
+            (
+                PredictiveSearchMode::Lookahead,
+                PredictiveRegime::Lookahead,
+                SearchObjective::PenalizedLookahead,
+                SuggestionValueKind::Lookahead,
+                SearchCandidateScope::CandidatePool,
+                false,
+            ),
+            (
+                PredictiveSearchMode::EscalatedExact,
+                PredictiveRegime::EscalatedExact,
+                SearchObjective::ExpectedGuesses,
+                SuggestionValueKind::ExactAction,
+                SearchCandidateScope::CandidatePool,
+                false,
+            ),
+            (
+                PredictiveSearchMode::Exact(ExactSuggestionMode::Exhaustive),
+                PredictiveRegime::Exact,
+                SearchObjective::ExpectedGuesses,
+                SuggestionValueKind::ExactAction,
+                SearchCandidateScope::AllActions,
+                true,
+            ),
+            (
+                PredictiveSearchMode::Exact(ExactSuggestionMode::Pooled),
+                PredictiveRegime::Exact,
+                SearchObjective::ExpectedGuesses,
+                SuggestionValueKind::ExactAction,
+                SearchCandidateScope::CandidatePool,
+                false,
+            ),
+        ] {
+            let batch = run(&solver, mode, false, &[]);
+            assert_eq!(batch.execution.route, route);
+            assert_eq!(batch.execution.objective, objective);
+            assert_eq!(batch.execution.selected_value_kind, Some(kind));
+            assert_eq!(batch.execution.candidate_scope, scope);
+            assert_eq!(batch.execution.root_selection_optimal, optimal);
+            assert_eq!(batch.execution.action_scope, SearchActionScope::Normal);
+            assert_eq!(
+                batch.execution.roots_evaluated,
+                batch.execution.roots_considered
+            );
+            assert!(batch.execution.roots_evaluated > 0);
+            assert_eq!(
+                batch.execution.selected_value_kind,
+                batch.suggestions.first().map(|row| row.value_kind)
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_roots_do_not_certify_pooled_continuations() {
+        let mut solver =
+            crate::solver::tests::test_solver(&["tower", "power", "bower", "rower", "sower"]);
+        solver.config.exact_exhaustive_threshold = 1;
+        solver.config.exact_candidate_pool = 1;
+        let batch = run(
+            &solver,
+            PredictiveSearchMode::Exact(ExactSuggestionMode::Exhaustive),
+            false,
+            &[],
+        );
+        assert_eq!(
+            batch.execution.candidate_scope,
+            SearchCandidateScope::AllActions
+        );
+        assert_eq!(
+            batch.execution.selected_value_kind,
+            Some(SuggestionValueKind::ContinuationEstimate)
+        );
+        assert!(batch.suggestions.iter().all(|row| row.exact_cost.is_some()
+            && row.value_kind == SuggestionValueKind::ContinuationEstimate));
+        assert!(!batch.execution.root_selection_optimal);
+        assert!(
+            batch
+                .execution
+                .summary()
+                .contains("pooled continuation estimate")
+        );
+    }
+
+    #[test]
+    fn hard_root_and_coverage_objectives_do_not_claim_global_expected_cost_optimality() {
+        let mut solver =
+            crate::solver::tests::test_solver(&["tower", "power", "bower", "rower", "sower"]);
+        let hard = run(
+            &solver,
+            PredictiveSearchMode::Exact(ExactSuggestionMode::Exhaustive),
+            true,
+            &[],
+        );
+        assert_eq!(
+            hard.execution.action_scope,
+            SearchActionScope::HardRootNormalContinuation
+        );
+        assert_eq!(
+            hard.execution.selected_value_kind,
+            Some(SuggestionValueKind::ExactAction)
+        );
+        assert!(!hard.execution.root_selection_optimal);
+        solver.config.second_guess_coverage_min_survivors = 1;
+        solver.config.second_guess_coverage_max_survivors = 10;
+        let coverage = run(
+            &solver,
+            PredictiveSearchMode::Exact(ExactSuggestionMode::Exhaustive),
+            false,
+            &[("xxxxx".into(), 0)],
+        );
+        assert_eq!(
+            coverage.execution.objective,
+            SearchObjective::ThreeSolveCoverageThenCost
+        );
+        assert!(!coverage.execution.root_selection_optimal);
+    }
+}
+
+#[cfg(test)]
+mod search_timing_tests {
+    use super::*;
+
+    #[test]
+    fn formats_numeric_search_timing_without_words() {
+        let timing = SearchTiming {
+            base_metrics: std::time::Duration::from_millis(2),
+            second_guess_coverage: std::time::Duration::from_millis(3),
+            lookahead_root: std::time::Duration::from_millis(5),
+            lookahead_root_count: 7,
+            exact_child: std::time::Duration::from_millis(11),
+            exact_child_count: 13,
+            large_child_metric_scan: std::time::Duration::from_millis(17),
+            large_child_metric_scan_count: 19,
+        };
+
+        assert_eq!(
+            timing.format_line(),
+            "benchmark-evidence search-timing base_ms=2 coverage_ms=3 lookahead_root_ms=5 lookahead_root_count=7 exact_child_ms=11 exact_child_count=13 large_child_metric_scan_ms=17 large_child_metric_scan_count=19"
+        );
     }
 }

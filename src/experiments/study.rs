@@ -15,7 +15,7 @@ use super::{
     ParameterScale, ParameterValue, PredictiveMetrics,
 };
 
-pub const STUDY_FORMAT_VERSION: u32 = 18;
+pub const STUDY_FORMAT_VERSION: u32 = 19;
 
 fn default_maximum_validation_folds() -> usize {
     12
@@ -451,6 +451,8 @@ pub enum TrialStatus {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StudyMeasurement {
     pub validation_fold_indices: Vec<usize>,
+    /// Calendar games inspected before selecting the stage's scored cohort.
+    pub examined_calendar_games: usize,
     pub scheduled_games: usize,
     pub solve_metrics_recorded: bool,
     pub solved_games: usize,
@@ -507,6 +509,7 @@ impl StudyMeasurement {
         self.validation_fold_indices
             .extend(fold.validation_fold_indices.iter().copied());
         self.validation_fold_indices.sort_unstable();
+        self.examined_calendar_games += fold.examined_calendar_games;
         self.scheduled_games += fold.scheduled_games;
         self.solve_metrics_recorded |= fold.solve_metrics_recorded;
         self.solved_games += fold.solved_games;
@@ -655,6 +658,17 @@ impl StudyState {
                 bail!("Pareto-ranked trial is missing its measurement");
             }
             if let Some(measurement) = &trial.measurement {
+                let elapsed_ms = trial
+                    .elapsed_ms
+                    .context("study measurement is missing cumulative elapsed time")?;
+                if trial.status == TrialStatus::Complete
+                    && (elapsed_ms > self.spec.maximum_trial_seconds.saturating_mul(1_000)
+                        || measurement.peak_memory_bytes.is_some_and(|bytes| {
+                            bytes > self.spec.maximum_memory_mb.saturating_mul(1024 * 1024)
+                        }))
+                {
+                    bail!("completed trial exceeds its declared resource budget");
+                }
                 let folds = measurement
                     .validation_fold_indices
                     .iter()
@@ -670,15 +684,34 @@ impl StudyState {
                 {
                     bail!("completed trial does not contain every required validation fold");
                 }
-                let maximum_games = self
-                    .evaluation_plan
-                    .folds
-                    .iter()
-                    .filter(|fold| folds.contains(&fold.index))
-                    .map(|fold| fold.validation.days() as usize)
-                    .sum::<usize>();
-                if measurement.scheduled_games > maximum_games
-                    || measurement.measured_prior_games > measurement.scheduled_games
+                let expected_calendar_games = folds.iter().try_fold(0usize, |count, index| {
+                    let fold = self
+                        .evaluation_plan
+                        .folds
+                        .iter()
+                        .find(|fold| fold.index == *index)
+                        .context("study measurement identifies an unknown validation fold")?;
+                    let range = super::DateRange::new(fold.validation.start, fold.validation.end)?;
+                    let days = usize::try_from(range.days())
+                        .context("validation fold date count is too large")?;
+                    count
+                        .checked_add(days)
+                        .context("validation date count overflowed")
+                })?;
+                if measurement.examined_calendar_games != expected_calendar_games
+                    || measurement.scheduled_games > expected_calendar_games
+                    || (!self.spec.stage.evaluates_recovery_only()
+                        && measurement.scheduled_games != expected_calendar_games)
+                    || measurement.measured_prior_games > measurement.examined_calendar_games
+                    || (self.spec.stage.evaluates_prior_only()
+                        && (measurement.solve_metrics_recorded
+                            || measurement
+                                .measured_prior_games
+                                .checked_add(measurement.coverage_gaps)
+                                != Some(measurement.scheduled_games)))
+                    || (!self.spec.stage.evaluates_prior_only()
+                        && measurement.scheduled_games > 0
+                        && !measurement.solve_metrics_recorded)
                     || (measurement.solve_metrics_recorded
                         && measurement
                             .solved_games
@@ -1414,9 +1447,12 @@ fn sample_value(definition: &ParameterDefinition, unit: f64) -> ParameterValue {
             let raw = match scale {
                 ParameterScale::Linear => minimum + unit * (maximum - minimum),
                 ParameterScale::Log => (minimum.ln() + unit * (maximum.ln() - minimum.ln())).exp(),
-            };
+            }
+            .clamp(*minimum, *maximum);
             let value = step.map_or(raw, |step| {
-                (minimum + ((raw - minimum) / step).round() * step).clamp(*minimum, *maximum)
+                let maximum_slot = ((maximum - minimum) / step).floor();
+                let slot = ((raw - minimum) / step).round().min(maximum_slot);
+                (minimum + slot * step).clamp(*minimum, *maximum)
             });
             ParameterValue::Float(value)
         }
@@ -1860,6 +1896,76 @@ mod tests {
     }
 
     #[test]
+    fn logarithmic_sampler_endpoint_applies_within_the_registered_domain() {
+        let base = PriorConfig::default();
+        let registry = predictive_parameter_registry(&base);
+        registry.validate().unwrap();
+        let definition = registry
+            .parameters
+            .iter()
+            .find(|item| item.name == "logistic_k")
+            .unwrap();
+        for unit in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let sampled = sample_value(definition, unit);
+            let values = BTreeMap::from([(definition.name.clone(), sampled)]);
+            registry
+                .apply_tunable_values(&base, &values)
+                .expect("sample is in domain");
+        }
+    }
+
+    #[test]
+    fn stepped_float_sampler_does_not_invent_an_off_grid_maximum() {
+        let base = PriorConfig::default();
+        let mut registry = predictive_parameter_registry(&base);
+        let definition = registry
+            .parameters
+            .iter_mut()
+            .find(|item| item.name == "logistic_k")
+            .unwrap();
+        definition.kind = ParameterKind::Float {
+            minimum: 0.001,
+            maximum: 0.1,
+            step: Some(0.06),
+            scale: ParameterScale::Linear,
+        };
+        definition.default = ParameterValue::Float(0.001);
+        let definition = definition.clone();
+        registry.validate().unwrap();
+        let ParameterValue::Float(value) = sample_value(&definition, 1.0) else {
+            panic!("float")
+        };
+        assert!((value - 0.061).abs() < 1e-12);
+        registry
+            .apply_tunable_values(
+                &base,
+                &BTreeMap::from([(definition.name, ParameterValue::Float(value))]),
+            )
+            .expect("stepped sample is in domain");
+    }
+
+    #[test]
+    fn candidate_entry_points_reject_invalid_domains_before_sampling() {
+        let base = PriorConfig::default();
+        let mut registry = predictive_parameter_registry(&base);
+        registry
+            .parameters
+            .iter_mut()
+            .find(|item| item.name == "logistic_k")
+            .unwrap()
+            .kind = ParameterKind::Float {
+            minimum: f64::NAN,
+            maximum: 0.1,
+            step: None,
+            scale: ParameterScale::Log,
+        };
+        let mut study = spec(StudyStage::SolvePolicy, 2);
+        assert!(generate_candidates(&registry, &base, &study).is_err());
+        study.strategy = StudySearchStrategy::ModelBased;
+        assert!(generate_model_based_candidate(&registry, &base, &study, &[]).is_err());
+    }
+
+    #[test]
     fn bounded_samplers_keep_dimensions_unique() {
         let registry = predictive_parameter_registry(&PriorConfig::default());
         let dimensions = registry
@@ -2238,7 +2344,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(metrics.conditional_mean_guesses, 4.0);
+        assert_eq!(metrics.conditional_mean_guesses, Some(4.0));
         let mut measurement = StudyMeasurement::default();
         measurement.record_solve_metrics(&metrics);
         assert_eq!(measurement.scheduled_games, 4);
@@ -2312,6 +2418,7 @@ mod tests {
         let mut aggregate = StudyMeasurement::default();
         let first = StudyMeasurement {
             validation_fold_indices: vec![0],
+            examined_calendar_games: 2,
             scheduled_games: 2,
             solve_metrics_recorded: true,
             solved_games: 2,
@@ -2325,6 +2432,7 @@ mod tests {
         };
         let second = StudyMeasurement {
             validation_fold_indices: vec![1],
+            examined_calendar_games: 2,
             scheduled_games: 2,
             solve_metrics_recorded: true,
             solved_games: 1,
@@ -2341,6 +2449,7 @@ mod tests {
         aggregate.merge_fold(&second).expect("second");
 
         assert_eq!(aggregate.validation_fold_indices, vec![0, 1]);
+        assert_eq!(aggregate.examined_calendar_games, 4);
         assert_eq!(aggregate.scheduled_games, 4);
         assert_eq!(aggregate.solved_games, 3);
         assert_eq!(aggregate.failures, 1);
@@ -2457,6 +2566,7 @@ mod tests {
             .min(spec.maximum_validation_folds);
         let mut measurement = StudyMeasurement {
             validation_fold_indices: (0..evaluation_plan.folds.len()).collect(),
+            examined_calendar_games: evaluation_plan.folds.len() * 30,
             scheduled_games: evaluation_plan.folds.len() * 30,
             measured_prior_games: evaluation_plan.folds.len() * 30,
             log_loss_sum: evaluation_plan.folds.len() as f64 * 60.0,
@@ -2487,6 +2597,92 @@ mod tests {
         let restored: StudyState = serde_json::from_str(&encoded).expect("restore checkpoint");
         restored.validate().expect("restored valid checkpoint");
         assert_eq!(state, restored);
+        let mut missing_population = serde_json::to_value(&restored).unwrap();
+        missing_population["trials"][0]["measurement"]
+            .as_object_mut()
+            .unwrap()
+            .remove("examined_calendar_games");
+        assert!(serde_json::from_value::<StudyState>(missing_population).is_err());
+        let mut unexamined = restored.clone();
+        unexamined.trials[0]
+            .measurement
+            .as_mut()
+            .unwrap()
+            .examined_calendar_games -= 1;
+        assert!(unexamined.validate().is_err());
+        let mut recovery = restored.clone();
+        recovery.spec.stage = StudyStage::CoverageRecovery;
+        recovery.trials[0].identity = recovery.trials[0]
+            .candidate
+            .identity(&recovery.spec, &recovery.provenance)
+            .unwrap();
+        let complete_calendar = recovery.trials[0]
+            .measurement
+            .as_ref()
+            .unwrap()
+            .examined_calendar_games;
+        let completed_folds = recovery.trials[0]
+            .measurement
+            .as_ref()
+            .unwrap()
+            .validation_fold_indices
+            .clone();
+        recovery.trials[0].measurement = Some(StudyMeasurement {
+            validation_fold_indices: completed_folds,
+            examined_calendar_games: complete_calendar,
+            ..StudyMeasurement::default()
+        });
+        recovery
+            .validate()
+            .expect("complete calendar can have no eligible recovery games");
+        let measured = recovery.trials[0].measurement.as_mut().unwrap();
+        measured.scheduled_games = 1;
+        measured.solve_metrics_recorded = true;
+        measured.solved_games = 1;
+        measured.solved_guess_sum = 2.0;
+        measured.penalized_guess_sum = 2.0;
+        measured.measured_prior_games = complete_calendar;
+        measured.log_loss_sum = complete_calendar as f64;
+        measured.brier_score_sum = complete_calendar as f64;
+        measured.refresh_derived();
+        recovery
+            .validate()
+            .expect("prior and recovery cohorts differ explicitly");
+        for missing_elapsed in [false, true] {
+            let mut interrupted = restored.clone();
+            interrupted.trials[0].elapsed_ms = if missing_elapsed {
+                None
+            } else {
+                Some(interrupted.spec.maximum_trial_seconds * 1_000 + 1)
+            };
+            assert!(interrupted.validate().is_err());
+            if !missing_elapsed {
+                interrupted.trials[0].status = TrialStatus::Failed;
+                interrupted.trials[0].reason = Some("cooperative budget exhausted".into());
+                interrupted
+                    .validate()
+                    .expect("retain validated over-budget chunks");
+            }
+        }
+        let mut over_memory = restored.clone();
+        over_memory.trials[0]
+            .measurement
+            .as_mut()
+            .unwrap()
+            .peak_memory_bytes = Some(over_memory.spec.maximum_memory_mb * 1024 * 1024 + 1);
+        assert!(over_memory.validate().is_err());
+        for status in [TrialStatus::Complete, TrialStatus::Running] {
+            let mut shortened = restored.clone();
+            shortened.trials[0].status = status;
+            let measurement = shortened.trials[0].measurement.as_mut().unwrap();
+            measurement.scheduled_games -= 1;
+            measurement.measured_prior_games -= 1;
+            measurement.refresh_derived();
+            assert!(
+                shortened.validate().is_err(),
+                "a recorded validation fold cannot omit a calendar game"
+            );
+        }
         for bad_folds in [vec![0, 0], vec![usize::MAX], vec![0]] {
             let mut invalid = restored.clone();
             invalid.trials[0]

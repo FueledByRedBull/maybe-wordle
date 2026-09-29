@@ -13,9 +13,23 @@
 > This project does not.
 > It models modern NYT Wordle as a moving target: historical answers are fetched from the live daily endpoint, candidate answers are seeded from pinned community lists, and the app can switch between a fast heuristic predictive solver and a certificate-checked fixed-model policy builder.
 
-## Next-release work in progress
+## September 29 audit build
 
-Production remains v20; no newer configuration has passed every release guard. The declared evaluation policy in [`config/evaluation.toml`](./config/evaluation.toml) freezes development through 2026-08-26 and reserves 2026-08-28 through 2026-09-26 as an untouched seal. The consumed June 18–July 17 seal is excluded from new validation targets.
+The [September 29 audit remediation](docs/superpowers/plans/2026-09-29-audit-remediation.md)
+corrects formal horizon optimization, dynamic-support pruning, input/persistence
+boundaries, GUI request/terminal handling, and evaluation/learning contracts.
+The final Windows gate passes 603 tests, 15 benchmark smoke workloads, formatting
+and warning-denied Clippy. Rebuilt GUI/CLI executables are in `dist`, with checksums.
+The audit rolling comparison retains a 3.1944 mean and 360/360 solves for selected
+v20; it establishes no score gain or flat-three result. Measurements and historical
+tables retain their recorded executable identities; the final reporting-only
+regret fix is identified separately in the release ledger.
+The production configuration has not been promoted or retuned. Native GUI
+acceptance and hosted cross-platform CI remain open; this GUI was left closed.
+Dependency checks and their limited maintenance exceptions are documented in
+[DEPENDENCIES.md](docs/DEPENDENCIES.md).
+
+Production remains v20; no newer configuration has passed every release guard. The declared evaluation policy in [`config/evaluation.toml`](./config/evaluation.toml) freezes development through 2026-08-26 and reserves 2026-08-28 through 2026-09-26 as an untouched seal. The consumed June 18–July 17 seal is excluded from new tuning and validation targets, but remains usable as chronological training history for later dates.
 
 The latest bounded policy investigation fixes the known nine- and 22-survivor
 hard-mode choices; all six audited states now match the exhaustive reference to
@@ -149,14 +163,36 @@ deadline, and both profiles recorded five recovery steps. This retrospective
 development run has `sealed_test_evaluated=false`, passes neither score nor
 latency guard, and does not promote the policy. The fixed-belief-only finite
 `search-regret` diagnostic is not validation of dynamic mode; production remains
-unchanged.
+unchanged. A separate opt-in `same-state-dynamic-regret` check compares both
+choices against a normal-mode dynamic reference on small, explicit development
+states; it is exact only up to six combined active/dormant survivors and does
+not validate hard-mode routing or whole-policy performance
+([scope and examples](docs/PREDICTIVE_MATH.md#same-state-dynamic-reference-2026-09-27)).
+
+A later one-pass fallback-partition optimization was checked three times on
+the same 30 allowed development dates. Dynamic finite scored 3.3000, 3.2667
+and 3.3667 against staged's 3.3333, with 30/30 solves in every run. All
+paired intervals crossed zero and finite per-move p95 stayed above 260 ms.
+The first two changed-binary runs matched each other on only 27/30 paths
+under the deadline;
+the final rebuilt binary did not retain their apparent point-score lead.
+This reduced charged finite work in those runs but is not a selected-policy change or a prospective
+score claim; see the [release ledger](docs/SEPTEMBER_RELEASE.md).
+
+The opt-in `staged-zero-failure-certificate` command checks a conservative
+six-turn witness for selected staged moves on explicit development dates.
+It does not change live play or prove the best move. A complete one-day smoke
+checked four roots and certified none; a nine-day run stopped at its four-minute
+cap after seven complete games and 22 roots, also with no certificates. The
+partial run is not a nine-day rate or a score comparison; see the
+[scope and evidence](docs/SEPTEMBER_RELEASE.md#september-27-staged-zero-failure-certificate-screen).
 
 The [September acceptance plan](docs/SEPTEMBER_RELEASE.md) puts shared game semantics
 and bounded search before further tuning. Live requests now name the puzzle date and
 derive history through the preceding day; effective model identities exclude future
 history. Current source has correctness changes and is not validated by the old v20
-scores. The retained `dist/` executables match the latest uncommitted source
-build and remain runnable; that does not make the experimental finite policy
+scores. The retained `dist/` executables are the pre-audit build until the final
+verified rebuild; that does not make the experimental finite policy
 a release candidate.
 The GUI starts without a console window. A native accessibility-tree check
 found the Play controls and separate board/suggestions panels, while a locked
@@ -166,7 +202,7 @@ gates.
 
 Private benchmark diagnostics are local-only and are not included in a clean checkout.
 
-Study v18 repairs grid endpoints, unique dimensions and complete elite inheritance;
+Study v19 adds complete-fold calendar accounting and cumulative interruption checks. It retains v18's grid endpoints, unique dimensions and complete elite inheritance;
 registry v7 removes the obsolete coverage child cap. It retains v17's solved-histogram
 totals and exclusion of shared-process memory from ranking. Older studies are historical
 evidence and cannot be resumed against the changed policy. New pattern caches use
@@ -260,11 +296,11 @@ Predictive opener/reply artifacts live under `data/derived/predictive/`. Their v
 
 Formal artifacts live under `data/formal/<model>/`. They are the heaviest build in the repo and are only needed if you want exact-policy analysis.
 
-Common first-run failures:
+First-run status and failures:
 
 - missing seed files or an incomplete checkout under `data/seed/`
-- no synced NYT history yet, so the requested date is outside the known range
-- predictive artifacts missing or stale for the date you asked for, so the solver uses normal live ranking without artifact promotion unless you explicitly pass `--live-fallback`
+- missing or incomplete NYT history leaves seed-supported predictive play available, with a persistent GUI notice reporting covered/expected days through the requested cutoff; history-based evaluation and explicit book builds require dated history
+- missing predictive artifacts permit live ranking without promotion; incompatible or corrupt current-version artifacts produce an explicit error. `--live-fallback` enables optional session-book evaluation only when eligible training history exists
 - `formal-optimal` selected before `build-optimal-policy` has generated the complete matching `data/formal/<model>/` file set
 
 ## Quick start
@@ -283,7 +319,7 @@ cargo run -- solve-interactive
 
 The selected predictive configuration is [`config/prior.toml`](./config/prior.toml), frozen as `selected-predictive-v20`.
 The table below is its historical promotion result from an earlier executable;
-the September 26 development replay follows in the generated section.
+the September 29 development comparison follows in the generated rolling section.
 
 | Evaluation | Games | Solved | All-game mean | 95% interval | Failures | Latency p95 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -294,91 +330,138 @@ Against the previous default, the selected configuration improved the developmen
 
 This historical evidence does **not** support a flat-three claim: the untouched sealed score was `3.3000`. That sealed window is now consumed and cannot be used for further tuning. Machine-readable records are [`rolling-selected-v20-final-20260726.json`](./benchmarks/predictive/rolling-selected-v20-final-20260726.json), [`frozen-candidate-v1.json`](./benchmarks/predictive/frozen-candidate-v1.json), and [`sealed-selected-v20-20260726.json`](./benchmarks/predictive/sealed-selected-v20-20260726.json).
 
-The following September 26 pre-validator-build development diagnostic compares the selected
-staged policy with exploratory v19b on 12 permitted folds. It does not reuse
-the consumed June 18-July 17 validation window or open the reserved August
-28-September 26 seal. It is neither a prospective result nor the pending
-seven-profile release matrix. The earlier five-prior screen remains in the
-[release ledger](./docs/SEPTEMBER_RELEASE.md).
+The following seven-profile **timing screen** covers only nine allowed dates,
+July 28-August 5, 2026 (63 profile-games). It completed in 19.58 seconds. Its
+selected-policy mean of 3.0000 is a small development slice, not a flat-three
+result or full release validation. The attempted 12-fold seven-profile matrix
+then reached its cumulative 20-minute limit: six profiles completed, but the
+selected disk-artifact profile did not. No completed full-matrix artifact was
+published. Checkpointed complete rows and the timeout log are retained locally.
+The separate full-fold selected-versus-v19b comparison is below.
+Neither run reused consumed validation targets or opened the reserved seal.
+The [previous-build seven-profile table](./docs/generated/september-seven-profile-current-full-v1.md)
+and [earlier selected-versus-v19b table](./docs/generated/september-post-layout-tests-rolling-v1.md)
+remain historical evidence, not validation of this audit's changes.
 
 <!-- BEGIN GENERATED PREDICTIVE EVIDENCE -->
 ## Predictive solver evidence
 
-Development-only diagnostic for `2025-07-03` through `2026-08-26` using selection `rolling_folds` (2025-07-03..2025-08-01, 2025-08-02..2025-08-31, 2025-09-01..2025-09-30, 2025-10-01..2025-10-30, 2025-10-31..2025-11-29, 2025-11-30..2025-12-29, 2025-12-30..2026-01-28, 2026-01-29..2026-02-27, 2026-02-28..2026-03-29, 2026-03-30..2026-04-28, 2026-04-29..2026-05-28, 2026-07-28..2026-08-26) and history through `2026-08-26`. The sealed test was **not** evaluated.
+Development-only diagnostic for `2026-07-28` through `2026-08-05` using selection `range` (2026-07-28..2026-08-05) and history through `2026-08-26`. The sealed test was **not** evaluated.
 
-Measured generation compute time: 508.32 s; process peak working set: 161.1 MiB; enforced budget: 1200 s / 4096 MiB.
+Measured generation compute time: 19.58 s; process peak working set: 122.1 MiB; enforced budget: 180 s / 4096 MiB.
 
 | Baseline | Coverage | Solved | All-game mean (7-guess penalty) | Conditional mean | 3 guesses | 4 guesses | Paired delta vs reference | W/T/L | Log loss | Brier | Latency p95 | Session fallback cold/warm |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `selected_staged` | 100.0% (360/360) | 100.0% (360/360) | 3.1944 [3.1194, 3.2722] | 3.1944 [3.1194, 3.2722] | 76.4% | 96.7% | +0.0000 [+0.0000, +0.0000] | 0/360/0 | 6.6703 | 0.9987 | 20.73 ms | n/a/n/a |
-| `v19b_staged` | 100.0% (360/360) | 100.0% (360/360) | 3.1917 [3.1194, 3.2694] | 3.1917 [3.1194, 3.2694] | 76.1% | 96.9% | -0.0028 [-0.0222, +0.0167] | 6/347/7 | 6.6703 | 0.9987 | 20.76 ms | n/a/n/a |
+| `previous_release_790ec2d` | 100.0% (9/9) | 100.0% (9/9) | 3.2222 [3.1111, 3.3333] | 3.2222 [3.1111, 3.3333] (modeled_games=9) | 77.8% | 100.0% | +0.2222 [+0.1111, +0.3333] | 0/7/2 | 7.1629 | 0.9992 | 23.15 ms | n/a/n/a |
+| `uniform_entropy` | 100.0% (9/9) | 100.0% (9/9) | 3.4444 [3.2222, 3.6667] | 3.4444 [3.2222, 3.6667] (modeled_games=9) | 55.6% | 100.0% | +0.4444 [+0.2222, +0.6667] | 0/5/4 | 7.7664 | 0.9996 | 24.62 ms | n/a/n/a |
+| `cooldown_entropy` | 100.0% (9/9) | 100.0% (9/9) | 3.2222 [3.1111, 3.3333] | 3.2222 [3.1111, 3.3333] (modeled_games=9) | 77.8% | 100.0% | +0.2222 [+0.1111, +0.3333] | 0/7/2 | 7.5965 | 0.9995 | 25.02 ms | n/a/n/a |
+| `weighted_proxy_only` | 100.0% (9/9) | 100.0% (9/9) | 3.1111 [3.0000, 3.2222] | 3.1111 [3.0000, 3.2222] (modeled_games=9) | 88.9% | 100.0% | +0.1111 [+0.0000, +0.2222] | 0/8/1 | 6.5562 | 0.9985 | 26.73 ms | n/a/n/a |
+| `weighted_proxy_exact_endgame` | 100.0% (9/9) | 100.0% (9/9) | 3.0000 [3.0000, 3.0000] | 3.0000 [3.0000, 3.0000] (modeled_games=9) | 100.0% | 100.0% | +0.0000 [+0.0000, +0.0000] | 0/9/0 | 6.5562 | 0.9985 | 26.78 ms | n/a/n/a |
+| `weighted_staged_no_artifacts` | 100.0% (9/9) | 100.0% (9/9) | 3.0000 [3.0000, 3.0000] | 3.0000 [3.0000, 3.0000] (modeled_games=9) | 100.0% | 100.0% | +0.0000 [+0.0000, +0.0000] | 0/9/0 | 6.5562 | 0.9985 | 27.69 ms | n/a/n/a |
+| `selected_default_disk_artifacts` | 100.0% (9/9) | 100.0% (9/9) | 3.0000 [3.0000, 3.0000] | 3.0000 [3.0000, 3.0000] (modeled_games=9) | 100.0% | 100.0% | +0.0000 [+0.0000, +0.0000] | 0/9/0 | 6.5562 | 0.9985 | 19.65 ms | n/a/n/a |
 
 Session-fallback timings are milliseconds; n/a means live session books are not used by that profile and were not benchmarked.
 
 Measured artifact sizes: `pattern_table` = 35132187 bytes; `answer_history` = 64472 bytes; `modeled_answers` = 177428 bytes; `predictive_books` = 812321 bytes.
 
-| Baseline | Prior top-1 | Prior top-3 | Prior top-5 | Confidence ECE | Search steps P/L/XE/X/F | Recovery/fallback steps | Artifact/session hits |
+| Baseline | Prior top-1 | Prior top-3 | Prior top-5 | Confidence ECE | Search steps P/L/XE/X/F/T | Recovery/fallback steps | Artifact/session hits |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `selected_staged` | 0.3% | 0.6% | 0.6% | 0.0017 [0.0013, 0.0077] | 386/139/0/625/0 | 36/292 | 0/0 |
-| `v19b_staged` | 0.3% | 0.6% | 0.6% | 0.0017 [0.0013, 0.0077] | 386/131/0/632/0 | 36/297 | 0/0 |
+| `previous_release_790ec2d` | 0.0% | 0.0% | 0.0% | 0.0008 [0.0008, 0.0008] | 9/3/0/17/0/0 | 0/7 | 0/0 |
+| `uniform_entropy` | 0.0% | 0.0% | 0.0% | 0.0004 [0.0004, 0.0004] | 31/0/0/0/0/0 | 0/10 | 0/0 |
+| `cooldown_entropy` | 0.0% | 0.0% | 0.0% | 0.0005 [0.0005, 0.0005] | 29/0/0/0/0/0 | 0/9 | 0/0 |
+| `weighted_proxy_only` | 0.0% | 0.0% | 0.0% | 0.0014 [0.0014, 0.0014] | 28/0/0/0/0/0 | 0/6 | 0/0 |
+| `weighted_proxy_exact_endgame` | 0.0% | 0.0% | 0.0% | 0.0014 [0.0014, 0.0014] | 12/0/0/15/0/0 | 0/7 | 0/0 |
+| `weighted_staged_no_artifacts` | 0.0% | 0.0% | 0.0% | 0.0014 [0.0014, 0.0014] | 9/3/0/15/0/0 | 0/7 | 0/0 |
+| `selected_default_disk_artifacts` | 0.0% | 0.0% | 0.0% | 0.0014 [0.0014, 0.0014] | 9/3/0/15/0/0 | 0/7 | 0/0 |
 
 Post-feedback posterior proper scores (means are conditional on scored states; scored/total keeps unscored gaps visible):
 
 | Baseline | Stratum | Turn | Scored/total states | Target probability | Log loss | Brier |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `selected_staged` | all | 1 | 332/360 | 0.0013 | 6.6703 | 0.9987 |
-| `selected_staged` | all | 2 | 334/360 | 0.1201 | 2.8215 | 0.8792 |
-| `selected_staged` | all | 3 | 320/329 | 0.7421 | 0.5525 | 0.2577 |
-| `selected_staged` | all | 4 | 84/85 | 0.8448 | 0.3250 | 0.1448 |
-| `selected_staged` | all | 5 | 12/12 | 0.6448 | 0.5897 | 0.3808 |
-| `selected_staged` | all | 6 | 4/4 | 1.0000 | -0.0000 | 0.0000 |
-| `selected_staged` | never_used | 1 | 315/343 | 0.0013 | 6.6155 | 0.9986 |
-| `selected_staged` | never_used | 2 | 317/343 | 0.1219 | 2.7757 | 0.8748 |
-| `selected_staged` | never_used | 3 | 303/312 | 0.7527 | 0.5150 | 0.2428 |
-| `selected_staged` | never_used | 4 | 76/77 | 0.8403 | 0.3450 | 0.1540 |
-| `selected_staged` | never_used | 5 | 12/12 | 0.6448 | 0.5897 | 0.3808 |
-| `selected_staged` | never_used | 6 | 4/4 | 1.0000 | -0.0000 | 0.0000 |
-| `selected_staged` | reused | 1 | 17/17 | 0.0008 | 7.6872 | 0.9998 |
-| `selected_staged` | reused | 2 | 17/17 | 0.0855 | 3.6756 | 0.9605 |
-| `selected_staged` | reused | 3 | 17/17 | 0.5519 | 1.2222 | 0.5237 |
-| `selected_staged` | reused | 4 | 8/8 | 0.8881 | 0.1358 | 0.0569 |
-| `selected_staged` | out_of_core | 1 | 0/28 | n/a | n/a | n/a |
-| `selected_staged` | out_of_core | 2 | 2/28 | 0.0170 | 4.6022 | 1.3337 |
-| `selected_staged` | out_of_core | 3 | 19/28 | 0.2065 | 3.1306 | 1.0928 |
-| `selected_staged` | out_of_core | 4 | 23/24 | 0.5470 | 1.0525 | 0.4781 |
-| `selected_staged` | out_of_core | 5 | 12/12 | 0.6448 | 0.5897 | 0.3808 |
-| `selected_staged` | out_of_core | 6 | 4/4 | 1.0000 | -0.0000 | 0.0000 |
-| `v19b_staged` | all | 1 | 332/360 | 0.0013 | 6.6703 | 0.9987 |
-| `v19b_staged` | all | 2 | 334/360 | 0.1195 | 2.7936 | 0.8798 |
-| `v19b_staged` | all | 3 | 320/329 | 0.7348 | 0.5578 | 0.2643 |
-| `v19b_staged` | all | 4 | 85/86 | 0.8612 | 0.2915 | 0.1276 |
-| `v19b_staged` | all | 5 | 11/11 | 0.6832 | 0.5067 | 0.3280 |
-| `v19b_staged` | all | 6 | 3/3 | 1.0000 | -0.0000 | 0.0000 |
-| `v19b_staged` | never_used | 1 | 315/343 | 0.0013 | 6.6155 | 0.9986 |
-| `v19b_staged` | never_used | 2 | 317/343 | 0.1210 | 2.7527 | 0.8756 |
-| `v19b_staged` | never_used | 3 | 303/312 | 0.7447 | 0.5220 | 0.2501 |
-| `v19b_staged` | never_used | 4 | 77/78 | 0.8585 | 0.3077 | 0.1349 |
-| `v19b_staged` | never_used | 5 | 11/11 | 0.6832 | 0.5067 | 0.3280 |
-| `v19b_staged` | never_used | 6 | 3/3 | 1.0000 | -0.0000 | 0.0000 |
-| `v19b_staged` | reused | 1 | 17/17 | 0.0008 | 7.6872 | 0.9998 |
-| `v19b_staged` | reused | 2 | 17/17 | 0.0906 | 3.5568 | 0.9588 |
-| `v19b_staged` | reused | 3 | 17/17 | 0.5589 | 1.1963 | 0.5171 |
-| `v19b_staged` | reused | 4 | 8/8 | 0.8881 | 0.1358 | 0.0569 |
-| `v19b_staged` | out_of_core | 1 | 0/28 | n/a | n/a | n/a |
-| `v19b_staged` | out_of_core | 2 | 2/28 | 0.0170 | 4.6022 | 1.3337 |
-| `v19b_staged` | out_of_core | 3 | 19/28 | 0.2068 | 3.0853 | 1.0860 |
-| `v19b_staged` | out_of_core | 4 | 23/24 | 0.5784 | 0.9746 | 0.4427 |
-| `v19b_staged` | out_of_core | 5 | 11/11 | 0.6832 | 0.5067 | 0.3280 |
-| `v19b_staged` | out_of_core | 6 | 3/3 | 1.0000 | -0.0000 | 0.0000 |
+| `previous_release_790ec2d` | all | 1 | 9/9 | 0.0008 | 7.1629 | 0.9992 |
+| `previous_release_790ec2d` | all | 2 | 9/9 | 0.0715 | 3.0110 | 0.9259 |
+| `previous_release_790ec2d` | all | 3 | 9/9 | 0.8482 | 0.2243 | 0.1294 |
+| `previous_release_790ec2d` | all | 4 | 2/2 | 0.7500 | 0.3466 | 0.2500 |
+| `previous_release_790ec2d` | never_used | 1 | 8/8 | 0.0008 | 7.1629 | 0.9992 |
+| `previous_release_790ec2d` | never_used | 2 | 8/8 | 0.0495 | 3.2128 | 0.9482 |
+| `previous_release_790ec2d` | never_used | 3 | 8/8 | 0.8392 | 0.2420 | 0.1448 |
+| `previous_release_790ec2d` | never_used | 4 | 2/2 | 0.7500 | 0.3466 | 0.2500 |
+| `previous_release_790ec2d` | reused | 1 | 1/1 | 0.0008 | 7.1630 | 0.9992 |
+| `previous_release_790ec2d` | reused | 2 | 1/1 | 0.2474 | 1.3967 | 0.7480 |
+| `previous_release_790ec2d` | reused | 3 | 1/1 | 0.9207 | 0.0827 | 0.0069 |
+| `uniform_entropy` | all | 1 | 9/9 | 0.0004 | 7.7664 | 0.9996 |
+| `uniform_entropy` | all | 2 | 9/9 | 0.0458 | 3.5389 | 0.9542 |
+| `uniform_entropy` | all | 3 | 9/9 | 0.6350 | 0.5995 | 0.3491 |
+| `uniform_entropy` | all | 4 | 4/4 | 0.9967 | 0.0033 | 0.0001 |
+| `uniform_entropy` | never_used | 1 | 8/8 | 0.0004 | 7.7664 | 0.9996 |
+| `uniform_entropy` | never_used | 2 | 8/8 | 0.0501 | 3.4216 | 0.9499 |
+| `uniform_entropy` | never_used | 3 | 8/8 | 0.6894 | 0.4732 | 0.2927 |
+| `uniform_entropy` | never_used | 4 | 3/3 | 0.9956 | 0.0045 | 0.0001 |
+| `uniform_entropy` | reused | 1 | 1/1 | 0.0004 | 7.7664 | 0.9996 |
+| `uniform_entropy` | reused | 2 | 1/1 | 0.0114 | 4.4773 | 0.9886 |
+| `uniform_entropy` | reused | 3 | 1/1 | 0.2000 | 1.6094 | 0.8000 |
+| `uniform_entropy` | reused | 4 | 1/1 | 1.0000 | -0.0000 | 0.0000 |
+| `cooldown_entropy` | all | 1 | 9/9 | 0.0005 | 7.5965 | 0.9995 |
+| `cooldown_entropy` | all | 2 | 9/9 | 0.0489 | 3.4098 | 0.9510 |
+| `cooldown_entropy` | all | 3 | 9/9 | 0.7600 | 0.3307 | 0.2230 |
+| `cooldown_entropy` | all | 4 | 2/2 | 1.0000 | -0.0000 | 0.0000 |
+| `cooldown_entropy` | never_used | 1 | 8/8 | 0.0005 | 7.5965 | 0.9995 |
+| `cooldown_entropy` | never_used | 2 | 8/8 | 0.0533 | 3.3017 | 0.9467 |
+| `cooldown_entropy` | never_used | 3 | 8/8 | 0.7934 | 0.2835 | 0.1884 |
+| `cooldown_entropy` | never_used | 4 | 2/2 | 1.0000 | -0.0000 | 0.0000 |
+| `cooldown_entropy` | reused | 1 | 1/1 | 0.0005 | 7.5965 | 0.9995 |
+| `cooldown_entropy` | reused | 2 | 1/1 | 0.0139 | 4.2743 | 0.9860 |
+| `cooldown_entropy` | reused | 3 | 1/1 | 0.4926 | 0.7080 | 0.5002 |
+| `weighted_proxy_only` | all | 1 | 9/9 | 0.0014 | 6.5562 | 0.9985 |
+| `weighted_proxy_only` | all | 2 | 9/9 | 0.1360 | 2.3725 | 0.8547 |
+| `weighted_proxy_only` | all | 3 | 9/9 | 0.8546 | 0.2155 | 0.1302 |
+| `weighted_proxy_only` | all | 4 | 1/1 | 0.5009 | 0.6913 | 0.4982 |
+| `weighted_proxy_only` | never_used | 1 | 8/8 | 0.0014 | 6.5532 | 0.9985 |
+| `weighted_proxy_only` | never_used | 2 | 8/8 | 0.1129 | 2.5270 | 0.8767 |
+| `weighted_proxy_only` | never_used | 3 | 8/8 | 0.8432 | 0.2354 | 0.1461 |
+| `weighted_proxy_only` | never_used | 4 | 1/1 | 0.5009 | 0.6913 | 0.4982 |
+| `weighted_proxy_only` | reused | 1 | 1/1 | 0.0014 | 6.5799 | 0.9986 |
+| `weighted_proxy_only` | reused | 2 | 1/1 | 0.3210 | 1.1364 | 0.6784 |
+| `weighted_proxy_only` | reused | 3 | 1/1 | 0.9456 | 0.0559 | 0.0033 |
+| `weighted_proxy_exact_endgame` | all | 1 | 9/9 | 0.0014 | 6.5562 | 0.9985 |
+| `weighted_proxy_exact_endgame` | all | 2 | 9/9 | 0.1360 | 2.3725 | 0.8547 |
+| `weighted_proxy_exact_endgame` | all | 3 | 9/9 | 0.9212 | 0.1011 | 0.0566 |
+| `weighted_proxy_exact_endgame` | never_used | 1 | 8/8 | 0.0014 | 6.5532 | 0.9985 |
+| `weighted_proxy_exact_endgame` | never_used | 2 | 8/8 | 0.1129 | 2.5270 | 0.8767 |
+| `weighted_proxy_exact_endgame` | never_used | 3 | 8/8 | 0.9182 | 0.1068 | 0.0633 |
+| `weighted_proxy_exact_endgame` | reused | 1 | 1/1 | 0.0014 | 6.5799 | 0.9986 |
+| `weighted_proxy_exact_endgame` | reused | 2 | 1/1 | 0.3210 | 1.1364 | 0.6784 |
+| `weighted_proxy_exact_endgame` | reused | 3 | 1/1 | 0.9456 | 0.0559 | 0.0033 |
+| `weighted_staged_no_artifacts` | all | 1 | 9/9 | 0.0014 | 6.5562 | 0.9985 |
+| `weighted_staged_no_artifacts` | all | 2 | 9/9 | 0.1360 | 2.3725 | 0.8547 |
+| `weighted_staged_no_artifacts` | all | 3 | 9/9 | 0.9740 | 0.0265 | 0.0012 |
+| `weighted_staged_no_artifacts` | never_used | 1 | 8/8 | 0.0014 | 6.5532 | 0.9985 |
+| `weighted_staged_no_artifacts` | never_used | 2 | 8/8 | 0.1129 | 2.5270 | 0.8767 |
+| `weighted_staged_no_artifacts` | never_used | 3 | 8/8 | 0.9775 | 0.0228 | 0.0009 |
+| `weighted_staged_no_artifacts` | reused | 1 | 1/1 | 0.0014 | 6.5799 | 0.9986 |
+| `weighted_staged_no_artifacts` | reused | 2 | 1/1 | 0.3210 | 1.1364 | 0.6784 |
+| `weighted_staged_no_artifacts` | reused | 3 | 1/1 | 0.9456 | 0.0559 | 0.0033 |
+| `selected_default_disk_artifacts` | all | 1 | 9/9 | 0.0014 | 6.5562 | 0.9985 |
+| `selected_default_disk_artifacts` | all | 2 | 9/9 | 0.1360 | 2.3725 | 0.8547 |
+| `selected_default_disk_artifacts` | all | 3 | 9/9 | 0.9740 | 0.0265 | 0.0012 |
+| `selected_default_disk_artifacts` | never_used | 1 | 8/8 | 0.0014 | 6.5532 | 0.9985 |
+| `selected_default_disk_artifacts` | never_used | 2 | 8/8 | 0.1129 | 2.5270 | 0.8767 |
+| `selected_default_disk_artifacts` | never_used | 3 | 8/8 | 0.9775 | 0.0228 | 0.0009 |
+| `selected_default_disk_artifacts` | reused | 1 | 1/1 | 0.0014 | 6.5799 | 0.9986 |
+| `selected_default_disk_artifacts` | reused | 2 | 1/1 | 0.3210 | 1.1364 | 0.6784 |
+| `selected_default_disk_artifacts` | reused | 3 | 1/1 | 0.9456 | 0.0559 | 0.0033 |
 
-Reference `selected_staged` all-game mean sensitivity: penalty 6 = 3.1944 [3.1194, 3.2722]; penalty 7 = 3.1944 [3.1194, 3.2722]; penalty 8 = 3.1944 [3.1194, 3.2722].
+Reference `selected_default_disk_artifacts` all-game mean sensitivity: penalty 6 = 3.0000 [3.0000, 3.0000]; penalty 7 = 3.0000 [3.0000, 3.0000]; penalty 8 = 3.0000 [3.0000, 3.0000].
 
 The old `3.2222` figure was conditional on 27 modeled games and omitted three coverage gaps. It is retained only as an attribution baseline, not as current performance. A flat three guesses is an aspiration; it is not supported unless the failure-penalized all-game sealed-test result reaches it after configuration freeze.
 
 The source JSON artifact records the `release_command`, full provenance, per-game paths, effective profile configs, paired comparisons, and limitations. Regenerate documentation with `benchmark-evidence-docs --evidence <source-json> --markdown-output <fragment> --readme <readme> --update`.
 <!-- END GENERATED PREDICTIVE EVIDENCE -->
 
-For clean-checkout documentation checks, the [current predictive evidence](./docs/evidence/september-post-layout-tests-rolling-public-v1.json)
+For clean-checkout documentation checks, the [audit timing-screen evidence](./docs/evidence/september-audit-timing-screen-public-v1.json),
+[audit rolling comparison](./docs/evidence/september-audit-rolling-public-v1.json),
+[previous-build seven-profile evidence](./docs/evidence/september-seven-profile-current-full-public-v1.json),
+[earlier selected-versus-v19b evidence](./docs/evidence/september-post-layout-tests-rolling-public-v1.json),
 and [earlier rolling comparison](./docs/evidence/september-finite-preordered-public-v1.json)
 retain per-date outcomes, path lengths, calibration numbers, and provenance but
 redact target and guess words. CI checks outcome-derived score and coverage
@@ -389,9 +472,10 @@ pending redistribution review. Run
 `pwsh -NoProfile -File scripts/redact_public_evidence.ps1 -Check` to validate the public copies in a
 clean checkout; regenerating them requires the private source artifacts.
 
-The generated rolling table below is an earlier-source finite-policy screen;
-the current selected-policy comparison is summarized above and in the
-[release ledger](./docs/SEPTEMBER_RELEASE.md#current-selected-policy-development-comparison).
+The generated rolling table below compares selected v20 staged with exploratory
+v19b on all 12 allowed development folds. The
+[release ledger](./docs/SEPTEMBER_RELEASE.md) records the benchmark limits,
+source identities and remaining promotion requirements.
 
 <!-- BEGIN GENERATED ROLLING EVIDENCE -->
 ### Rolling-origin promotion guard
@@ -400,17 +484,17 @@ Across 12 non-overlapping development folds (360 scheduled games), the sealed te
 
 | Configuration | Solved | All-game mean | Delta vs baseline | W/T/L | Latency p95 | Guard decision |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `finite_baseline_250ms` | 354/360 | 3.5389 [3.4472, 3.6333] | reference | -- | 29.79 ms | retained |
-| `finite_preordered_250ms` | 360/360 | 3.5833 [3.5055, 3.6694] | +0.0444 [-0.0639, +0.1556] | 95/156/109 | 263.15 ms | rejected: no solve-quality gain |
+| `audit_selected_staged` | 360/360 | 3.1944 [3.1194, 3.2722] | reference | -- | 28.29 ms | retained |
+| `audit_v19b_staged` | 360/360 | 3.1917 [3.1194, 3.2694] | -0.0028 [-0.0222, +0.0167] | 6/347/7 | 27.25 ms | not promoted: improvement uncertain |
 
-| Configuration | Prior top-1/3/5 | Confidence ECE | Search steps P/L/XE/X/F | Recovery/fallback steps |
+| Configuration | Prior top-1/3/5 | Confidence ECE | Search steps P/L/XE/X/F/T | Recovery/fallback steps |
 | --- | ---: | ---: | ---: | ---: |
-| `finite_baseline_250ms` | 0.3%/0.6%/0.6% | 0.0015 [0.0012, 0.0071] | 0/0/0/0/1268 | 0/1268 |
-| `finite_preordered_250ms` | 0.3%/0.6%/0.6% | 0.0015 [0.0012, 0.0071] | 0/0/0/0/1290 | 0/1290 |
+| `audit_selected_staged` | 0.3%/0.6%/0.6% | 0.0017 [0.0013, 0.0077] | 386/139/0/609/0/16 | 36/292 |
+| `audit_v19b_staged` | 0.3%/0.6%/0.6% | 0.0017 [0.0013, 0.0077] | 386/131/0/618/0/14 | 36/297 |
 
 Development decisions:
 
-- `finite_preordered_250ms` is rejected because it did not improve solve quality.
+- `audit_v19b_staged` is retained as a development finalist, not promoted, because the observed improvement's paired interval includes zero.
 
 This development comparison did not access the sealed window and does not establish prospective performance. Any later sealed evaluation requires separate evidence.
 <!-- END GENERATED ROLLING EVIDENCE -->
@@ -474,7 +558,7 @@ The historical archive is fetched from the NYT daily puzzle endpoint:
 
 ## Formal mode
 
-`formal-optimal` is a fixed-model analysis mode, not a prediction of NYT editorial choices. It expects generated policy artifacts in `data/formal/<model>/`, including:
+`formal-optimal` is a fixed-model analysis mode, not a prediction of NYT editorial choices. It loads `data/formal/<model>/current.json`, whose checksums select one immutable `generations/gen-.../` directory containing:
 
 - `manifest.json`
 - `state_values.bin`
@@ -492,9 +576,9 @@ cargo run --release -- build-optimal-policy --model formal-v1
 cargo run --release -- verify-optimal-policy --model formal-v1
 ```
 
-The formal build is intentionally offline-heavy. Refinement pruning is disabled because its former dominance direction was not valid for the lexicographic objective. Certificate v7 records exact, non-progress, equivalent-partition, or admissible bound witnesses for every candidate and the states required to verify them. The independent verifier reconstructs feedback partitions, child states, probability masses, objective comparisons, and proof closure without calling the exhaustive optimizer or sharing the builder's partition implementation. A third slow reference and mutation tests cross-check tractable randomized universes.
+The formal build is intentionally offline-heavy. The explicit lexicographic objective first finds the minimum feasible worst-case depth, then minimizes expected cost conditional on that remaining depth: `E(S,d)`. A child may use spare depth to reduce expected cost; choosing only its own minimum-depth policy is incorrect. The audit's nine-answer weighted fixture has depth 4 and expected cost `235/132`. `ExpectedOnly` is a separate objective without that minimum-depth constraint. Refinement pruning remains disabled. Certificate v8 records exact, non-progress, equivalent-partition, or admissible bound witnesses for every candidate and the states required to verify them. The independent verifier reconstructs feedback partitions, child states, probability masses, objective comparisons, and proof closure without calling the exhaustive optimizer or sharing the builder's partition implementation. A third slow reference and mutation tests cross-check tractable randomized universes.
 
-Only pinned seed inputs such as `prior.toml` belong in `data/formal/formal-v1/`. The former 34.4 MB `pattern_table.bin` is now an ignored cache: `build-optimal-policy` deterministically regenerates it from the pinned guess/answer lists, and loading validates its magic, dimensions, SHA-256 word-list identities, exact payload length, and pattern range. The directory is not a usable formal policy until the complete matching artifact set is generated. Certificate format version 7 invalidates older formal outputs.
+Only pinned seed inputs such as the root `prior.toml` are tracked in `data/formal/formal-v1/`. The former 34.4 MB root `pattern_table.bin` is an ignored input cache: `build-optimal-policy` regenerates it from the pinned lists. Each published generation includes its own table and prior snapshot. Loading checks declared lengths, SHA-256 identities, dimensions and pattern range without repairing files. Certificate v8 and objective/state v3 invalidate older flat proof sets; rebuild them. Runtime explanation uses the stored primary action and bounded, cancellable alternatives. Hitting the alternative-work cap retains the exact primary; CLI/GUI report incomplete alternatives rather than failing the valid primary or claiming a complete ranking. See [persistence guarantees](docs/PERSISTENCE.md).
 
 The machine-readable [`scale-v2.json`](./benchmarks/formal/scale-v2.json) benchmark used the full 14,855-word guess list with pinned answer prefixes through eight answers. The eight-answer certificate was about 1.05 GiB and process peak working set about 2.48 GiB; the next run was stopped because its projected peak exceeded the declared 4 GiB budget. Extrapolation to the complete 2,358-answer model is computationally infeasible, so formal claims are deliberately limited to independently verified tractable universes.
 
@@ -544,11 +628,17 @@ Recovery behavior is also explicit. Every date-supported candidate remains in fe
 
 `evaluation-plan` emits the canonical expanding-window rolling-origin folds and sealed final-test window as JSON. `study-run` runs deterministic domain studies over development folds with typed parameters, grid/low-discrepancy/random/local-refinement/model-based sampling, atomic per-fold and per-suggestion checkpoints, cooperative cancellation, safe resume, hard-constraint violations, and Pareto ranks. `--base-config <TOML>` lets each stage start from a frozen finalist instead of the mutable default. Static strategies parallelize independent candidates and use serialized, nested time-spread successive-halving rungs so early pruning sees early, middle, and late development periods; finalists still evaluate all 12 folds. Fold scoring runs without latency measurement, then complete finalists receive serialized latency measurements after the parallel pool joins, preventing CPU contention from corrupting the promotion metric. Observation-driven TPE-style search is sequential so every suggestion consumes the preceding completed trial. Trial identity binds strategy, parallelism, fold selection, fold/time/peak-working-set budgets, canonical base config, registry, evaluation plan, data cutoff, launch-time source/data content, and the exact running executable. Long evidence and study commands recheck that identity at phase boundaries and fail instead of publishing a mixed-input run. Windows, Linux, and macOS studies sample the process working set at checkpoints, store the peak in trial measurements, fail a trial that crosses `--maximum-memory-mb`, but exclude the shared-process peak from candidate ordering; isolated runs are needed for candidate-specific memory comparisons. `tune-prior` uses the common prior-only calibration runner and applies an additional solve-quality guard before returning a complete TOML config. `fit-proxy-weights` is a compatibility shortcut for the common `proxy-ranker` stage; it changes only registered proxy-domain knobs and scores them on rolling all-game solve quality instead of the removed greedy 80/20 coordinate search. Evidence, rolling comparison, studies, tuning, and `evaluate-live-config` share the same canonical development/sealed boundary; ordinary development commands cannot evaluate the sealed window. `parameter-registry` emits all current predictive, book, recovery, operational, safety, and manual settings; only declared hyperparameters are optimizer-controlled.
 
-Study format v18 and registry format v7 bind typed cohorts and canonical SHA-256 config/registry/data/code identities into provenance. Prefer the coherent stages `proxy-core`, `proxy-risk`, `proxy-small-state`, `search-routing`, `search-exact`, `search-coverage`, `search-lookahead`, `search-pool`, `search-danger`, and `search-penalty`; `proxy-ranker` and `solve-policy` remain aggregate compatibility stages. Registry tests compare all 84 entries against every serialized `PriorConfig` leaf, prove that every entry changes cryptographic config identity, and prove that all 78 optimizer-controlled knobs occur in exactly one granular stage. This includes formerly hidden opener-holdout, artifact-freshness and danger posterior/candidate windows, mass/size disagreement cutoffs, and ambiguity saturation; `session_reply_pool` controls reply-book construction, and `second_guess_coverage_pool` is no longer clamped to 24. The ambiguity cutoff, normalized danger features, two candidate-pool expansion multipliers, six exact-pool source fractions, and separate reply bucket-ratio penalty are explicit study parameters. Static and model-based granular studies first generate one deterministic, config-valid perturbation for every eligible knob and reject a trial count too small to include that sweep plus the baseline; wider proposals begin only after this coverage prelude. Solver work runs on explicitly sized 8 MiB-stack threads, including the custom Rayon study pool, so deep exact branches do not inherit platform-default worker stacks. The default cumulative per-candidate wall-clock cap is two hours; pre-v18 study checkpoints are historical because measurement semantics or earlier search/latency protocols changed.
+Study format v19 and registry format v7 bind typed cohorts and canonical SHA-256 config/registry/data/code identities into provenance. Prefer the coherent stages `proxy-core`, `proxy-risk`, `proxy-small-state`, `search-routing`, `search-exact`, `search-coverage`, `search-lookahead`, `search-pool`, `search-danger`, and `search-penalty`; `proxy-ranker` and `solve-policy` remain aggregate compatibility stages. Registry tests compare all 84 entries against every serialized `PriorConfig` leaf, prove that every entry changes cryptographic config identity, and prove that all 78 optimizer-controlled knobs occur in exactly one granular stage. This includes formerly hidden opener-holdout, artifact-freshness and danger posterior/candidate windows, mass/size disagreement cutoffs, and ambiguity saturation; `session_reply_pool` controls reply-book construction, and `second_guess_coverage_pool` is no longer clamped to 24. The ambiguity cutoff, normalized danger features, two candidate-pool expansion multipliers, six exact-pool source fractions, and separate reply bucket-ratio penalty are explicit study parameters. Static and model-based granular studies first generate one deterministic, config-valid perturbation for every eligible knob and reject a trial count too small to include that sweep plus the baseline; wider proposals begin only after this coverage prelude. Solver work runs on explicitly sized 8 MiB-stack threads, including the custom Rayon study pool, so deep exact branches do not inherit platform-default worker stacks. The default cumulative per-candidate wall-clock cap is two hours; pre-v19 study checkpoints are historical because measurement semantics or earlier search/latency protocols changed.
 
 The exact predictive recurrence prunes with a weight-aware admissible lower bound rather than the former uniform-count bound. Skewed-prior and zero-mass-branch fixtures protect the correction, and probability concentration ignores zero-mass-only buckets while structural coverage diagnostics retain them. The 2026-07-19 audit also removed an extra unit that double-counted heuristic lookahead replies above the exact threshold and replaced the small-state proxy's uniform-count table with a weighted one-step cost. Those ranking changes require fresh rolling evidence; older generated scores remain audit history until regeneration completes. See [`docs/PREDICTIVE_MATH.md`](./docs/PREDICTIVE_MATH.md) for the formulas and scope.
 
-`search-regret` provides a separate tractable-state check against exhaustive Bellman search. Its versioned reports follow deterministic artifact-free proxy paths, bind source/executable/data/config identity, and retain the exact observations for replay. The first audit exposed a proxy choice that could leave the entire state unchanged; all predictive regimes now exclude non-progressing guesses. After that fix, bounded lookahead matched exhaustive cost on 27/30 sampled states across the 3–16 survivor bands, with combined mean regret about `0.000072`; proxy-only ranking had combined mean regret about `0.159111` and reached `0.899180` on one state. This supports keeping bounded lookahead, but it is a math diagnostic—not a sealed-test or mean-guesses claim. See [`search-regret-v1.json`](./benchmarks/predictive/search-regret-v1.json) and [`search-regret-9-16-v1.json`](./benchmarks/predictive/search-regret-9-16-v1.json).
+`search-regret` provides a separate tractable-state check against exhaustive Bellman search. Its versioned reports follow deterministic artifact-free proxy paths, bind source/executable/data/config identity, and retain the exact observations for replay. The first audit exposed a proxy choice that could leave the entire state unchanged; unlimited-horizon fixed-weight ranking excludes non-progressing guesses. Dynamic finite search must retain probes that can change dormant support even without shrinking the active set. After that fix, bounded lookahead matched exhaustive cost on 27/30 sampled states across the 3–16 survivor bands, with combined mean regret about `0.000072`; proxy-only ranking had combined mean regret about `0.159111` and reached `0.899180` on one state. This supports keeping bounded lookahead, but it is a math diagnostic—not a sealed-test or mean-guesses claim. See [`search-regret-v1.json`](./benchmarks/predictive/search-regret-v1.json) and [`search-regret-9-16-v1.json`](./benchmarks/predictive/search-regret-9-16-v1.json).
+
+Current regret schema 2 checks its cumulative deadline inside path collection and
+exhaustive search. `complete` and `stop_reason` distinguish a finished diagnostic
+from interruption; `planned_states` counts selected states and `sampled_states`
+counts fully evaluated rows. Interrupted reports retain those complete rows only,
+and their summaries do not stand in for the unfinished population.
 
 For the experimental six-turn policy, use `search-regret --finite --config
 config/candidates/september-finite-fast.toml --from 2026-07-28 --to 2026-08-26
@@ -569,13 +659,13 @@ Both commands explicitly exclude the sealed `2026-06-18` through `2026-07-17` wi
 
 The release performance profile covers the full 2,358-answer proxy root plus replayable 15-answer lookahead and pooled-exact states. Warm suggestion latency was `36.724 ms`, `94.153 ms`, and `189.173 ms` respectively on the recorded Windows/AMD system; process peak working set reached `83.0 MiB`. The dedicated allocator benchmark also records CPU time, process cycles, allocation calls/bytes, page faults, cold/warm ratios, executable/config/input identity, and explicit measurement limitations. See [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) and [`release-performance-v1.json`](./benchmarks/predictive/release-performance-v1.json).
 
-`book-policy` performs cutoff-safe optimization: each candidate/fold gets an isolated artifact namespace, opener/reply artifacts are rebuilt from history available at the training cutoff and each 14-day freshness boundary, and validation runs in disk-only mode. Cancellation, time, and memory budgets are checked between snapshots. `joint` remains artifact-free because its registered space excludes book parameters; book finalists enter only an explicit final refinement cohort.
+`book-policy` performs cutoff-safe optimization: each candidate/fold gets an isolated artifact namespace, opener/reply artifacts are rebuilt from history available at the training cutoff and each 14-day freshness boundary, and validation runs in disk-only mode. Cancellation and cumulative time/process-memory guards reach the inner book and simulated-game searches; completed work is retained on interruption. These are cooperative stops, not OS-enforced hard caps. `joint` remains artifact-free because its registered space excludes book parameters; book finalists enter only an explicit final refinement cohort.
 
 Special diagnostic configurations are data, not hidden code branches. [`config/profiles/aggressive-three-guess.json`](./config/profiles/aggressive-three-guess.json), [`config/profiles/offline-book.json`](./config/profiles/offline-book.json), and [`config/profiles/wide-pools.json`](./config/profiles/wide-pools.json) are versioned parameter overlays parsed and validated by the same registry used for studies. The migration exposed invalid legacy pool ordering; serialized profiles now keep root candidate/reply pools within declared bounds and no larger than their medium-state counterparts. The old flattened ablations were removed because they silently rewrote `manual_weights`; manual word overrides remain a separate auditable layer.
 
 Fixed benchmark and ablation cohorts are also declarative. [`config/experiments/development-evidence.json`](./config/experiments/development-evidence.json) defines seven generated-README baselines, including an immutable previous-release config, and can bind a safe repository-relative base config before typed overlays. [`config/experiments/predictive-ablations.json`](./config/experiments/predictive-ablations.json) defines the baseline/wide-pool combinations, including weight mode, model variant, artifact policy, and typed parameter overlays. Exact-zero float values are accepted only through the diagnostic-profile path so entropy ablations can disable terms without changing the strictly positive log-search domains.
 
-Non-optimizer search diagnostics are declarative too. [`config/experiments/diagnostic-suite.json`](./config/experiments/diagnostic-suite.json) owns the three-guess rescue profile and root/reply limits, default four-guess opener tournament, hard-case category count and scan/cutoff values, book forced-search depth, and evidence/evaluation/study latency sample budgets. The shipped suite is schema-validated and tested. These settings no longer survive as disconnected constants in solver code; all promotable parameter search remains in the typed Rust study runner.
+Non-optimizer search diagnostics are declarative too. [`config/experiments/diagnostic-suite.json`](./config/experiments/diagnostic-suite.json) owns the three-guess rescue profile and root/reply limits, default four-guess opener tournament, hard-case category count and scan/cutoff values, and evidence/evaluation/study latency sample budgets. Suite v2 removes the inert book `forced_suggestion_top` setting; forced simulations always execute the selected policy's next action. The shipped suite is schema-validated and tested. These settings no longer survive as disconnected constants in solver code; all promotable parameter search remains in the typed Rust study runner.
 
 The current equal-compute prior-calibration diagnostic gives every strategy eight candidates × twelve folds (96 candidate-fold evaluations). Lower is better:
 
@@ -595,19 +685,41 @@ The previous Python/Optuna path is not an evidence source for promotion. [`bench
 
 `rolling-compare` evaluates a named candidate over every development fold and can safely reuse a prior default baseline only when the complete plan and canonical default TOML match. `benchmark-evidence-docs` and `rolling-evidence-docs` update or verify the generated README sections from their JSON artifacts.
 
-`benchmark-evidence` writes versioned JSON plus a generated Markdown fragment and rejects excluded evaluation dates. Use `--rolling-folds` instead of `--from/--to` for the exact noncontiguous development folds, and `--matrix` to select a separate experiment matrix. Checkpoints bind the selected dates, matrix contents and resolved profile configurations. Long runs emit flushed `profile-start`, per-game, and `profile-complete` records with completed/total work, elapsed time, and an evolving ETA. Profiles run sequentially; finite-policy games also run sequentially so their wall-clock search budgets do not compete. Legacy games may use Rayon. Outer resource limits are checked between profiles, not inside an unbounded legacy search. The selected v20 configuration remains the production default; its historical sealed score is `3.3000`, not a three-guess claim or validation of the experimental finite policy.
+`freeze-prospective --config <candidate.toml> --comparison <rolling.json>`
+creates an immutable freeze only for a full-coverage, zero-failure development
+winner whose paired 95% interval is entirely below zero. It records the next
+30-day UTC window beginning after the freeze date, separately from the
+reserved, untouched August 28-September 26 seal. Freezing requires complete
+daily history from the development cutoff through the UTC freeze date and
+binds a digest of the later training rows.
+`evaluate-prospective --frozen <freeze.json>`
+can run only after that window's final UTC day has elapsed and exact history
+coverage, source/config and pre-window-history identity, and once-only marker
+preflight pass. The first evaluation attempt acquires the one-window
+reservation for this release;
+interrupted attempts cannot be rerun as fresh tests. The raw report defaults
+to ignored `target/diagnostics/`; keep it and the markers local. No current
+candidate is eligible, and no prospective freeze or evaluation has been performed.
+
+`benchmark-evidence` writes versioned JSON plus a generated Markdown fragment and rejects excluded evaluation dates. Use `--rolling-folds` instead of `--from/--to` for the exact noncontiguous development folds, and `--matrix` to select a separate experiment matrix. Checkpoint v5 binds the selected dates, matrix contents, resolved profile configurations, time/memory ceilings, and effective Rayon worker count; older checkpoints cannot resume. Long runs emit flushed `profile-start`, per-game, and `profile-complete` records with completed/total work, elapsed time, and an evolving ETA. Profiles run sequentially; finite-policy games also run sequentially so their wall-clock search budgets do not compete. Legacy games may use Rayon. Cumulative resource limits are polled within games, search, books and latency probes as well as at profile boundaries; partial profiles are not published as completed evidence. The selected v20 configuration remains the production default; its historical sealed score is `3.3000`, not a three-guess claim or validation of the experimental finite policy.
 
 Backtests keep coverage gaps in all-game denominators and report both an explicitly conditional mean over modeled games and a failure-penalized all-game mean. Mean intervals and paired comparisons use deterministic chronological block bootstrap samples; coverage and solve rates use Wilson intervals. Experiment output also includes log loss and multiclass Brier score. These are diagnostics for a heuristic prior, not evidence that its probabilities are calibrated.
 
+Set `MAYBE_WORDLE_EVIDENCE_TIMING=1` for stderr-only per-profile phase
+timings during `benchmark-evidence`; these do not alter saved evidence or
+checkpoints. The September 29 full seven-profile matrix reached its 20-minute
+ceiling and retained only complete profiles; the separate two-policy rolling
+comparison completed. Earlier successful full-matrix timings belong to their
+recorded builds, not the audit build (see the [release ledger](./docs/SEPTEMBER_RELEASE.md)).
+
 The equations, domains, exact-versus-heuristic boundaries, coupling audit, and verification map are documented in [`docs/PREDICTIVE_MATH.md`](./docs/PREDICTIVE_MATH.md).
 
-The Rust GUI is a predictive-first workspace with Play, Policy, Diagnostics, and secondary Formal panels. One worker shares a replaceable pending slot: obsolete queued work is discarded and predictive searches cooperate with cancellation when a newer request arrives. Stale responses cannot replace the current state. After feedback, a provisional preview is followed by the selected configured, Fast, or Strong search; finite results distinguish heuristic actions, completed policy bounds, exact values, and budget exhaustion. Play includes keyboard feedback codes (`0/1/2` or `b/y/g`), Enter-to-apply, an accessible six-row board, compact history, a suggestion inspector, and a filterable/exportable candidate list. Board tiles use font-safe `A`, `P`, and `C` markers for absent, present, and correct feedback; the earlier Unicode marks rendered as empty squares with some Windows fonts. Text scaling and a stacked layout support narrow windows. The displayed puzzle date and history cutoff make the information boundary explicit.
+The Rust GUI is a predictive-first workspace with Play, Policy, Diagnostics, and secondary Formal panels. One worker shares a replaceable pending slot: obsolete queued work is discarded and predictive searches cooperate with cancellation when a newer request arrives. Pending requests clear old recommendations; stale responses cannot replace the current state. Each request uses the explicitly selected configured, Fast, or Strong policy, without an automatic alternate-policy preview. Results report the actual route, value quality, action scope, and stop reason. Play includes keyboard feedback codes (`0/1/2` or `b/y/g`), Enter-to-apply, a six-row board, compact history, a suggestion inspector, and a filterable/exportable full candidate list. Board tiles use contrast-safe, font-safe `A`, `P`, and `C` markers for absent, present, and correct feedback; the earlier Unicode marks rendered as empty squares with some Windows fonts. Text scaling and a stacked layout support narrow windows. The puzzle date, history cutoff, and persistent incomplete-history notice make the information boundary explicit. Native keyboard and assistive-technology acceptance remains open.
 
 The guess/feedback controls now wrap at the minimum window width; a regression
-checks that all five feedback buttons stay visible. The rebuilt app launches,
-but the Windows UI helper could not activate its returned window, so native
-visual and keyboard verification of the reported wide-window appearance is
-still open.
+checks that all five feedback buttons stay visible. Earlier builds received
+limited native checks, but the audit build has deliberately remained closed.
+Its fresh native visual, keyboard and accessibility acceptance remains open.
 
 Missing derived data no longer prevents the window from opening. The setup surface offers explicit public-history sync, local build, retry, progress/error reporting, and cooperative cancellation at phase/request boundaries. Formal artifacts remain optional; their absence does not block predictive play.
 
@@ -693,9 +805,14 @@ PLAN.md
 
 ```bash
 cargo test
-cargo run -- backtest
-cargo run -- experiments
+cargo run -- backtest --from 2026-07-18 --to 2026-08-26
+cargo run -- experiments --from 2026-07-18 --to 2026-08-26
 cargo run -- gui
 ```
+
+`backtest` and `experiments` require an explicit range inside declared
+development. They reject the consumed June 18–July 17 validation window and
+the declared August 28–September 26 sealed test; those dates must not be used
+as new tuning or validation targets.
 
 If you want the longer design rationale, the planning notes are in [`PLAN.md`](./PLAN.md).

@@ -1,3 +1,14 @@
+mod diagnostics;
+mod formal;
+mod play;
+mod policy;
+#[cfg(test)]
+use play::{candidate_csv, matching_candidates, show_candidate_browser, show_game_board};
+
+mod runtime;
+use crate::predictive::types::{SearchActionScope, SearchExecution, SuggestionValueKind};
+use runtime::*;
+
 use std::{
     path::PathBuf,
     sync::{
@@ -16,18 +27,19 @@ use eframe::egui::{self, Color32, RichText};
 use crate::{
     SOLVER_THREAD_STACK_BYTES,
     config::PriorConfig,
-    data::{ProjectPaths, sync_nyt_history},
+    data::{ProjectPaths, sync_nyt_history_cancellable},
     experiments::predictive_parameter_registry,
     formal::{
-        DEFAULT_FORMAL_MODEL_ID, FormalPolicyRuntime, FormalStateExplanation, FormalSuggestion,
-        artifacts_exist,
+        DEFAULT_FORMAL_ALTERNATIVE_PARTITIONS, DEFAULT_FORMAL_MODEL_ID, FormalAlternativesStatus,
+        FormalPolicyRuntime, FormalStateExplanation, FormalSuggestion, artifacts_exist,
     },
+    game::{self, GameRules, GameStatus},
     model::build_model_artifacts,
     predictive::{
         PredictiveArtifactState, PredictiveCandidateSummary, PredictiveStateSummary,
         PredictiveSuggestRequest, PredictiveSuggestionMode, RecoveryMode,
     },
-    scoring::parse_feedback,
+    scoring::{decode_feedback, parse_feedback},
     solver::{
         AbsurdleSuggestion, FiniteSearchCandidate, FiniteSearchOptions, FiniteSearchQuality,
         FiniteSearchReason, FiniteSearchResult, SolveState, Solver, Suggestion,
@@ -52,259 +64,43 @@ pub fn run_gui(root: PathBuf) -> Result<()> {
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-struct LoadedWorkspace {
-    config: PriorConfig,
-    predictive_solver: Solver,
-    formal_solver: Option<FormalPolicyRuntime>,
-}
-
-fn load_workspace(paths: &ProjectPaths) -> Result<LoadedWorkspace> {
-    paths.ensure_layout()?;
-    let config = PriorConfig::load_or_create(&paths.config_prior)?;
-    let predictive_solver = Solver::from_paths(paths, &config)?;
-    let formal_solver = if artifacts_exist(paths, DEFAULT_FORMAL_MODEL_ID) {
-        Some(FormalPolicyRuntime::load(paths, DEFAULT_FORMAL_MODEL_ID)?)
-    } else {
-        None
-    };
-    Ok(LoadedWorkspace {
-        config,
-        predictive_solver,
-        formal_solver,
-    })
-}
-
-enum MaybeWordleApp {
-    Ready(Box<WordleGuiApp>),
-    Setup(Box<SetupApp>),
-}
-
-impl MaybeWordleApp {
-    fn load_or_setup(paths: ProjectPaths) -> Self {
-        match load_workspace(&paths) {
-            Ok(workspace) => Self::Ready(Box::new(WordleGuiApp::new(workspace))),
-            Err(error) => Self::Setup(Box::new(SetupApp::new(paths, error.to_string()))),
-        }
-    }
-}
-
-impl eframe::App for MaybeWordleApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        match self {
-            Self::Ready(app) => app.update(ctx, frame),
-            Self::Setup(app) => {
-                if let Some(workspace) = app.update(ctx) {
-                    *self = Self::Ready(Box::new(WordleGuiApp::new(workspace)));
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SetupAction {
-    SyncAndBuild,
-    BuildLocal,
-    RetryLoad,
-}
-
-impl SetupAction {
-    fn label(self) -> &'static str {
-        match self {
-            Self::SyncAndBuild => "Sync history & build",
-            Self::BuildLocal => "Build from local data",
-            Self::RetryLoad => "Retry existing model",
-        }
-    }
-}
-
-enum SetupEvent {
-    Progress(String),
-    Complete(Box<std::result::Result<LoadedWorkspace, String>>),
-}
-
-struct SetupApp {
-    paths: ProjectPaths,
-    error: String,
-    progress: String,
-    running: bool,
-    cancel_requested: Arc<AtomicBool>,
-    receiver: Option<Receiver<SetupEvent>>,
-}
-
-impl SetupApp {
-    fn new(paths: ProjectPaths, error: String) -> Self {
-        Self {
-            paths,
-            error,
-            progress: "Model data is not ready yet.".to_string(),
-            running: false,
-            cancel_requested: Arc::new(AtomicBool::new(false)),
-            receiver: None,
-        }
-    }
-
-    fn start(&mut self, action: SetupAction) {
-        if self.running {
-            return;
-        }
-        self.cancel_requested = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::clone(&self.cancel_requested);
-        let paths = self.paths.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.receiver = Some(receiver);
-        self.running = true;
-        self.error.clear();
-        self.progress = format!("{}…", action.label());
-        let spawn_result = thread::Builder::new()
-            .name("maybe-wordle-setup".to_string())
-            .stack_size(SOLVER_THREAD_STACK_BYTES)
-            .spawn(move || {
-                let result = (|| -> Result<LoadedWorkspace> {
-                    paths.ensure_layout()?;
-                    let config = PriorConfig::load_or_create(&paths.config_prior)?;
-                    match action {
-                        SetupAction::SyncAndBuild => {
-                            let _ = sender.send(SetupEvent::Progress(
-                                "Syncing NYT history. You can keep using other apps.".to_string(),
-                            ));
-                            let summary = sync_nyt_history(&paths, &config, Solver::today())?;
-                            if cancelled.load(Ordering::Acquire) {
-                                anyhow::bail!("setup cancelled after history sync");
-                            }
-                            let _ = sender.send(SetupEvent::Progress(format!(
-                                "Synced {} of {} dates; building local model…",
-                                summary.fetched, summary.total
-                            )));
-                            build_model_artifacts(&paths, &config, Solver::today())?;
-                        }
-                        SetupAction::BuildLocal => {
-                            let _ = sender.send(SetupEvent::Progress(
-                                "Building model from the local seed and history files…".to_string(),
-                            ));
-                            build_model_artifacts(&paths, &config, Solver::today())?;
-                        }
-                        SetupAction::RetryLoad => {}
-                    }
-                    if cancelled.load(Ordering::Acquire) {
-                        anyhow::bail!("setup cancelled");
-                    }
-                    load_workspace(&paths)
-                })()
-                .map_err(|error| format!("{error:#}"));
-                let _ = sender.send(SetupEvent::Complete(Box::new(result)));
-            });
-        if let Err(error) = spawn_result {
-            self.receiver = None;
-            self.running = false;
-            self.progress = "Setup worker could not start.".to_string();
-            self.error = format!("failed to start setup worker: {error}");
-        }
-    }
-
-    fn update(&mut self, ctx: &egui::Context) -> Option<LoadedWorkspace> {
-        ctx.set_visuals(workspace_visuals());
-        let mut completed = None;
-        if let Some(receiver) = &self.receiver {
-            while let Ok(event) = receiver.try_recv() {
-                match event {
-                    SetupEvent::Progress(progress) => self.progress = progress,
-                    SetupEvent::Complete(result) => {
-                        self.running = false;
-                        match *result {
-                            Ok(workspace) => {
-                                self.progress =
-                                    "Model ready; opening the predictive desk…".to_string();
-                                completed = Some(workspace);
-                            }
-                            Err(error) => {
-                                self.progress =
-                                    "Setup did not complete. Correct the issue or choose an action to retry."
-                                        .to_string();
-                                self.error = error;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if self.running {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
-
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::default()
-                    .fill(Color32::from_rgb(246, 240, 232))
-                    .inner_margin(32.0),
-            )
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(28.0);
-                    ui.label(
-                        RichText::new("MAYBE / WORDLE")
-                            .monospace()
-                            .size(13.0)
-                            .color(Color32::from_rgb(171, 73, 43)),
-                    );
-                    ui.heading(
-                        RichText::new("Prepare the predictive desk")
-                            .size(34.0)
-                            .color(Color32::from_rgb(42, 49, 43)),
-                    );
-                    ui.label(
-                        RichText::new(
-                            "The app opens even when derived data is missing. Sync public history or rebuild from files already on this machine.",
-                        )
-                        .color(Color32::from_rgb(92, 72, 54)),
-                    );
-                    ui.add_space(24.0);
-                });
-                egui::Frame::group(ui.style())
-                    .fill(Color32::from_rgb(255, 252, 247))
-                    .inner_margin(24.0)
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("SETUP STATUS").monospace().strong());
-                        ui.label(&self.progress);
-                        if !self.error.is_empty() {
-                            ui.add_space(8.0);
-                            ui.colored_label(Color32::from_rgb(150, 45, 45), &self.error);
-                        }
-                        ui.add_space(16.0);
-                        ui.horizontal_wrapped(|ui| {
-                            for action in [
-                                SetupAction::SyncAndBuild,
-                                SetupAction::BuildLocal,
-                                SetupAction::RetryLoad,
-                            ] {
-                                if ui
-                                    .add_enabled(!self.running, egui::Button::new(action.label()))
-                                    .clicked()
-                                {
-                                    self.start(action);
-                                }
-                            }
-                            if ui
-                                .add_enabled(self.running, egui::Button::new("Cancel"))
-                                .clicked()
-                            {
-                                self.cancel_requested.store(true, Ordering::Release);
-                                self.progress =
-                                    "Cancellation requested; finishing the current file or request…"
-                                        .to_string();
-                            }
-                        });
-                    });
-            });
-        completed
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GuiSolverMode {
     FormalOptimal,
     Predictive,
     Absurdle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GuiStatus {
+    Loading(String),
+    Ready,
+    Notice(String),
+    InputError(String),
+    WorkerError(String),
+}
+
+impl GuiStatus {
+    fn color(&self) -> Color32 {
+        if self.is_error() {
+            Color32::from_rgb(150, 45, 45)
+        } else {
+            Color32::from_rgb(92, 72, 54)
+        }
+    }
+    fn message(&self) -> &str {
+        match self {
+            Self::Ready => "",
+            Self::Loading(message)
+            | Self::Notice(message)
+            | Self::InputError(message)
+            | Self::WorkerError(message) => message,
+        }
+    }
+
+    fn is_error(&self) -> bool {
+        matches!(self, Self::InputError(_) | Self::WorkerError(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -373,7 +169,6 @@ struct BoardDraft {
 
 enum BoardAction {
     ReplaceGuess(String),
-    ReplaceFeedbackCode(String),
     CycleTile(usize),
     Reset,
 }
@@ -389,16 +184,6 @@ fn reduce_board_draft(current: &BoardDraft, action: BoardAction) -> BoardDraft {
                 .collect::<String>()
                 .to_ascii_lowercase();
         }
-        BoardAction::ReplaceFeedbackCode(code) => {
-            for (index, value) in code
-                .chars()
-                .filter_map(feedback_shortcut_value)
-                .take(5)
-                .enumerate()
-            {
-                next.feedback[index] = value;
-            }
-        }
         BoardAction::CycleTile(index) if index < next.feedback.len() => {
             next.feedback[index] = (next.feedback[index] + 1) % 3;
         }
@@ -409,15 +194,6 @@ fn reduce_board_draft(current: &BoardDraft, action: BoardAction) -> BoardDraft {
         }
     }
     next
-}
-
-fn feedback_shortcut_value(character: char) -> Option<u8> {
-    match character.to_ascii_lowercase() {
-        '0' | 'b' | 'x' => Some(0),
-        '1' | 'y' => Some(1),
-        '2' | 'g' => Some(2),
-        _ => None,
-    }
 }
 
 fn feedback_code(feedback: [u8; 5]) -> String {
@@ -442,6 +218,9 @@ struct WordleGuiApp {
     config: PriorConfig,
     predictive_solver: Solver,
     formal_solver: Option<FormalPolicyRuntime>,
+    formal_availability: FormalAvailability,
+    formal_receiver: Option<Receiver<std::result::Result<Option<FormalPolicyRuntime>, String>>>,
+    formal_cancel: Arc<AtomicBool>,
     workspace_view: WorkspaceView,
     mode: GuiSolverMode,
     search_profile: GuiSearchProfile,
@@ -462,96 +241,21 @@ struct WordleGuiApp {
     predictive_artifact_state: PredictiveArtifactState,
     predictive_model_metadata: String,
     predictive_finite_search: Option<FiniteSearchResult>,
+    predictive_execution: Option<SearchExecution>,
+    history_coverage: HistoryCoverage,
     top: usize,
     force_in_two_only: bool,
     hard_mode: bool,
-    status: String,
+    status: GuiStatus,
     formal_explanation: Option<FormalStateExplanation>,
     suggestion_sort: SuggestionSort,
     suggestion_sort_descending: bool,
-    selected_suggestion: Option<usize>,
-    request_sender: LatestWorkerDispatcher,
+    selected_suggestion: Option<String>,
+    request_sender: Option<LatestWorkerDispatcher>,
     response_receiver: Receiver<WorkerResponse>,
     latest_generation: u64,
+    current_request: Option<WorkerRequest>,
     computing: bool,
-}
-
-#[derive(Default)]
-struct LatestWorkerQueue {
-    pending: Option<WorkerRequest>,
-    latest_generation: u64,
-    shutdown: bool,
-    #[cfg(test)]
-    test_cancel_hook: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-}
-
-struct LatestWorkerDispatcher {
-    shared: Arc<(Mutex<LatestWorkerQueue>, Condvar)>,
-}
-
-impl LatestWorkerDispatcher {
-    fn send(&self, request: WorkerRequest) -> Result<()> {
-        let (lock, ready) = &*self.shared;
-        let mut queue = lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("suggestion worker queue is poisoned"))?;
-        if queue.shutdown {
-            anyhow::bail!("suggestion workers have stopped");
-        }
-        queue.latest_generation = request.generation;
-        queue.pending = Some(request);
-        ready.notify_one();
-        Ok(())
-    }
-}
-
-impl Drop for LatestWorkerDispatcher {
-    fn drop(&mut self) {
-        let (lock, ready) = &*self.shared;
-        if let Ok(mut queue) = lock.lock() {
-            queue.shutdown = true;
-            ready.notify_all();
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct WorkerRequest {
-    generation: u64,
-    mode: GuiSolverMode,
-    date_text: String,
-    observations: Vec<(String, u8)>,
-    top: usize,
-    force_in_two_only: bool,
-    hard_mode: bool,
-    search_profile: GuiSearchProfile,
-}
-
-#[derive(Clone, Debug)]
-enum WorkerPayload {
-    Predictive {
-        state: PredictiveStateSummary,
-        suggestions: Vec<Suggestion>,
-        candidates: Vec<PredictiveCandidateSummary>,
-        artifact_state: PredictiveArtifactState,
-        model_metadata: String,
-        finite_search: Option<FiniteSearchResult>,
-    },
-    Absurdle {
-        state: SolveState,
-        suggestions: Vec<AbsurdleSuggestion>,
-    },
-    Formal {
-        explanation: FormalStateExplanation,
-        suggestions: Vec<FormalSuggestion>,
-    },
-}
-
-#[derive(Clone, Debug)]
-struct WorkerResponse {
-    generation: u64,
-    complete: bool,
-    payload: std::result::Result<WorkerPayload, String>,
 }
 
 impl WordleGuiApp {
@@ -563,26 +267,19 @@ impl WordleGuiApp {
     }
 
     fn apply_board_action(&mut self, action: BoardAction) {
+        let changes_feedback = !matches!(action, BoardAction::ReplaceGuess(_));
         let next = reduce_board_draft(&self.board_draft(), action);
         self.current_guess = next.guess;
         self.current_feedback = next.feedback;
-        self.feedback_code = feedback_code(self.current_feedback);
+        if changes_feedback {
+            self.feedback_code = feedback_code(self.current_feedback);
+        }
     }
 
     fn update_feedback_code(&mut self, code: String) {
-        let sanitized = code
-            .chars()
-            .filter(|character| feedback_shortcut_value(*character).is_some())
-            .take(5)
-            .collect::<String>();
-        self.feedback_code = sanitized.clone();
-        if sanitized.chars().count() == 5 {
-            let next = reduce_board_draft(
-                &self.board_draft(),
-                BoardAction::ReplaceFeedbackCode(sanitized),
-            );
-            self.current_feedback = next.feedback;
-            self.feedback_code = feedback_code(self.current_feedback);
+        self.feedback_code = code;
+        if let Ok(pattern) = parse_feedback(&self.feedback_code) {
+            self.current_feedback = decode_feedback(pattern);
         }
     }
 
@@ -594,12 +291,18 @@ impl WordleGuiApp {
         } = workspace;
         let date_text = Solver::today().format("%Y-%m-%d").to_string();
         let mode = GuiSolverMode::Predictive;
-        let (request_sender, response_receiver) =
-            spawn_worker(predictive_solver.clone(), formal_solver.clone());
+        let worker = spawn_worker(predictive_solver.clone(), formal_solver.clone());
         let mut app = Self {
             config,
             predictive_solver,
+            formal_availability: if formal_solver.is_some() {
+                FormalAvailability::Ready
+            } else {
+                FormalAvailability::Absent
+            },
             formal_solver,
+            formal_receiver: None,
+            formal_cancel: Arc::new(AtomicBool::new(false)),
             workspace_view: WorkspaceView::Play,
             mode,
             search_profile: GuiSearchProfile::Configured,
@@ -620,125 +323,27 @@ impl WordleGuiApp {
             predictive_artifact_state: PredictiveArtifactState::NoPredictiveArtifactAvailable,
             predictive_model_metadata: String::new(),
             predictive_finite_search: None,
+            predictive_execution: None,
+            history_coverage: HistoryCoverage::NotRequested,
             top: 10,
             force_in_two_only: false,
             hard_mode: false,
-            status: String::new(),
+            status: GuiStatus::Ready,
             formal_explanation: None,
             suggestion_sort: SuggestionSort::Rank,
             suggestion_sort_descending: false,
             selected_suggestion: None,
-            request_sender,
-            response_receiver,
+            request_sender: None,
+            response_receiver: mpsc::channel().1,
             latest_generation: 0,
+            current_request: None,
             computing: false,
         };
-        app.schedule_recompute();
+        app.install_worker(worker);
         app
     }
 
-    fn schedule_recompute(&mut self) {
-        self.latest_generation = self.latest_generation.wrapping_add(1);
-        let request = WorkerRequest {
-            generation: self.latest_generation,
-            mode: self.mode,
-            date_text: self.date_text.clone(),
-            observations: self.observations.clone(),
-            top: self.top,
-            force_in_two_only: self.force_in_two_only,
-            hard_mode: self.hard_mode,
-            search_profile: self.search_profile,
-        };
-        self.computing = true;
-        self.status = if self.mode == GuiSolverMode::Predictive {
-            if let Some(options) = self.search_profile.finite_options(&self.predictive_solver) {
-                predictive_finite_compute_status(self.search_profile, options)
-            } else {
-                predictive_compute_status(self.predictive_artifact_state)
-            }
-        } else {
-            "Computing...".to_string()
-        };
-        if let Err(error) = self.request_sender.send(request) {
-            self.set_error(error);
-        }
-    }
-
-    fn drain_worker_responses(&mut self) {
-        while let Ok(response) = self.response_receiver.try_recv() {
-            if !worker_response_is_current(self.latest_generation, response.generation) {
-                continue;
-            }
-            self.computing = !response.complete;
-            match response.payload {
-                Ok(WorkerPayload::Predictive {
-                    state,
-                    suggestions,
-                    candidates,
-                    artifact_state,
-                    model_metadata,
-                    finite_search,
-                }) => {
-                    self.surviving_count = state.surviving;
-                    self.total_weight = state.effective_total_weight;
-                    self.predictive_recovery_mode = state.recovery_mode_used;
-                    self.predictive_artifact_state = artifact_state;
-                    self.predictive_model_metadata = model_metadata;
-                    self.predictive_finite_search = finite_search;
-                    self.predictive_suggestions = suggestions;
-                    self.predictive_candidates = candidates;
-                    if self
-                        .selected_suggestion
-                        .is_some_and(|index| index >= self.predictive_suggestions.len())
-                    {
-                        self.selected_suggestion = None;
-                    }
-                    self.absurdle_suggestions.clear();
-                    self.formal_suggestions.clear();
-                    self.formal_explanation = None;
-                    self.status = predictive_response_status(
-                        response.complete,
-                        self.predictive_finite_search.as_ref(),
-                    );
-                }
-                Ok(WorkerPayload::Absurdle { state, suggestions }) => {
-                    self.surviving_count = state.surviving.len();
-                    self.total_weight = 0.0;
-                    self.predictive_recovery_mode = None;
-                    self.predictive_artifact_state =
-                        PredictiveArtifactState::NoPredictiveArtifactAvailable;
-                    self.predictive_finite_search = None;
-                    self.absurdle_suggestions = suggestions;
-                    self.predictive_suggestions.clear();
-                    self.predictive_candidates.clear();
-                    self.formal_suggestions.clear();
-                    self.formal_explanation = None;
-                    self.status.clear();
-                }
-                Ok(WorkerPayload::Formal {
-                    explanation,
-                    suggestions,
-                }) => {
-                    self.surviving_count = explanation.surviving_answers;
-                    self.total_weight = 0.0;
-                    self.predictive_recovery_mode = None;
-                    self.predictive_artifact_state =
-                        PredictiveArtifactState::NoPredictiveArtifactAvailable;
-                    self.predictive_finite_search = None;
-                    self.formal_explanation = Some(explanation);
-                    self.formal_suggestions = suggestions;
-                    self.predictive_suggestions.clear();
-                    self.predictive_candidates.clear();
-                    self.absurdle_suggestions.clear();
-                    self.status.clear();
-                }
-                Err(error) => self.set_error(anyhow::anyhow!(error)),
-            }
-        }
-    }
-
-    fn set_error(&mut self, error: anyhow::Error) {
-        self.status = error.to_string();
+    fn clear_result(&mut self) {
         self.predictive_suggestions.clear();
         self.predictive_candidates.clear();
         self.absurdle_suggestions.clear();
@@ -750,32 +355,60 @@ impl WordleGuiApp {
         self.predictive_recovery_mode = None;
         self.predictive_artifact_state = PredictiveArtifactState::NoPredictiveArtifactAvailable;
         self.predictive_finite_search = None;
-        self.computing = false;
+        self.predictive_execution = None;
+        self.predictive_model_metadata.clear();
     }
 
     fn commit_current_row(&mut self) {
-        let guess = self.current_guess.trim().to_ascii_lowercase();
-        if guess.is_empty() {
-            self.status = "Enter a five-letter guess before applying the row.".to_string();
-            return;
-        }
-        if self.mode == GuiSolverMode::Predictive
-            && let Some(error) = self
-                .predictive_solver
-                .hard_mode_violation(&self.observations, &guess)
-                .filter(|_| self.hard_mode)
-        {
-            self.status = error;
-            return;
-        }
-        match self.row_pattern() {
-            Ok(pattern) => {
-                self.observations.push((guess, pattern));
+        let proposed = game::try_append_observation(
+            &self.observations,
+            &self.current_guess,
+            &self.feedback_code,
+            self.rules(),
+            |history| match self.mode {
+                GuiSolverMode::Predictive => {
+                    let date = NaiveDate::parse_from_str(&self.date_text, "%Y-%m-%d")
+                        .context("invalid puzzle date")?;
+                    self.predictive_solver
+                        .validate_game_history(date, history, self.hard_mode)?;
+                    Ok(())
+                }
+                GuiSolverMode::Absurdle => {
+                    self.predictive_solver.absurdle_apply_history(history)?;
+                    Ok(())
+                }
+                GuiSolverMode::FormalOptimal => {
+                    self.formal_solver
+                        .as_ref()
+                        .context("Formal model is unavailable")?
+                        .apply_history(history)?;
+                    Ok(())
+                }
+            },
+        );
+        match proposed {
+            Ok(history) => {
+                self.observations = history;
                 self.apply_board_action(BoardAction::Reset);
                 self.schedule_recompute();
             }
-            Err(error) => self.status = error.to_string(),
+            Err(error) => self.status = GuiStatus::InputError(error.to_string()),
         }
+    }
+
+    fn rules(&self) -> GameRules {
+        if self.mode == GuiSolverMode::Absurdle {
+            GameRules::Absurdle
+        } else {
+            GameRules::Wordle
+        }
+    }
+
+    fn can_apply_row(&self) -> bool {
+        matches!(
+            game::status(&self.observations, self.rules()),
+            Ok(GameStatus::Active)
+        ) && self.row_pattern().is_ok()
     }
 
     fn toggle_suggestion_sort(&mut self, sort: SuggestionSort) {
@@ -790,380 +423,18 @@ impl WordleGuiApp {
         }
     }
 
-    fn show_narrow_play(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.label(RichText::new("BOARD / HISTORY").monospace().strong());
-            show_history_timeline(ui, &self.observations);
-            ui.add_space(8.0);
-            show_game_board(
-                ui,
-                &self.observations,
-                &self.current_guess,
-                self.current_feedback,
-            );
-        });
-        ui.add_space(12.0);
-        ui.group(|ui| {
-            ui.label(RichText::new("NEXT ACTION").monospace().strong());
-            match self.mode {
-                GuiSolverMode::Predictive => {
-                    let sorted = sorted_predictive_indices(
-                        &self.predictive_suggestions,
-                        self.suggestion_sort,
-                        self.suggestion_sort_descending,
-                    );
-                    for index in sorted.into_iter().take(8) {
-                        let suggestion = &self.predictive_suggestions[index];
-                        let label = if let Some(value) = &suggestion.finite_value {
-                            format!(
-                                "{}  {}  failure risk {}  expected remaining attempts {}",
-                                suggestion.word.to_ascii_uppercase(),
-                                finite_quality_label(value.quality),
-                                format_finite_failure_risk(value),
-                                format_finite_expected_attempts(value),
-                            )
-                        } else {
-                            format!(
-                                "{}  {}  solve {:.3}  H {:.3}  cost {}",
-                                suggestion.word.to_ascii_uppercase(),
-                                suggestion_method(suggestion),
-                                suggestion.solve_probability,
-                                suggestion.entropy,
-                                format_suggestion_cost(suggestion)
-                            )
-                        };
-                        if ui
-                            .selectable_label(self.selected_suggestion == Some(index), label)
-                            .clicked()
-                        {
-                            self.selected_suggestion = Some(index);
-                        }
-                    }
-                    ui.separator();
-                    show_suggestion_inspector(
-                        ui,
-                        self.selected_suggestion
-                            .and_then(|index| self.predictive_suggestions.get(index)),
-                        self.predictive_artifact_state,
-                        self.predictive_recovery_mode,
-                    );
-                }
-                GuiSolverMode::Absurdle => {
-                    for suggestion in &self.absurdle_suggestions {
-                        ui.label(format!(
-                            "{} · worst {} · entropy {:.3}",
-                            suggestion.word.to_ascii_uppercase(),
-                            suggestion.largest_bucket_size,
-                            suggestion.entropy
-                        ));
-                    }
-                }
-                GuiSolverMode::FormalOptimal => {
-                    for suggestion in &self.formal_suggestions {
-                        ui.label(format!(
-                            "{} · worst {} · expected {:.6}",
-                            suggestion.word.to_ascii_uppercase(),
-                            suggestion.objective.worst_case_depth,
-                            suggestion.objective.expected_guesses
-                        ));
-                    }
-                }
-            }
-        });
-        if self.mode == GuiSolverMode::Predictive {
-            ui.add_space(12.0);
-            egui::CollapsingHeader::new("Candidate browser")
-                .default_open(false)
-                .show(ui, |ui| {
-                    show_candidate_browser(
-                        ui,
-                        &mut self.candidate_filter,
-                        &self.predictive_candidates,
-                    );
-                });
-        }
-    }
-
-    fn show_policy_panel(&mut self, ui: &mut egui::Ui) {
-        ui.columns(2, |columns| {
-            columns[0].group(|ui| {
-                ui.label(RichText::new("SEARCH ALLOCATION").monospace().strong());
-                ui.add_space(8.0);
-                policy_row(ui, "Mode", self.config.search_policy_mode.label());
-                policy_row(
-                    ui,
-                    "Exact",
-                    &format!(
-                        "≤ {} survivors; exhaustive ≤ {}",
-                        self.config.exact_threshold, self.config.exact_exhaustive_threshold
-                    ),
-                );
-                policy_row(
-                    ui,
-                    "Lookahead",
-                    &format!(
-                        "≤ {} survivors; medium profile ≤ {}",
-                        self.config.lookahead_threshold,
-                        self.config.medium_state_lookahead_threshold
-                    ),
-                );
-                policy_row(
-                    ui,
-                    "Candidate pools",
-                    &format!(
-                        "exact {} · lookahead {}/{}",
-                        self.config.exact_candidate_pool,
-                        self.config.lookahead_candidate_pool,
-                        self.config.medium_state_lookahead_candidate_pool
-                    ),
-                );
-                policy_row(
-                    ui,
-                    "Danger escalation",
-                    &format!(
-                        "lookahead {:.2} · exact {:.2}",
-                        self.config.danger_lookahead_threshold, self.config.danger_exact_threshold
-                    ),
-                );
-            });
-            columns[1].group(|ui| {
-                ui.label(RichText::new("PREDICTIVE CONTRACT").monospace().strong());
-                ui.add_space(8.0);
-                policy_row(
-                    ui,
-                    "Puzzle date",
-                    if self.date_text.is_empty() {
-                        "not selected"
-                    } else {
-                        &self.date_text
-                    },
-                );
-                policy_row(ui, "Profile", self.search_profile.label());
-                policy_row(
-                    ui,
-                    "Artifact path",
-                    if self
-                        .search_profile
-                        .finite_options(&self.predictive_solver)
-                        .is_some()
-                    {
-                        predictive_finite_banner_text(self.search_profile)
-                    } else {
-                        predictive_banner_text(self.predictive_artifact_state)
-                    },
-                );
-                if let Some(search) = &self.predictive_finite_search {
-                    policy_row(ui, "Finite search", &format_finite_search_summary(search));
-                }
-                policy_row(
-                    ui,
-                    "Recovery",
-                    self.predictive_recovery_mode
-                        .map_or("not active", RecoveryMode::label),
-                );
-                policy_row(
-                    ui,
-                    "Manual overrides",
-                    &format!(
-                        "{} auditable word weights",
-                        self.config.manual_weights.len()
-                    ),
-                );
-                policy_row(ui, "Registry", &predictive_registry_summary(&self.config));
-            });
-        });
-        ui.add_space(16.0);
-        egui::Frame::group(ui.style())
-            .fill(Color32::from_rgb(255, 252, 247))
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.label(RichText::new("IDENTITY & STALENESS").monospace().strong());
-                if self.predictive_model_metadata.is_empty() {
-                    ui.label("Model identity will appear after the next predictive suggestion.");
+    fn sort_label(&self, label: &str, sort: SuggestionSort) -> String {
+        if self.suggestion_sort == sort {
+            format!(
+                "{label} {}",
+                if self.suggestion_sort_descending {
+                    "↓"
                 } else {
-                    ui.label(&self.predictive_model_metadata);
+                    "↑"
                 }
-                if self
-                    .search_profile
-                    .finite_options(&self.predictive_solver)
-                    .is_none()
-                    && let Some(message) = predictive_reply_book_text(
-                        self.observations.len(),
-                        self.predictive_artifact_state,
-                    )
-                {
-                    ui.label(message);
-                }
-            });
-    }
-
-    fn show_diagnostics_panel(&mut self, ui: &mut egui::Ui) {
-        let surface = gui_surface_state(
-            false,
-            self.computing,
-            &self.status,
-            self.predictive_recovery_mode,
-            self.predictive_suggestions.len(),
-        );
-        ui.horizontal_wrapped(|ui| {
-            diagnostic_badge(ui, "SURFACE", surface.label());
-            diagnostic_badge(
-                ui,
-                "WORKERS",
-                if self.computing {
-                    "latest request running"
-                } else {
-                    "idle"
-                },
-            );
-            diagnostic_badge(
-                ui,
-                "ARTIFACT",
-                if self
-                    .search_profile
-                    .finite_options(&self.predictive_solver)
-                    .is_some()
-                {
-                    predictive_finite_banner_text(self.search_profile)
-                } else {
-                    predictive_banner_text(self.predictive_artifact_state)
-                },
-            );
-            diagnostic_badge(ui, "SURVIVORS", &self.surviving_count.to_string());
-        });
-        if let Some(search) = &self.predictive_finite_search {
-            ui.label(
-                RichText::new(format_finite_search_summary(search))
-                    .small()
-                    .color(Color32::from_rgb(92, 72, 54)),
-            );
-        }
-        ui.add_space(16.0);
-        if is_compact_layout(ui.available_width()) {
-            ui.group(|ui| self.show_live_trace(ui));
-            ui.add_space(10.0);
-            ui.group(|ui| self.show_recovery_provenance(ui));
-        } else {
-            ui.columns(2, |columns| {
-                columns[0].group(|ui| self.show_live_trace(ui));
-                columns[1].group(|ui| self.show_recovery_provenance(ui));
-            });
-        }
-        ui.add_space(16.0);
-        ui.label(
-            RichText::new(
-                "The cancellable solver worker shares one replaceable pending slot: obsolete queued work is discarded, and bounded finite searches exit when a newer generation arrives.",
             )
-            .small()
-            .color(Color32::from_rgb(92, 72, 54)),
-        );
-    }
-
-    fn show_live_trace(&self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("LIVE TRACE").monospace().strong());
-        policy_row(ui, "Generation", &self.latest_generation.to_string());
-        policy_row(
-            ui,
-            "Suggestions",
-            &self.predictive_suggestions.len().to_string(),
-        );
-        policy_row(
-            ui,
-            "Candidates",
-            &self.predictive_candidates.len().to_string(),
-        );
-        policy_row(ui, "Posterior mass", &format!("{:.6}", self.total_weight));
-        policy_row(
-            ui,
-            "Exact label",
-            if self.surviving_count <= self.config.exact_exhaustive_threshold {
-                "exhaustive exact"
-            } else if self.surviving_count <= self.config.exact_threshold {
-                "candidate-pool exact"
-            } else {
-                "proxy / lookahead allocation"
-            },
-        );
-    }
-
-    fn show_recovery_provenance(&self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("RECOVERY & PROVENANCE").monospace().strong());
-        ui.label(if self.status.is_empty() {
-            "No runtime error."
         } else {
-            &self.status
-        });
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new(if self.predictive_model_metadata.is_empty() {
-                "No model response has been received yet."
-            } else {
-                &self.predictive_model_metadata
-            })
-            .monospace()
-            .small(),
-        );
-    }
-
-    fn show_formal_panel(&mut self, ui: &mut egui::Ui) {
-        if self.formal_solver.is_none() {
-            ui.group(|ui| {
-                ui.label(RichText::new("FORMAL ARTIFACTS MISSING").monospace().strong());
-                ui.label(formal_unavailable_text());
-                ui.label(
-                    "Formal mode is deliberately secondary. Predictive play remains available without these artifacts.",
-                );
-            });
-            return;
-        }
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Recompute from current history").clicked() {
-                self.mode = GuiSolverMode::FormalOptimal;
-                self.schedule_recompute();
-            }
-            ui.label(format!("{} observations applied", self.observations.len()));
-        });
-        ui.add_space(12.0);
-        if let Some(explanation) = &self.formal_explanation {
-            ui.group(|ui| {
-                ui.label(RichText::new("VERIFIED POLICY STATE").monospace().strong());
-                policy_row(ui, "Model", &explanation.model_id);
-                policy_row(ui, "Manifest", &explanation.manifest_hash);
-                policy_row(
-                    ui,
-                    "Objective",
-                    &format!(
-                        "worst {} · expected {:.6}",
-                        explanation.objective.worst_case_depth,
-                        explanation.objective.expected_guesses
-                    ),
-                );
-                policy_row(
-                    ui,
-                    "Surviving answers",
-                    &explanation.surviving_answers.to_string(),
-                );
-            });
-        }
-        ui.add_space(12.0);
-        for suggestion in &self.formal_suggestions {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(suggestion.word.to_ascii_uppercase())
-                        .monospace()
-                        .strong(),
-                );
-                ui.label(format!(
-                    "worst {} · expected {:.6}",
-                    suggestion.objective.worst_case_depth, suggestion.objective.expected_guesses
-                ));
-            });
-            ui.separator();
-        }
-        if self.computing {
-            ui.spinner();
-        } else if !self.status.is_empty() {
-            ui.colored_label(Color32::from_rgb(150, 45, 45), &self.status);
+            label.to_string()
         }
     }
 
@@ -1171,12 +442,7 @@ impl WordleGuiApp {
         if self.current_guess.trim().len() != 5 {
             anyhow::bail!("current guess must be exactly 5 letters");
         }
-        let feedback = self
-            .current_feedback
-            .iter()
-            .map(|value| char::from(b'0' + *value))
-            .collect::<String>();
-        parse_feedback(&feedback)
+        parse_feedback(&self.feedback_code)
     }
 }
 
@@ -1185,6 +451,7 @@ impl eframe::App for WordleGuiApp {
         ctx.set_zoom_factor(self.text_scale);
         ctx.set_visuals(workspace_visuals());
         self.drain_worker_responses();
+        self.drain_formal_load();
         if !ctx.wants_keyboard_input()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
         {
@@ -1196,7 +463,7 @@ impl eframe::App for WordleGuiApp {
         {
             self.apply_board_action(BoardAction::Reset);
         }
-        if self.computing {
+        if self.computing || self.formal_receiver.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         egui::CentralPanel::default()
@@ -1284,6 +551,13 @@ impl eframe::App for WordleGuiApp {
                 );
                 ui.add_space(12.0);
 
+                if self.mode == GuiSolverMode::Predictive
+                    && let Some(notice) = self.history_coverage.notice()
+                {
+                    ui.label(RichText::new(notice).color(Color32::from_rgb(92, 72, 54)));
+                    ui.add_space(8.0);
+                }
+
                 match self.workspace_view {
                     WorkspaceView::Policy => {
                         self.show_policy_panel(ui);
@@ -1300,750 +574,10 @@ impl eframe::App for WordleGuiApp {
                     WorkspaceView::Play => {}
                 }
 
-                ui.horizontal_wrapped(|ui| {
-                    let formal_available = self.formal_solver.is_some();
-                    let previous_mode = self.mode;
-                    ui.label("Tool");
-                    egui::ComboBox::from_id_salt("solver-mode")
-                        .selected_text(self.mode.label(formal_available))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.mode,
-                                GuiSolverMode::Predictive,
-                                GuiSolverMode::Predictive.label(formal_available),
-                            );
-                            ui.selectable_value(
-                                &mut self.mode,
-                                GuiSolverMode::Absurdle,
-                                GuiSolverMode::Absurdle.label(formal_available),
-                            );
-                            if formal_available {
-                                ui.selectable_value(
-                                    &mut self.mode,
-                                    GuiSolverMode::FormalOptimal,
-                                    GuiSolverMode::FormalOptimal.label(formal_available),
-                                );
-                            }
-                        });
-                    if !formal_available {
-                        ui.label(RichText::new(formal_unavailable_text()).small().weak());
-                    }
-                    if self.mode != previous_mode {
-                        self.schedule_recompute();
-                    }
-                    if self.mode == GuiSolverMode::Predictive {
-                        ui.separator();
-                        let previous_profile = self.search_profile;
-                        ui.label("Profile");
-                        egui::ComboBox::from_id_salt("predictive-search-profile")
-                            .selected_text(self.search_profile.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.search_profile,
-                                    GuiSearchProfile::Configured,
-                                    GuiSearchProfile::Configured.label(),
-                                );
-                                ui.selectable_value(
-                                    &mut self.search_profile,
-                                    GuiSearchProfile::FiniteFast,
-                                    GuiSearchProfile::FiniteFast.label(),
-                                );
-                                ui.selectable_value(
-                                    &mut self.search_profile,
-                                    GuiSearchProfile::FiniteStrong,
-                                    GuiSearchProfile::FiniteStrong.label(),
-                                );
-                            });
-                        if self.search_profile != previous_profile {
-                            self.schedule_recompute();
-                        }
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Date");
-                    let mut date_changed = false;
-                    ui.add_enabled_ui(self.mode == GuiSolverMode::Predictive, |ui| {
-                        date_changed = ui
-                            .add_sized([120.0, 24.0], egui::TextEdit::singleline(&mut self.date_text))
-                            .changed();
-                    });
-                    if self.mode == GuiSolverMode::FormalOptimal {
-                        if let Some(explanation) = &self.formal_explanation {
-                            ui.label(format!(
-                                "model {} / manifest {}",
-                                explanation.model_id, explanation.manifest_hash
-                            ));
-                        } else {
-                            ui.label(format!("model {}", DEFAULT_FORMAL_MODEL_ID));
-                        }
-                    }
-                    ui.label("Top");
-                    let top_changed = ui.add(egui::Slider::new(&mut self.top, 3..=20)).changed();
-                    if ui.button("Apply row").clicked() {
-                        self.commit_current_row();
-                    }
-                    if ui.button("Undo").clicked() {
-                        self.observations.pop();
-                        self.schedule_recompute();
-                    }
-                    if ui.button("Reset").clicked() {
-                        self.observations.clear();
-                        self.apply_board_action(BoardAction::Reset);
-                        self.selected_suggestion = None;
-                        self.schedule_recompute();
-                    }
-                    if self.mode == GuiSolverMode::Predictive {
-                        let hard_changed =
-                            ui.checkbox(&mut self.hard_mode, "Hard Mode").changed();
-                        if hard_changed {
-                            self.schedule_recompute();
-                        }
-                        let force_changed =
-                            ui.checkbox(&mut self.force_in_two_only, "Force In 2 Only").changed();
-                        if force_changed {
-                            self.schedule_recompute();
-                        }
-                    }
-                    if date_changed || top_changed {
-                        self.schedule_recompute();
-                    }
-                });
-
-                ui.add_space(16.0);
-                let mut keyboard_apply = false;
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Guess");
-                    let response = ui.add_sized(
-                        [120.0, 30.0],
-                        egui::TextEdit::singleline(&mut self.current_guess).hint_text("e.g. crane"),
-                    );
-                    if response.changed() {
-                        self.apply_board_action(BoardAction::ReplaceGuess(
-                            self.current_guess.clone(),
-                        ));
-                    }
-                    keyboard_apply |= response.lost_focus()
-                        && ctx.input(|input| input.key_pressed(egui::Key::Enter));
-
-                    ui.label("Feedback");
-                    let mut edited_feedback = self.feedback_code.clone();
-                    let feedback_response = ui.add_sized(
-                        [88.0, 30.0],
-                        egui::TextEdit::singleline(&mut edited_feedback)
-                            .font(egui::TextStyle::Monospace)
-                            .hint_text("01210"),
-                    );
-                    if feedback_response.changed() {
-                        self.update_feedback_code(edited_feedback);
-                    }
-                    keyboard_apply |= feedback_response.lost_focus()
-                        && ctx.input(|input| input.key_pressed(egui::Key::Enter));
-
-                    let mut clicked_tile = None;
-                    for (index, value) in self.current_feedback.iter_mut().enumerate() {
-                        let (_, color) = tile_label_and_color(*value);
-                        let letter = self
-                            .current_guess
-                            .chars()
-                            .nth(index)
-                            .map(|character| character.to_ascii_uppercase().to_string())
-                            .unwrap_or_else(|| " ".to_string());
-                        let label = format!("{letter}\n{}", feedback_accessible_label(*value));
-                        if ui
-                            .add_sized(
-                                [58.0, 58.0],
-                                egui::Button::new(
-                                    RichText::new(label)
-                                        .size(15.0)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                    .fill(color),
-                            )
-                            .clicked()
-                        {
-                            clicked_tile = Some(index);
-                        }
-                    }
-                    if let Some(index) = clicked_tile {
-                        self.apply_board_action(BoardAction::CycleTile(index));
-                    }
-                });
-                if keyboard_apply {
-                    self.commit_current_row();
-                }
-                ui.label(
-                    RichText::new(
-                        "Keyboard: type five feedback symbols (0/1/2 or b/y/g) and press Enter. Tile labels supplement color; repeated letters must match Wordle exactly.",
-                    )
-                    .small()
-                    .color(Color32::from_rgb(92, 72, 54)),
-                );
-
-                ui.add_space(12.0);
-                match self.mode {
-                    GuiSolverMode::Predictive => {
-                        let mut summary = format!(
-                            "Remaining candidates: {}   total weight: {:.4}",
-                            self.surviving_count, self.total_weight
-                        );
-                        if let Some(mode) = self.predictive_recovery_mode {
-                            summary.push_str(&format!("   recovery: {}", mode.label()));
-                        }
-                        ui.label(
-                            RichText::new(summary)
-                                .strong()
-                                .color(Color32::from_rgb(67, 53, 39)),
-                        );
-                        let banner = if self
-                            .search_profile
-                            .finite_options(&self.predictive_solver)
-                            .is_some()
-                        {
-                            predictive_finite_banner_text(self.search_profile)
-                        } else {
-                            predictive_banner_text(self.predictive_artifact_state)
-                        };
-                        ui.label(
-                            RichText::new(banner).color(Color32::from_rgb(92, 72, 54)),
-                        );
-                        if let Some(search) = &self.predictive_finite_search {
-                            ui.label(
-                                RichText::new(format_finite_search_summary(search))
-                                    .small()
-                                    .color(Color32::from_rgb(92, 72, 54)),
-                            );
-                        }
-                        if !self.predictive_model_metadata.is_empty() {
-                            ui.label(
-                                RichText::new(&self.predictive_model_metadata)
-                                    .small()
-                                    .color(Color32::from_rgb(92, 72, 54)),
-                            );
-                        }
-                        if self
-                            .search_profile
-                            .finite_options(&self.predictive_solver)
-                            .is_none()
-                            && let Some(message) = predictive_reply_book_text(
-                                self.observations.len(),
-                                self.predictive_artifact_state,
-                            ) {
-                                ui.label(
-                                    RichText::new(message).color(Color32::from_rgb(92, 72, 54)),
-                                );
-                        }
-                    }
-                    GuiSolverMode::Absurdle => {
-                        ui.label(
-                            RichText::new(format!("Remaining candidates: {}", self.surviving_count))
-                                .strong()
-                                .color(Color32::from_rgb(67, 53, 39)),
-                        );
-                    }
-                    GuiSolverMode::FormalOptimal => {
-                        let summary = if let Some(explanation) = &self.formal_explanation {
-                            format!(
-                                "Remaining candidates: {}   worst-case depth: {}   expected guesses: {:.6}",
-                                explanation.surviving_answers,
-                                explanation.objective.worst_case_depth,
-                                explanation.objective.expected_guesses
-                            )
-                        } else {
-                            format!("Remaining candidates: {}", self.surviving_count)
-                        };
-                        ui.label(
-                            RichText::new(summary)
-                                .strong()
-                                .color(Color32::from_rgb(67, 53, 39)),
-                        );
-                    }
-                }
-
-                if !self.status.is_empty() {
-                    ui.add_space(8.0);
-                    let color = if self.computing || self.predictive_finite_search.is_some() {
-                        Color32::from_rgb(92, 72, 54)
-                    } else {
-                        Color32::from_rgb(150, 45, 45)
-                    };
-                    ui.colored_label(color, &self.status);
-                }
-
-                ui.add_space(16.0);
-                if is_compact_layout(ui.available_width()) {
-                    self.show_narrow_play(ui);
-                    return;
-                }
-                ui.columns(2, |columns| {
-                    columns[0].group(|ui| {
-                        ui.heading("Game Board");
-                        ui.label(
-                            RichText::new(format!(
-                                "{} of 6 rows applied",
-                                self.observations.len()
-                            ))
-                            .color(Color32::from_rgb(92, 72, 54)),
-                        );
-                        ui.add_space(8.0);
-                        show_history_timeline(ui, &self.observations);
-                        ui.add_space(8.0);
-                        show_game_board(
-                            ui,
-                            &self.observations,
-                            &self.current_guess,
-                            self.current_feedback,
-                        );
-                        ui.separator();
-                        show_candidate_browser(
-                            ui,
-                            &mut self.candidate_filter,
-                            &self.predictive_candidates,
-                        );
-                    });
-
-                    columns[1].group(|ui| {
-                        let (heading, summary) = match self.mode {
-                            GuiSolverMode::Predictive => (
-                                "Wordle Suggestions",
-                                if self
-                                    .search_profile
-                                    .finite_options(&self.predictive_solver)
-                                    .is_some()
-                                {
-                                    "Ranks by modeled six-turn failure risk, then expected attempts."
-                                } else {
-                                    "Ranks guesses by predictive expected progress."
-                                },
-                            ),
-                            GuiSolverMode::Absurdle => (
-                                "Absurdle Suggestions",
-                                "Ranks guesses by minimizing the largest surviving bucket.",
-                            ),
-                            GuiSolverMode::FormalOptimal => (
-                                "Formal Suggestions",
-                                "Ranks guesses by the formal optimal-policy objective.",
-                            ),
-                        };
-                        ui.heading(heading);
-                        ui.label(
-                            RichText::new(summary).color(Color32::from_rgb(92, 72, 54)),
-                        );
-                        ui.add_space(8.0);
-                        match self.mode {
-                            GuiSolverMode::Predictive => {
-                                if self.predictive_suggestions.is_empty() {
-                                    ui.label(
-                                        RichText::new(
-                                            "No suggestions match the current filters.",
-                                        )
-                                        .color(Color32::from_rgb(92, 72, 54)),
-                                    );
-                                } else {
-                                    let finite_table = self
-                                        .search_profile
-                                        .finite_options(&self.predictive_solver)
-                                        .is_some();
-                                    let sorted_indices = sorted_predictive_indices(
-                                        &self.predictive_suggestions,
-                                        self.suggestion_sort,
-                                        self.suggestion_sort_descending,
-                                    );
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("predictive-suggestion-scroll")
-                                        .max_height(330.0)
-                                        .show(ui, |ui| {
-                                            egui::Grid::new("predictive-suggestion-table")
-                                                .striped(true)
-                                                .min_col_width(54.0)
-                                                .show(ui, |ui| {
-                                                    if ui.button("Rank").clicked() {
-                                                        self.toggle_suggestion_sort(
-                                                            SuggestionSort::Rank,
-                                                        );
-                                                    }
-                                                    ui.label("Word");
-                                                    if finite_table {
-                                                        ui.label("Quality");
-                                                        ui.label("Failure risk");
-                                                        ui.label("Expected attempts");
-                                                    } else {
-                                                        ui.label("Method");
-                                                        if ui.button("Solve").clicked() {
-                                                            self.toggle_suggestion_sort(
-                                                                SuggestionSort::SolveProbability,
-                                                            );
-                                                        }
-                                                        if ui.button("Entropy").clicked() {
-                                                            self.toggle_suggestion_sort(
-                                                                SuggestionSort::Entropy,
-                                                            );
-                                                        }
-                                                        if ui.button("Remain").clicked() {
-                                                            self.toggle_suggestion_sort(
-                                                                SuggestionSort::ExpectedRemaining,
-                                                            );
-                                                        }
-                                                    }
-                                                    if ui.button("Worst").clicked() {
-                                                        self.toggle_suggestion_sort(
-                                                            SuggestionSort::WorstBucket,
-                                                        );
-                                                    }
-                                                    if !finite_table {
-                                                        ui.label("Cost");
-                                                    }
-                                                    ui.end_row();
-
-                                                    for (rank, index) in
-                                                        sorted_indices.into_iter().enumerate()
-                                                    {
-                                                        let suggestion =
-                                                            &self.predictive_suggestions[index];
-                                                        ui.label((rank + 1).to_string());
-                                                        if ui
-                                                            .selectable_label(
-                                                                self.selected_suggestion
-                                                                    == Some(index),
-                                                                RichText::new(
-                                                                    suggestion
-                                                                        .word
-                                                                        .to_ascii_uppercase(),
-                                                                )
-                                                                .strong()
-                                                                .color(Color32::from_rgb(
-                                                                    42, 49, 43,
-                                                                )),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            self.selected_suggestion = Some(index);
-                                                        }
-                                                        if finite_table {
-                                                            if let Some(value) = &suggestion.finite_value {
-                                                                ui.label(finite_quality_label(
-                                                                    value.quality,
-                                                                ));
-                                                                ui.label(format_finite_failure_risk(
-                                                                    value,
-                                                                ));
-                                                                ui.label(
-                                                                    format_finite_expected_attempts(
-                                                                        value,
-                                                                    ),
-                                                                );
-                                                            } else {
-                                                                ui.label("pending");
-                                                                ui.label("pending");
-                                                                ui.label("unevaluated");
-                                                            }
-                                                        } else {
-                                                            ui.label(suggestion_method(suggestion));
-                                                            ui.label(format!(
-                                                                "{:.3}",
-                                                                suggestion.solve_probability
-                                                            ));
-                                                            ui.label(format!(
-                                                                "{:.3}",
-                                                                suggestion.entropy
-                                                            ));
-                                                            ui.label(format!(
-                                                                "{:.2}",
-                                                                suggestion.expected_remaining
-                                                            ));
-                                                        }
-                                                        ui.label(
-                                                            suggestion
-                                                                .worst_non_green_bucket_size
-                                                                .to_string(),
-                                                        );
-                                                        if !finite_table {
-                                                            ui.label(format_suggestion_cost(
-                                                                suggestion,
-                                                            ));
-                                                        }
-                                                        ui.end_row();
-                                                    }
-                                                });
-                                        });
-                                    ui.separator();
-                                    show_suggestion_inspector(
-                                        ui,
-                                        self.selected_suggestion.and_then(|index| {
-                                            self.predictive_suggestions.get(index)
-                                        }),
-                                        self.predictive_artifact_state,
-                                        self.predictive_recovery_mode,
-                                    );
-                                }
-                            }
-                            GuiSolverMode::Absurdle => {
-                                for suggestion in &self.absurdle_suggestions {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            RichText::new(suggestion.word.to_ascii_uppercase())
-                                                .size(18.0)
-                                                .strong()
-                                                .color(Color32::from_rgb(58, 44, 32)),
-                                        );
-                                        ui.label(format!("worst {}", suggestion.largest_bucket_size));
-                                        ui.label(format!(
-                                            "second {}",
-                                            suggestion.second_largest_bucket_size
-                                        ));
-                                        ui.label(format!(
-                                            "multi {}",
-                                            suggestion.multi_answer_bucket_count
-                                        ));
-                                        ui.label(format!("entropy {:.4}", suggestion.entropy));
-                                    });
-                                    ui.separator();
-                                }
-                            }
-                            GuiSolverMode::FormalOptimal => {
-                                for suggestion in &self.formal_suggestions {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            RichText::new(suggestion.word.to_ascii_uppercase())
-                                                .size(18.0)
-                                                .strong()
-                                                .color(Color32::from_rgb(58, 44, 32)),
-                                        );
-                                        ui.label(format!(
-                                            "worst {}",
-                                            suggestion.objective.worst_case_depth
-                                        ));
-                                        ui.label(format!(
-                                            "expected {:.6}",
-                                            suggestion.objective.expected_guesses
-                                        ));
-                                        ui.label(format!(
-                                            "buckets {}",
-                                            suggestion
-                                                .bucket_sizes
-                                                .iter()
-                                                .map(|size| size.to_string())
-                                                .collect::<Vec<_>>()
-                                                .join(",")
-                                        ));
-                                    });
-                                    ui.separator();
-                                }
-                            }
-                        }
-                    });
-                });
+                self.show_play(ui, ctx);
                     });
             });
     }
-}
-
-fn spawn_worker(
-    predictive_solver: Solver,
-    formal_solver: Option<FormalPolicyRuntime>,
-) -> (LatestWorkerDispatcher, Receiver<WorkerResponse>) {
-    const WORKER_COUNT: usize = 1;
-    let shared = Arc::new((Mutex::new(LatestWorkerQueue::default()), Condvar::new()));
-    let (response_sender, response_receiver) = mpsc::channel::<WorkerResponse>();
-    for worker_index in 0..WORKER_COUNT {
-        let shared = Arc::clone(&shared);
-        let response_sender = response_sender.clone();
-        let predictive_solver = predictive_solver.clone();
-        let formal_solver = formal_solver.clone();
-        thread::Builder::new()
-            .name(format!("maybe-wordle-solver-{worker_index}"))
-            .stack_size(SOLVER_THREAD_STACK_BYTES)
-            .spawn(move || {
-                loop {
-                    let request = {
-                        let (lock, ready) = &*shared;
-                        let mut queue = match lock.lock() {
-                            Ok(queue) => queue,
-                            Err(_) => return,
-                        };
-                        while queue.pending.is_none() && !queue.shutdown {
-                            queue = match ready.wait(queue) {
-                                Ok(queue) => queue,
-                                Err(_) => return,
-                            };
-                        }
-                        if queue.shutdown {
-                            return;
-                        }
-                        queue.pending.take().expect("pending request")
-                    };
-                    let should_preview = request.mode == GuiSolverMode::Predictive
-                        && !request.observations.is_empty();
-                    let cancelled = || worker_request_cancelled(&shared, request.generation);
-                    if should_preview {
-                        let preview = compute_worker_payload(
-                            &predictive_solver,
-                            formal_solver.as_ref(),
-                            &request,
-                            true,
-                            &cancelled,
-                        )
-                        .map_err(|error| error.to_string());
-                        let preview_failed = preview.is_err();
-                        if response_sender
-                            .send(WorkerResponse {
-                                generation: request.generation,
-                                complete: preview_failed,
-                                payload: preview,
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if preview_failed {
-                            continue;
-                        }
-                        let superseded = {
-                            let (lock, _) = &*shared;
-                            match lock.lock() {
-                                Ok(queue) => {
-                                    queue.shutdown || queue.latest_generation > request.generation
-                                }
-                                Err(_) => return,
-                            }
-                        };
-                        if superseded {
-                            continue;
-                        }
-                    }
-                    let payload = compute_worker_payload(
-                        &predictive_solver,
-                        formal_solver.as_ref(),
-                        &request,
-                        false,
-                        &cancelled,
-                    )
-                    .map_err(|error| error.to_string());
-                    if response_sender
-                        .send(WorkerResponse {
-                            generation: request.generation,
-                            complete: true,
-                            payload,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            })
-            .expect("failed to start GUI solver worker");
-    }
-    drop(response_sender);
-    (LatestWorkerDispatcher { shared }, response_receiver)
-}
-
-fn compute_worker_payload(
-    predictive_solver: &Solver,
-    formal_solver: Option<&FormalPolicyRuntime>,
-    request: &WorkerRequest,
-    proxy_preview: bool,
-    cancelled: &(dyn Fn() -> bool + Sync),
-) -> Result<WorkerPayload> {
-    match request.mode {
-        GuiSolverMode::Predictive => {
-            let date = NaiveDate::parse_from_str(&request.date_text, "%Y-%m-%d")
-                .with_context(|| format!("invalid date: {}", request.date_text))?;
-            let search_profile = request.search_profile;
-            let predictive_request = PredictiveSuggestRequest {
-                puzzle_date: date,
-                observations: &request.observations,
-                top: request.top,
-                hard_mode: request.hard_mode,
-                force_in_two_only: request.force_in_two_only,
-                mode: PredictiveSuggestionMode::FastDiskOnly,
-            };
-            let response = if let Some(mut options) =
-                search_profile.finite_options(predictive_solver)
-            {
-                if proxy_preview {
-                    options.budget = Duration::from_millis(30);
-                }
-                predictive_solver.suggest_predictive_controlled(
-                    predictive_request,
-                    options,
-                    cancelled,
-                )?
-            } else if proxy_preview {
-                predictive_solver
-                    .suggest_predictive_proxy_preview_cancellable(predictive_request, cancelled)?
-            } else {
-                predictive_solver.suggest_predictive_cancellable(predictive_request, cancelled)?
-            };
-            let artifact_state = response.artifact_state;
-            let mut model_metadata = format!(
-                "Puzzle date: {} (history through {})\nPredictive model: {}\nConfig identity: {}\nHistory snapshot: {} ({})\nCached promotion: {}",
-                response.puzzle_date,
-                response.history_cutoff,
-                response.model_version,
-                response.model_manifest_hash,
-                response
-                    .history_snapshot_date
-                    .map(|date| date.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                response.history_snapshot_hash,
-                response.promotion_source.is_some()
-            );
-            if request.hard_mode && response.finite_search.is_none() {
-                model_metadata.push_str("\nLegacy costs assume normal-mode future replies; finite profiles enforce hard-mode legality recursively.");
-            }
-            Ok(WorkerPayload::Predictive {
-                state: response.state,
-                suggestions: response.suggestions,
-                candidates: response.candidates,
-                artifact_state,
-                model_metadata,
-                finite_search: response.finite_search,
-            })
-        }
-        GuiSolverMode::Absurdle => {
-            let state = predictive_solver.absurdle_apply_history(&request.observations)?;
-            let suggestions =
-                predictive_solver.absurdle_suggestions(&request.observations, request.top)?;
-            Ok(WorkerPayload::Absurdle { state, suggestions })
-        }
-        GuiSolverMode::FormalOptimal => {
-            let runtime = formal_solver
-                .ok_or_else(|| anyhow::anyhow!("formal-optimal artifacts are not available"))?;
-            let state = runtime.apply_history(&request.observations)?;
-            let explanation = runtime.explain_state(&state, request.top)?;
-            let suggestions = runtime.suggest(&state, request.top)?;
-            Ok(WorkerPayload::Formal {
-                explanation,
-                suggestions,
-            })
-        }
-    }
-}
-
-fn worker_request_cancelled(
-    shared: &Arc<(Mutex<LatestWorkerQueue>, Condvar)>,
-    generation: u64,
-) -> bool {
-    let (lock, _) = &**shared;
-    #[cfg(test)]
-    let test_cancel_hook = match lock.lock() {
-        Ok(queue) => queue.test_cancel_hook.clone(),
-        Err(_) => return true,
-    };
-    #[cfg(test)]
-    if let Some(hook) = test_cancel_hook {
-        hook(generation);
-    }
-    match lock.lock() {
-        Ok(queue) => queue.shutdown || queue.latest_generation > generation,
-        Err(_) => true,
-    }
-}
-
-fn worker_response_is_current(latest_generation: u64, response_generation: u64) -> bool {
-    latest_generation == response_generation
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2072,7 +606,7 @@ impl GuiSurfaceState {
 fn gui_surface_state(
     missing_data: bool,
     computing: bool,
-    status: &str,
+    status: &GuiStatus,
     recovery: Option<RecoveryMode>,
     suggestion_count: usize,
 ) -> GuiSurfaceState {
@@ -2080,7 +614,7 @@ fn gui_surface_state(
         GuiSurfaceState::MissingData
     } else if computing {
         GuiSurfaceState::Loading
-    } else if !status.is_empty() {
+    } else if status.is_error() {
         GuiSurfaceState::Error
     } else if recovery.is_some() {
         GuiSurfaceState::Recovery
@@ -2187,15 +721,7 @@ fn sorted_predictive_indices(
 }
 
 fn suggestion_method(suggestion: &Suggestion) -> &'static str {
-    if suggestion.finite_value.is_some() {
-        "finite"
-    } else if suggestion.exact_cost.is_some() {
-        "exact"
-    } else if suggestion.lookahead_cost.is_some() {
-        "lookahead"
-    } else {
-        "proxy"
-    }
+    suggestion.value_kind.label()
 }
 
 fn finite_quality_label(quality: FiniteSearchQuality) -> &'static str {
@@ -2266,30 +792,13 @@ fn predictive_finite_compute_status(
     )
 }
 
-fn predictive_response_status(
-    complete: bool,
-    finite_search: Option<&FiniteSearchResult>,
-) -> String {
-    if !complete {
-        if finite_search.is_some() {
-            "Finite preview shown; refining the bounded ranking in the background.".to_string()
-        } else {
-            "Fast proxy preview shown; refining the configured ranking in the background."
-                .to_string()
-        }
-    } else {
-        match finite_search.map(|search| search.reason) {
-            Some(FiniteSearchReason::Deadline) => {
-                "Finite search reached its time budget; showing completed results.".to_string()
-            }
-            Some(FiniteSearchReason::NodeBudget) => {
-                "Finite search reached its node budget; showing completed results.".to_string()
-            }
-            Some(FiniteSearchReason::Cancelled) => {
-                "Finite search was cancelled before completion.".to_string()
-            }
-            Some(FiniteSearchReason::Complete) | None => String::new(),
-        }
+fn predictive_response_status(finite_search: Option<&FiniteSearchResult>) -> GuiStatus {
+    match finite_search.map(|search| search.reason) {
+        None | Some(FiniteSearchReason::Complete) => GuiStatus::Ready,
+        Some(reason) => GuiStatus::Notice(format!(
+            "Bounded search stopped: {}. See evaluated quality per action.",
+            finite_reason_label(reason)
+        )),
     }
 }
 
@@ -2300,237 +809,6 @@ fn format_suggestion_cost(suggestion: &Suggestion) -> String {
         .or(suggestion.proxy_cost)
         .map(|cost| format!("{cost:.3}"))
         .unwrap_or_else(|| "-".to_string())
-}
-
-fn show_suggestion_inspector(
-    ui: &mut egui::Ui,
-    suggestion: Option<&Suggestion>,
-    artifact_state: PredictiveArtifactState,
-    recovery_mode: Option<RecoveryMode>,
-) {
-    ui.heading("Suggestion Inspector");
-    let Some(suggestion) = suggestion else {
-        ui.label("Select a suggestion row to inspect its evidence.");
-        return;
-    };
-    ui.label(
-        RichText::new(suggestion.word.to_ascii_uppercase())
-            .size(22.0)
-            .strong(),
-    );
-    if let Some(value) = &suggestion.finite_value {
-        ui.label(format!(
-            "{} · failure risk {} · expected remaining attempts {}",
-            finite_quality_label(value.quality),
-            format_finite_failure_risk(value),
-            format_finite_expected_attempts(value),
-        ));
-        if value.quality == FiniteSearchQuality::UpperBound {
-            ui.label(
-                "Completed rollout: the combined lexicographic objective is bounded, while these two displayed scalars are rollout values rather than individual bounds.",
-            );
-        }
-    } else {
-        ui.label(format!(
-            "{} ranking · solve probability {:.4} · entropy {:.4} bits · expected remaining {:.2}",
-            suggestion_method(suggestion),
-            suggestion.solve_probability,
-            suggestion.entropy,
-            suggestion.expected_remaining
-        ));
-    }
-    ui.label(format!(
-        "Worst non-green bucket {} answers ({:.1}% posterior mass); {} large buckets; {} dangerous-mass buckets.",
-        suggestion.worst_non_green_bucket_size,
-        suggestion.largest_non_green_bucket_mass * 100.0,
-        suggestion.large_non_green_bucket_count,
-        suggestion.dangerous_mass_bucket_count
-    ));
-    if suggestion.force_in_two {
-        ui.colored_label(
-            Color32::from_rgb(37, 99, 72),
-            "Force-in-two: every modeled non-green reply has a finishing guess.",
-        );
-    }
-    ui.label(format!(
-        "Artifact source: {}. Recovery: {}.",
-        if suggestion.finite_value.is_some() {
-            "bounded finite search (predictive books not used)"
-        } else {
-            predictive_banner_text(artifact_state)
-        },
-        recovery_mode.map_or("not active", RecoveryMode::label)
-    ));
-}
-
-fn show_candidate_browser(
-    ui: &mut egui::Ui,
-    filter: &mut String,
-    candidates: &[PredictiveCandidateSummary],
-) {
-    ui.heading("Candidate Browser");
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [180.0, 24.0],
-            egui::TextEdit::singleline(filter).hint_text("Filter answers"),
-        );
-        if ui.button("Copy CSV").clicked() {
-            let normalized = filter.trim().to_ascii_lowercase();
-            let mut csv = String::from("word,probability,modeled_weight,fallback_support\n");
-            for candidate in candidates
-                .iter()
-                .filter(|candidate| normalized.is_empty() || candidate.word.contains(&normalized))
-            {
-                csv.push_str(&format!(
-                    "{},{:.12},{:.12},{}\n",
-                    candidate.word,
-                    candidate.probability,
-                    candidate.modeled_weight,
-                    candidate.fallback_support
-                ));
-            }
-            ui.ctx().copy_text(csv);
-        }
-    });
-    let normalized = filter.trim().to_ascii_lowercase();
-    let matching = candidates
-        .iter()
-        .filter(|candidate| normalized.is_empty() || candidate.word.contains(&normalized))
-        .collect::<Vec<_>>();
-    ui.label(
-        RichText::new(format!(
-            "{} matching / {} live candidates",
-            matching.len(),
-            candidates.len()
-        ))
-        .small()
-        .color(Color32::from_rgb(92, 72, 54)),
-    );
-    egui::ScrollArea::vertical()
-        .id_salt("predictive-candidate-scroll")
-        .max_height(150.0)
-        .show(ui, |ui| {
-            egui::Grid::new("candidate-browser-grid")
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label("Word");
-                    ui.label("Probability");
-                    ui.label("Support");
-                    ui.end_row();
-                    for candidate in matching.into_iter().take(100) {
-                        ui.label(RichText::new(candidate.word.to_ascii_uppercase()).strong());
-                        ui.label(format!("{:.5}%", candidate.probability * 100.0));
-                        ui.label(if candidate.fallback_support {
-                            "fallback"
-                        } else {
-                            "modeled"
-                        });
-                        ui.end_row();
-                    }
-                });
-        });
-}
-
-fn show_game_board(
-    ui: &mut egui::Ui,
-    observations: &[(String, u8)],
-    current_guess: &str,
-    current_feedback: [u8; 5],
-) {
-    ui.label(
-        RichText::new("Tile markers: A absent / P present / C correct")
-            .small()
-            .color(Color32::from_rgb(92, 72, 54)),
-    );
-    ui.add_space(4.0);
-    for row in 0..6 {
-        ui.horizontal(|ui| {
-            let (letters, feedback, applied) = if let Some((guess, pattern)) = observations.get(row)
-            {
-                (
-                    guess.chars().collect::<Vec<_>>(),
-                    decode_pattern(pattern),
-                    true,
-                )
-            } else if row == observations.len() {
-                (
-                    current_guess.chars().collect::<Vec<_>>(),
-                    current_feedback,
-                    false,
-                )
-            } else {
-                (Vec::new(), [0; 5], false)
-            };
-            for (column, value) in feedback.iter().copied().enumerate() {
-                let letter = letters
-                    .get(column)
-                    .copied()
-                    .map(|character| character.to_ascii_uppercase().to_string())
-                    .unwrap_or_else(|| " ".to_string());
-                let color = if applied {
-                    tile_label_and_color(value).1
-                } else {
-                    Color32::from_rgb(225, 218, 208)
-                };
-                let marker = if applied { feedback_marker(value) } else { " " };
-                egui::Frame::default()
-                    .fill(color)
-                    .corner_radius(3.0)
-                    .show(ui, |ui| {
-                        ui.set_width(48.0);
-                        ui.set_min_height(48.0);
-                        if applied || letter != " " {
-                            ui.centered_and_justified(|ui| {
-                                ui.label(
-                                    RichText::new(format!("{letter}\n{marker}"))
-                                        .size(15.0)
-                                        .strong()
-                                        .color(if applied {
-                                            Color32::WHITE
-                                        } else {
-                                            Color32::from_rgb(42, 49, 43)
-                                        }),
-                                );
-                            });
-                        }
-                    });
-            }
-        });
-        ui.add_space(4.0);
-    }
-}
-
-fn show_history_timeline(ui: &mut egui::Ui, observations: &[(String, u8)]) {
-    if observations.is_empty() {
-        ui.label(
-            RichText::new("No observations yet")
-                .monospace()
-                .small()
-                .color(Color32::from_rgb(92, 72, 54)),
-        );
-        return;
-    }
-    ui.horizontal_wrapped(|ui| {
-        for (index, (guess, pattern)) in observations.iter().enumerate() {
-            let code = feedback_code(decode_pattern(pattern));
-            egui::Frame::default()
-                .fill(Color32::from_rgb(239, 228, 211))
-                .corner_radius(5.0)
-                .inner_margin(egui::Margin::symmetric(7, 4))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} {} {}",
-                            index + 1,
-                            guess.to_ascii_uppercase(),
-                            code
-                        ))
-                        .monospace()
-                        .small(),
-                    );
-                });
-        }
-    });
 }
 
 fn feedback_accessible_label(value: u8) -> &'static str {
@@ -2549,22 +827,12 @@ fn feedback_marker(value: u8) -> &'static str {
     }
 }
 
-fn tile_label_and_color(value: u8) -> (&'static str, Color32) {
+fn tile_label_and_color(value: u8) -> (&'static str, Color32, Color32) {
     match value {
-        0 => ("Gray", Color32::from_rgb(124, 126, 130)),
-        1 => ("Yellow", Color32::from_rgb(201, 180, 88)),
-        _ => ("Green", Color32::from_rgb(106, 170, 100)),
+        0 => ("Gray", Color32::from_rgb(124, 126, 130), Color32::BLACK),
+        1 => ("Yellow", Color32::from_rgb(201, 180, 88), Color32::BLACK),
+        _ => ("Green", Color32::from_rgb(106, 170, 100), Color32::BLACK),
     }
-}
-
-fn decode_pattern(pattern: &u8) -> [u8; 5] {
-    let mut value = *pattern;
-    let mut decoded = [0u8; 5];
-    for slot in &mut decoded {
-        *slot = value % 3;
-        value /= 3;
-    }
-    decoded
 }
 
 fn predictive_banner_text(state: PredictiveArtifactState) -> &'static str {
@@ -2610,26 +878,18 @@ mod tests {
 
     use super::{
         BoardAction, BoardDraft, FiniteSearchCandidate, FiniteSearchQuality, FiniteSearchReason,
-        FiniteSearchResult, GuiSearchProfile, GuiSolverMode, GuiSurfaceState,
+        FiniteSearchResult, GuiSearchProfile, GuiSolverMode, GuiStatus, GuiSurfaceState,
         LatestWorkerDispatcher, LatestWorkerQueue, Solver, Suggestion, WorkerPayload,
         WorkerRequest, feedback_accessible_label, feedback_marker, finite_quality_label,
         formal_unavailable_text, format_finite_expected_attempts, format_finite_failure_risk,
         gui_surface_state, is_compact_layout, predictive_banner_text, predictive_compute_status,
         predictive_finite_banner_text, predictive_registry_summary, predictive_reply_book_text,
         predictive_response_status, reduce_board_draft, spawn_worker, worker_request_cancelled,
-        worker_response_is_current,
     };
 
-    fn worker_fixture_solver() -> (Solver, std::path::PathBuf) {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "maybe-wordle-gui-worker-test-{}-{unique}",
-            std::process::id()
-        ));
-        let paths = crate::data::ProjectPaths::new(&root);
+    fn worker_fixture_solver() -> (Solver, crate::test_support::TestDirectory) {
+        let root = crate::test_support::TestDirectory::new("gui-worker");
+        let paths = crate::data::ProjectPaths::new(root.path());
         paths.ensure_layout().expect("fixture layout");
         let words = [
             "cigar", "rebut", "sissy", "humph", "awake", "blush", "focal", "evade", "naval",
@@ -2660,6 +920,40 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_method_does_not_infer_exactness_from_a_numeric_cost() {
+        let (mut solver, _root) = worker_fixture_solver();
+        solver.config.search_policy_mode = crate::config::SearchPolicyMode::ProxyOnly;
+        let state = solver.initial_state(NaiveDate::from_ymd_opt(2026, 7, 26).unwrap());
+        let mut row = solver.suggestions(&state, 1).unwrap().remove(0);
+        row.exact_cost = Some(2.0);
+        assert!(super::suggestion_method(&row).contains("proxy"));
+        for kind in [
+            super::SuggestionValueKind::Lookahead,
+            super::SuggestionValueKind::ContinuationEstimate,
+            super::SuggestionValueKind::ExactAction,
+            super::SuggestionValueKind::Finite(FiniteSearchQuality::Heuristic),
+            super::SuggestionValueKind::Finite(FiniteSearchQuality::UpperBound),
+            super::SuggestionValueKind::Finite(FiniteSearchQuality::Exact),
+            super::SuggestionValueKind::Terminal,
+        ] {
+            row.value_kind = kind;
+            assert_eq!(super::suggestion_method(&row), kind.label());
+        }
+    }
+
+    #[test]
+    fn every_feedback_pattern_uses_the_canonical_board_encoding() {
+        for pattern in 0..crate::scoring::PATTERN_SPACE as u8 {
+            let decoded = crate::scoring::decode_feedback(pattern);
+            let expected = [1u8, 3, 9, 27, 81].map(|power| (pattern / power) % 3);
+            assert_eq!(decoded, expected);
+            let code = super::feedback_code(decoded);
+            assert_eq!(crate::scoring::parse_feedback(&code).unwrap(), pattern);
+            assert_eq!(code, crate::scoring::format_feedback_trits(pattern));
+        }
+    }
+
+    #[test]
     fn configured_staged_gui_keeps_experimental_finite_search_opt_in() {
         let (solver, root) = worker_fixture_solver();
         assert!(
@@ -2672,7 +966,7 @@ mod tests {
                 .finite_options(&solver)
                 .is_some()
         );
-        let _ = std::fs::remove_dir_all(root);
+        drop(root);
     }
 
     #[test]
@@ -2687,10 +981,12 @@ mod tests {
         assert_eq!(present.feedback, [0, 1, 0, 0, 0]);
         let correct = reduce_board_draft(&present, BoardAction::CycleTile(1));
         assert_eq!(correct.feedback, [0, 2, 0, 0, 0]);
-        let coded = reduce_board_draft(
-            &correct,
-            BoardAction::ReplaceFeedbackCode("byg20".to_string()),
-        );
+        let coded = BoardDraft {
+            feedback: crate::scoring::decode_feedback(
+                crate::scoring::parse_feedback("byg20").expect("mixed code"),
+            ),
+            ..correct
+        };
         assert_eq!(coded.feedback, [0, 1, 2, 2, 0]);
         assert_eq!(feedback_accessible_label(2), "Correct");
         assert_eq!(
@@ -2698,6 +994,556 @@ mod tests {
             ["A", "P", "C"]
         );
         assert_eq!(reduce_board_draft(&coded, BoardAction::Reset), initial);
+    }
+
+    #[test]
+    fn feedback_text_is_authoritative_and_invalid_edits_preserve_the_draft() {
+        let (solver, root) = worker_fixture_solver();
+        let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
+            config: solver.config.clone(),
+            predictive_solver: solver,
+            formal_solver: None,
+        });
+        app.current_guess = "cigar".to_string();
+        for invalid in ["0", "", "byg", "2222!2"] {
+            app.update_feedback_code("22222".to_string());
+            app.update_feedback_code(invalid.to_string());
+            assert!(
+                app.row_pattern().is_err(),
+                "invalid visible draft {invalid:?}"
+            );
+            app.commit_current_row();
+            assert!(app.observations.is_empty());
+            assert_eq!(app.current_guess, "cigar");
+            assert_eq!(app.feedback_code, invalid);
+        }
+        drop(app);
+        drop(root);
+    }
+
+    #[test]
+    fn history_submission_is_transactional_and_terminal_states_block_entry() {
+        let (solver, root) = worker_fixture_solver();
+        let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
+            config: solver.config.clone(),
+            predictive_solver: solver,
+            formal_solver: None,
+        });
+        app.date_text = "2026-07-26".to_string();
+        for guess in ["zzzzz", "cig"] {
+            app.current_guess = guess.to_string();
+            app.update_feedback_code("00000".into());
+            app.commit_current_row();
+            assert!(app.observations.is_empty());
+            assert_eq!(app.current_guess, guess);
+            assert!(matches!(app.status, GuiStatus::InputError(_)));
+        }
+        app.current_guess = "cigar".into();
+        app.update_feedback_code("22222".into());
+        app.commit_current_row();
+        assert_eq!(app.observations.len(), 1);
+        assert!(!app.computing);
+        assert!(!app.can_apply_row());
+        app.current_guess = "rebut".into();
+        app.commit_current_row();
+        assert_eq!(app.observations.len(), 1);
+        assert_eq!(app.current_guess, "rebut");
+        app.observations.pop();
+        app.schedule_recompute();
+        assert!(app.can_apply_row());
+        drop(app);
+        drop(root);
+    }
+
+    #[test]
+    fn dropped_response_sender_becomes_recoverable_worker_error() {
+        let (solver, root) = worker_fixture_solver();
+        let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
+            config: solver.config.clone(),
+            predictive_solver: solver,
+            formal_solver: None,
+        });
+        let (sender, receiver) = mpsc::channel();
+        app.response_receiver = receiver;
+        drop(sender);
+        app.drain_worker_responses();
+        assert!(!app.computing);
+        assert!(matches!(app.status, GuiStatus::WorkerError(_)));
+        assert!(app.request_sender.is_none());
+        app.retry_worker();
+        assert!(app.request_sender.is_some());
+        assert!(app.computing);
+        drop(app);
+        drop(root);
+    }
+
+    #[test]
+    fn slow_loading_first_frame_and_close_do_not_wait_for_a_worker_result() {
+        let root = crate::test_support::TestDirectory::new("gui-loading");
+        let mut setup =
+            super::SetupApp::new(crate::data::ProjectPaths::new(root.path()), String::new());
+        let (sender, receiver) = mpsc::channel();
+        setup.running = true;
+        setup.receiver = Some(receiver);
+        let cancellation = Arc::clone(&setup.cancel_requested);
+        let mut app = super::MaybeWordleApp::Loading(Box::new(setup));
+        let context = eframe::egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = context.run(Default::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        assert!(matches!(app, super::MaybeWordleApp::Loading(_)));
+        assert!(!output.shapes.is_empty());
+        drop(app);
+        assert!(cancellation.load(AtomicOrdering::Acquire));
+        drop(sender);
+    }
+
+    #[test]
+    fn injected_spawn_failure_and_poisoned_queue_are_recoverable() {
+        let (solver, root) = worker_fixture_solver();
+        let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
+            config: solver.config.clone(),
+            predictive_solver: solver,
+            formal_solver: None,
+        });
+        app.install_worker(Err(anyhow::anyhow!("injected thread spawn failure")));
+        assert!(app.request_sender.is_none());
+        assert!(!app.computing);
+        assert!(matches!(app.status, GuiStatus::WorkerError(_)));
+        app.retry_worker();
+        let shared = Arc::clone(&app.request_sender.as_ref().unwrap().shared);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = shared.0.lock().unwrap();
+            panic!("injected queue poison");
+        });
+        assert!(poisoned.join().is_err());
+        app.schedule_recompute();
+        assert!(app.request_sender.is_none());
+        assert!(!app.computing);
+        assert!(app.status.is_error());
+        drop(app);
+        drop(root);
+    }
+
+    #[test]
+    fn virtual_candidate_browser_can_render_its_last_row() {
+        use eframe::egui;
+        for count in [1, 100, 101, 2315] {
+            let candidates = (0..count)
+                .map(|index| crate::predictive::PredictiveCandidateSummary {
+                    word: format!("w{index:04}"),
+                    probability: 0.01,
+                    modeled_weight: 1.0,
+                    fallback_support: false,
+                })
+                .collect::<Vec<_>>();
+            let context = egui::Context::default();
+            let mut filter = String::new();
+            let mut output = None;
+            let mut declared_content_height = 0.0;
+            let mut row_spacing = 0.0;
+            for step in 0..3 {
+                output = Some(context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(560.0, 620.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            if step == 1 {
+                                let id = ui.make_persistent_id(egui::Id::new(
+                                    "predictive-candidate-scroll",
+                                ));
+                                let mut state = egui::scroll_area::State::load(ctx, id)
+                                    .expect("candidate scroll state");
+                                // Let the widget clamp to its actual bottom; the test
+                                // must not duplicate the production row-height formula.
+                                state.offset.y = 1_000_000.0;
+                                state.store(ctx, id);
+                            }
+                            row_spacing = ui.spacing().item_spacing.y;
+                            declared_content_height =
+                                super::show_candidate_browser(ui, &mut filter, &candidates)
+                                    .content_size
+                                    .y;
+                        });
+                    },
+                ));
+            }
+            let last = candidates.last().unwrap().word.to_ascii_uppercase();
+            if count > 1 {
+                let positions = output
+                    .as_ref()
+                    .unwrap()
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text().starts_with('W') => {
+                            Some(text.pos.y)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let actual_row_pitch = positions[1] - positions[0];
+                assert!(
+                    (declared_content_height - (actual_row_pitch * count as f32 - row_spacing))
+                        .abs()
+                        < 0.1,
+                    "virtual row geometry disagrees with rendered rows: content={declared_content_height}, pitch={actual_row_pitch}, count={count}"
+                );
+            }
+            assert!(output.unwrap().shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == last)), "last candidate not rendered for {count}");
+        }
+    }
+
+    #[test]
+    fn candidate_browser_filter_and_csv_keep_every_row_in_order() {
+        for count in [0, 1, 100, 101, 2315] {
+            let candidates = (0..count)
+                .map(|index| crate::predictive::PredictiveCandidateSummary {
+                    word: format!("w{index:04}"),
+                    probability: 0.01,
+                    modeled_weight: 1.0,
+                    fallback_support: false,
+                })
+                .collect::<Vec<_>>();
+            let matching = super::matching_candidates(&candidates, "");
+            assert_eq!(matching.len(), count);
+            let csv = super::candidate_csv(&matching);
+            let exported = csv
+                .lines()
+                .skip(1)
+                .map(|row| row.split(',').next().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                exported,
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.word.as_str())
+                    .collect::<Vec<_>>()
+            );
+            if let Some(last) = candidates.last() {
+                let filtered =
+                    super::matching_candidates(&candidates, &last.word.to_ascii_uppercase());
+                assert_eq!(filtered.len(), 1);
+                assert_eq!(filtered[0].word, last.word);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_status_severity_does_not_depend_on_wording_or_budget_reason() {
+        for status in [
+            GuiStatus::Ready,
+            GuiStatus::Notice("error is only a word".into()),
+            GuiStatus::Loading("loading".into()),
+        ] {
+            assert!(!status.is_error());
+        }
+        for status in [
+            GuiStatus::InputError("".into()),
+            GuiStatus::WorkerError("".into()),
+        ] {
+            assert!(status.is_error());
+        }
+    }
+
+    #[test]
+    fn corrupt_optional_formal_artifacts_do_not_block_predictive_workspace() {
+        let (solver, root) = worker_fixture_solver();
+        let paths = crate::data::ProjectPaths::new(root.path());
+        let artifacts = crate::formal::PolicyArtifactSet::for_model(
+            &paths,
+            crate::formal::DEFAULT_FORMAL_MODEL_ID,
+        );
+        std::fs::create_dir_all(&artifacts.model_dir).expect("formal fixture");
+        for path in [
+            &artifacts.prior_spec,
+            &artifacts.manifest,
+            &artifacts.values,
+            &artifacts.policy,
+            &artifacts.metadata,
+            &artifacts.certificate,
+            &artifacts.small_state_table,
+            &artifacts.pattern_table,
+        ] {
+            std::fs::write(path, "corrupt").expect("corrupt fixture artifact");
+        }
+        let workspace = super::load_workspace(&paths).expect("predictive remains independent");
+        let mut app = super::WordleGuiApp::new(workspace);
+        app.start_formal_load(paths);
+        assert_eq!(app.formal_availability, super::FormalAvailability::Loading);
+        let outcome = app
+            .formal_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("formal completion");
+        assert!(outcome.is_err());
+        let (sender, receiver) = mpsc::channel();
+        sender.send(outcome).expect("inject completed outcome");
+        app.formal_receiver = Some(receiver);
+        app.drain_formal_load();
+        assert!(matches!(
+            app.formal_availability,
+            super::FormalAvailability::Unavailable(_)
+        ));
+        assert!(app.request_sender.is_some());
+        assert_eq!(app.mode, GuiSolverMode::Predictive);
+        drop(app);
+        drop(solver);
+        drop(root);
+    }
+
+    #[test]
+    fn successful_seed_only_predictions_keep_a_history_limitation_notice() {
+        let (mut solver, root) = worker_fixture_solver();
+        solver.config.search_policy_mode = crate::config::SearchPolicyMode::ProxyOnly;
+        let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
+            config: solver.config.clone(),
+            predictive_solver: solver,
+            formal_solver: None,
+        });
+        let request = app.current_request.clone().expect("initial request");
+        let payload =
+            super::compute_worker_payload(&app.predictive_solver, None, &request, &|| false)
+                .expect("seed-only predictive play remains usable");
+        let (sender, receiver) = mpsc::channel();
+        app.response_receiver = receiver;
+        sender
+            .send(super::WorkerResponse {
+                request,
+                payload: Ok(payload),
+            })
+            .unwrap();
+        app.drain_worker_responses();
+        assert!(
+            matches!(app.status, GuiStatus::Notice(_)),
+            "missing history must not report clean Ready: {:?}",
+            app.status
+        );
+        assert!(app.status.message().contains("history"));
+        assert!(!app.status.is_error());
+        assert!(!app.predictive_suggestions.is_empty());
+        let initial_notice = app.history_coverage.notice().expect("persistent notice");
+        app.schedule_recompute();
+        assert_eq!(
+            app.history_coverage.notice().as_deref(),
+            Some(initial_notice.as_str())
+        );
+        assert!(matches!(app.status, GuiStatus::Loading(_)));
+        app.set_error(anyhow::anyhow!("synthetic worker failure"));
+        assert_eq!(
+            app.history_coverage.notice().as_deref(),
+            Some(initial_notice.as_str())
+        );
+        app.date_text = "2021-06-20".into();
+        app.schedule_recompute();
+        assert_eq!(
+            app.history_coverage,
+            super::HistoryCoverage::Limited {
+                cutoff: NaiveDate::from_ymd_opt(2021, 6, 19).unwrap(),
+                expected_days: 1,
+                covered_days: 0,
+            }
+        );
+        app.mode = GuiSolverMode::Absurdle;
+        app.schedule_recompute();
+        assert_eq!(app.history_coverage, super::HistoryCoverage::NotRequested);
+        drop(app);
+        drop(root);
+    }
+
+    #[test]
+    fn history_coverage_counts_unique_dates_only_through_the_requested_cutoff() {
+        let cutoff = NaiveDate::from_ymd_opt(2021, 6, 21).unwrap();
+        let entry = |day| crate::data::NytDailyEntry {
+            id: None,
+            print_date: NaiveDate::from_ymd_opt(2021, 6, day).unwrap(),
+            solution: "cigar".into(),
+            days_since_launch: None,
+            editor: None,
+        };
+        for (days, covered_days) in [
+            (vec![], 0),
+            (vec![20, 21], 2),
+            (vec![19, 21], 2),
+            (vec![19, 20], 2),
+            (vec![19, 19, 21, 22, 23], 2),
+        ] {
+            let history = days.into_iter().map(entry).collect::<Vec<_>>();
+            assert_eq!(
+                super::HistoryCoverage::through_cutoff(&history, cutoff),
+                super::HistoryCoverage::Limited {
+                    cutoff,
+                    expected_days: 3,
+                    covered_days,
+                }
+            );
+        }
+        assert_eq!(
+            super::HistoryCoverage::through_cutoff(
+                &[entry(21), entry(20), entry(19), entry(22)],
+                cutoff
+            ),
+            super::HistoryCoverage::Complete
+        );
+        assert_eq!(
+            super::HistoryCoverage::through_cutoff(
+                &[],
+                NaiveDate::from_ymd_opt(2021, 6, 18).unwrap()
+            ),
+            super::HistoryCoverage::Complete
+        );
+    }
+
+    #[test]
+    fn worker_response_identity_includes_controls_not_only_generation() {
+        let (solver, root) = worker_fixture_solver();
+        let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
+            config: solver.config.clone(),
+            predictive_solver: solver,
+            formal_solver: None,
+        });
+        let mut stale = app.current_request.clone().unwrap();
+        stale.date_text = "2000-01-01".into();
+        let (sender, receiver) = mpsc::channel();
+        app.response_receiver = receiver;
+        sender
+            .send(super::WorkerResponse {
+                request: stale,
+                payload: Err("stale failure".into()),
+            })
+            .unwrap();
+        app.drain_worker_responses();
+        assert!(app.computing);
+        assert!(!app.status.is_error());
+        drop(app);
+        drop(root);
+    }
+
+    #[test]
+    fn feedback_palette_meets_normal_text_contrast() {
+        let luminance = |color: eframe::egui::Color32| {
+            let channels = [color.r(), color.g(), color.b()].map(|value| {
+                let channel = f64::from(value) / 255.0;
+                if channel <= 0.04045 {
+                    channel / 12.92
+                } else {
+                    ((channel + 0.055) / 1.055).powf(2.4)
+                }
+            });
+            0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+        };
+        for value in 0..3 {
+            let background = luminance(super::tile_label_and_color(value).1);
+            let foreground = luminance(super::tile_label_and_color(value).2);
+            let contrast =
+                (background.max(foreground) + 0.05) / (background.min(foreground) + 0.05);
+            assert!(contrast >= 4.5, "state {value} contrast {contrast}");
+        }
+    }
+
+    #[test]
+    fn setup_disconnect_is_not_an_infinite_loading_state() {
+        let root = crate::test_support::TestDirectory::new("gui-setup-disconnect");
+        let mut app =
+            super::SetupApp::new(crate::data::ProjectPaths::new(root.path()), String::new());
+        let (sender, receiver) = mpsc::channel();
+        app.receiver = Some(receiver);
+        app.running = true;
+        drop(sender);
+        let context = eframe::egui::Context::default();
+        let _ = context.run(Default::default(), |ctx| {
+            assert!(app.update(ctx).is_none());
+        });
+        assert!(!app.running);
+        assert!(app.error.contains("disconnected"));
+    }
+
+    #[test]
+    fn material_request_changes_invalidate_old_result_details() {
+        let (solver, root) = worker_fixture_solver();
+        let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
+            config: solver.config.clone(),
+            predictive_solver: solver,
+            formal_solver: None,
+        });
+        app.surviving_count = 32;
+        app.total_weight = 1.0;
+        app.selected_suggestion = Some("cigar".to_string());
+        app.predictive_model_metadata = "old request".to_string();
+        app.predictive_execution = Some(
+            app.predictive_solver
+                .suggest_predictive(PredictiveSuggestRequest {
+                    puzzle_date: NaiveDate::from_ymd_opt(2026, 7, 26).unwrap(),
+                    observations: &[],
+                    top: 1,
+                    hard_mode: false,
+                    force_in_two_only: false,
+                    mode: PredictiveSuggestionMode::LiveOnly,
+                })
+                .unwrap()
+                .execution,
+        );
+        app.date_text = "2026-07-27".to_string();
+        app.schedule_recompute();
+        assert_eq!(app.surviving_count, 0);
+        assert_eq!(app.total_weight, 0.0);
+        assert!(app.selected_suggestion.is_none());
+        assert!(app.predictive_model_metadata.is_empty());
+        assert!(app.predictive_execution.is_none());
+        assert!(app.computing);
+        drop(app);
+        drop(root);
+    }
+
+    #[test]
+    fn live_trace_renders_actual_execution_not_configured_thresholds() {
+        let (mut solver, root) = worker_fixture_solver();
+        solver.config.search_policy_mode = crate::config::SearchPolicyMode::ProxyOnly;
+        solver.config.exact_exhaustive_threshold = solver.guesses.len();
+        solver.config.exact_threshold = solver.guesses.len();
+        let response = solver
+            .suggest_predictive(PredictiveSuggestRequest {
+                puzzle_date: NaiveDate::from_ymd_opt(2026, 7, 26).unwrap(),
+                observations: &[],
+                top: 1,
+                hard_mode: false,
+                force_in_two_only: false,
+                mode: PredictiveSuggestionMode::LiveOnly,
+            })
+            .unwrap();
+        assert!(response.state.surviving <= solver.config.exact_exhaustive_threshold);
+        let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
+            config: solver.config.clone(),
+            predictive_solver: solver,
+            formal_solver: None,
+        });
+        app.predictive_execution = Some(response.execution);
+        app.surviving_count = response.state.surviving;
+        let context = eframe::egui::Context::default();
+        let output = context.run(Default::default(), |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| app.show_live_trace(ui));
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                eframe::egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("route=proxy"), "{text}");
+        assert!(text.contains("heuristic proxy"), "{text}");
+        assert!(!text.contains("exhaustive exact"));
+        drop(app);
+        drop(root);
     }
 
     #[test]
@@ -2729,7 +1575,7 @@ mod tests {
     #[test]
     fn spawned_worker_hands_off_to_superseding_predictive_request() {
         let (solver, root) = worker_fixture_solver();
-        let (dispatcher, receiver) = spawn_worker(solver, None);
+        let (dispatcher, receiver) = spawn_worker(solver, None).expect("worker spawn");
         dispatcher
             .send(predictive_worker_request(1, GuiSearchProfile::FiniteStrong))
             .expect("first predictive request");
@@ -2741,11 +1587,11 @@ mod tests {
             let response = receiver
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("superseding predictive request did not complete");
-            if response.generation == 2 && response.complete {
+            if response.request.generation == 2 {
                 break response;
             }
         };
-        assert_eq!(current.generation, 2);
+        assert_eq!(current.request.generation, 2);
         match current.payload.expect("current predictive payload") {
             WorkerPayload::Predictive { finite_search, .. } => {
                 assert!(
@@ -2757,7 +1603,7 @@ mod tests {
         }
 
         drop(dispatcher);
-        let _ = std::fs::remove_dir_all(root);
+        drop(root);
     }
 
     #[test]
@@ -2781,7 +1627,7 @@ mod tests {
                     .expect("release first request");
             }
         });
-        let (dispatcher, receiver) = spawn_worker(solver, None);
+        let (dispatcher, receiver) = spawn_worker(solver, None).expect("worker spawn");
         {
             let (lock, _) = &*dispatcher.shared;
             let mut queue = lock.lock().expect("queue");
@@ -2810,7 +1656,7 @@ mod tests {
             let response = receiver
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("superseding predictive request did not complete");
-            if response.generation == 1 {
+            if response.request.generation == 1 {
                 let WorkerPayload::Predictive { finite_search, .. } =
                     response.payload.expect("obsolete predictive payload")
                 else {
@@ -2821,16 +1667,16 @@ mod tests {
                     FiniteSearchReason::Cancelled
                 );
                 cancelled_obsolete_response = true;
-            } else if response.generation == 2 && response.complete {
+            } else if response.request.generation == 2 {
                 break response;
             }
         };
         assert!(cancelled_obsolete_response);
-        assert_eq!(current.generation, 2);
+        assert_eq!(current.request.generation, 2);
         assert!(current.payload.is_ok());
 
         drop(dispatcher);
-        let _ = std::fs::remove_dir_all(root);
+        drop(root);
     }
 
     #[test]
@@ -2865,39 +1711,45 @@ mod tests {
             "cancellation must be observed by the ranking stage"
         );
 
-        let _ = std::fs::remove_dir_all(root);
+        drop(root);
     }
 
     #[test]
     fn rendered_surface_states_cover_setup_loading_normal_recovery_and_error() {
         assert_eq!(
-            gui_surface_state(true, false, "", None, 0),
+            gui_surface_state(true, false, &GuiStatus::Ready, None, 0),
             GuiSurfaceState::MissingData
         );
         assert_eq!(
-            gui_surface_state(false, true, "", None, 0),
+            gui_surface_state(false, true, &GuiStatus::Ready, None, 0),
             GuiSurfaceState::Loading
         );
         assert_eq!(
-            gui_surface_state(false, false, "", None, 0),
+            gui_surface_state(false, false, &GuiStatus::Ready, None, 0),
             GuiSurfaceState::Empty
         );
         assert_eq!(
-            gui_surface_state(false, false, "", None, 3),
+            gui_surface_state(false, false, &GuiStatus::Ready, None, 3),
             GuiSurfaceState::Normal
         );
         assert_eq!(
             gui_surface_state(
                 false,
                 false,
-                "",
+                &GuiStatus::Ready,
                 Some(crate::predictive::RecoveryMode::EpsilonRepair),
                 3,
             ),
             GuiSurfaceState::Recovery
         );
         assert_eq!(
-            gui_surface_state(false, false, "bad model", None, 0),
+            gui_surface_state(
+                false,
+                false,
+                &GuiStatus::WorkerError("bad model".into()),
+                None,
+                0
+            ),
             GuiSurfaceState::Error
         );
     }
@@ -2911,15 +1763,9 @@ mod tests {
     }
 
     #[test]
-    fn worker_response_discards_stale_generations() {
-        assert!(worker_response_is_current(7, 7));
-        assert!(!worker_response_is_current(7, 6));
-        assert!(!worker_response_is_current(7, 8));
-    }
-
-    #[test]
     fn worker_cancellation_tracks_newer_generation_and_shutdown() {
         let shared = Arc::new((Mutex::new(LatestWorkerQueue::default()), Condvar::new()));
+        shared.0.lock().expect("queue").latest_generation = 4;
         assert!(!worker_request_cancelled(&shared, 4));
         {
             let mut queue = shared.0.lock().expect("queue");
@@ -3010,8 +1856,8 @@ mod tests {
 
     #[test]
     fn finite_profile_and_completion_status_expose_boundaries() {
-        assert!(predictive_response_status(false, None).contains("configured ranking"));
-        assert!(!predictive_response_status(false, None).contains("exact ranking"));
+        assert_eq!(predictive_response_status(None), GuiStatus::Ready);
+        assert!(!predictive_response_status(None).is_error());
         assert_eq!(
             GuiSearchProfile::FiniteFast.label(),
             "Finite fast (experimental)"
@@ -3025,6 +1871,8 @@ mod tests {
             "Using finite fast search (experimental)"
         );
         let search = FiniteSearchResult {
+            root_candidates_considered: 0,
+            all_legal_roots_evaluated: false,
             candidates: Vec::new(),
             reason: FiniteSearchReason::Deadline,
             nodes_visited: 3,
@@ -3032,7 +1880,10 @@ mod tests {
             cache_hits: 1,
             proposal_sampled: false,
         };
-        assert!(predictive_response_status(true, Some(&search)).contains("time budget"));
+        assert!(matches!(
+            predictive_response_status(Some(&search)),
+            GuiStatus::Notice(_)
+        ));
     }
 
     #[test]
@@ -3048,7 +1899,7 @@ mod tests {
         let (solver, root) = worker_fixture_solver();
         let mut request = predictive_worker_request(1, GuiSearchProfile::FiniteFast);
         request.hard_mode = true;
-        let bounded = super::compute_worker_payload(&solver, None, &request, true, &|| false)
+        let bounded = super::compute_worker_payload(&solver, None, &request, &|| false)
             .expect("experimental bounded hard-mode preview");
         let super::WorkerPayload::Predictive {
             model_metadata,
@@ -3062,14 +1913,14 @@ mod tests {
         assert!(!model_metadata.contains("normal-mode future replies"));
 
         request.search_profile = GuiSearchProfile::Configured;
-        let payload = super::compute_worker_payload(&solver, None, &request, true, &|| false)
-            .expect("legacy hard-mode preview");
+        let payload = super::compute_worker_payload(&solver, None, &request, &|| false)
+            .expect("configured hard-mode result");
         let super::WorkerPayload::Predictive { model_metadata, .. } = payload else {
             panic!("expected predictive payload");
         };
         assert!(model_metadata.contains("normal-mode future replies"));
         drop(solver);
-        std::fs::remove_dir_all(root).expect("remove owned fixture");
+        drop(root);
     }
 
     #[test]
@@ -3188,11 +2039,15 @@ mod tests {
             (1260.0, true),
         ] {
             let (solver, root) = worker_fixture_solver();
-            let (request_sender, response_receiver) = spawn_worker(solver.clone(), None);
+            let (request_sender, response_receiver) =
+                spawn_worker(solver.clone(), None).expect("worker spawn");
             let mut app = super::WordleGuiApp {
                 config: crate::config::PriorConfig::default(),
                 predictive_solver: solver,
                 formal_solver: None,
+                formal_availability: super::FormalAvailability::Absent,
+                formal_receiver: None,
+                formal_cancel: Arc::new(AtomicBool::new(false)),
                 workspace_view: super::WorkspaceView::Play,
                 mode: GuiSolverMode::Predictive,
                 search_profile: GuiSearchProfile::Configured,
@@ -3207,6 +2062,7 @@ mod tests {
                     Vec::new()
                 },
                 predictive_suggestions: vec![Suggestion {
+                    value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                     finite_value: None,
                     word: "humph".to_string(),
                     entropy: 1.0,
@@ -3235,17 +2091,20 @@ mod tests {
                 predictive_artifact_state: PredictiveArtifactState::NoPredictiveArtifactAvailable,
                 predictive_model_metadata: String::new(),
                 predictive_finite_search: None,
+                predictive_execution: None,
+                history_coverage: super::HistoryCoverage::NotRequested,
                 top: 10,
                 force_in_two_only: false,
                 hard_mode: false,
-                status: String::new(),
+                status: GuiStatus::Ready,
                 formal_explanation: None,
                 suggestion_sort: super::SuggestionSort::Rank,
                 suggestion_sort_descending: false,
                 selected_suggestion: None,
-                request_sender,
+                request_sender: Some(request_sender),
                 response_receiver,
                 latest_generation: 0,
+                current_request: None,
                 computing: false,
             };
             let screen_rect = eframe::egui::Rect::from_min_size(
@@ -3367,18 +2226,22 @@ mod tests {
             );
 
             drop(app);
-            let _ = std::fs::remove_dir_all(root);
+            drop(root);
         }
     }
 
     #[test]
     fn guess_feedback_controls_stay_inside_minimum_window() {
         let (solver, root) = worker_fixture_solver();
-        let (request_sender, response_receiver) = spawn_worker(solver.clone(), None);
+        let (request_sender, response_receiver) =
+            spawn_worker(solver.clone(), None).expect("worker spawn");
         let mut app = super::WordleGuiApp {
             config: crate::config::PriorConfig::default(),
             predictive_solver: solver,
             formal_solver: None,
+            formal_availability: super::FormalAvailability::Absent,
+            formal_receiver: None,
+            formal_cancel: Arc::new(AtomicBool::new(false)),
             workspace_view: super::WorkspaceView::Play,
             mode: GuiSolverMode::Predictive,
             search_profile: GuiSearchProfile::Configured,
@@ -3399,17 +2262,20 @@ mod tests {
             predictive_artifact_state: PredictiveArtifactState::NoPredictiveArtifactAvailable,
             predictive_model_metadata: String::new(),
             predictive_finite_search: None,
+            predictive_execution: None,
+            history_coverage: super::HistoryCoverage::NotRequested,
             top: 10,
             force_in_two_only: false,
             hard_mode: false,
-            status: String::new(),
+            status: GuiStatus::Ready,
             formal_explanation: None,
             suggestion_sort: super::SuggestionSort::Rank,
             suggestion_sort_descending: false,
             selected_suggestion: None,
-            request_sender,
+            request_sender: Some(request_sender),
             response_receiver,
             latest_generation: 0,
+            current_request: None,
             computing: false,
         };
         let screen_rect = eframe::egui::Rect::from_min_size(
@@ -3438,7 +2304,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         drop(app);
-        let _ = std::fs::remove_dir_all(root);
+        drop(root);
 
         assert_eq!(
             feedback_tiles.len(),

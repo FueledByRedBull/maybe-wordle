@@ -1,5 +1,19 @@
 # Maybe Wordle Implementation Plan
 
+> 2026-09-29: [The audit remediation ledger](docs/superpowers/plans/2026-09-29-audit-remediation.md)
+> records implementation and local verification for all 48 September 28 review
+> findings, including 603 passing tests and the unchanged selected-policy rolling
+> score. Native GUI/platform acceptance and candidate-promotion research remain
+> open in TODO. Earlier checkpoints retain their original evidence scope.
+
+> 2026-09-27 prospective-workflow checkpoint: a distinct immutable freeze and
+> once-only 30-day UTC evaluation path is implemented with synthetic tests.
+> Freeze schema v2 binds complete pre-window history through the UTC freeze
+> date; reports cannot share the marker directory.
+> It does not reopen the consumed seal. No development challenger currently
+> clears the eligibility interval, so no candidate is frozen and no future
+> result exists. The September release ledger and TODO remain the live gates.
+
 > 2026-09-26 [pre-validator-build development replay table](docs/generated/september-post-layout-tests-rolling-v1.md):
 > selected staged solved 360/360 allowed development games at 3.1944 guesses;
 > exploratory v19b solved 360/360 at 3.1917. All 720 paths matched the prior
@@ -72,6 +86,18 @@
 > across modes despite one TOML; a pure search comparison remains open.
 > Earlier traced runs and individual divergent moves remain in the September
 > acceptance plan.
+
+> 2026-09-27/28 continuation: a measured recursive exact-search bound and
+> answer-first incumbent ordering reduced a matched nine-date seven-profile
+> slice from 80.62 to 17.98/17.96 seconds without changing any of its 63
+> game payloads. The full current-schema seven-profile development matrix then
+> completed 2,520/2,520 profile-games in 13.91 minutes with zero failures or
+> gaps. A rebuilt-executable rerun took about 15.12 minutes and matched all
+> 2,520 outcomes and guess paths. Selected staged remained at 3.1944 over
+> 360 games. This is a runtime
+> and evidence-coverage gain, not a demonstrated score improvement or a
+> prospective/flat-three result. `TODO.md` retains the unqualified candidate,
+> native GUI, and prospective work.
 
 > 2026-08-30 measurement audit: the next release is unfinished and production remains v20. Development is frozen through August 26; August 28–September 26 is the new untouched seal. Study format v17 computes solved-only totals from the solved histogram and excludes shared process peak memory from candidate ordering/Pareto ranks. Earlier August v16 screens remain historical, not current promotion evidence. New studies, isolated finalist memory validation, profile-matrix evidence, and release checks are still required; see `TODO.md`.
 

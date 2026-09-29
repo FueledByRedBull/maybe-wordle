@@ -198,35 +198,21 @@ pub fn fit_learned_proxy_experiment(
     })
 }
 
-pub fn learned_proxy_feature_names() -> Vec<String> {
-    [
-        "entropy",
-        "solve_probability",
-        "expected_remaining",
-        "force_in_two",
-        "worst_non_green_bucket_size",
-        "largest_non_green_bucket_mass",
-        "high_mass_ambiguous_bucket_count",
-        "smoothness_penalty",
-        "large_non_green_bucket_count",
-        "dangerous_mass_bucket_count",
-        "non_green_mass_in_large_buckets",
-        "posterior_answer_probability",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
+pub use crate::predictive::learned_proxy::learned_proxy_feature_names;
 
-pub const SURVIVAL_EXPERIMENT_VERSION: u32 = 1;
+pub const SURVIVAL_EXPERIMENT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PriorScoreMetrics {
     pub games: usize,
     pub coverage_gaps: usize,
-    pub mean_log_loss: f64,
-    pub mean_brier: f64,
-    pub mean_target_rank: f64,
+    pub covered_games: usize,
+    pub log_loss_sum: f64,
+    pub brier_sum: f64,
+    pub target_rank_sum: f64,
+    pub mean_log_loss: Option<f64>,
+    pub mean_brier: Option<f64>,
+    pub mean_target_rank: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -248,11 +234,14 @@ pub struct SurvivalFoldEvidence {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SolvePolicyAggregate {
     pub scheduled_games: usize,
+    pub modeled_games: usize,
     pub solved_games: usize,
     pub unsolved_games: usize,
     pub coverage_gaps: usize,
-    pub conditional_mean_guesses: f64,
-    pub all_game_penalized_mean_guesses: f64,
+    pub modeled_guess_total: usize,
+    pub all_game_penalized_guess_total: f64,
+    pub conditional_mean_guesses: Option<f64>,
+    pub all_game_penalized_mean_guesses: Option<f64>,
     pub maximum_fold_latency_p95_ms: f64,
     pub peak_memory_bytes: Option<u64>,
 }
@@ -278,6 +267,7 @@ pub struct SurvivalExperimentReport {
     pub survival: PriorScoreMetrics,
     pub solve_quality: SurvivalSolveAggregateComparison,
     pub total_reuse_events: usize,
+    pub fold_reuse_event_exposures: usize,
     pub elapsed_ms: u64,
     pub peak_memory_bytes: Option<u64>,
     pub promotable: bool,
@@ -299,6 +289,10 @@ pub fn run_survival_experiment(
     );
     let evaluation_plan = Solver::development_evaluation_plan(paths)?;
     history.retain(|entry| entry.print_date <= evaluation_plan.development.end);
+    ensure!(
+        !history.is_empty(),
+        "survival experiment has no development history"
+    );
     let history_range = DateRange::new(
         history.first().expect("non-empty").print_date,
         history.last().expect("non-empty").print_date,
@@ -330,6 +324,7 @@ pub fn run_survival_experiment(
             .to_string(),
     };
     let mut folds = Vec::new();
+    let mut unique_reuse_events = BTreeSet::new();
     for fold in &evaluation_plan.folds {
         let observations =
             survival_observations_at_cutoff(&history, &support, &policy_eras, fold.training.end)?;
@@ -341,7 +336,8 @@ pub fn run_survival_experiment(
             fold.validation.end,
         );
         let training = build_fold_training_inputs(&observations, fold_spec)?;
-        let model = SurvivalModel::fit_fold(&training, &policy_eras, &SurvivalConfig::default())?;
+        let model = SurvivalModel::fit_fold(&training, &policy_eras, &SurvivalConfig::default())
+            .with_context(|| format!("survival fit is ineligible for fold {}", training.fold.id))?;
         let (logistic, survival) = evaluate_prior_curves(
             &history,
             &support,
@@ -357,18 +353,16 @@ pub fn run_survival_experiment(
             .collect::<Vec<_>>();
         let solve_comparison =
             solver.compare_survival_model_on_games(&validation_games, &model, 1)?;
-        let reuse_events = training
-            .observations
-            .iter()
-            .filter(|observation| observation.reused)
-            .count();
+        let fold_events = reuse_event_identities(&training.observations);
+        let reuse_events = fold_events.len();
+        unique_reuse_events.extend(fold_events);
         eprintln!(
-            "survival phase=fold fold={}/{} reuse_events={} logistic_logloss={:.6} survival_logloss={:.6} elapsed_s={:.1}",
+            "survival phase=fold fold={}/{} reuse_events={} logistic_logloss={} survival_logloss={} elapsed_s={:.1}",
             fold.index + 1,
             evaluation_plan.folds.len(),
             reuse_events,
-            logistic.mean_log_loss,
-            survival.mean_log_loss,
+            format_prior_mean(logistic.mean_log_loss),
+            format_prior_mean(survival.mean_log_loss),
             started.elapsed().as_secs_f64()
         );
         folds.push(SurvivalFoldEvidence {
@@ -386,14 +380,15 @@ pub fn run_survival_experiment(
             solve_comparison,
         });
     }
-    let logistic = aggregate_prior_metrics(folds.iter().map(|fold| &fold.logistic));
-    let survival = aggregate_prior_metrics(folds.iter().map(|fold| &fold.survival));
-    let total_reuse_events = folds.iter().map(|fold| fold.reuse_events).sum();
-    let solve_quality = aggregate_survival_solves(&folds);
+    let logistic = aggregate_prior_metrics(folds.iter().map(|fold| &fold.logistic))?;
+    let survival = aggregate_prior_metrics(folds.iter().map(|fold| &fold.survival))?;
+    let total_reuse_events = unique_reuse_events.len();
+    let fold_reuse_event_exposures = folds.iter().map(|fold| fold.reuse_events).sum();
+    let solve_quality = aggregate_survival_solves(&folds)?;
     let mut promotion_blockers = Vec::new();
     if total_reuse_events < 100 {
         promotion_blockers.push(format!(
-            "Only {total_reuse_events} fold-local reuse events are available; the hazard fit is too sparse for promotion."
+            "Only {total_reuse_events} unique reuse events are available ({fold_reuse_event_exposures} fold exposures); the hazard fit is too sparse for promotion."
         ));
     }
     if survival.coverage_gaps > 0 {
@@ -402,9 +397,7 @@ pub fn run_survival_experiment(
             survival.coverage_gaps
         ));
     }
-    if survival.mean_log_loss >= logistic.mean_log_loss
-        || survival.mean_brier >= logistic.mean_brier
-    {
+    if !prior_metrics_improve(&survival, &logistic) {
         promotion_blockers.push(
             "The survival curve did not beat the logistic baseline on both development log loss and Brier score."
                 .to_string(),
@@ -412,8 +405,9 @@ pub fn run_survival_experiment(
     }
     if solve_quality.survival.coverage_gaps > solve_quality.baseline.coverage_gaps
         || solve_quality.survival.unsolved_games > solve_quality.baseline.unsolved_games
-        || solve_quality.survival.all_game_penalized_mean_guesses
-            >= solve_quality.baseline.all_game_penalized_mean_guesses
+        || !matches!((solve_quality.survival.all_game_penalized_mean_guesses,
+            solve_quality.baseline.all_game_penalized_mean_guesses),
+            (Some(candidate), Some(baseline)) if candidate < baseline)
     {
         promotion_blockers.push(
             "The survival prior did not strictly improve paired rolling solve quality without increasing failures or coverage gaps."
@@ -465,6 +459,7 @@ pub fn run_survival_experiment(
         survival,
         solve_quality,
         total_reuse_events,
+        fold_reuse_event_exposures,
         elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         peak_memory_bytes: crate::process_memory::process_memory_snapshot()
             .map(|snapshot| snapshot.peak_working_set_bytes),
@@ -473,44 +468,107 @@ pub fn run_survival_experiment(
     })
 }
 
-fn aggregate_survival_solves(folds: &[SurvivalFoldEvidence]) -> SurvivalSolveAggregateComparison {
-    fn aggregate<'a>(
-        evidence: impl Iterator<Item = &'a crate::solver::SolvePolicyEvidence>,
-    ) -> SolvePolicyAggregate {
-        let mut aggregate = SolvePolicyAggregate::default();
-        let mut conditional_guess_total = 0.0;
-        let mut penalized_guess_total = 0.0;
-        for item in evidence {
-            let metrics = &item.summary.canonical;
-            aggregate.scheduled_games += metrics.scheduled_games;
-            aggregate.solved_games += metrics.solved_games;
-            aggregate.unsolved_games += metrics.unsolved_games;
-            aggregate.coverage_gaps += metrics.coverage_gaps;
-            conditional_guess_total +=
-                metrics.conditional_mean_guesses * metrics.solved_games as f64;
-            penalized_guess_total +=
-                metrics.all_game_penalized_mean_guesses * metrics.scheduled_games as f64;
-            aggregate.maximum_fold_latency_p95_ms = aggregate
-                .maximum_fold_latency_p95_ms
-                .max(item.latency_p95_ms);
-            aggregate.peak_memory_bytes =
-                match (aggregate.peak_memory_bytes, item.peak_memory_bytes) {
-                    (Some(left), Some(right)) => Some(left.max(right)),
-                    (left, right) => left.or(right),
-                };
-        }
-        aggregate.conditional_mean_guesses =
-            conditional_guess_total / aggregate.solved_games.max(1) as f64;
-        aggregate.all_game_penalized_mean_guesses =
-            penalized_guess_total / aggregate.scheduled_games.max(1) as f64;
-        aggregate
-    }
+fn reuse_event_identities(observations: &[SurvivalObservation]) -> BTreeSet<(String, NaiveDate)> {
+    // The exclusive interval end identifies the same event across truncated or overlapping folds.
+    observations
+        .iter()
+        .filter(|observation| observation.reused)
+        .map(|observation| (observation.word.clone(), observation.exit_date))
+        .collect()
+}
 
-    SurvivalSolveAggregateComparison {
+fn format_prior_mean(value: Option<f64>) -> String {
+    value.map_or_else(|| "unavailable".to_string(), |value| format!("{value:.6}"))
+}
+
+fn prior_metrics_improve(candidate: &PriorScoreMetrics, baseline: &PriorScoreMetrics) -> bool {
+    candidate.covered_games > 0
+        && baseline.covered_games > 0
+        && matches!((candidate.mean_log_loss, baseline.mean_log_loss, candidate.mean_brier, baseline.mean_brier),
+        (Some(candidate_loss), Some(baseline_loss), Some(candidate_brier), Some(baseline_brier))
+        if [candidate_loss, baseline_loss, candidate_brier, baseline_brier].iter().all(|value| value.is_finite())
+            && candidate_loss < baseline_loss && candidate_brier < baseline_brier)
+}
+
+fn aggregate_survival_solves(
+    folds: &[SurvivalFoldEvidence],
+) -> Result<SurvivalSolveAggregateComparison> {
+    Ok(SurvivalSolveAggregateComparison {
         search_policy: "proxy_only_without_predictive_books".to_string(),
-        baseline: aggregate(folds.iter().map(|fold| &fold.solve_comparison.baseline)),
-        survival: aggregate(folds.iter().map(|fold| &fold.solve_comparison.survival)),
+        baseline: aggregate_solve_metrics(folds.iter().map(|fold| {
+            let item = &fold.solve_comparison.baseline;
+            (
+                &item.summary.canonical,
+                item.latency_p95_ms,
+                item.peak_memory_bytes,
+            )
+        }))?,
+        survival: aggregate_solve_metrics(folds.iter().map(|fold| {
+            let item = &fold.solve_comparison.survival;
+            (
+                &item.summary.canonical,
+                item.latency_p95_ms,
+                item.peak_memory_bytes,
+            )
+        }))?,
+    })
+}
+
+fn aggregate_solve_metrics<'a>(
+    evidence: impl Iterator<Item = (&'a crate::experiments::PredictiveMetrics, f64, Option<u64>)>,
+) -> Result<SolvePolicyAggregate> {
+    let mut aggregate = SolvePolicyAggregate::default();
+    for (metrics, latency_p95_ms, peak_memory_bytes) in evidence {
+        aggregate.scheduled_games = aggregate
+            .scheduled_games
+            .checked_add(metrics.scheduled_games)
+            .context("scheduled game count overflow")?;
+        aggregate.modeled_games = aggregate
+            .modeled_games
+            .checked_add(metrics.modeled_games)
+            .context("modeled game count overflow")?;
+        aggregate.solved_games = aggregate
+            .solved_games
+            .checked_add(metrics.solved_games)
+            .context("solved game count overflow")?;
+        aggregate.unsolved_games = aggregate
+            .unsolved_games
+            .checked_add(metrics.unsolved_games)
+            .context("unsolved game count overflow")?;
+        aggregate.coverage_gaps = aggregate
+            .coverage_gaps
+            .checked_add(metrics.coverage_gaps)
+            .context("coverage gap count overflow")?;
+        aggregate.modeled_guess_total = aggregate
+            .modeled_guess_total
+            .checked_add(metrics.modeled_guess_total)
+            .context("modeled guess total overflow")?;
+        ensure!(
+            metrics.all_game_penalized_guess_total.is_finite()
+                && metrics.all_game_penalized_guess_total >= 0.0,
+            "penalized guess total must be finite and non-negative"
+        );
+        aggregate.all_game_penalized_guess_total += metrics.all_game_penalized_guess_total;
+        ensure!(
+            aggregate.all_game_penalized_guess_total.is_finite(),
+            "penalized guess total overflow"
+        );
+        ensure!(
+            latency_p95_ms.is_finite() && latency_p95_ms >= 0.0,
+            "fold latency must be finite and non-negative"
+        );
+        aggregate.maximum_fold_latency_p95_ms =
+            aggregate.maximum_fold_latency_p95_ms.max(latency_p95_ms);
+        aggregate.peak_memory_bytes = match (aggregate.peak_memory_bytes, peak_memory_bytes) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        };
     }
+    aggregate.conditional_mean_guesses = (aggregate.modeled_games > 0)
+        .then(|| aggregate.modeled_guess_total as f64 / aggregate.modeled_games as f64);
+    aggregate.all_game_penalized_mean_guesses = (aggregate.scheduled_games > 0)
+        .then(|| aggregate.all_game_penalized_guess_total / aggregate.scheduled_games as f64);
+    Ok(aggregate)
 }
 
 fn policy_eras_from_history(history: &[NytDailyEntry]) -> Result<Vec<PolicyEra>> {
@@ -631,6 +689,8 @@ fn evaluate_prior_curves(
     config: &PriorConfig,
     model: &SurvivalModel,
 ) -> Result<(PriorScoreMetrics, PriorScoreMetrics)> {
+    model.validate()?;
+    crate::experiments::validate_predictive_config(config)?;
     let mut support = seed_support.iter().cloned().collect::<BTreeSet<_>>();
     let mut last_seen = BTreeMap::<String, NaiveDate>::new();
     for entry in history
@@ -670,8 +730,8 @@ fn evaluate_prior_curves(
                 survival_scores.push(1.0);
             }
         }
-        logistic.observe(&logistic_scores, target_index);
-        survival.observe(&survival_scores, target_index);
+        logistic.observe(&logistic_scores, target_index)?;
+        survival.observe(&survival_scores, target_index)?;
         support.insert(target.clone());
         last_seen.insert(target, entry.print_date);
     }
@@ -703,17 +763,28 @@ struct ScoreAccumulator {
 }
 
 impl ScoreAccumulator {
-    fn observe(&mut self, scores: &[f64], target_index: Option<usize>) {
-        self.games += 1;
-        let Some(target_index) = target_index else {
-            self.coverage_gaps += 1;
-            return;
-        };
+    fn observe(&mut self, scores: &[f64], target_index: Option<usize>) -> Result<()> {
+        ensure!(
+            scores
+                .iter()
+                .all(|score| score.is_finite() && *score >= 0.0),
+            "prior scores must be finite and non-negative"
+        );
         let total = scores.iter().sum::<f64>();
-        if !total.is_finite() || total <= 0.0 {
+        ensure!(
+            total.is_finite() && (total > 0.0 || (scores.is_empty() && target_index.is_none())),
+            "prior scores must have finite positive total mass"
+        );
+        let Some(target_index) = target_index else {
+            self.games += 1;
             self.coverage_gaps += 1;
-            return;
-        }
+            return Ok(());
+        };
+        ensure!(
+            target_index < scores.len(),
+            "prior target index is outside score support"
+        );
+        self.games += 1;
         let target_probability = scores[target_index] / total;
         self.log_loss += -target_probability.max(1e-15).ln();
         self.brier += scores
@@ -733,56 +804,66 @@ impl ScoreAccumulator {
                     *index != target_index && score.total_cmp(&scores[target_index]).is_gt()
                 })
                 .count() as f64;
+        Ok(())
     }
 
     fn finish(self) -> PriorScoreMetrics {
-        let covered = self.games.saturating_sub(self.coverage_gaps);
+        let covered = self.games - self.coverage_gaps;
         PriorScoreMetrics {
             games: self.games,
             coverage_gaps: self.coverage_gaps,
-            mean_log_loss: if covered == 0 {
-                f64::INFINITY
-            } else {
-                self.log_loss / covered as f64
-            },
-            mean_brier: if covered == 0 {
-                f64::INFINITY
-            } else {
-                self.brier / covered as f64
-            },
-            mean_target_rank: if covered == 0 {
-                f64::INFINITY
-            } else {
-                self.target_rank / covered as f64
-            },
+            covered_games: covered,
+            log_loss_sum: self.log_loss,
+            brier_sum: self.brier,
+            target_rank_sum: self.target_rank,
+            mean_log_loss: (covered > 0).then(|| self.log_loss / covered as f64),
+            mean_brier: (covered > 0).then(|| self.brier / covered as f64),
+            mean_target_rank: (covered > 0).then(|| self.target_rank / covered as f64),
         }
     }
 }
 
 fn aggregate_prior_metrics<'a>(
     metrics: impl Iterator<Item = &'a PriorScoreMetrics>,
-) -> PriorScoreMetrics {
-    let mut games = 0usize;
-    let mut gaps = 0usize;
-    let mut log_loss = 0.0;
-    let mut brier = 0.0;
-    let mut rank = 0.0;
+) -> Result<PriorScoreMetrics> {
+    let mut aggregate = ScoreAccumulator::default();
     for metric in metrics {
-        let covered = metric.games.saturating_sub(metric.coverage_gaps);
-        games += metric.games;
-        gaps += metric.coverage_gaps;
-        log_loss += metric.mean_log_loss * covered as f64;
-        brier += metric.mean_brier * covered as f64;
-        rank += metric.mean_target_rank * covered as f64;
+        ensure!(
+            metric.games.checked_sub(metric.coverage_gaps) == Some(metric.covered_games),
+            "prior metric coverage counts are inconsistent"
+        );
+        let sums = [
+            metric.log_loss_sum,
+            metric.brier_sum,
+            metric.target_rank_sum,
+        ];
+        ensure!(
+            sums.iter().all(|sum| sum.is_finite() && *sum >= 0.0),
+            "prior metric sums must be finite and non-negative"
+        );
+        ensure!(
+            metric.covered_games > 0 || sums.iter().all(|sum| *sum == 0.0),
+            "unmeasured prior metrics must have zero additive sums"
+        );
+        aggregate.games = aggregate
+            .games
+            .checked_add(metric.games)
+            .context("prior game count overflow")?;
+        aggregate.coverage_gaps = aggregate
+            .coverage_gaps
+            .checked_add(metric.coverage_gaps)
+            .context("prior gap count overflow")?;
+        aggregate.log_loss += metric.log_loss_sum;
+        aggregate.brier += metric.brier_sum;
+        aggregate.target_rank += metric.target_rank_sum;
+        ensure!(
+            [aggregate.log_loss, aggregate.brier, aggregate.target_rank]
+                .iter()
+                .all(|sum| sum.is_finite()),
+            "prior metric sum overflow"
+        );
     }
-    let covered = games.saturating_sub(gaps);
-    PriorScoreMetrics {
-        games,
-        coverage_gaps: gaps,
-        mean_log_loss: log_loss / covered.max(1) as f64,
-        mean_brier: brier / covered.max(1) as f64,
-        mean_target_rank: rank / covered.max(1) as f64,
-    }
+    Ok(aggregate.finish())
 }
 
 #[cfg(test)]
@@ -791,6 +872,219 @@ mod tests {
 
     fn date(day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2024, 1, day).expect("date")
+    }
+
+    #[test]
+    fn uncovered_fold_does_not_poison_measured_prior_metrics() {
+        let mut uncovered = ScoreAccumulator::default();
+        uncovered.observe(&[1.0, 1.0], None).expect("uncovered");
+        let mut measured = ScoreAccumulator::default();
+        measured.observe(&[1.0, 1.0], Some(0)).expect("measured");
+        let metrics = [uncovered.finish(), measured.finish()];
+        let aggregate = aggregate_prior_metrics(metrics.iter()).expect("aggregate");
+        let json = serde_json::to_value(aggregate).expect("metrics json");
+        assert_eq!(json["games"], 2);
+        assert_eq!(json["coverage_gaps"], 1);
+        assert_eq!(json["mean_log_loss"].as_f64(), Some(2.0_f64.ln()));
+        assert_eq!(json["mean_brier"].as_f64(), Some(0.5));
+        assert_eq!(json["mean_target_rank"].as_f64(), Some(1.0));
+        assert_eq!(json["covered_games"], 1);
+    }
+
+    #[test]
+    fn empty_and_all_gap_priors_have_zero_sums_and_unavailable_means() {
+        let mut uncovered = ScoreAccumulator::default();
+        uncovered.observe(&[], None).expect("gap");
+        let metrics = [ScoreAccumulator::default().finish(), uncovered.finish()];
+        let aggregate = aggregate_prior_metrics(metrics.iter()).expect("aggregate");
+        for metric in metrics.iter().chain(std::iter::once(&aggregate)) {
+            assert_eq!(metric.covered_games, 0);
+            assert_eq!(
+                (
+                    metric.log_loss_sum,
+                    metric.brier_sum,
+                    metric.target_rank_sum
+                ),
+                (0.0, 0.0, 0.0)
+            );
+            assert_eq!(
+                (
+                    metric.mean_log_loss,
+                    metric.mean_brier,
+                    metric.mean_target_rank
+                ),
+                (None, None, None)
+            );
+            let json = serde_json::to_value(metric).expect("json");
+            assert!(json["mean_log_loss"].is_null());
+            assert_eq!(json["log_loss_sum"], 0.0);
+            assert_eq!(format_prior_mean(metric.mean_log_loss), "unavailable");
+        }
+        let mut measured = ScoreAccumulator::default();
+        measured.observe(&[1.0], Some(0)).expect("measured");
+        let measured = measured.finish();
+        assert!(!prior_metrics_improve(&aggregate, &measured));
+        assert!(!prior_metrics_improve(&measured, &aggregate));
+        assert_eq!(
+            aggregate_prior_metrics(std::iter::empty())
+                .expect("empty")
+                .mean_log_loss,
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_prior_scores_are_errors_not_coverage_gaps() {
+        let mut accumulator = ScoreAccumulator::default();
+        for scores in [
+            vec![f64::NAN],
+            vec![f64::INFINITY],
+            vec![-1.0],
+            vec![0.0],
+            vec![f64::MAX, f64::MAX],
+        ] {
+            assert!(accumulator.observe(&scores, Some(0)).is_err());
+            assert!(accumulator.observe(&scores, None).is_err());
+        }
+        assert!(accumulator.observe(&[1.0], Some(1)).is_err());
+        assert_eq!(accumulator.finish().games, 0);
+        let mut invalid = PriorScoreMetrics {
+            games: 1,
+            covered_games: 1,
+            log_loss_sum: f64::INFINITY,
+            ..PriorScoreMetrics::default()
+        };
+        assert!(aggregate_prior_metrics([&invalid].into_iter()).is_err());
+        invalid.log_loss_sum = f64::MAX;
+        assert!(aggregate_prior_metrics([&invalid, &invalid].into_iter()).is_err());
+        invalid.covered_games = 0;
+        assert!(aggregate_prior_metrics([&invalid].into_iter()).is_err());
+    }
+
+    #[test]
+    fn reuse_events_are_unique_across_overlapping_training_folds() {
+        let first = vec![SurvivalObservation::reused_observation(
+            "word",
+            date(1),
+            date(5),
+            "a",
+        )];
+        let second = vec![
+            SurvivalObservation::reused_observation("word", date(3), date(5), "a")
+                .with_elapsed_offset(2),
+            SurvivalObservation::reused_observation("word", date(6), date(9), "a"),
+            SurvivalObservation::right_censored("other", date(3), date(5), "a"),
+        ];
+        let first = reuse_event_identities(&first);
+        let second = reuse_event_identities(&second);
+        assert_eq!(first.len() + second.len(), 3);
+        assert_eq!(first.union(&second).count(), 2);
+    }
+
+    #[test]
+    fn prior_evaluation_rejects_invalid_model_even_without_seen_words() {
+        let mut model = SurvivalModel::fit_with_policy_eras(
+            &[SurvivalObservation::reused_observation(
+                "word",
+                date(1),
+                date(3),
+                "a",
+            )],
+            &[PolicyEra::new("a", date(1), None)],
+            &SurvivalConfig::default(),
+        )
+        .expect("model");
+        model.converged = false;
+        assert!(
+            evaluate_prior_curves(
+                &[],
+                &["word".into()],
+                date(3),
+                DateRange::new(date(4), date(5)).expect("range"),
+                &PriorConfig::default(),
+                &model
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn solve_aggregation_weights_all_modeled_games_including_failures() {
+        use crate::experiments::{BootstrapConfig, GameOutcome, summarize_predictive_outcomes};
+        let bootstrap = BootstrapConfig {
+            resamples: 1,
+            block_length: 1,
+            seed: 1,
+        };
+        let first = summarize_predictive_outcomes(
+            &[
+                GameOutcome::solved(date(1), 1),
+                GameOutcome::unsolved(date(2), 6),
+            ],
+            7.0,
+            bootstrap,
+        )
+        .expect("first fold");
+        let second =
+            summarize_predictive_outcomes(&[GameOutcome::solved(date(3), 2)], 7.0, bootstrap)
+                .expect("second fold");
+        let aggregate =
+            aggregate_solve_metrics([(&first, 1.0, None), (&second, 2.0, None)].into_iter())
+                .expect("aggregate");
+        assert_eq!(
+            serde_json::to_value(aggregate).expect("json")["conditional_mean_guesses"].as_f64(),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn solve_aggregates_match_flattened_games_for_every_partition() {
+        use crate::experiments::{BootstrapConfig, GameOutcome, summarize_predictive_outcomes};
+        let bootstrap = BootstrapConfig {
+            resamples: 1,
+            block_length: 1,
+            seed: 1,
+        };
+        let games = [
+            GameOutcome::coverage_gap(date(1)),
+            GameOutcome::unsolved(date(2), 6),
+            GameOutcome::solved(date(3), 2),
+            GameOutcome::solved(date(4), 1),
+            GameOutcome::coverage_gap(date(5)),
+            GameOutcome::unsolved(date(6), 5),
+        ];
+        let flat = summarize_predictive_outcomes(&games, 7.0, bootstrap).expect("flat");
+        for width in 1..=games.len() {
+            let folds = games
+                .chunks(width)
+                .map(|games| summarize_predictive_outcomes(games, 7.0, bootstrap).expect("fold"))
+                .collect::<Vec<_>>();
+            let aggregate =
+                aggregate_solve_metrics(folds.iter().map(|metrics| (metrics, 1.0, None)))
+                    .expect("aggregate");
+            assert_eq!(aggregate.scheduled_games, flat.scheduled_games);
+            assert_eq!(aggregate.modeled_games, flat.modeled_games);
+            assert_eq!(aggregate.modeled_guess_total, flat.modeled_guess_total);
+            assert_eq!(
+                aggregate.all_game_penalized_guess_total,
+                flat.all_game_penalized_guess_total
+            );
+            assert_eq!(
+                aggregate.conditional_mean_guesses,
+                flat.conditional_mean_guesses
+            );
+            assert_eq!(
+                aggregate.all_game_penalized_mean_guesses,
+                Some(flat.all_game_penalized_mean_guesses)
+            );
+        }
+        let gap = summarize_predictive_outcomes(&games[..1], 7.0, bootstrap).expect("gap");
+        let gap = aggregate_solve_metrics([(&gap, 0.0, None)].into_iter()).expect("gap aggregate");
+        assert_eq!(gap.conditional_mean_guesses, None);
+        assert_eq!(gap.all_game_penalized_mean_guesses, Some(7.0));
+        let empty = aggregate_solve_metrics(std::iter::empty()).expect("empty");
+        assert_eq!(empty.conditional_mean_guesses, None);
+        assert_eq!(empty.all_game_penalized_mean_guesses, None);
     }
 
     #[test]

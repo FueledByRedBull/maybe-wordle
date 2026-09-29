@@ -8,9 +8,8 @@ mod profile;
 mod study;
 
 pub use diagnostic::{
-    BookDiagnosticSpec, DIAGNOSTIC_SUITE_FORMAT_VERSION, DiagnosticExperimentSuite,
-    HardCaseDiagnosticSpec, LatencyDiagnosticSpec, ThreeGuessDiagnosticSpec,
-    default_diagnostic_suite,
+    DIAGNOSTIC_SUITE_FORMAT_VERSION, DiagnosticExperimentSuite, HardCaseDiagnosticSpec,
+    LatencyDiagnosticSpec, ThreeGuessDiagnosticSpec, default_diagnostic_suite,
 };
 pub use folds::{
     DateRange, EVALUATION_POLICY_FORMAT_VERSION, EvaluationPlan, EvaluationPolicy,

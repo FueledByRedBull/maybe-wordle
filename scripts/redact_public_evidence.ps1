@@ -18,15 +18,33 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $specs = @(
     [pscustomobject]@{
         Name = 'rolling'
-        Schema = 4
+        Schemas = @(4, 5)
         Input = Join-Path $repoRoot 'benchmarks/predictive/september-finite-preordered-v1.json'
         Output = Join-Path $repoRoot 'docs/evidence/september-finite-preordered-public-v1.json'
     },
     [pscustomobject]@{
         Name = 'benchmark'
-        Schema = 7
+        Schemas = @(7, 8)
         Input = Join-Path $repoRoot 'benchmarks/predictive/september-post-layout-tests-rolling-v1.json'
         Output = Join-Path $repoRoot 'docs/evidence/september-post-layout-tests-rolling-public-v1.json'
+    },
+    [pscustomobject]@{
+        Name = 'audit-rolling'
+        Schemas = @(5)
+        Input = Join-Path $repoRoot 'target/diagnostics/september-audit-rolling-v1.json'
+        Output = Join-Path $repoRoot 'docs/evidence/september-audit-rolling-public-v1.json'
+    },
+    [pscustomobject]@{
+        Name = 'previous-seven-profile'
+        Schemas = @(7, 8)
+        Input = Join-Path $repoRoot 'target/diagnostics/september-seven-profile-current-full-v1.json'
+        Output = Join-Path $repoRoot 'docs/evidence/september-seven-profile-current-full-public-v1.json'
+    },
+    [pscustomobject]@{
+        Name = 'audit-timing-screen'
+        Schemas = @(8)
+        Input = Join-Path $repoRoot 'target/diagnostics/september-audit-timing-screen-v1.json'
+        Output = Join-Path $repoRoot 'docs/evidence/september-audit-timing-screen-public-v1.json'
     }
 )
 
@@ -167,7 +185,7 @@ function Assert-Game([object] $Game, [string] $Context, [bool] $Public) {
 
 function Get-GameCollections([object] $Root, [int] $Schema, [string] $Context) {
     Assert-Object $Root $Context
-    if ($Schema -eq 4) {
+    if ($Schema -in @(4, 5)) {
         foreach ($name in @('baseline', 'candidate')) {
             Assert-HasProperty $Root $name $Context
             Assert-HasProperty $Root.$name 'games' "$Context.$name"
@@ -179,7 +197,7 @@ function Get-GameCollections([object] $Root, [int] $Schema, [string] $Context) {
         )
     }
 
-    if ($Schema -eq 7) {
+    if ($Schema -in @(7, 8)) {
         Assert-HasProperty $Root 'baselines' $Context
         Assert-Array $Root.baselines "$Context.baselines"
         $collections = @()
@@ -199,14 +217,14 @@ function Get-GameCollections([object] $Root, [int] $Schema, [string] $Context) {
     Stop-Redaction "$Context has an unsupported schema"
 }
 
-function Assert-RootSchema([object] $Root, [int] $Schema, [string] $Context) {
+function Assert-RootSchema([object] $Root, [int[]] $Schemas, [string] $Context) {
     Assert-Object $Root $Context
     Assert-HasProperty $Root 'schema_version' $Context
     Assert-Number $Root.schema_version "$Context.schema_version"
-    if ($Root.schema_version -ne $Schema) {
+    if ($Root.schema_version -notin $Schemas) {
         Stop-Redaction "$Context has an unexpected schema version"
     }
-    [void](Get-GameCollections $Root $Schema $Context)
+    [void](Get-GameCollections $Root ([int]$Root.schema_version) $Context)
 }
 
 function Get-JsonRoot([string] $Path) {
@@ -278,10 +296,10 @@ function Assert-Equivalent([string] $Expected, [string] $Actual, [string] $Conte
     }
 }
 
-function Assert-PublicArtifact([object] $Root, [int] $Schema, [string] $Context) {
-    Assert-RootSchema $Root $Schema $Context
+function Assert-PublicArtifact([object] $Root, [int[]] $Schemas, [string] $Context) {
+    Assert-RootSchema $Root $Schemas $Context
     Assert-Marker $Root $Context
-    $collections = @(Get-GameCollections $Root $Schema $Context)
+    $collections = @(Get-GameCollections $Root ([int]$Root.schema_version) $Context)
     foreach ($collection in $collections) {
         for ($gameIndex = 0; $gameIndex -lt $collection.Games.Count; $gameIndex++) {
             Assert-Game $collection.Games[$gameIndex] "$Context.$($collection.Label).games[$gameIndex]" $true
@@ -300,22 +318,23 @@ function Write-Utf8Json([string] $Path, [object] $Root) {
 foreach ($spec in $specs) {
     if ($Check) {
         $publicRoot = Get-JsonRoot $spec.Output
-        [void](Assert-PublicArtifact $publicRoot $spec.Schema $spec.Name)
+        [void](Assert-PublicArtifact $publicRoot $spec.Schemas $spec.Name)
         continue
     }
 
     $sourceRoot = Get-JsonRoot $spec.Input
-    Assert-RootSchema $sourceRoot $spec.Schema $spec.Name
+    Assert-RootSchema $sourceRoot $spec.Schemas $spec.Name
+    $sourceSchema = [int]$sourceRoot.schema_version
     if ((Get-PropertyNames $sourceRoot) -contains $markerName) {
         Stop-Redaction "$spec.Name input already contains a public redaction marker"
     }
-    $sourceCollections = @(Get-GameCollections $sourceRoot $spec.Schema $spec.Name)
+    $sourceCollections = @(Get-GameCollections $sourceRoot $sourceSchema $spec.Name)
     foreach ($collection in $sourceCollections) {
         for ($gameIndex = 0; $gameIndex -lt $collection.Games.Count; $gameIndex++) {
             Assert-Game $collection.Games[$gameIndex] "$spec.Name.$($collection.Label).games[$gameIndex]" $false
         }
     }
-    $sourceNormalized = Get-NormalizedJson $sourceRoot $spec.Schema
+    $sourceNormalized = Get-NormalizedJson $sourceRoot $sourceSchema
     $sourcePathLengths = @(Get-PathLengths $sourceCollections)
 
     Redact-Games $sourceCollections
@@ -323,7 +342,7 @@ foreach ($spec in $specs) {
     Write-Utf8Json $spec.Output $sourceRoot
 
     $publicRoot = Get-JsonRoot $spec.Output
-    $publicCollections = @(Assert-PublicArtifact $publicRoot $spec.Schema $spec.Name)
+    $publicCollections = @(Assert-PublicArtifact $publicRoot @($sourceSchema) $spec.Name)
     $publicPathLengths = @(Get-PathLengths $publicCollections)
     if ($sourcePathLengths.Count -ne $publicPathLengths.Count) {
         Stop-Redaction "$spec.Name changed the number of games"
@@ -333,7 +352,7 @@ foreach ($spec in $specs) {
             Stop-Redaction "$spec.Name changed a path count"
         }
     }
-    Assert-Equivalent $sourceNormalized (Get-NormalizedJson $publicRoot $spec.Schema) $spec.Name
+    Assert-Equivalent $sourceNormalized (Get-NormalizedJson $publicRoot $sourceSchema) $spec.Name
 }
 
 if ($Check) {

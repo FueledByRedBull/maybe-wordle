@@ -57,6 +57,8 @@ pub struct FiniteSearchCandidate {
 #[derive(Clone, Debug)]
 pub struct FiniteSearchResult {
     pub candidates: Vec<FiniteSearchCandidate>,
+    pub root_candidates_considered: usize,
+    pub all_legal_roots_evaluated: bool,
     pub reason: FiniteSearchReason,
     /// Recursive calls, including memo hits, not unique expanded states.
     pub nodes_visited: usize,
@@ -402,12 +404,36 @@ impl<'a> FiniteSearchRunner<'a> {
         guesses
     }
 
+    fn partition_fallback_by_pattern(
+        &mut self,
+        fallback_surviving: &[usize],
+        guess_index: usize,
+        patterns: &[u8],
+    ) -> Option<[Vec<usize>; PATTERN_SPACE]> {
+        let mut selected = [false; PATTERN_SPACE];
+        for pattern in patterns {
+            selected[*pattern as usize] = true;
+        }
+        let mut partitions = std::array::from_fn(|_| Vec::new());
+        for answer_index in fallback_surviving {
+            if !self.control.poll(false) {
+                return None;
+            }
+            let pattern = self.solver.answer_pattern(guess_index, *answer_index) as usize;
+            if selected[pattern] {
+                partitions[pattern].push(*answer_index);
+            }
+        }
+        Some(partitions)
+    }
+
     fn child_node(
         &mut self,
         node: &FiniteNode,
         guess_index: usize,
         pattern: u8,
         subset: Vec<usize>,
+        fallback_subset: Option<Vec<usize>>,
     ) -> Result<Option<FiniteNode>> {
         let mut observations = if self.hard_mode {
             node.observations.clone()
@@ -419,8 +445,15 @@ impl<'a> FiniteSearchRunner<'a> {
         }
         let (subset, dynamic_belief) =
             if let (Some(parent), Some(basis)) = (&node.dynamic_belief, self.dynamic_basis) {
-                let Some((subset, belief)) =
-                    self.dynamic_child_belief(node, parent, basis, guess_index, pattern, subset)?
+                let Some((subset, belief)) = self.dynamic_child_belief(
+                    node,
+                    parent,
+                    basis,
+                    guess_index,
+                    pattern,
+                    subset,
+                    fallback_subset,
+                )?
                 else {
                     return Ok(None);
                 };
@@ -435,6 +468,10 @@ impl<'a> FiniteSearchRunner<'a> {
         }))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit dynamic transition inputs keep the optional prepartitioned fallback distinct"
+    )]
     fn dynamic_child_belief(
         &mut self,
         node: &FiniteNode,
@@ -443,6 +480,7 @@ impl<'a> FiniteSearchRunner<'a> {
         guess_index: usize,
         pattern: u8,
         active_subset: Vec<usize>,
+        fallback_subset: Option<Vec<usize>>,
     ) -> Result<Option<(Vec<usize>, FiniteDynamicBelief)>> {
         let mut active = Vec::with_capacity(active_subset.len());
         for answer_index in active_subset {
@@ -454,15 +492,20 @@ impl<'a> FiniteSearchRunner<'a> {
             })?;
             active.push((answer_index, parent.weights[position]));
         }
-        let mut fallback_surviving = Vec::new();
-        for answer_index in &parent.fallback_surviving {
-            if !self.control.poll(false) {
-                return Ok(None);
+        let mut fallback_surviving = if let Some(fallback_subset) = fallback_subset {
+            fallback_subset
+        } else {
+            let mut fallback_surviving = Vec::new();
+            for answer_index in &parent.fallback_surviving {
+                if !self.control.poll(false) {
+                    return Ok(None);
+                }
+                if self.solver.answer_pattern(guess_index, *answer_index) == pattern {
+                    fallback_surviving.push(*answer_index);
+                }
             }
-            if self.solver.answer_pattern(guess_index, *answer_index) == pattern {
-                fallback_surviving.push(*answer_index);
-            }
-        }
+            fallback_surviving
+        };
 
         let mut fallback_active = parent.fallback_active;
         if !parent.condition_only {
@@ -1063,6 +1106,37 @@ impl<'a> FiniteSearchRunner<'a> {
         let mut quality = FiniteSearchQuality::Exact;
         let mut exact_bounds = true;
 
+        let mut fallback_patterns = if remaining_turns > 1 {
+            if let Some(belief) = node.dynamic_belief.as_ref()
+                && !belief.fallback_surviving.is_empty()
+            {
+                let child_patterns = patterns
+                    .iter()
+                    .copied()
+                    .filter(|pattern| {
+                        *pattern != ALL_GREEN_PATTERN
+                            && self.partition.frames[depth].masses[*pattern as usize] > 0.0
+                    })
+                    .collect::<Vec<_>>();
+                if child_patterns.is_empty() {
+                    None
+                } else {
+                    let Some(partitions) = self.partition_fallback_by_pattern(
+                        &belief.fallback_surviving,
+                        guess_index,
+                        &child_patterns,
+                    ) else {
+                        return Ok(None);
+                    };
+                    Some(partitions)
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         for (pattern_index, pattern) in patterns.iter().copied().enumerate() {
             if !self.control.poll(false) {
                 return Ok(None);
@@ -1092,7 +1166,12 @@ impl<'a> FiniteSearchRunner<'a> {
                 let child_subset = std::mem::take(
                     &mut self.partition.frames[depth].child_subsets[pattern as usize],
                 );
-                let Some(child) = self.child_node(node, guess_index, pattern, child_subset)? else {
+                let fallback_subset = fallback_patterns
+                    .as_mut()
+                    .map(|partitions| std::mem::take(&mut partitions[pattern as usize]));
+                let Some(child) =
+                    self.child_node(node, guess_index, pattern, child_subset, fallback_subset)?
+                else {
                     return Ok(None);
                 };
                 let result =
@@ -1224,9 +1303,14 @@ impl<'a> FiniteSearchRunner<'a> {
             self.cache_hits = self.cache_hits.saturating_add(1);
             return Ok(Some(cached));
         }
-        // One or two legal answers attain the universal attempts bound by
-        // guessing the heavier answer first. No dictionary scan is needed.
+        // One legal answer wins immediately. Two can be solved in order only
+        // when a miss cannot activate dormant fallback answers.
         if node.subset.len() <= 2
+            && (node.subset.len() == 1
+                || node
+                    .dynamic_belief
+                    .as_ref()
+                    .is_none_or(|belief| belief.fallback_surviving.is_empty()))
             && node.subset.iter().all(|index| {
                 self.solver
                     .guess_index
@@ -1286,7 +1370,11 @@ impl<'a> FiniteSearchRunner<'a> {
             if !self.control.poll(false) {
                 return Ok(best.map(Self::downgrade_to_upper_bound));
             }
-            if best.is_some() {
+            if best.is_some()
+                && node.dynamic_belief.as_ref().is_none_or(|belief| {
+                    belief.condition_only || belief.fallback_surviving.is_empty()
+                })
+            {
                 let first = self.solver.answer_pattern(guess_index, node.subset[0]);
                 let mut non_progressing = first != ALL_GREEN_PATTERN;
                 for answer in node.subset.iter().skip(1) {
@@ -1298,8 +1386,10 @@ impl<'a> FiniteSearchRunner<'a> {
                     }
                     non_progressing = self.solver.answer_pattern(guess_index, *answer) == first;
                 }
-                // No information and no solve: spending a turn cannot improve
-                // the optimum, and hard-mode history can only restrict replies.
+                // With fixed support, no information and no solve cannot improve
+                // the optimum; hard-mode history can only restrict replies.
+                // A dynamic probe may instead remove dormant support, so the
+                // active partition alone cannot prove it is non-progressing.
                 // Keep fixed-root evaluation unchanged; prune only the argmin.
                 if non_progressing {
                     continue;
@@ -1687,6 +1777,8 @@ impl Solver {
         if !runner.control.poll(true) {
             return Ok(FiniteSearchResult {
                 candidates: vec![runner.heuristic_candidate(quick)],
+                root_candidates_considered: 1,
+                all_legal_roots_evaluated: false,
                 reason: runner
                     .control
                     .reason
@@ -1719,6 +1811,8 @@ impl Solver {
                         );
                     }
                     return Ok(FiniteSearchResult {
+                        root_candidates_considered: 1,
+                        all_legal_roots_evaluated: false,
                         candidates: vec![FiniteSearchCandidate {
                             guess_index: selected,
                             failure_probability: result.value.failure_probability,
@@ -1738,6 +1832,8 @@ impl Solver {
             }
             return Ok(FiniteSearchResult {
                 candidates: vec![runner.heuristic_candidate(selected)],
+                root_candidates_considered: 1,
+                all_legal_roots_evaluated: false,
                 reason: runner
                     .control
                     .reason
@@ -1751,8 +1847,10 @@ impl Solver {
 
         let enumerate_all =
             root.subset.len() <= options.exact_state_threshold || remaining_turns <= 2;
+        let mut all_legal_roots_enumerated = false;
         let mut roots = if enumerate_all {
             let mut legal = runner.all_legal_guesses(&root);
+            all_legal_roots_enumerated = runner.control.reason.is_none();
             legal.retain(|guess| *guess != quick);
             legal.insert(0, quick);
             legal
@@ -1769,13 +1867,13 @@ impl Solver {
             roots.retain(|guess| *guess != baseline);
             roots.insert(0, baseline);
         }
-
         let mut candidates = runner.evaluate_roots(&root, &roots, remaining_turns)?;
         if !enumerate_all && runner.control.reason.is_none() {
             // The shortlist is an initial policy, not a stopping condition.
             // Preserve its completed incumbents while spending spare budget
             // on all legal roots and exact continuations.
             let additional_roots = runner.all_legal_guesses(&root);
+            all_legal_roots_enumerated = runner.control.reason.is_none();
             let initial_roots = roots.clone();
             roots.extend(
                 additional_roots
@@ -1806,6 +1904,9 @@ impl Solver {
         candidates.retain(|candidate| seen.insert(candidate.guess_index));
 
         Ok(FiniteSearchResult {
+            root_candidates_considered: roots.len(),
+            all_legal_roots_evaluated: all_legal_roots_enumerated
+                && runner.control.reason.is_none(),
             candidates,
             reason: runner
                 .control
@@ -1837,11 +1938,7 @@ fn recovery_mode_code(mode: RecoveryMode) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        fs,
-        time::{Duration, SystemTime, UNIX_EPOCH},
-    };
+    use std::{collections::HashMap, fs, time::Duration};
 
     use crate::{
         config::PriorConfig,
@@ -1857,7 +1954,6 @@ mod tests {
     }
 
     fn test_solver_with_guesses(words: &[&str], guess_words: &[&str]) -> Solver {
-        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let guesses = guess_words
             .iter()
             .map(|word| (*word).to_string())
@@ -1872,15 +1968,8 @@ mod tests {
                 history_dates: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "maybe-wordle-finite-test-{}-{unique}-{}",
-            std::process::id(),
-            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let fixture = crate::test_support::TestDirectory::new("solver-fixture");
+        let root = fixture.path().to_path_buf();
         fs::create_dir_all(&root).expect("test pattern root");
         let pattern_table =
             PatternTable::load_or_build_at(&root.join("pattern.bin"), &guesses, &answers)
@@ -1889,20 +1978,24 @@ mod tests {
             config: PriorConfig::default(),
             mode: WeightMode::Uniform,
             variant: ModelVariant::SeedPlusHistory,
-            guesses: guesses.clone(),
-            answers,
-            primary_answer_count: words.len(),
-            history_dates: Vec::new(),
-            pattern_table,
-            guess_index: guesses
-                .iter()
-                .enumerate()
-                .map(|(index, word)| (word.clone(), index))
-                .collect::<HashMap<_, _>>(),
+            data: std::sync::Arc::new(crate::solver::SolverData {
+                guesses: guesses.clone(),
+                answers,
+                primary_answer_count: words.len(),
+                history_dates: Vec::new(),
+                pattern_table,
+                guess_index: guesses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, word)| (word.clone(), index))
+                    .collect::<HashMap<_, _>>(),
+            }),
             artifact_dir: root.join("predictive"),
             session_opener_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_reply_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_third_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity_cache: Default::default(),
+            test_fixture: Some(std::sync::Arc::new(fixture)),
         }
     }
 
@@ -2009,12 +2102,7 @@ mod tests {
         hard_mode: bool,
     ) -> (f64, f64) {
         (0..solver.guesses.len())
-            .filter(|guess| {
-                !hard_mode
-                    || solver
-                        .hard_mode_violation(history, &solver.guesses[*guess])
-                        .is_none()
-            })
+            .filter(|guess| !hard_mode || oracle_legal(&solver.guesses[*guess], history))
             .map(|guess| dynamic_oracle_move(solver, state, history, turns, hard_mode, guess))
             .min_by(|left, right| {
                 left.0
@@ -2524,7 +2612,7 @@ mod tests {
     #[test]
     fn dynamic_finite_values_match_recovery_and_duplicate_clue_oracles() {
         let mut solver = test_solver(&["aaaaa", "bbbbb", "ccccc", "ddddd", "eeeee"]);
-        solver.primary_answer_count = 3;
+        solver.data_mut().primary_answer_count = 3;
         solver.config.fallback_activation_threshold = 2;
         let state = solver.initial_state(chrono::NaiveDate::from_ymd_opt(2026, 3, 10).unwrap());
         assert_eq!(state.surviving, vec![0, 1, 2]);
@@ -2595,9 +2683,281 @@ mod tests {
     }
 
     #[test]
+    fn dormant_five_word_all_roots_match_oracle_across_thresholds_and_horizons() {
+        for threshold in [0, 1, 2, 4] {
+            let mut solver = test_solver(&["tower", "power", "bower", "rower", "sower"]);
+            solver.data_mut().primary_answer_count = 3;
+            solver.config.fallback_activation_threshold = threshold;
+            solver.config.fallback_prior_mass = 0.4;
+            let initial =
+                solver.initial_state(chrono::NaiveDate::from_ymd_opt(2026, 3, 10).unwrap());
+            let clue = oracle_feedback("rower", "tower");
+            let mut filtered = initial.clone();
+            solver.apply_feedback(&mut filtered, "rower", clue).unwrap();
+            assert!(!filtered.fallback_surviving.contains(&3));
+            for (state, history) in [
+                (initial, Vec::new()),
+                (filtered, vec![("rower".to_string(), clue)]),
+            ] {
+                for hard in [false, true] {
+                    for turns in 1..=4 {
+                        let result = solver
+                            .finite_horizon_search_dynamic(
+                                &state,
+                                &history,
+                                turns,
+                                hard,
+                                options(8),
+                                &|| false,
+                            )
+                            .unwrap();
+                        assert_eq!(result.reason, FiniteSearchReason::Complete);
+                        let legal = solver
+                            .guesses
+                            .iter()
+                            .filter(|guess| !hard || oracle_legal(guess, &history))
+                            .count();
+                        assert_eq!(result.candidates.len(), legal);
+                        for candidate in &result.candidates {
+                            let expected = dynamic_oracle_move(
+                                &solver,
+                                &state,
+                                &history,
+                                turns,
+                                hard,
+                                candidate.guess_index,
+                            );
+                            assert!(
+                                (candidate.failure_probability - expected.0).abs() < 1e-12,
+                                "threshold={threshold} turns={turns} hard={hard} history={history:?} guess={} actual={} expected={}",
+                                solver.guesses[candidate.guess_index],
+                                candidate.failure_probability,
+                                expected.0
+                            );
+                            assert!((candidate.expected_attempts - expected.1).abs() < 1e-12);
+                            assert_eq!(candidate.quality, FiniteSearchQuality::Exact);
+                            if threshold == 1
+                                && turns == 3
+                                && history.is_empty()
+                                && candidate.guess_index == 0
+                            {
+                                assert!((candidate.failure_probability - 2.0 / 9.0).abs() < 1e-12);
+                                assert!((candidate.expected_attempts - 2.0).abs() < 1e-12);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nonprogressing_active_probe_can_remove_dormant_support_and_improve_risk() {
+        let words = ["aaaaa", "bbbbb", "cdddd", "cffff", "cgggg"];
+        let guesses = ["aaaaa", "bbbbb", "cdddd", "cffff", "cgggg", "ccccc"];
+        let mut solver = test_solver_with_guesses(&words, &guesses);
+        solver.data_mut().primary_answer_count = 2;
+        solver.config.fallback_activation_threshold = 1;
+        solver.config.fallback_prior_mass = 0.4;
+        let state = solver.initial_state(chrono::NaiveDate::from_ymd_opt(2026, 3, 10).unwrap());
+        assert_eq!(state.surviving, [0, 1]);
+        let expected = dynamic_oracle_value(&solver, &state, &[], 3, false);
+        assert_eq!(expected.0, 0.0);
+        assert_eq!(expected.1, 2.5);
+        let node = super::FiniteNode {
+            subset: state.surviving.clone(),
+            observations: Vec::new(),
+            dynamic_belief: Some(super::FiniteDynamicBelief {
+                weights: state
+                    .surviving
+                    .iter()
+                    .map(|index| state.weights[*index])
+                    .collect(),
+                fallback_surviving: state.fallback_surviving.clone(),
+                condition_only: state.condition_only,
+                fallback_active: state.fallback_active,
+                recovery_mode_used: state.recovery_mode_used,
+            }),
+        };
+        let mut runner = super::FiniteSearchRunner::with_dynamic_basis(
+            &solver,
+            &state.weights,
+            Some(&state),
+            options(8),
+            false,
+            &|| false,
+        );
+        for _ in 0..2 {
+            let actual = runner.evaluate_exact_node(&node, 3, 0).unwrap().unwrap();
+            assert!((actual.value.failure_probability - expected.0).abs() < 1e-12);
+            assert!((actual.value.expected_attempts - expected.1).abs() < 1e-12);
+            assert_eq!(actual.quality, FiniteSearchQuality::Exact);
+        }
+        assert!(
+            runner.cache_hits > 0,
+            "the repeated evaluation must reuse its exact memo"
+        );
+    }
+
+    #[test]
+    fn dynamic_two_answer_continuation_counts_dormant_reactivation() {
+        let mut solver = test_solver(&["aaaaa", "bbbbb", "ccccc", "ddddd"]);
+        solver.data_mut().primary_answer_count = 3;
+        solver.config.fallback_activation_threshold = 1;
+        let state = solver.initial_state(chrono::NaiveDate::from_ymd_opt(2026, 3, 10).unwrap());
+        assert_eq!(state.surviving, vec![0, 1, 2]);
+        assert_eq!(state.fallback_surviving, vec![3]);
+
+        let guess_index = solver.guess_index["aaaaa"];
+        let expected = dynamic_oracle_move(&solver, &state, &[], 3, false, guess_index);
+        assert!(
+            expected.0 > 0.0,
+            "a later miss must activate dormant support"
+        );
+
+        let result = solver
+            .finite_horizon_search_dynamic(&state, &[], 3, false, options(8), &|| false)
+            .expect("finite search");
+        let actual = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.guess_index == guess_index)
+            .expect("first-guess candidate");
+        assert_eq!(actual.quality, FiniteSearchQuality::Exact);
+        assert!(
+            (actual.failure_probability - expected.0).abs() < 1e-12,
+            "dormant activation missed: actual={}, expected={}",
+            actual.failure_probability,
+            expected.0
+        );
+        assert!((actual.expected_attempts - expected.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dynamic_fallback_partition_preserves_duplicate_feedback_transitions_within_work_cap() {
+        let words = [
+            "allee", "llama", "cigar", "eerie", "llapy", "party", "ebcde", "apple", "ample",
+            "selle", "level",
+        ];
+        let mut solver = test_solver_with_guesses(&words, &["allee"]);
+        solver.data_mut().primary_answer_count = 4;
+        solver.config.fallback_activation_threshold = 2;
+        let state = solver.initial_state(chrono::NaiveDate::from_ymd_opt(2026, 3, 10).unwrap());
+        let guess_index = solver.guess_index["allee"];
+        let expected_patterns = [
+            oracle_feedback("allee", "llama"),
+            oracle_feedback("allee", "cigar"),
+            oracle_feedback("allee", "eerie"),
+        ];
+        let fallback_patterns = words[4..]
+            .iter()
+            .map(|word| oracle_feedback("allee", word))
+            .collect::<Vec<_>>();
+        let mut distinct_patterns = expected_patterns.to_vec();
+        distinct_patterns.sort_unstable();
+        distinct_patterns.dedup();
+        assert_eq!(distinct_patterns.len(), expected_patterns.len());
+        assert!(
+            expected_patterns
+                .iter()
+                .all(|pattern| fallback_patterns.contains(pattern))
+        );
+
+        let options = FiniteSearchOptions {
+            node_limit: Some(42),
+            ..options(usize::MAX)
+        };
+        let mut runner = super::FiniteSearchRunner::with_dynamic_basis(
+            &solver,
+            &state.weights,
+            Some(&state),
+            options,
+            false,
+            &|| false,
+        );
+        let root = super::FiniteNode {
+            subset: state.surviving.clone(),
+            observations: Vec::new(),
+            dynamic_belief: Some(super::FiniteDynamicBelief {
+                weights: state
+                    .surviving
+                    .iter()
+                    .map(|index| state.weights[*index])
+                    .collect(),
+                fallback_surviving: state.fallback_surviving.clone(),
+                condition_only: state.condition_only,
+                fallback_active: state.fallback_active,
+                recovery_mode_used: state.recovery_mode_used,
+            }),
+        };
+        let total_weight = runner.total_weight(&root).expect("root weight");
+        let Some(partition) = runner
+            .partition_patterns(&root, guess_index, 0, false)
+            .expect("root partition")
+        else {
+            panic!("root partition should fit the work cap");
+        };
+        assert!(
+            expected_patterns
+                .iter()
+                .all(|pattern| partition.patterns.contains(pattern))
+        );
+
+        let result = runner
+            .evaluate_partitioned_move(
+                &root,
+                guess_index,
+                2,
+                0,
+                true,
+                total_weight,
+                &partition.patterns,
+                None,
+            )
+            .expect("candidate evaluation");
+        assert!(
+            matches!(result, Some(super::FiniteMoveEvaluation::Complete(_))),
+            "duplicate-feedback children should complete within the work cap; reason={:?}, units={}",
+            runner.control.reason,
+            runner.control.work_units
+        );
+
+        for pattern in expected_patterns {
+            let mut expected_state = state.clone();
+            solver
+                .apply_feedback(&mut expected_state, "allee", pattern)
+                .expect("oracle child transition");
+            if fallback_patterns.contains(&pattern) {
+                assert!(expected_state.fallback_active);
+            }
+            expected_state.surviving.sort_unstable();
+            let expected_child = super::FiniteNode {
+                subset: expected_state.surviving.clone(),
+                observations: Vec::new(),
+                dynamic_belief: Some(super::FiniteDynamicBelief {
+                    weights: expected_state
+                        .surviving
+                        .iter()
+                        .map(|index| expected_state.weights[*index])
+                        .collect(),
+                    fallback_surviving: expected_state.fallback_surviving,
+                    condition_only: expected_state.condition_only,
+                    fallback_active: expected_state.fallback_active,
+                    recovery_mode_used: expected_state.recovery_mode_used,
+                }),
+            };
+            let expected_key = runner.node_key(&expected_child, 1);
+            assert!(
+                runner.exact_memo.contains_key(&expected_key),
+                "the evaluated child for duplicate feedback pattern {pattern} must match the state transition"
+            );
+        }
+    }
+
+    #[test]
     fn dynamic_fallback_transition_obeys_the_work_budget() {
         let mut solver = test_solver(&["aaaaa", "bbbbb", "ccccc", "ddddd", "eeeee"]);
-        solver.primary_answer_count = 3;
+        solver.data_mut().primary_answer_count = 3;
         solver.config.fallback_activation_threshold = 2;
         let state = solver.initial_state(chrono::NaiveDate::from_ymd_opt(2026, 3, 10).unwrap());
         let mut bounded = options(8);
@@ -2627,7 +2987,7 @@ mod tests {
         };
 
         let child = runner
-            .child_node(&root, 0, 0, vec![1, 2])
+            .child_node(&root, 0, 0, vec![1, 2], None)
             .expect("dynamic child transition");
         assert!(
             child.is_none(),

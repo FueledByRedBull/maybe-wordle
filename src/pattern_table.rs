@@ -1,10 +1,13 @@
-use std::{fs::File, io::Read};
+use std::{
+    fs::File,
+    io::{Read, Write},
+};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 use crate::{
-    atomic_file::atomic_write,
+    atomic_file::atomic_write_with,
     identity::{CanonicalSha256, digest_bytes},
     model::AnswerRecord,
     scoring::{PATTERN_SPACE, score_guess},
@@ -43,16 +46,20 @@ impl PatternTable {
             .iter()
             .map(|answer| answer.word.as_str())
             .collect::<Vec<_>>();
-        let rows = guesses
-            .par_iter()
-            .map(|guess| {
-                answer_words
-                    .iter()
-                    .map(|answer| score_guess(guess, answer))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let data = rows.into_iter().flatten().collect::<Vec<_>>();
+        let length = guesses
+            .len()
+            .checked_mul(answer_words.len())
+            .context("pattern table size overflow")?;
+        let mut data = vec![0; length];
+        if !answer_words.is_empty() {
+            data.par_chunks_mut(answer_words.len())
+                .zip(guesses.par_iter())
+                .for_each(|(row, guess)| {
+                    for (value, answer) in row.iter_mut().zip(&answer_words) {
+                        *value = score_guess(guess, answer);
+                    }
+                });
+        }
 
         let table = Self {
             guess_count: guesses.len(),
@@ -65,6 +72,16 @@ impl PatternTable {
 
     pub fn get(&self, guess_index: usize, answer_index: usize) -> u8 {
         self.data[(guess_index * self.answer_count) + answer_index]
+    }
+
+    /// Read an immutable artifact without repairing or replacing it on failure.
+    pub fn load_existing_at(
+        path: &std::path::Path,
+        guesses: &[String],
+        answers: &[AnswerRecord],
+    ) -> Result<Self> {
+        Self::try_load(path, guesses, answers)?
+            .with_context(|| format!("missing, corrupt or stale pattern table {}", path.display()))
     }
 
     pub fn bytes_len(&self) -> usize {
@@ -80,13 +97,19 @@ impl PatternTable {
             return Ok(None);
         }
 
-        let mut bytes = Vec::new();
-        File::open(path)
-            .with_context(|| format!("failed to open {}", path.display()))?
-            .read_to_end(&mut bytes)
+        let mut file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let file_length = file
+            .metadata()
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+            .len();
+        if file_length < HEADER_SIZE as u64 {
+            return Ok(None);
+        }
+        let mut bytes = [0; HEADER_SIZE];
+        file.read_exact(&mut bytes)
             .with_context(|| format!("failed to read {}", path.display()))?;
-
-        if bytes.len() < HEADER_SIZE || &bytes[..MAGIC.len()] != MAGIC {
+        if &bytes[..MAGIC.len()] != MAGIC {
             return Ok(None);
         }
 
@@ -106,8 +129,20 @@ impl PatternTable {
             return Ok(None);
         }
 
-        let data = bytes[HEADER_SIZE..].to_vec();
-        if data.len() != guess_count * answer_count {
+        let Some(length) = guess_count.checked_mul(answer_count) else {
+            return Ok(None);
+        };
+        if file_length != (HEADER_SIZE as u64).saturating_add(length as u64) {
+            return Ok(None);
+        }
+        let mut data = vec![0; length];
+        file.read_exact(&mut data)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if file
+            .read(&mut [0])
+            .with_context(|| format!("failed to read {}", path.display()))?
+            != 0
+        {
             return Ok(None);
         }
         if data.iter().any(|value| *value as usize >= PATTERN_SPACE) {
@@ -125,16 +160,16 @@ impl PatternTable {
     }
 
     fn persist(&self, path: &std::path::Path, guesses: &[String], answers: &[&str]) -> Result<()> {
-        let mut bytes = Vec::with_capacity(HEADER_SIZE + self.data.len());
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&(self.guess_count as u32).to_le_bytes());
-        bytes.extend_from_slice(&(self.answer_count as u32).to_le_bytes());
-        bytes.extend_from_slice(&hash_word_list(guesses.iter().map(String::as_str)));
-        bytes.extend_from_slice(&hash_word_list(answers.iter().copied()));
-        bytes.extend_from_slice(&digest_bytes(PAYLOAD_DIGEST_DOMAIN, &self.data));
-        bytes.extend_from_slice(&self.data);
-
-        atomic_write(path, &bytes)
+        atomic_write_with(path, |file| {
+            file.write_all(MAGIC)?;
+            file.write_all(&(self.guess_count as u32).to_le_bytes())?;
+            file.write_all(&(self.answer_count as u32).to_le_bytes())?;
+            file.write_all(&hash_word_list(guesses.iter().map(String::as_str)))?;
+            file.write_all(&hash_word_list(answers.iter().copied()))?;
+            file.write_all(&digest_bytes(PAYLOAD_DIGEST_DOMAIN, &self.data))?;
+            file.write_all(&self.data)?;
+            Ok(())
+        })
     }
 }
 
@@ -176,10 +211,168 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        PathBuf::from("target/audit-work/pattern-tests").join(format!(
             "maybe-wordle-pattern-table-{label}-{}-{unique}.bin",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn published_tables_are_never_rebuilt_by_read_only_loading() {
+        let directory = crate::test_support::TestDirectory::new("published-pattern");
+        let path = directory.path().join("patterns.bin");
+        let (guesses, answers) = test_inputs();
+        assert!(PatternTable::load_existing_at(&path, &guesses, &answers).is_err());
+        assert!(!path.exists());
+        PatternTable::load_or_build_at(&path, &guesses, &answers).unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(PatternTable::load_existing_at(&path, &guesses, &answers).is_ok());
+        let mut corrupted = original.clone();
+        corrupted[HEADER_SIZE] = (corrupted[HEADER_SIZE] + 1) % 243;
+        fs::write(&path, &corrupted).unwrap();
+        assert!(PatternTable::load_existing_at(&path, &guesses, &answers).is_err());
+        assert_eq!(fs::read(&path).unwrap(), corrupted);
+        fs::write(&path, &original).unwrap();
+        assert!(PatternTable::load_existing_at(&path, &guesses[1..], &answers).is_err());
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn flat_table_matches_direct_scoring_and_preserves_serialized_payload() {
+        let path = test_path("direct");
+        let words = [
+            "lilly", "alley", "added", "dread", "eerie", "sissy", "humph",
+        ];
+        let guesses: Vec<_> = words.iter().map(|word| word.to_string()).collect();
+        let answers: Vec<_> = words
+            .iter()
+            .rev()
+            .map(|word| AnswerRecord {
+                word: word.to_string(),
+                in_seed: true,
+                manual_entry: false,
+                manual_weight: 1.0,
+                history_dates: Vec::new(),
+            })
+            .collect();
+        let table = PatternTable::load_or_build_at(&path, &guesses, &answers).expect("build");
+        let loaded = PatternTable::try_load(&path, &guesses, &answers)
+            .expect("load")
+            .expect("valid table");
+        let bytes = fs::read(&path).expect("persisted bytes");
+        assert_eq!(&bytes[..8], b"MWORDPT3");
+        assert_eq!(&bytes[8..16], &[7, 0, 0, 0, 7, 0, 0, 0]);
+        assert_eq!(bytes.len(), HEADER_SIZE + words.len() * words.len());
+        for (guess_index, guess) in guesses.iter().enumerate() {
+            for (answer_index, answer) in answers.iter().enumerate() {
+                let expected = score_guess(guess, &answer.word);
+                assert_eq!(table.get(guess_index, answer_index), expected);
+                assert_eq!(loaded.get(guess_index, answer_index), expected);
+                assert_eq!(
+                    bytes[HEADER_SIZE + guess_index * answers.len() + answer_index],
+                    expected
+                );
+            }
+        }
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn sampled_bundled_words_match_direct_scoring() {
+        let path = test_path("bundled-sample");
+        let guesses: Vec<_> = include_str!("../data/seed/valid_guesses.txt")
+            .lines()
+            .step_by(97)
+            .take(64)
+            .map(str::to_string)
+            .collect();
+        let answers: Vec<_> = include_str!("../data/seed/candidate_answers.txt")
+            .lines()
+            .step_by(37)
+            .take(32)
+            .map(|word| AnswerRecord {
+                word: word.to_string(),
+                in_seed: true,
+                manual_entry: false,
+                manual_weight: 1.0,
+                history_dates: Vec::new(),
+            })
+            .collect();
+        assert_eq!((guesses.len(), answers.len()), (64, 32));
+        let table =
+            PatternTable::load_or_build_at(&path, &guesses, &answers).expect("sampled build");
+        for (g, guess) in guesses.iter().enumerate() {
+            for (a, answer) in answers.iter().enumerate() {
+                assert_eq!(table.get(g, a), score_guess(guess, &answer.word));
+            }
+        }
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn truncated_extended_and_wrong_identity_tables_are_rejected() {
+        let path = test_path("invalid-length-or-identity");
+        let (guesses, answers) = test_inputs();
+        PatternTable::load_or_build_at(&path, &guesses, &answers).expect("build");
+        let original = fs::read(&path).expect("bytes");
+        for length in [0, 1, 7, HEADER_SIZE - 1, HEADER_SIZE, original.len() - 1] {
+            fs::write(&path, &original[..length]).expect("truncated fixture");
+            assert!(
+                PatternTable::try_load(&path, &guesses, &answers)
+                    .expect("reject truncation")
+                    .is_none()
+            );
+        }
+        let mut extended = original.clone();
+        extended.push(0);
+        fs::write(&path, extended).expect("extended fixture");
+        assert!(
+            PatternTable::try_load(&path, &guesses, &answers)
+                .expect("reject trailing data")
+                .is_none()
+        );
+        for offset in [8, 12, 16, 48, 80] {
+            let mut corrupted = original.clone();
+            corrupted[offset] ^= 1;
+            fs::write(&path, corrupted).expect("identity fixture");
+            assert!(
+                PatternTable::try_load(&path, &guesses, &answers)
+                    .expect("reject identity")
+                    .is_none()
+            );
+        }
+        let mut invalid_pattern = original;
+        invalid_pattern[HEADER_SIZE] = 243;
+        fs::write(&path, invalid_pattern).expect("invalid pattern");
+        assert!(
+            PatternTable::try_load(&path, &guesses, &answers)
+                .expect_err("invalid pattern is an error")
+                .to_string()
+                .contains("invalid pattern")
+        );
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn empty_dimensions_remain_valid_zero_byte_tables() {
+        let (guesses, answers) = test_inputs();
+        for (label, guesses, answers) in [
+            ("empty-guesses", Vec::new(), answers),
+            ("empty-answers", guesses, Vec::new()),
+        ] {
+            let path = test_path(label);
+            let table =
+                PatternTable::load_or_build_at(&path, &guesses, &answers).expect("empty table");
+            assert_eq!(table.bytes_len(), 0);
+            assert_eq!(
+                PatternTable::try_load(&path, &guesses, &answers)
+                    .expect("reload")
+                    .expect("valid empty table")
+                    .bytes_len(),
+                0
+            );
+            fs::remove_file(path).expect("cleanup");
+        }
     }
 
     #[test]

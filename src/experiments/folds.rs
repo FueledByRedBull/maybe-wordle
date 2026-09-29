@@ -64,6 +64,53 @@ pub struct EvaluationPlan {
     pub sealed_test: DateRange,
     pub folds: Vec<RollingOriginFold>,
     pub config: RollingOriginConfig,
+    #[serde(default)]
+    pub excluded_target_ranges: Vec<DateRange>,
+}
+
+impl EvaluationPlan {
+    /// Target eligibility is separate from chronological history available as features.
+    pub fn eligible_target_dates(
+        &self,
+        range: DateRange,
+        dates: impl IntoIterator<Item = NaiveDate>,
+    ) -> Result<std::collections::BTreeSet<NaiveDate>> {
+        DateRange::new(range.start, range.end)?;
+        if range.start < self.history.start || range.end > self.development.end {
+            bail!("target range is outside the declared development history");
+        }
+        Ok(dates
+            .into_iter()
+            .filter(|date| range.contains(*date))
+            .filter(|date| {
+                !self
+                    .excluded_target_ranges
+                    .iter()
+                    .any(|hole| hole.contains(*date))
+            })
+            .collect())
+    }
+
+    pub fn validation_target_dates(&self) -> Result<std::collections::BTreeSet<NaiveDate>> {
+        let mut dates = std::collections::BTreeSet::new();
+        for fold in &self.folds {
+            let selected = self.eligible_target_dates(
+                fold.validation,
+                fold.validation
+                    .start
+                    .iter_days()
+                    .take(fold.validation.days() as usize),
+            )?;
+            if selected.len() as u64 != fold.validation.days() {
+                bail!(
+                    "validation fold {} intersects excluded target dates",
+                    fold.index
+                );
+            }
+            dates.extend(selected);
+        }
+        Ok(dates)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,6 +155,31 @@ impl EvaluationPolicy {
             if index > 0 && self.excluded_validation[index - 1].end >= range.start {
                 bail!("excluded validation ranges must be sorted and non-overlapping");
             }
+        }
+        Ok(())
+    }
+
+    pub fn validate_development_target_range(&self, requested: DateRange) -> Result<()> {
+        DateRange::new(requested.start, requested.end)?;
+        self.validate()?;
+        if requested.end > self.development_cutoff {
+            bail!(
+                "range {}..{} is outside declared development ending {}",
+                requested.start,
+                requested.end,
+                self.development_cutoff
+            );
+        }
+        if self
+            .excluded_validation
+            .iter()
+            .any(|excluded| ranges_overlap(requested, *excluded))
+        {
+            bail!(
+                "range {}..{} intersects a consumed validation window",
+                requested.start,
+                requested.end
+            );
         }
         Ok(())
     }
@@ -202,6 +274,7 @@ pub fn build_rolling_origin_plan(
         sealed_test,
         folds,
         config,
+        excluded_target_ranges: Vec::new(),
     })
 }
 
@@ -296,6 +369,7 @@ pub fn build_declared_rolling_origin_plan(
         sealed_test: policy.sealed_test,
         folds,
         config,
+        excluded_target_ranges: policy.excluded_validation.clone(),
     })
 }
 
@@ -309,6 +383,41 @@ mod tests {
 
     fn date(raw: &str) -> NaiveDate {
         NaiveDate::parse_from_str(raw, "%Y-%m-%d").expect("date")
+    }
+
+    #[test]
+    fn explicit_target_dates_preserve_fold_holes_and_exclude_consumed_labels() {
+        let history = DateRange::new(date("2030-01-01"), date("2030-01-20")).unwrap();
+        let config = RollingOriginConfig {
+            minimum_training_days: 2,
+            validation_days: 2,
+            step_days: 4,
+            sealed_test_days: 2,
+            maximum_folds: 3,
+        };
+        let mut plan = build_rolling_origin_plan(history, config).unwrap();
+        let first = plan.folds[0].validation;
+        let last = plan.folds.last().unwrap().validation;
+        let dates = plan.validation_target_dates().unwrap();
+        assert_eq!(dates.len(), 6);
+        let gap = first.end.succ_opt().unwrap();
+        assert!(gap < last.start);
+        assert!(!dates.contains(&gap));
+        plan.excluded_target_ranges = vec![DateRange::new(gap, gap).unwrap()];
+        let training_targets = plan
+            .eligible_target_dates(
+                plan.development,
+                history.start.iter_days().take(history.days() as usize),
+            )
+            .unwrap();
+        assert!(!training_targets.contains(&gap));
+        assert!(
+            plan.history.contains(gap),
+            "excluded target remains available chronological history"
+        );
+        assert_eq!(plan.validation_target_dates().unwrap(), dates);
+        plan.excluded_target_ranges.push(first);
+        assert!(plan.validation_target_dates().is_err());
     }
 
     #[test]
@@ -353,7 +462,7 @@ mod tests {
 
     #[test]
     fn declared_plan_preserves_new_seal_and_excludes_consumed_targets() {
-        let history = DateRange::new(date("2021-06-19"), date("2026-08-26")).expect("range");
+        let history = DateRange::new(date("2021-06-18"), date("2026-08-26")).expect("range");
         let policy = EvaluationPolicy {
             format_version: EVALUATION_POLICY_FORMAT_VERSION,
             development_cutoff: date("2026-08-26"),
@@ -374,12 +483,54 @@ mod tests {
             plan.folds.last().expect("latest fold").validation,
             DateRange::new(date("2026-07-28"), date("2026-08-26")).expect("latest")
         );
-        assert!(plan.folds.iter().all(|fold| {
-            !ranges_overlap(
-                fold.validation,
-                DateRange::new(date("2026-06-18"), date("2026-07-17")).expect("old seal"),
-            )
-        }));
+        let consumed = DateRange::new(date("2026-06-18"), date("2026-07-17")).expect("consumed");
+        let latest = plan.folds.last().expect("latest fold");
+        assert!(latest.training.start <= consumed.start);
+        assert!(latest.training.end >= consumed.end);
+        assert!(!ranges_overlap(latest.validation, consumed));
+        assert!(
+            plan.folds
+                .iter()
+                .all(|fold| { !ranges_overlap(fold.validation, consumed,) })
+        );
+    }
+
+    #[test]
+    fn evaluation_policy_rejects_consumed_and_sealed_target_ranges() {
+        let policy = EvaluationPolicy {
+            format_version: EVALUATION_POLICY_FORMAT_VERSION,
+            development_cutoff: date("2026-08-26"),
+            sealed_test: DateRange::new(date("2026-08-28"), date("2026-09-26")).expect("seal"),
+            excluded_validation: vec![
+                DateRange::new(date("2026-06-18"), date("2026-07-17")).expect("consumed"),
+            ],
+        };
+
+        assert!(
+            policy
+                .validate_development_target_range(
+                    DateRange::new(date("2026-07-18"), date("2026-08-26")).expect("allowed"),
+                )
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate_development_target_range(
+                    DateRange::new(date("2026-07-17"), date("2026-07-18")).expect("consumed"),
+                )
+                .expect_err("consumed target range")
+                .to_string()
+                .contains("consumed validation")
+        );
+        assert!(
+            policy
+                .validate_development_target_range(
+                    DateRange::new(date("2026-08-28"), date("2026-09-26")).expect("sealed"),
+                )
+                .expect_err("sealed target range")
+                .to_string()
+                .contains("outside declared development")
+        );
     }
 
     #[test]

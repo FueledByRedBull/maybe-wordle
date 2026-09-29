@@ -9,41 +9,43 @@ permissions:
 
 jobs:
   rust:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.97.0
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Format
+        if: runner.os == 'Windows'
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        if: runner.os == 'Windows'
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
+      - name: Build CLI and GUI without opening a window
+        run: cargo build --locked --bins
+      - name: CLI smoke
+        run: cargo run --locked --bin maybe-wordle -- --help
       - name: Check public evidence redaction
+        if: runner.os == 'Windows'
         run: pwsh -NoProfile -File scripts/redact_public_evidence.ps1 -Check
       - name: Verify published rolling evidence
+        if: runner.os == 'Windows'
         run: >-
           cargo run --locked --bin maybe-wordle -- rolling-evidence-docs
-          --comparison docs/evidence/september-finite-preordered-public-v1.json
+          --comparison docs/evidence/september-audit-rolling-public-v1.json
           --markdown-output docs/generated/rolling-evidence.md --readme README.md
-      - name: Verify current predictive evidence
+      - name: Verify current predictive timing-screen evidence
+        if: runner.os == 'Windows'
         run: >-
           cargo run --locked --bin maybe-wordle -- benchmark-evidence-docs
-          --evidence docs/evidence/september-post-layout-tests-rolling-public-v1.json
-          --markdown-output docs/generated/september-post-layout-tests-rolling-v1.md
+          --evidence docs/evidence/september-audit-timing-screen-public-v1.json
+          --markdown-output docs/generated/september-audit-timing-screen-v1.md
           --readme README.md
-
-  macos-memory:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.97.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Validate native resident-set sampler
-        run: cargo test process_memory_is_available_and_sane --lib

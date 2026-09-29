@@ -3,6 +3,7 @@ pub enum PredictivePromotionSource {
     ExactDateOpenerArtifact,
     RecentOpenerArtifact,
     ReplyBook,
+    RecentReplyBook,
     SessionRootFallback,
     SessionReplyFallback,
     SessionThirdFallback,

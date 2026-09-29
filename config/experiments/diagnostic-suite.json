@@ -1,5 +1,5 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "name": "predictive-diagnostic-suite",
   "three_guess_rescue": {
     "profile": "aggressive-three-guess",
@@ -28,8 +28,5 @@
     "evaluation_runs": 3,
     "study_runs": 3,
     "top_suggestions": 10
-  },
-  "book_build": {
-    "forced_suggestion_top": 5
   }
 }

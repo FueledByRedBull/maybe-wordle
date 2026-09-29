@@ -1,5 +1,9 @@
 use std::path::Path;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDirectory;
+
 use chrono::NaiveDate;
 use maybe_wordle::{
     config::PriorConfig,
@@ -190,15 +194,28 @@ fn recursively_replay_finite_baseline(
     (failure_probability, expected_attempts)
 }
 
-fn fixture_paths(label: &str) -> ProjectPaths {
-    let root = std::env::temp_dir().join(format!(
-        "maybe-wordle-predictive-{label}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    let paths = ProjectPaths::new(&root);
+fn fixture_paths(label: &str) -> (TestDirectory, ProjectPaths) {
+    let fixture = TestDirectory::new(label);
+    let paths = ProjectPaths::new(fixture.path());
     paths.ensure_layout().expect("layout");
-    paths
+    (fixture, paths)
+}
+
+#[test]
+fn same_label_fixtures_do_not_replace_each_other() {
+    let (first_owner, first) = fixture_paths("fixture-ownership-regression");
+    write_fixture(&first.root.join("owned.txt"), "first");
+    let (second_owner, second) = fixture_paths("fixture-ownership-regression");
+    assert_ne!(first.root, second.root);
+    assert_eq!(
+        std::fs::read_to_string(first.root.join("owned.txt")).expect("first fixture retained"),
+        "first"
+    );
+    drop(first_owner);
+    assert!(!first.root.exists());
+    assert!(second.root.exists());
+    drop(second_owner);
+    assert!(!second.root.exists());
 }
 
 fn assert_same_predictive_response(
@@ -248,8 +265,10 @@ fn disk_only_request<'a>(
 
 #[test]
 fn predictive_public_books_ignore_same_day_future_history_and_storage_order() {
-    let paths = fixture_paths("public-book-date-boundary");
+    let (_fixture, paths) = fixture_paths("public-book-date-boundary");
     write_standard_fixture(&paths);
+    let guesses = std::fs::read_to_string(&paths.seed_guesses).expect("guesses");
+    write_fixture(&paths.seed_guesses, &(guesses + "zzzzz\n"));
     let config = PriorConfig {
         search_policy_mode: maybe_wordle::config::SearchPolicyMode::ProxyOnly,
         ..PriorConfig::default()
@@ -407,13 +426,11 @@ fn predictive_public_books_ignore_same_day_future_history_and_storage_order() {
             .map(|suggestion| &suggestion.word)
             .collect::<Vec<_>>()
     );
-
-    let _ = std::fs::remove_dir_all(paths.root);
 }
 
 #[test]
 fn predictive_api_uses_exact_date_opener_artifact_in_fast_mode() {
-    let paths = fixture_paths("exact-artifact");
+    let (_fixture, paths) = fixture_paths("exact-artifact");
     write_standard_fixture(&paths);
     let config = PriorConfig {
         session_window_days: 1,
@@ -442,13 +459,14 @@ fn predictive_api_uses_exact_date_opener_artifact_in_fast_mode() {
         Some(PredictivePromotionSource::ExactDateOpenerArtifact)
     );
     assert_eq!(response.promoted_word, Some(opener.opener));
-    let _ = std::fs::remove_dir_all(paths.root);
 }
 
 #[test]
 fn puzzle_replay_ignores_same_day_and_future_history_including_new_primary_words() {
-    let paths = fixture_paths("puzzle-date-boundary");
+    let (_fixture, paths) = fixture_paths("puzzle-date-boundary");
     write_standard_fixture(&paths);
+    let guesses = std::fs::read_to_string(&paths.seed_guesses).expect("guesses");
+    write_fixture(&paths.seed_guesses, &(guesses + "zzzzz\n"));
     let config = PriorConfig::default();
     let puzzle_date = NaiveDate::from_ymd_opt(2024, 1, 4).expect("date");
     let baseline = Solver::from_paths(&paths, &config).expect("baseline");
@@ -599,12 +617,11 @@ fn puzzle_replay_ignores_same_day_and_future_history_including_new_primary_words
             .unwrap()
             .probability
     );
-    let _ = std::fs::remove_dir_all(paths.root);
 }
 
 #[test]
 fn finite_live_and_evaluation_share_policy_and_stop_after_six_turns() {
-    let paths = fixture_paths("finite-live-evaluation");
+    let (_fixture, paths) = fixture_paths("finite-live-evaluation");
     write_standard_fixture(&paths);
     let config = PriorConfig {
         search_policy_mode: maybe_wordle::config::SearchPolicyMode::FiniteFast,
@@ -660,12 +677,11 @@ fn finite_live_and_evaluation_share_policy_and_stop_after_six_turns() {
             })
             .is_err()
     );
-    let _ = std::fs::remove_dir_all(paths.root);
 }
 
 #[test]
 fn finite_fast_dynamic_public_history_preserves_hard_mode_fallback_and_six_turn_boundary() {
-    let paths = fixture_paths("finite-fast-dynamic-public");
+    let (_fixture, paths) = fixture_paths("finite-fast-dynamic-public");
     write_dynamic_public_fixture(&paths);
     let config = PriorConfig {
         search_policy_mode: maybe_wordle::config::SearchPolicyMode::FiniteFastDynamic,
@@ -804,19 +820,13 @@ fn finite_fast_dynamic_public_history_preserves_hard_mode_fallback_and_six_turn_
         })
         .expect_err("seven turns must be rejected");
     assert!(error.to_string().contains("at most six turns"));
-
-    let _ = std::fs::remove_dir_all(paths.root);
 }
 
 #[test]
 fn staged_fixed_belief_matches_finite_posterior_without_changing_search() {
     use maybe_wordle::config::SearchPolicyMode;
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("test-staged-fixed-belief-{}", std::process::id()));
-    let paths = ProjectPaths::new(&root);
-    paths.ensure_layout().expect("layout");
+    let (_fixture, paths) = fixture_paths("staged-fixed-belief");
     write_standard_fixture(&paths);
     let base = PriorConfig::default();
     let staged = Solver::from_paths(
@@ -889,14 +899,13 @@ fn staged_fixed_belief_matches_finite_posterior_without_changing_search() {
         assert_eq!(left.word, right.word);
         assert!((left.probability - right.probability).abs() < 1e-12);
     }
-    std::fs::remove_dir_all(root).expect("fixture cleanup");
 }
 
 #[test]
 fn selected_staged_policy_keeps_dynamic_finite_search_experimental() {
     use maybe_wordle::config::SearchPolicyMode;
 
-    let paths = fixture_paths("staged-six-turn-dispatch");
+    let (_fixture, paths) = fixture_paths("staged-six-turn-dispatch");
     write_standard_fixture(&paths);
     let config = PriorConfig {
         search_policy_mode: SearchPolicyMode::Staged,
@@ -975,7 +984,6 @@ fn selected_staged_policy_keeps_dynamic_finite_search_experimental() {
         assert_eq!(left.word, right.word);
         assert_eq!(left.probability, right.probability);
     }
-    std::fs::remove_dir_all(paths.root).expect("fixture cleanup");
 }
 
 #[test]
@@ -983,7 +991,7 @@ fn finite_post_search_cancellation_keeps_one_action_and_stops_formatting() {
     use maybe_wordle::solver::{FiniteSearchOptions, FiniteSearchReason};
     use std::cell::Cell;
 
-    let paths = fixture_paths("finite-post-search-cancellation");
+    let (_fixture, paths) = fixture_paths("finite-post-search-cancellation");
     write_standard_fixture(&paths);
     let solver = Solver::from_paths(&paths, &PriorConfig::default()).expect("solver");
     let observations = vec![("cigar".to_string(), 0); 5];
@@ -1027,12 +1035,11 @@ fn finite_post_search_cancellation_keeps_one_action_and_stops_formatting() {
         interrupted.suggestions[0].word,
         complete.suggestions[0].word
     );
-    std::fs::remove_dir_all(paths.root).expect("remove toy fixture");
 }
 
 #[test]
 fn finite_force_in_two_filter_precedes_requested_top_limit() {
-    let paths = fixture_paths("finite-force-in-two-limit");
+    let (_fixture, paths) = fixture_paths("finite-force-in-two-limit");
     write_standard_fixture(&paths);
     write_fixture(&paths.seed_guesses, "cigar\ncigam\ncigap\nrampy\nzzzzz\n");
     write_fixture(&paths.seed_answers, "cigar\ncigam\ncigap\n");
@@ -1061,12 +1068,11 @@ fn finite_force_in_two_filter_precedes_requested_top_limit() {
     assert_eq!(filtered.suggestions.len(), 1);
     assert_eq!(filtered.suggestions[0].word, "rampy");
     assert!(filtered.suggestions[0].force_in_two);
-    std::fs::remove_dir_all(paths.root).expect("remove toy fixture");
 }
 
 #[test]
 fn finite_baseline_replay_matches_grouped_normal_and_hard_policy_value() {
-    let paths = fixture_paths("finite-baseline-replay");
+    let (_fixture, paths) = fixture_paths("finite-baseline-replay");
     write_baseline_fixture(&paths);
     let config = PriorConfig {
         search_policy_mode: maybe_wordle::config::SearchPolicyMode::FiniteBaseline,
@@ -1116,12 +1122,11 @@ fn finite_baseline_replay_matches_grouped_normal_and_hard_policy_value() {
             assert!((value.expected_attempts - expected_attempts).abs() < 1e-12);
         }
     }
-    let _ = std::fs::remove_dir_all(paths.root);
 }
 
 #[test]
 fn predictive_boundaries_reject_invalid_hard_history_and_post_solve_turns() {
-    let paths = fixture_paths("invalid-hard-history");
+    let (_fixture, paths) = fixture_paths("invalid-hard-history");
     write_standard_fixture(&paths);
     let solver = Solver::from_paths(&paths, &PriorConfig::default()).unwrap();
     let observations = vec![
@@ -1137,7 +1142,7 @@ fn predictive_boundaries_reject_invalid_hard_history_and_post_solve_turns() {
     let solved = vec![("cigar".to_string(), 242), ("cigar".to_string(), 242)];
     for (history, message) in [
         (&observations, "invalid hard-mode turn 2"),
-        (&solved, "solved Wordle game"),
+        (&solved, "a solved game cannot contain further turns"),
     ] {
         let request = PredictiveSuggestRequest {
             puzzle_date: NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
@@ -1147,24 +1152,16 @@ fn predictive_boundaries_reject_invalid_hard_history_and_post_solve_turns() {
             force_in_two_only: false,
             mode: PredictiveSuggestionMode::LiveOnly,
         };
-        assert!(
-            solver
-                .suggest_predictive(request)
-                .unwrap_err()
-                .to_string()
-                .contains(message)
-        );
-        assert!(
-            solver
-                .suggest_predictive_controlled(
-                    request,
-                    maybe_wordle::solver::FiniteSearchOptions::fast(),
-                    &|| false
-                )
-                .unwrap_err()
-                .to_string()
-                .contains(message)
-        );
+        let error = solver.suggest_predictive(request).unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{error:#}");
+        let error = solver
+            .suggest_predictive_controlled(
+                request,
+                maybe_wordle::solver::FiniteSearchOptions::fast(),
+                &|| false,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{error:#}");
     }
     for history in [
         vec![("x".to_string(), 0)],
@@ -1174,12 +1171,11 @@ fn predictive_boundaries_reject_invalid_hard_history_and_post_solve_turns() {
         assert!(solver.hard_mode_violation(&history, "cigar").is_some());
     }
     assert!(solver.hard_mode_violation(&[], "x").is_some());
-    let _ = std::fs::remove_dir_all(paths.root);
 }
 
 #[test]
 fn predictive_api_uses_recent_opener_artifact_when_exact_date_is_missing() {
-    let paths = fixture_paths("recent-artifact");
+    let (_fixture, paths) = fixture_paths("recent-artifact");
     write_standard_fixture(&paths);
     let config = PriorConfig {
         session_window_days: 1,
@@ -1209,12 +1205,11 @@ fn predictive_api_uses_recent_opener_artifact_when_exact_date_is_missing() {
         Some(PredictivePromotionSource::RecentOpenerArtifact)
     );
     assert_eq!(response.promoted_word, Some(opener.opener));
-    let _ = std::fs::remove_dir_all(paths.root);
 }
 
 #[test]
 fn predictive_api_distinguishes_full_and_disk_only_session_fallbacks() {
-    let paths = fixture_paths("session-fallback");
+    let (_fixture, paths) = fixture_paths("session-fallback");
     write_standard_fixture(&paths);
     let config = PriorConfig {
         session_window_days: 1,
@@ -1251,12 +1246,11 @@ fn predictive_api_distinguishes_full_and_disk_only_session_fallbacks() {
         Some(PredictivePromotionSource::SessionRootFallback)
     );
     assert!(full.promoted_word.is_some());
-    let _ = std::fs::remove_dir_all(paths.root);
 }
 
 #[test]
 fn recovery_modes_are_explicit_in_predictive_api() {
-    let paths = fixture_paths("recovery");
+    let (_fixture, paths) = fixture_paths("recovery");
     write_zero_mass_fixture(&paths);
     let as_of = NaiveDate::from_ymd_opt(2024, 1, 4).expect("date");
 
@@ -1305,5 +1299,4 @@ fn recovery_modes_are_explicit_in_predictive_api() {
             .contains("no positive answer mass remains"),
         "unexpected error: {error}"
     );
-    let _ = std::fs::remove_dir_all(paths.root);
 }

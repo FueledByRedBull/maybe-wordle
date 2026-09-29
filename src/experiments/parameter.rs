@@ -202,6 +202,7 @@ impl ParameterRegistry {
         base: &PriorConfig,
         values: &BTreeMap<String, ParameterValue>,
     ) -> Result<PriorConfig> {
+        self.validate()?;
         let mut document = toml::Value::try_from(base.clone())?;
         for (name, value) in values {
             let definition = self
@@ -223,6 +224,7 @@ impl ParameterRegistry {
         base: &PriorConfig,
         values: &BTreeMap<String, ParameterValue>,
     ) -> Result<PriorConfig> {
+        self.validate()?;
         let mut document = toml::Value::try_from(base.clone())?;
         for (name, value) in values {
             let definition = self
@@ -586,7 +588,14 @@ fn validate_value(definition: &ParameterDefinition, value: &ParameterValue) -> R
                 step,
             },
             ParameterValue::Integer(value),
-        ) => value >= minimum && value <= maximum && (value - minimum) % step == 0,
+        ) => {
+            value >= minimum
+                && value <= maximum
+                && *step > 0
+                && value
+                    .checked_sub(*minimum)
+                    .is_some_and(|offset| offset % step == 0)
+        }
         (ParameterKind::Categorical { choices }, ParameterValue::Categorical(value)) => {
             choices.contains(value)
         }
@@ -616,7 +625,10 @@ fn set_toml_value(document: &mut toml::Value, path: &str, value: toml::Value) ->
             let table = cursor
                 .as_table_mut()
                 .ok_or_else(|| anyhow::anyhow!("parameter parent is not a table: {path}"))?;
-            table.insert(part.to_string(), value);
+            let leaf = table
+                .get_mut(part)
+                .ok_or_else(|| anyhow::anyhow!("parameter path does not exist: {path}"))?;
+            *leaf = value;
             return Ok(());
         }
         cursor = cursor
@@ -631,7 +643,7 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
     let mut parameters = vec![
         float(
             "base_seed_weight",
-            ParameterDomain::Prior,
+            ParameterCohort::PriorCalibration,
             config.base_seed_weight,
             0.05,
             2.0,
@@ -646,7 +658,7 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
         ),
         float(
             "base_history_only_weight",
-            ParameterDomain::Prior,
+            ParameterCohort::PriorCalibration,
             config.base_history_only_weight,
             0.01,
             1.0,
@@ -657,7 +669,7 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
         ),
         integer(
             "cooldown_days",
-            ParameterDomain::Prior,
+            ParameterCohort::PriorCalibration,
             config.cooldown_days,
             0,
             730,
@@ -667,7 +679,7 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
         ),
         float(
             "cooldown_floor",
-            ParameterDomain::Prior,
+            ParameterCohort::PriorCalibration,
             config.cooldown_floor,
             0.0,
             0.25,
@@ -682,7 +694,7 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
         ),
         float(
             "midpoint_days",
-            ParameterDomain::Prior,
+            ParameterCohort::PriorCalibration,
             config.midpoint_days,
             30.0,
             1_825.0,
@@ -693,7 +705,7 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
         ),
         float(
             "logistic_k",
-            ParameterDomain::Prior,
+            ParameterCohort::PriorCalibration,
             config.logistic_k,
             0.001,
             0.1,
@@ -705,9 +717,9 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
         float(
             "fallback_prior_mass",
             if config.search_policy_mode.uses_fixed_belief() {
-                ParameterDomain::Prior
+                ParameterCohort::PriorCalibration
             } else {
-                ParameterDomain::Recovery
+                ParameterCohort::CoverageRecovery
             },
             config.fallback_prior_mass,
             0.0001,
@@ -723,7 +735,7 @@ pub fn predictive_parameter_registry(config: &PriorConfig) -> ParameterRegistry 
         ),
         integer(
             "fallback_activation_threshold",
-            ParameterDomain::Recovery,
+            ParameterCohort::CoverageRecovery,
             config.fallback_activation_threshold as i64,
             0,
             256,
@@ -784,6 +796,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
     let mut parameters = [
         (
             "proxy_weights.entropy_w",
+            ParameterCohort::ProxyCore,
             weights.entropy_w,
             0.01,
             8.0,
@@ -791,6 +804,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.bucket_mass_w",
+            ParameterCohort::ProxyCore,
             weights.bucket_mass_w,
             0.01,
             8.0,
@@ -798,6 +812,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.bucket_size_w",
+            ParameterCohort::ProxyCore,
             weights.bucket_size_w,
             0.001,
             2.0,
@@ -805,6 +820,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.ambiguous_w",
+            ParameterCohort::ProxyCore,
             weights.ambiguous_w,
             0.001,
             4.0,
@@ -812,6 +828,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.proxy_w",
+            ParameterCohort::ProxyCore,
             weights.proxy_w,
             0.01,
             6.0,
@@ -819,6 +836,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.solve_prob_w",
+            ParameterCohort::ProxyCore,
             weights.solve_prob_w,
             0.001,
             2.0,
@@ -826,6 +844,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.posterior_w",
+            ParameterCohort::ProxyCore,
             weights.posterior_w,
             0.001,
             2.0,
@@ -833,6 +852,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.smoothness_w",
+            ParameterCohort::ProxyCore,
             weights.smoothness_w,
             0.001,
             4.0,
@@ -840,6 +860,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.gray_reuse_w",
+            ParameterCohort::ProxyCore,
             weights.gray_reuse_w,
             0.001,
             2.0,
@@ -847,6 +868,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.large_bucket_count_w",
+            ParameterCohort::ProxyRisk,
             weights.large_bucket_count_w,
             0.001,
             2.0,
@@ -854,6 +876,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.dangerous_mass_count_w",
+            ParameterCohort::ProxyRisk,
             weights.dangerous_mass_count_w,
             0.001,
             2.0,
@@ -861,6 +884,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         (
             "proxy_weights.large_bucket_mass_w",
+            ParameterCohort::ProxyRisk,
             weights.large_bucket_mass_w,
             0.001,
             4.0,
@@ -868,10 +892,10 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
     ]
     .into_iter()
-    .map(|(name, default, minimum, maximum, description)| {
+    .map(|(name, cohort, default, minimum, maximum, description)| {
         float(
             name,
-            ParameterDomain::Proxy,
+            cohort,
             default,
             minimum,
             maximum,
@@ -884,7 +908,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
     .collect::<Vec<_>>();
     parameters.push(integer(
         "proxy_small_state_lower_bound_threshold",
-        ParameterDomain::Proxy,
+        ParameterCohort::ProxySmallState,
         config.proxy_small_state_lower_bound_threshold as i64,
         0,
         64,
@@ -894,7 +918,7 @@ fn proxy_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
     ));
     parameters.push(float(
         "ambiguous_mass_threshold",
-        ParameterDomain::Proxy,
+        ParameterCohort::ProxyRisk,
         config.ambiguous_mass_threshold,
         0.01,
         0.50,
@@ -938,7 +962,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         },
         integer(
             "exact_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchExact,
             config.exact_threshold as i64,
             16,
             256,
@@ -948,7 +972,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "exact_exhaustive_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchExact,
             config.exact_exhaustive_threshold as i64,
             2,
             32,
@@ -958,7 +982,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "exact_candidate_pool",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchExact,
             config.exact_candidate_pool as i64,
             16,
             320,
@@ -968,7 +992,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "second_guess_coverage_min_survivors",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchCoverage,
             config.second_guess_coverage_min_survivors as i64,
             0,
             512,
@@ -978,7 +1002,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "second_guess_coverage_max_survivors",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchCoverage,
             config.second_guess_coverage_max_survivors as i64,
             0,
             512,
@@ -988,7 +1012,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "second_guess_coverage_pool",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchCoverage,
             config.second_guess_coverage_pool as i64,
             8,
             256,
@@ -998,7 +1022,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "lookahead_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchLookahead,
             config.lookahead_threshold as i64,
             32,
             512,
@@ -1008,7 +1032,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "medium_state_lookahead_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchLookahead,
             config.medium_state_lookahead_threshold as i64,
             24,
             256,
@@ -1018,7 +1042,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "lookahead_candidate_pool",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchLookahead,
             config.lookahead_candidate_pool as i64,
             4,
             128,
@@ -1028,7 +1052,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "medium_state_lookahead_candidate_pool",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchLookahead,
             config.medium_state_lookahead_candidate_pool as i64,
             4,
             192,
@@ -1038,7 +1062,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "lookahead_reply_pool",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchLookahead,
             config.lookahead_reply_pool as i64,
             2,
             96,
@@ -1048,7 +1072,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "medium_state_lookahead_reply_pool",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchLookahead,
             config.medium_state_lookahead_reply_pool as i64,
             2,
             128,
@@ -1058,7 +1082,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "lookahead_root_force_in_two_scan",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchLookahead,
             config.lookahead_root_force_in_two_scan as i64,
             8,
             512,
@@ -1068,7 +1092,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "medium_state_force_in_two_scan",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchLookahead,
             config.medium_state_force_in_two_scan as i64,
             8,
             768,
@@ -1078,7 +1102,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "large_state_split_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchRouting,
             config.large_state_split_threshold as i64,
             8,
             160,
@@ -1088,7 +1112,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "pool_tight_gap_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.pool_tight_gap_threshold,
             0.0,
             0.25,
@@ -1099,7 +1123,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "pool_medium_gap_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.pool_medium_gap_threshold,
             0.0,
             0.5,
@@ -1110,7 +1134,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "pool_tight_expansion_multiplier",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.pool_tight_expansion_multiplier,
             1.0,
             4.0,
@@ -1121,7 +1145,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "pool_medium_expansion_multiplier",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.pool_medium_expansion_multiplier,
             1.0,
             3.0,
@@ -1132,7 +1156,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "pool_diversity_stride",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.pool_diversity_stride as i64,
             1,
             16,
@@ -1142,7 +1166,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "exact_pool_primary_fraction",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.exact_pool_primary_fraction,
             0.0,
             1.0,
@@ -1153,7 +1177,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "exact_pool_entropy_fraction",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.exact_pool_entropy_fraction,
             0.0,
             1.0,
@@ -1164,7 +1188,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "exact_pool_worst_bucket_fraction",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.exact_pool_worst_bucket_fraction,
             0.0,
             1.0,
@@ -1175,7 +1199,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "exact_pool_mass_reducer_fraction",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.exact_pool_mass_reducer_fraction,
             0.0,
             1.0,
@@ -1186,7 +1210,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "exact_pool_solve_probability_fraction",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.exact_pool_solve_probability_fraction,
             0.0,
             1.0,
@@ -1197,7 +1221,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "exact_pool_posterior_fraction",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPool,
             config.exact_pool_posterior_fraction,
             0.0,
             1.0,
@@ -1208,7 +1232,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "danger_top_concentration_w",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_top_concentration_w,
             0.0,
             1.0,
@@ -1219,7 +1243,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "danger_bucket_mass_w",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_bucket_mass_w,
             0.0,
             1.0,
@@ -1230,7 +1254,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "danger_bucket_ratio_w",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_bucket_ratio_w,
             0.0,
             1.0,
@@ -1241,7 +1265,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "danger_ambiguous_w",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_ambiguous_w,
             0.0,
             1.0,
@@ -1252,7 +1276,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "danger_disagreement_w",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_disagreement_w,
             0.0,
             1.0,
@@ -1263,7 +1287,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "danger_posterior_window",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_posterior_window as i64,
             1,
             12,
@@ -1273,7 +1297,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "danger_candidate_window",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_candidate_window as i64,
             1,
             12,
@@ -1283,7 +1307,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "danger_mass_disagreement_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_mass_disagreement_threshold,
             0.0,
             0.5,
@@ -1294,7 +1318,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "danger_size_disagreement_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_size_disagreement_threshold as i64,
             1,
             20,
@@ -1304,7 +1328,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "danger_ambiguity_saturation_count",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_ambiguity_saturation_count as i64,
             1,
             20,
@@ -1314,7 +1338,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "danger_lookahead_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_lookahead_threshold,
             0.0,
             1.0,
@@ -1325,7 +1349,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "danger_exact_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_exact_threshold,
             0.0,
             1.0,
@@ -1336,7 +1360,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "danger_reply_pool_bonus",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_reply_pool_bonus as i64,
             0,
             64,
@@ -1346,7 +1370,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "danger_exact_root_pool",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_exact_root_pool as i64,
             4,
             128,
@@ -1356,7 +1380,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "danger_exact_survivor_cap",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchDanger,
             config.danger_exact_survivor_cap as i64,
             17,
             512,
@@ -1366,7 +1390,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "lookahead_trap_penalty",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPenalty,
             config.lookahead_trap_penalty,
             0.0,
             2.0,
@@ -1377,7 +1401,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "lookahead_worst_bucket_ratio_penalty",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPenalty,
             config.lookahead_worst_bucket_ratio_penalty,
             0.0,
             2.0,
@@ -1388,7 +1412,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "lookahead_large_bucket_penalty",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPenalty,
             config.lookahead_large_bucket_penalty,
             0.0,
             1.0,
@@ -1399,7 +1423,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "lookahead_dangerous_mass_penalty",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPenalty,
             config.lookahead_dangerous_mass_penalty,
             0.0,
             1.0,
@@ -1410,7 +1434,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "lookahead_large_bucket_mass_penalty",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPenalty,
             config.lookahead_large_bucket_mass_penalty,
             0.0,
             1.0,
@@ -1421,7 +1445,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "trap_size_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPenalty,
             config.trap_size_threshold as i64,
             2,
             20,
@@ -1431,7 +1455,7 @@ fn search_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         float(
             "trap_mass_threshold",
-            ParameterDomain::SearchPolicy,
+            ParameterCohort::SearchPenalty,
             config.trap_mass_threshold,
             0.01,
             0.75,
@@ -1452,7 +1476,7 @@ fn book_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
     vec![
         integer(
             "session_opener_pool",
-            ParameterDomain::BookPolicy,
+            ParameterCohort::BookPolicy,
             config.session_opener_pool as i64,
             4,
             128,
@@ -1462,7 +1486,7 @@ fn book_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "session_opener_holdout_shortlist",
-            ParameterDomain::BookPolicy,
+            ParameterCohort::BookPolicy,
             config.session_opener_holdout_shortlist as i64,
             1,
             32,
@@ -1472,7 +1496,7 @@ fn book_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "session_reply_pool",
-            ParameterDomain::BookPolicy,
+            ParameterCohort::BookPolicy,
             config.session_reply_pool as i64,
             4,
             128,
@@ -1482,7 +1506,7 @@ fn book_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "session_window_days",
-            ParameterDomain::BookPolicy,
+            ParameterCohort::BookPolicy,
             config.session_window_days as i64,
             7,
             180,
@@ -1492,7 +1516,7 @@ fn book_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         integer(
             "session_artifact_freshness_days",
-            ParameterDomain::BookPolicy,
+            ParameterCohort::BookPolicy,
             config.session_artifact_freshness_days as i64,
             1,
             60,
@@ -1524,7 +1548,7 @@ fn recovery_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         },
         float(
             "recovery.epsilon_scale",
-            ParameterDomain::Recovery,
+            ParameterCohort::CoverageRecovery,
             config.recovery.epsilon_scale,
             1e-12,
             1e-2,
@@ -1540,8 +1564,7 @@ fn operational_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
     vec![
         non_tunable_integer(
             "sync_reverify_days",
-            ParameterDomain::Operational,
-            ParameterRole::Operational,
+            ParameterCohort::Operational,
             config.sync_reverify_days,
             0,
             365,
@@ -1549,8 +1572,7 @@ fn operational_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         non_tunable_integer(
             "sync_request_timeout_seconds",
-            ParameterDomain::Operational,
-            ParameterRole::Operational,
+            ParameterCohort::Operational,
             config.sync_request_timeout_seconds as i64,
             1,
             300,
@@ -1558,8 +1580,7 @@ fn operational_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         non_tunable_integer(
             "sync_retry_attempts",
-            ParameterDomain::Operational,
-            ParameterRole::Operational,
+            ParameterCohort::Operational,
             config.sync_retry_attempts as i64,
             0,
             20,
@@ -1567,8 +1588,7 @@ fn operational_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
         ),
         non_tunable_integer(
             "sync_retry_backoff_millis",
-            ParameterDomain::Operational,
-            ParameterRole::Operational,
+            ParameterCohort::Operational,
             config.sync_retry_backoff_millis as i64,
             0,
             60_000,
@@ -1590,96 +1610,10 @@ fn operational_parameters(config: &PriorConfig) -> Vec<ParameterDefinition> {
     ]
 }
 
-fn parameter_cohort(name: &str, domain: ParameterDomain, role: ParameterRole) -> ParameterCohort {
-    match (domain, role) {
-        (ParameterDomain::Prior, ParameterRole::Hyperparameter) => {
-            ParameterCohort::PriorCalibration
-        }
-        (ParameterDomain::Recovery, ParameterRole::Hyperparameter) => {
-            ParameterCohort::CoverageRecovery
-        }
-        (ParameterDomain::BookPolicy, ParameterRole::Hyperparameter) => ParameterCohort::BookPolicy,
-        (ParameterDomain::Operational, ParameterRole::Operational) => ParameterCohort::Operational,
-        (ParameterDomain::Safety, ParameterRole::Safety) => ParameterCohort::Safety,
-        (ParameterDomain::ManualOverride, ParameterRole::ManualOverride) => {
-            ParameterCohort::ManualOverride
-        }
-        (ParameterDomain::Proxy, ParameterRole::Hyperparameter) => match name {
-            "proxy_weights.entropy_w"
-            | "proxy_weights.bucket_mass_w"
-            | "proxy_weights.bucket_size_w"
-            | "proxy_weights.ambiguous_w"
-            | "proxy_weights.proxy_w"
-            | "proxy_weights.solve_prob_w"
-            | "proxy_weights.posterior_w"
-            | "proxy_weights.smoothness_w"
-            | "proxy_weights.gray_reuse_w" => ParameterCohort::ProxyCore,
-            "proxy_weights.large_bucket_count_w"
-            | "proxy_weights.dangerous_mass_count_w"
-            | "proxy_weights.large_bucket_mass_w"
-            | "ambiguous_mass_threshold" => ParameterCohort::ProxyRisk,
-            "proxy_small_state_lower_bound_threshold" => ParameterCohort::ProxySmallState,
-            _ => panic!("proxy parameter {name} has no typed cohort"),
-        },
-        (ParameterDomain::SearchPolicy, ParameterRole::Hyperparameter) => match name {
-            "search_policy_mode" | "large_state_split_threshold" => ParameterCohort::SearchRouting,
-            "exact_threshold" | "exact_exhaustive_threshold" | "exact_candidate_pool" => {
-                ParameterCohort::SearchExact
-            }
-            "second_guess_coverage_min_survivors"
-            | "second_guess_coverage_max_survivors"
-            | "second_guess_coverage_pool" => ParameterCohort::SearchCoverage,
-            "lookahead_threshold"
-            | "medium_state_lookahead_threshold"
-            | "lookahead_candidate_pool"
-            | "medium_state_lookahead_candidate_pool"
-            | "lookahead_reply_pool"
-            | "medium_state_lookahead_reply_pool"
-            | "lookahead_root_force_in_two_scan"
-            | "medium_state_force_in_two_scan" => ParameterCohort::SearchLookahead,
-            "pool_tight_gap_threshold"
-            | "pool_medium_gap_threshold"
-            | "pool_tight_expansion_multiplier"
-            | "pool_medium_expansion_multiplier"
-            | "pool_diversity_stride"
-            | "exact_pool_primary_fraction"
-            | "exact_pool_entropy_fraction"
-            | "exact_pool_worst_bucket_fraction"
-            | "exact_pool_mass_reducer_fraction"
-            | "exact_pool_solve_probability_fraction"
-            | "exact_pool_posterior_fraction" => ParameterCohort::SearchPool,
-            "danger_lookahead_threshold"
-            | "danger_exact_threshold"
-            | "danger_top_concentration_w"
-            | "danger_bucket_mass_w"
-            | "danger_bucket_ratio_w"
-            | "danger_ambiguous_w"
-            | "danger_disagreement_w"
-            | "danger_posterior_window"
-            | "danger_candidate_window"
-            | "danger_mass_disagreement_threshold"
-            | "danger_size_disagreement_threshold"
-            | "danger_ambiguity_saturation_count"
-            | "danger_reply_pool_bonus"
-            | "danger_exact_root_pool"
-            | "danger_exact_survivor_cap" => ParameterCohort::SearchDanger,
-            "lookahead_trap_penalty"
-            | "lookahead_worst_bucket_ratio_penalty"
-            | "lookahead_large_bucket_penalty"
-            | "lookahead_dangerous_mass_penalty"
-            | "lookahead_large_bucket_mass_penalty"
-            | "trap_size_threshold"
-            | "trap_mass_threshold" => ParameterCohort::SearchPenalty,
-            _ => panic!("search-policy parameter {name} has no typed cohort"),
-        },
-        _ => panic!("parameter {name} has unsupported domain/role pair {domain:?}/{role:?}"),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn float(
     name: &str,
-    domain: ParameterDomain,
+    cohort: ParameterCohort,
     default: f64,
     minimum: f64,
     maximum: f64,
@@ -1690,9 +1624,9 @@ fn float(
 ) -> ParameterDefinition {
     ParameterDefinition {
         name: name.to_string(),
-        domain,
-        cohort: parameter_cohort(name, domain, ParameterRole::Hyperparameter),
-        role: ParameterRole::Hyperparameter,
+        domain: cohort.domain(),
+        cohort,
+        role: cohort.role(),
         default: ParameterValue::Float(default),
         kind: ParameterKind::Float {
             minimum,
@@ -1708,7 +1642,7 @@ fn float(
 #[allow(clippy::too_many_arguments)]
 fn integer(
     name: &str,
-    domain: ParameterDomain,
+    cohort: ParameterCohort,
     default: i64,
     minimum: i64,
     maximum: i64,
@@ -1718,9 +1652,9 @@ fn integer(
 ) -> ParameterDefinition {
     ParameterDefinition {
         name: name.to_string(),
-        domain,
-        cohort: parameter_cohort(name, domain, ParameterRole::Hyperparameter),
-        role: ParameterRole::Hyperparameter,
+        domain: cohort.domain(),
+        cohort,
+        role: cohort.role(),
         default: ParameterValue::Integer(default),
         kind: ParameterKind::Integer {
             minimum,
@@ -1734,8 +1668,7 @@ fn integer(
 
 fn non_tunable_integer(
     name: &str,
-    domain: ParameterDomain,
-    role: ParameterRole,
+    cohort: ParameterCohort,
     default: i64,
     minimum: i64,
     maximum: i64,
@@ -1743,9 +1676,9 @@ fn non_tunable_integer(
 ) -> ParameterDefinition {
     ParameterDefinition {
         name: name.to_string(),
-        domain,
-        cohort: parameter_cohort(name, domain, role),
-        role,
+        domain: cohort.domain(),
+        cohort,
+        role: cohort.role(),
         default: ParameterValue::Integer(default),
         kind: ParameterKind::Integer {
             minimum,
@@ -1764,7 +1697,7 @@ fn validate_definition(parameter: &ParameterDefinition) -> Result<()> {
                 minimum,
                 maximum,
                 step,
-                ..
+                scale,
             },
             ParameterValue::Float(default),
         ) => {
@@ -1772,9 +1705,21 @@ fn validate_definition(parameter: &ParameterDefinition) -> Result<()> {
                 || !maximum.is_finite()
                 || !default.is_finite()
                 || minimum > maximum
+                || parameter.tunable() && minimum == maximum
+                || !(maximum - minimum).is_finite()
                 || default < minimum
                 || default > maximum
-                || step.is_some_and(|step| !step.is_finite() || step <= 0.0)
+                || *scale == ParameterScale::Log
+                    && (*minimum <= 0.0 || parameter.tunable() && maximum.ln() <= minimum.ln())
+                || step.is_some_and(|step| {
+                    !step.is_finite()
+                        || step <= 0.0
+                        || parameter.tunable()
+                            && (step > maximum - minimum
+                                || minimum + step <= *minimum
+                                || maximum - step >= *maximum)
+                        || !((maximum - minimum) / step).is_finite()
+                })
             {
                 bail!("invalid float definition for {}", parameter.name);
             }
@@ -1786,10 +1731,32 @@ fn validate_definition(parameter: &ParameterDefinition) -> Result<()> {
                 step,
             },
             ParameterValue::Integer(default),
-        ) if minimum <= maximum && default >= minimum && default <= maximum && *step > 0 => {}
-        (ParameterKind::Categorical { choices }, ParameterValue::Categorical(default))
-            if !choices.is_empty() && choices.contains(default) => {}
-        (ParameterKind::FloatMap, ParameterValue::FloatMap) => {}
+        ) => {
+            let span = maximum.checked_sub(*minimum);
+            if default < minimum
+                || default > maximum
+                || *step <= 0
+                || span.is_none_or(|span| {
+                    span < 0
+                        || parameter.tunable() && (span == 0 || *step > span)
+                        || *step > 0 && (span / step).checked_add(1).is_none()
+                })
+            {
+                bail!("invalid integer definition for {}", parameter.name);
+            }
+        }
+        (ParameterKind::Categorical { choices }, ParameterValue::Categorical(default)) => {
+            let unique = choices.iter().collect::<HashSet<_>>();
+            if choices.is_empty()
+                || parameter.tunable() && choices.len() < 2
+                || unique.len() != choices.len()
+                || choices.iter().any(|choice| choice.trim().is_empty())
+                || !choices.contains(default)
+            {
+                bail!("invalid categorical definition for {}", parameter.name);
+            }
+        }
+        (ParameterKind::FloatMap, ParameterValue::FloatMap) if !parameter.tunable() => {}
         _ => bail!("kind/default mismatch for {}", parameter.name),
     }
     Ok(())
@@ -1800,6 +1767,138 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    fn custom_registry(kind: ParameterKind, default: ParameterValue) -> ParameterRegistry {
+        ParameterRegistry {
+            format_version: 7,
+            constraints: Vec::new(),
+            parameters: vec![ParameterDefinition {
+                name: "custom".to_string(),
+                domain: ParameterDomain::Prior,
+                cohort: ParameterCohort::PriorCalibration,
+                role: ParameterRole::Hyperparameter,
+                default,
+                kind,
+                objectives: vec![ObjectiveKind::Calibration],
+                description: "test dimension".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn custom_float_domains_reject_undefined_sampling_arithmetic() {
+        for (minimum, maximum, step, scale) in [
+            (0.0, 1.0, None, ParameterScale::Log),
+            (-1.0, 1.0, None, ParameterScale::Log),
+            (1.0, 1.0, None, ParameterScale::Linear),
+            (-f64::MAX, f64::MAX, None, ParameterScale::Linear),
+            (1.0, 2.0, Some(2.0), ParameterScale::Linear),
+            (1.0, 2.0, Some(f64::from_bits(1)), ParameterScale::Linear),
+            (
+                1e300,
+                f64::from_bits(1e300_f64.to_bits() + 1),
+                None,
+                ParameterScale::Log,
+            ),
+        ] {
+            let registry = custom_registry(
+                ParameterKind::Float {
+                    minimum,
+                    maximum,
+                    step,
+                    scale,
+                },
+                ParameterValue::Float(minimum),
+            );
+            assert!(
+                registry.validate().is_err(),
+                "accepted {minimum}..{maximum}, {scale:?}, step {step:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_integer_domains_reject_overflow_and_degenerate_steps() {
+        for (minimum, maximum, step) in [
+            (i64::MIN, i64::MAX, 1),
+            (0, i64::MAX, 1),
+            (2, 2, 1),
+            (0, 5, 0),
+            (0, 5, -1),
+            (0, 5, 6),
+        ] {
+            let registry = custom_registry(
+                ParameterKind::Integer {
+                    minimum,
+                    maximum,
+                    step,
+                },
+                ParameterValue::Integer(minimum),
+            );
+            assert!(
+                registry.validate().is_err(),
+                "accepted {minimum}..{maximum}, step {step}"
+            );
+        }
+        let registry = custom_registry(
+            ParameterKind::Integer {
+                minimum: i64::MIN,
+                maximum: i64::MIN + 10,
+                step: 2,
+            },
+            ParameterValue::Integer(i64::MIN),
+        );
+        registry.validate().unwrap();
+        assert!(
+            validate_value(
+                &registry.parameters[0],
+                &ParameterValue::Integer(i64::MIN + 10)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_value(&registry.parameters[0], &ParameterValue::Integer(i64::MAX)).is_err()
+        );
+    }
+
+    #[test]
+    fn custom_categories_and_unknown_leaves_are_rejected() {
+        for choices in [vec!["a", "a"], vec!["a", ""], vec!["a"]] {
+            let registry = custom_registry(
+                ParameterKind::Categorical {
+                    choices: choices.into_iter().map(str::to_string).collect(),
+                },
+                ParameterValue::Categorical("a".to_string()),
+            );
+            assert!(registry.validate().is_err());
+        }
+        for name in ["invented", "proxy_weights.invented", "recovery.invented"] {
+            let mut registry = custom_registry(
+                ParameterKind::Float {
+                    minimum: 1.0,
+                    maximum: 2.0,
+                    step: None,
+                    scale: ParameterScale::Linear,
+                },
+                ParameterValue::Float(1.0),
+            );
+            registry.parameters[0].name = name.to_string();
+            registry.validate().unwrap();
+            let values = BTreeMap::from([(name.to_string(), ParameterValue::Float(2.0))]);
+            assert!(
+                registry
+                    .apply_tunable_values(&PriorConfig::default(), &values)
+                    .is_err(),
+                "accepted unknown leaf {name}"
+            );
+            assert!(
+                registry
+                    .apply_diagnostic_values(&PriorConfig::default(), &values)
+                    .is_err(),
+                "accepted unknown diagnostic leaf {name}"
+            );
+        }
+    }
 
     fn collect_leaf_paths(prefix: &str, value: &toml::Value, paths: &mut BTreeSet<String>) {
         if let toml::Value::Table(table) = value {

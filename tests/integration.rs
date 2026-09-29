@@ -1,5 +1,9 @@
 use std::path::Path;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDirectory;
+
 use chrono::{Days, NaiveDate};
 use maybe_wordle::{
     config::{PriorConfig, SearchPolicyMode},
@@ -112,9 +116,9 @@ fn write_multi_fold_predictive_fixture(paths: &ProjectPaths) {
 
 #[test]
 fn formal_policy_builds_and_verifies_certificate() {
-    let root = std::env::temp_dir().join("maybe-wordle-integration-formal");
-    let _ = std::fs::remove_dir_all(&root);
-    let paths = ProjectPaths::new(&root);
+    let fixture = TestDirectory::new("integration-formal");
+    let root = fixture.path();
+    let paths = ProjectPaths::new(root);
     paths.ensure_layout().expect("layout");
     let formal_dir = root.join(format!("data/formal/{DEFAULT_FORMAL_MODEL_ID}"));
     std::fs::create_dir_all(&formal_dir).expect("formal dir");
@@ -140,14 +144,13 @@ fn formal_policy_builds_and_verifies_certificate() {
     assert!(oracle.verified_small_states > 0 || oracle.verified_medium_states > 0);
     let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("load");
     assert!(runtime.initial_state().count() > 0);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn expected_only_model_builds_separately() {
-    let root = std::env::temp_dir().join("maybe-wordle-integration-expected");
-    let _ = std::fs::remove_dir_all(&root);
-    let paths = ProjectPaths::new(&root);
+    let fixture = TestDirectory::new("integration-expected");
+    let root = fixture.path();
+    let paths = ProjectPaths::new(root);
     paths.ensure_layout().expect("layout");
     let formal_dir = root.join(format!("data/formal/{DEFAULT_EXPECTED_ONLY_MODEL_ID}"));
     std::fs::create_dir_all(&formal_dir).expect("formal dir");
@@ -164,14 +167,13 @@ fn expected_only_model_builds_separately() {
     )
     .expect("verify");
     assert_eq!(verify.verified_cached_states, summary.solved_states);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn predictive_experiments_and_tuning_work_on_toy_fixture() {
-    let root = std::env::temp_dir().join("maybe-wordle-integration-predictive");
-    let _ = std::fs::remove_dir_all(&root);
-    let paths = ProjectPaths::new(&root);
+    let fixture = TestDirectory::new("integration-predictive");
+    let root = fixture.path();
+    let paths = ProjectPaths::new(root);
     paths.ensure_layout().expect("layout");
     write_predictive_fixture(&paths);
 
@@ -221,7 +223,11 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
             );
             assert!(
                 report.backtest.canonical.all_game_penalized_mean_guesses
-                    >= report.backtest.canonical.conditional_mean_guesses
+                    >= report
+                        .backtest
+                        .canonical
+                        .conditional_mean_guesses
+                        .expect("modeled fixture games")
             );
         }
     }
@@ -530,14 +536,13 @@ fn predictive_experiments_and_tuning_work_on_toy_fixture() {
             .expect("second move");
         assert!(!second_move.is_empty());
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn completed_multi_rung_static_study_replay_preserves_state_and_summary() {
-    let root = std::env::temp_dir().join("maybe-wordle-integration-study-replay");
-    let _ = std::fs::remove_dir_all(&root);
-    let paths = ProjectPaths::new(&root);
+    let fixture = TestDirectory::new("integration-study-replay");
+    let root = fixture.path();
+    let paths = ProjectPaths::new(root);
     paths.ensure_layout().expect("layout");
     write_multi_fold_predictive_fixture(&paths);
 
@@ -604,6 +609,4 @@ fn completed_multi_rung_static_study_replay_preserves_state_and_summary() {
             .map(|config| toml::to_string(config).expect("serialize config")),
     );
     assert_eq!(replay_state.trials, first_state.trials);
-
-    let _ = std::fs::remove_dir_all(&root);
 }

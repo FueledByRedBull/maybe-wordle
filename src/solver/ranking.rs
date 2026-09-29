@@ -1,6 +1,29 @@
 use super::*;
 
 impl Solver {
+    pub(super) fn suggestion_from_metric(&self, metric: GuessMetrics) -> Suggestion {
+        Suggestion {
+            value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
+            finite_value: None,
+            word: self.guesses[metric.guess_index].clone(),
+            entropy: metric.entropy,
+            solve_probability: metric.solve_probability,
+            expected_remaining: metric.expected_remaining,
+            force_in_two: metric.force_in_two,
+            known_absent_letter_hits: metric.known_absent_letter_hits,
+            worst_non_green_bucket_size: metric.worst_non_green_bucket_size,
+            largest_non_green_bucket_mass: metric.largest_non_green_bucket_mass,
+            large_non_green_bucket_count: metric.large_non_green_bucket_count,
+            dangerous_mass_bucket_count: metric.dangerous_mass_bucket_count,
+            non_green_mass_in_large_buckets: metric.non_green_mass_in_large_buckets,
+            proxy_cost: Some(metric.proxy_cost),
+            large_state_score: Some(metric.large_state_score),
+            posterior_answer_probability: metric.posterior_answer_probability,
+            lookahead_cost: None,
+            exact_cost: None,
+        }
+    }
+
     pub(super) fn score_guess_metrics_for_subset_controlled(
         &self,
         subset: &[usize],
@@ -52,10 +75,15 @@ impl Solver {
         guess_index: usize,
         subset: &[usize],
         total: f64,
-    ) -> AbsurdleSuggestion {
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<AbsurdleSuggestion> {
+        super::search::check_predictive_search_cancelled(cancelled)?;
         let mut counts = [0usize; PATTERN_SPACE];
         let mut touched_patterns = Vec::new();
-        for answer_index in subset {
+        for (index, answer_index) in subset.iter().enumerate() {
+            if index % 128 == 0 {
+                super::search::check_predictive_search_cancelled(cancelled)?;
+            }
             let pattern = self.answer_pattern(guess_index, *answer_index) as usize;
             if counts[pattern] == 0 {
                 touched_patterns.push(pattern as u8);
@@ -88,13 +116,13 @@ impl Solver {
             }
         }
 
-        AbsurdleSuggestion {
+        Ok(AbsurdleSuggestion {
             word: self.guesses[guess_index].clone(),
             entropy,
             largest_bucket_size,
             second_largest_bucket_size,
             multi_answer_bucket_count,
-        }
+        })
     }
 
     pub(super) fn score_guess_metrics(
@@ -416,12 +444,15 @@ pub(super) fn hamming_distance(left: &str, right: &str) -> usize {
         .count()
 }
 
-pub(super) fn promote_cached_suggestion(suggestions: &mut [Suggestion], cached_word: &str) {
+pub(super) fn promote_cached_suggestion(suggestions: &mut [Suggestion], cached_word: &str) -> bool {
     if let Some(position) = suggestions
         .iter()
         .position(|suggestion| suggestion.word == cached_word)
     {
         suggestions[..=position].rotate_right(1);
+        true
+    } else {
+        false
     }
 }
 
@@ -896,6 +927,7 @@ mod tests {
     fn equal_coverage_defers_to_appended_search_cost() {
         fn suggestion(word: &str, proxy_cost: f64, lookahead_cost: f64) -> Suggestion {
             Suggestion {
+                value_kind: crate::predictive::types::SuggestionValueKind::Proxy,
                 finite_value: None,
                 word: word.to_string(),
                 entropy: 0.0,

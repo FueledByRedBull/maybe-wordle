@@ -1,5 +1,6 @@
 /target
 /dist/
+.*.mwedit.lock
 /data/raw/*.jsonl
 /data/derived/
 /data/formal/*/pattern_table.bin
@@ -9,3 +10,5 @@
 /data/formal/*/proof_metadata.json
 /data/formal/*/proof_certificate.json
 /data/formal/*/small_state_table.json
+/data/formal/*/current.json
+/data/formal/*/generations/

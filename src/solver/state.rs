@@ -203,6 +203,20 @@ impl Solver {
         Ok(state)
     }
 
+    /// Validates a proposed live history without ranking guesses or mutating callers.
+    pub fn validate_game_history(
+        &self,
+        puzzle_date: NaiveDate,
+        observations: &[(String, u8)],
+        hard_mode: bool,
+    ) -> Result<SolveState> {
+        validate_predictive_history(observations, hard_mode)?;
+        self.apply_history(
+            crate::predictive::history_cutoff(puzzle_date)?,
+            observations,
+        )
+    }
+
     pub fn absurdle_initial_state(&self) -> SolveState {
         SolveState {
             condition_only: false,
@@ -357,25 +371,15 @@ impl Solver {
         self.suggest_predictive_with_search_mode(request, Some(PredictiveSearchMode::ProxyOnly))
     }
 
-    pub(crate) fn suggest_predictive_cancellable(
+    /// Run the configured predictive policy with cooperative cancellation.
+    /// Cancellation is observed at search boundaries, not a hard wall-clock deadline.
+    /// Full session-book construction is excluded; use LiveOnly or FastDiskOnly.
+    pub fn suggest_predictive_cancellable(
         &self,
         request: PredictiveSuggestRequest<'_>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<PredictiveSuggestResponse> {
         self.suggest_predictive_with_search_mode_controlled(request, None, cancelled, false)
-    }
-
-    pub(crate) fn suggest_predictive_proxy_preview_cancellable(
-        &self,
-        request: PredictiveSuggestRequest<'_>,
-        cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> Result<PredictiveSuggestResponse> {
-        self.suggest_predictive_with_search_mode_controlled(
-            request,
-            Some(PredictiveSearchMode::ProxyOnly),
-            cancelled,
-            false,
-        )
     }
 
     fn suggest_predictive_with_search_mode(
@@ -488,10 +492,12 @@ impl Solver {
             batch
                 .suggestions
                 .retain(|suggestion| suggestion.force_in_two);
+            batch.execution.root_selection_optimal = false;
         }
         batch
             .suggestions
             .truncate(request.top.min(batch.suggestions.len()));
+        batch.execution.selected_value_kind = batch.suggestions.first().map(|row| row.value_kind);
         let dynamic_belief = !state.condition_only;
         let mut response = self.predictive_response(request, state, batch)?;
         let mut identity = crate::identity::CanonicalSha256::new("maybe-wordle-finite-policy-v4");
@@ -549,6 +555,7 @@ impl Solver {
                 .then_with(|| left.word.cmp(&right.word))
         });
         Ok(PredictiveSuggestResponse {
+            execution: suggestions.execution,
             finite_search: suggestions.finite_search,
             puzzle_date: request.puzzle_date,
             history_cutoff: as_of,
@@ -562,6 +569,7 @@ impl Solver {
             candidates,
             promoted_word: suggestions.promoted_word,
             promotion_source: suggestions.promotion_source,
+            promoted_artifact_date: suggestions.promoted_artifact_date,
             artifact_state: PredictiveArtifactState::from_promotion_source(
                 suggestions.promotion_source,
             ),
@@ -674,8 +682,26 @@ impl Solver {
         observations: &[(String, u8)],
         top: usize,
     ) -> Result<Vec<AbsurdleSuggestion>> {
-        let state = self.absurdle_apply_history(observations)?;
-        self.absurdle_suggestions_for_state(&state, top)
+        self.absurdle_suggestions_cancellable(observations, top, &|| false)
+    }
+
+    pub fn absurdle_suggestions_cancellable(
+        &self,
+        observations: &[(String, u8)],
+        top: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<AbsurdleSuggestion>> {
+        check_predictive_search_cancelled(cancelled)?;
+        let terminal = crate::game::status(observations, crate::game::GameRules::Absurdle)?;
+        let mut state = self.absurdle_initial_state();
+        for (guess, pattern) in observations {
+            check_predictive_search_cancelled(cancelled)?;
+            self.apply_feedback(&mut state, guess, *pattern)?;
+        }
+        if terminal == crate::game::GameStatus::Solved {
+            return Ok(Vec::new());
+        }
+        self.absurdle_suggestions_for_state_controlled(&state, top, cancelled)
     }
 
     pub fn absurdle_suggestions_for_state(
@@ -683,16 +709,30 @@ impl Solver {
         state: &SolveState,
         top: usize,
     ) -> Result<Vec<AbsurdleSuggestion>> {
+        self.absurdle_suggestions_for_state_controlled(state, top, &|| false)
+    }
+
+    fn absurdle_suggestions_for_state_controlled(
+        &self,
+        state: &SolveState,
+        top: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<AbsurdleSuggestion>> {
+        check_predictive_search_cancelled(cancelled)?;
         if state.surviving.is_empty() {
             bail!("cannot score guesses with an empty state");
         }
         let total = state.surviving.len() as f64;
         let mut suggestions = (0..self.guesses.len())
             .into_par_iter()
-            .map(|guess_index| self.absurdle_score_guess(guess_index, &state.surviving, total))
-            .collect::<Vec<_>>();
+            .map(|guess_index| {
+                self.absurdle_score_guess(guess_index, &state.surviving, total, cancelled)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        check_predictive_search_cancelled(cancelled)?;
         suggestions.sort_by(compare_absurdle_suggestions);
         suggestions.truncate(top.min(suggestions.len()));
+        check_predictive_search_cancelled(cancelled)?;
         Ok(suggestions)
     }
 
@@ -706,21 +746,8 @@ impl Solver {
 }
 
 fn validate_predictive_history(observations: &[(String, u8)], hard_mode: bool) -> Result<()> {
-    if observations.len() > 6 {
-        bail!("a Wordle game has at most six turns");
-    }
-    for (index, (guess, pattern)) in observations.iter().enumerate() {
-        if guess.len() != HARD_MODE_WORD_LENGTH
-            || !guess.bytes().all(|byte| byte.is_ascii_lowercase())
-        {
-            bail!("history guess must be exactly 5 lowercase letters");
-        }
-        if *pattern as usize >= PATTERN_SPACE {
-            bail!("history contains an invalid feedback pattern");
-        }
-        if index > 0 && observations[index - 1].1 == ALL_GREEN_PATTERN {
-            bail!("a solved Wordle game cannot contain further turns");
-        }
+    crate::game::status(observations, crate::game::GameRules::Wordle)?;
+    for (index, (guess, _)) in observations.iter().enumerate() {
         if hard_mode && let Some(error) = hard_mode_violation_message(&observations[..index], guess)
         {
             bail!("invalid hard-mode turn {}: {}", index + 1, error);

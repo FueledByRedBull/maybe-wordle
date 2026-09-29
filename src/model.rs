@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use csv::Writer;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use crate::{
     config::PriorConfig,
     data::{
         NytDailyEntry, ProjectPaths, normalize_word, read_history_jsonl, read_word_list,
-        validate_history_continuity,
+        validate_answer_universe, validate_history_continuity,
     },
 };
 
@@ -113,8 +113,12 @@ pub struct BuildSummary {
     pub guess_count: usize,
     pub answer_count: usize,
     pub fallback_answer_count: usize,
+    /// Distinct primary answers observed on or before the requested snapshot date.
     pub historical_answers: usize,
+    /// Daily observations on or before the requested snapshot date.
     pub history_rows: usize,
+    /// Full source archive size, including observations after a backdated snapshot.
+    pub source_history_rows: usize,
 }
 
 pub fn load_model(paths: &ProjectPaths, config: &PriorConfig) -> Result<ModelData> {
@@ -130,6 +134,8 @@ pub fn load_model_with_variant(
         .with_context(|| format!("failed to load {}", paths.seed_guesses.display()))?;
     let seed_answers = read_word_list(&paths.seed_answers)
         .with_context(|| format!("failed to load {}", paths.seed_answers.display()))?;
+    validate_answer_universe(&guesses, seed_answers.iter().map(String::as_str))
+        .with_context(|| format!("invalid seed universe in {}", paths.root.display()))?;
     let manual_additions = read_word_list(&paths.manual_additions)
         .with_context(|| format!("failed to load {}", paths.manual_additions.display()))?;
     let history = read_history_jsonl(&paths.raw_history)
@@ -165,12 +171,13 @@ pub fn load_model_with_variant(
     }
 
     for word in manual_keys.into_iter().chain(manual_additions) {
-        if word.len() == 5 && word.bytes().all(|byte| byte.is_ascii_lowercase()) {
-            builders
-                .entry(word.clone())
-                .or_insert_with(|| AnswerRecordBuilder::new(word))
-                .manual_entry = true;
+        if word.len() != 5 || !word.bytes().all(|byte| byte.is_ascii_lowercase()) {
+            bail!("invalid manual answer {word:?}: expected five lowercase ASCII letters");
         }
+        builders
+            .entry(word.clone())
+            .or_insert_with(|| AnswerRecordBuilder::new(word))
+            .manual_entry = true;
     }
 
     let extra_words = builders
@@ -190,6 +197,13 @@ pub fn load_model_with_variant(
         .filter_map(|word| builders.remove(&word))
         .map(|builder| builder.finish(config))
         .collect::<Vec<_>>();
+    validate_answer_universe(&guesses, answers.iter().map(|answer| answer.word.as_str()))
+        .with_context(|| {
+            format!(
+                "invalid modeled answer universe in {}",
+                paths.root.display()
+            )
+        })?;
     let primary_answer_count = answers.len();
     let answer_lookup = answers
         .iter()
@@ -234,13 +248,13 @@ pub fn build_model_artifacts(
         guess_count: model.guesses.len(),
         answer_count: model.primary_answer_count,
         fallback_answer_count: model.answers.len() - model.primary_answer_count,
-        historical_answers: model
-            .answers
+        historical_answers: history_rows.len(),
+        history_rows: model
+            .history
             .iter()
-            .take(model.primary_answer_count)
-            .filter(|answer| !answer.history_dates.is_empty())
+            .filter(|entry| entry.print_date <= as_of)
             .count(),
-        history_rows: model.history.len(),
+        source_history_rows: model.history.len(),
     })
 }
 
@@ -380,13 +394,15 @@ fn build_history_rows(records: &[AnswerRecord], as_of: NaiveDate) -> Vec<AnswerH
     records
         .iter()
         .filter_map(|record| {
-            let first_seen = record.history_dates.first().copied()?;
-            let last_seen = record.history_dates.last().copied()?;
+            let cutoff = record.history_dates.partition_point(|date| *date <= as_of);
+            let seen_dates = &record.history_dates[..cutoff];
+            let first_seen = seen_dates.first().copied()?;
+            let last_seen = seen_dates.last().copied()?;
             Some(AnswerHistoryRow {
                 word: record.word.clone(),
                 first_seen: first_seen.format("%Y-%m-%d").to_string(),
                 last_seen: last_seen.format("%Y-%m-%d").to_string(),
-                times_seen: record.history_dates.len(),
+                times_seen: seen_dates.len(),
                 days_since_last_seen: (as_of - last_seen).num_days(),
             })
         })
@@ -478,8 +494,8 @@ mod tests {
     use crate::config::PriorConfig;
 
     use super::{
-        AnswerRecord, ModelVariant, WeightMode, load_model_with_variant, weight_snapshot,
-        weight_snapshot_for_mode,
+        AnswerRecord, ModelVariant, WeightMode, build_history_rows, load_model_with_variant,
+        weight_snapshot, weight_snapshot_for_mode,
     };
 
     #[test]
@@ -555,6 +571,148 @@ mod tests {
             boundary_discontinuity <= MAX_DEFAULT_CONFIG_BOUNDARY_DISCONTINUITY,
             "default config cooldown boundary jump is too large: {boundary_discontinuity}"
         );
+    }
+
+    #[test]
+    fn model_loading_rejects_malformed_programmatic_manual_keys() {
+        let root = crate::test_support::TestDirectory::new("model-manual-key");
+        let paths = crate::data::ProjectPaths::new(root.path());
+        paths.ensure_layout().expect("layout");
+        std::fs::write(&paths.seed_guesses, "cigar\n").expect("guesses");
+        std::fs::write(&paths.seed_answers, "cigar\n").expect("answers");
+        std::fs::write(&paths.manual_additions, "").expect("manual");
+        for word in ["cig4r", "four", "CIGAR"] {
+            let mut config = PriorConfig::default();
+            config.manual_weights.insert(word.into(), 1.0);
+            let error =
+                load_model_with_variant(&paths, &config, ModelVariant::SeedOnly).expect_err(word);
+            assert!(format!("{error:#}").contains(word));
+        }
+    }
+
+    #[test]
+    fn model_loading_rejects_empty_required_vocabularies() {
+        let root = crate::test_support::TestDirectory::new("model-empty");
+        let paths = crate::data::ProjectPaths::new(root.path());
+        paths.ensure_layout().expect("layout");
+        std::fs::write(&paths.manual_additions, "").expect("manual");
+        for (guesses, answers) in [("", "cigar\n"), ("cigar\n", "")] {
+            std::fs::write(&paths.seed_guesses, guesses).expect("guesses");
+            std::fs::write(&paths.seed_answers, answers).expect("answers");
+            let error =
+                load_model_with_variant(&paths, &PriorConfig::default(), ModelVariant::SeedOnly)
+                    .expect_err("empty vocabulary");
+            assert!(format!("{error:#}").contains("empty"));
+        }
+    }
+
+    #[test]
+    fn model_loading_rejects_unguessable_seed_manual_and_history_answers() {
+        let root = crate::test_support::TestDirectory::new("model-guessability");
+        let paths = crate::data::ProjectPaths::new(root.path());
+        paths.ensure_layout().expect("layout");
+        std::fs::write(&paths.seed_guesses, "cigar\n").expect("guesses");
+        for source in ["seed", "manual", "history", "manual-weight"] {
+            std::fs::write(
+                &paths.seed_answers,
+                if source == "seed" {
+                    "rebut\n"
+                } else {
+                    "cigar\n"
+                },
+            )
+            .expect("answers");
+            std::fs::write(
+                &paths.manual_additions,
+                if source == "manual" { "rebut\n" } else { "" },
+            )
+            .expect("manual");
+            std::fs::write(
+                &paths.raw_history,
+                if source == "history" {
+                    "{\"solution\":\"rebut\",\"print_date\":\"2024-02-01\"}\n"
+                } else {
+                    ""
+                },
+            )
+            .expect("history");
+            let mut config = PriorConfig::default();
+            if source == "manual-weight" {
+                config.manual_weights.insert("rebut".into(), 1.0);
+            }
+            let error = load_model_with_variant(&paths, &config, ModelVariant::SeedPlusHistory)
+                .expect_err(source);
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("rebut") && message.contains("guess"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn backdated_artifact_summary_reports_effective_history() {
+        let root = crate::test_support::TestDirectory::new("model-as-of");
+        let paths = crate::data::ProjectPaths::new(root.path());
+        paths.ensure_layout().expect("layout");
+        std::fs::write(&paths.seed_guesses, "cigar\nrebut\n").expect("guesses");
+        std::fs::write(&paths.seed_answers, "cigar\nrebut\n").expect("answers");
+        std::fs::write(&paths.manual_additions, "").expect("manual");
+        let raw = concat!(
+            "{\"solution\":\"cigar\",\"print_date\":\"2024-02-01\"}\n",
+            "{\"solution\":\"rebut\",\"print_date\":\"2024-02-02\"}\n"
+        );
+        std::fs::write(&paths.raw_history, raw).expect("history");
+        let summary = super::build_model_artifacts(
+            &paths,
+            &PriorConfig::default(),
+            NaiveDate::from_ymd_opt(2024, 2, 1).expect("date"),
+        )
+        .expect("backdated artifacts");
+        assert_eq!(summary.historical_answers, 1);
+        assert_eq!(summary.history_rows, 1);
+        assert_eq!(summary.source_history_rows, 2);
+        assert_eq!(
+            std::fs::read_to_string(&paths.raw_history).expect("source"),
+            raw
+        );
+    }
+
+    #[test]
+    fn history_export_excludes_future_occurrences_and_future_only_words() {
+        let as_of = NaiveDate::from_ymd_opt(2024, 2, 1).expect("date");
+        let past = as_of - Duration::days(10);
+        let record = AnswerRecord {
+            word: "cigar".into(),
+            in_seed: true,
+            manual_entry: false,
+            manual_weight: 1.0,
+            history_dates: vec![past, as_of],
+        };
+        let mut with_future = record.clone();
+        with_future.history_dates.push(as_of + Duration::days(1));
+        let future_only = AnswerRecord {
+            word: "rebut".into(),
+            history_dates: vec![as_of + Duration::days(2)],
+            ..record.clone()
+        };
+        let expected = build_history_rows(std::slice::from_ref(&record), as_of);
+        let actual = build_history_rows(&[with_future.clone(), future_only], as_of);
+        assert_eq!(
+            serde_json::to_value(&actual).expect("serialize"),
+            serde_json::to_value(&expected).expect("serialize")
+        );
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].first_seen, past.to_string());
+        assert_eq!(actual[0].last_seen, as_of.to_string());
+        assert_eq!(actual[0].times_seen, 2);
+        assert_eq!(actual[0].days_since_last_seen, 0);
+        assert_eq!(
+            weight_snapshot(&record, &PriorConfig::default(), as_of).final_weight,
+            weight_snapshot(&with_future, &PriorConfig::default(), as_of).final_weight
+        );
+        // A historical export must not mutate the full source provenance.
+        assert_eq!(with_future.history_dates.len(), 3);
     }
 
     #[test]
@@ -739,9 +897,8 @@ mod tests {
 
     #[test]
     fn seed_only_variant_drops_history_only_answers() {
-        let root = std::env::temp_dir().join("maybe-wordle-model-variant-test");
-        let _ = std::fs::remove_dir_all(&root);
-        let paths = crate::data::ProjectPaths::new(&root);
+        let root = crate::test_support::TestDirectory::new("model-variant");
+        let paths = crate::data::ProjectPaths::new(root.path());
         paths.ensure_layout().expect("layout");
         std::fs::write(&paths.seed_guesses, "cigar\nrebut\n").expect("guesses");
         std::fs::write(&paths.seed_answers, "cigar\n").expect("seed");
@@ -764,6 +921,5 @@ mod tests {
         assert_eq!(seed_only.answers[1].word, "rebut");
         assert_eq!(full.primary_answer_count, 2);
         assert_eq!(full.answers.len(), 2);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

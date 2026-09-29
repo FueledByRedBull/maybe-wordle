@@ -13,10 +13,22 @@ struct IndependentPartition {
     mass: f64,
 }
 
+#[cfg(test)]
 pub(super) fn verify_certificate_witnesses(
     runtime: &FormalPolicyRuntime,
     certificate: &ProofCertificate,
 ) -> Result<()> {
+    verify_certificate_witnesses_controlled(runtime, certificate, &|| false)
+}
+
+pub(super) fn verify_certificate_witnesses_controlled(
+    runtime: &FormalPolicyRuntime,
+    certificate: &ProofCertificate,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    super::check_cancelled(cancelled)?;
+    validate_structure(runtime, certificate)?;
+    runtime.validate_metadata()?;
     validate_header(runtime, certificate)?;
     let model = &runtime.model;
     let mut keys = Vec::with_capacity(certificate.states.len());
@@ -34,7 +46,8 @@ pub(super) fn verify_certificate_witnesses(
             model.answers.len(),
             state.answer_indices.iter().map(|index| *index as usize),
             &model.zobrist,
-        );
+        )
+        .with_horizon(state.horizon);
         if state_ids.insert(key.clone(), state.state_id).is_some() {
             bail!("certificate repeats an answer state");
         }
@@ -51,9 +64,44 @@ pub(super) fn verify_certificate_witnesses(
     if root.answer_indices != root_indices {
         bail!("certificate root does not contain the complete answer universe");
     }
+    if keys[certificate.root_state_id as usize] != runtime.root_state {
+        bail!("certificate root horizon does not match the persisted policy root");
+    }
+    let mut feasibility = HashMap::new();
+    match model.objective_spec.kind {
+        FormalObjectiveKind::Lexicographic => {
+            let horizon = root
+                .horizon
+                .ok_or_else(|| anyhow!("lexicographic root needs a horizon"))?;
+            if horizon == 0
+                || root.best_objective.worst_case_depth != horizon
+                || can_finish(
+                    runtime,
+                    &root.answer_indices,
+                    horizon - 1,
+                    &mut feasibility,
+                    cancelled,
+                )?
+            {
+                bail!("certificate root horizon is not minimum feasible depth");
+            }
+        }
+        FormalObjectiveKind::ExpectedOnly if root.horizon.is_some() => {
+            bail!("expected-only certificate must be unconstrained");
+        }
+        FormalObjectiveKind::ExpectedOnly => {}
+    }
 
     for state in &certificate.states {
+        super::check_cancelled(cancelled)?;
         validate_objective(state.state_id, "best", &state.best_objective)?;
+        if state.horizon.is_some() != root.horizon.is_some()
+            || state.horizon.is_some_and(|horizon| {
+                horizon == 0 || state.best_objective.worst_case_depth > horizon
+            })
+        {
+            bail!("certificate state horizon is inconsistent with objective");
+        }
         if state.best_guess >= model.guesses.len() {
             bail!(
                 "certificate best guess is out of range for state {}",
@@ -84,6 +132,7 @@ pub(super) fn verify_certificate_witnesses(
         let mut candidate_objectives = vec![None; model.guesses.len()];
         let mut independently_best: Option<(usize, PolicyObjective)> = None;
         for (candidate_position, candidate) in state.candidates.iter().enumerate() {
+            super::check_cancelled(cancelled)?;
             if candidate.guess_index >= model.guesses.len() {
                 bail!(
                     "certificate candidate guess is out of range for state {}",
@@ -106,8 +155,33 @@ pub(super) fn verify_certificate_witnesses(
             let partitions =
                 independent_partition(runtime, &state.answer_indices, candidate.guess_index);
             match &candidate.witness {
+                PersistedCandidateWitness::Infeasible => {
+                    let horizon = state.horizon.ok_or_else(|| {
+                        anyhow!("unconstrained candidate cannot be horizon-infeasible")
+                    })?;
+                    let mut has_infeasible_child = false;
+                    for (pattern, child) in partitions.iter().enumerate() {
+                        if pattern != ALL_GREEN_PATTERN as usize
+                            && let Some(child) = child
+                            && !can_finish(
+                                runtime,
+                                &child.answer_indices,
+                                horizon - 1,
+                                &mut feasibility,
+                                cancelled,
+                            )?
+                        {
+                            has_infeasible_child = true;
+                            break;
+                        }
+                    }
+                    if !has_infeasible_child {
+                        bail!("invalid infeasible witness for state {}", state.state_id);
+                    }
+                }
                 PersistedCandidateWitness::NonProgress { pattern } => {
-                    if *pattern == ALL_GREEN_PATTERN
+                    if *pattern as usize >= PATTERN_SPACE
+                        || *pattern == ALL_GREEN_PATTERN
                         || partitions[*pattern as usize]
                             .as_ref()
                             .is_none_or(|partition| {
@@ -148,7 +222,7 @@ pub(super) fn verify_certificate_witnesses(
                             candidate.guess_index,
                             &objective,
                             &model.guesses,
-                            model.objective_spec.kind,
+                            FormalObjectiveKind::ExpectedOnly,
                         );
                         candidate_objectives[candidate.guess_index] = Some(objective);
                     }
@@ -192,7 +266,8 @@ pub(super) fn verify_certificate_witnesses(
                         expected_guesses: 1.0,
                     };
                     for child in children {
-                        if child.pattern == ALL_GREEN_PATTERN
+                        if child.pattern as usize >= PATTERN_SPACE
+                            || child.pattern == ALL_GREEN_PATTERN
                             || std::mem::replace(&mut seen_patterns[child.pattern as usize], true)
                         {
                             bail!(
@@ -220,6 +295,7 @@ pub(super) fn verify_certificate_witnesses(
                             })?;
                         if child.child_state_id >= state.state_id
                             || child_state.answer_indices != partition.answer_indices
+                            || child_state.horizon != state.horizon.map(|horizon| horizon - 1)
                         {
                             bail!(
                                 "certificate child state mismatch for state {} pattern {}",
@@ -244,9 +320,13 @@ pub(super) fn verify_certificate_witnesses(
                                 child.pattern
                             );
                         }
-                        recomputed.worst_case_depth = recomputed
-                            .worst_case_depth
-                            .max(1 + child.objective.worst_case_depth);
+                        recomputed.worst_case_depth = recomputed.worst_case_depth.max(
+                            child
+                                .objective
+                                .worst_case_depth
+                                .checked_add(1)
+                                .ok_or_else(|| anyhow!("certificate depth overflows"))?,
+                        );
                         recomputed.expected_guesses +=
                             (partition.mass / total_mass) * child.objective.expected_guesses;
                     }
@@ -257,12 +337,18 @@ pub(super) fn verify_certificate_witnesses(
                             candidate.guess_index
                         );
                     }
+                    if state
+                        .horizon
+                        .is_some_and(|horizon| objective.worst_case_depth > horizon)
+                    {
+                        bail!("certificate candidate exceeds its horizon");
+                    }
                     update_independent_best(
                         &mut independently_best,
                         candidate.guess_index,
                         objective,
                         &model.guesses,
-                        model.objective_spec.kind,
+                        FormalObjectiveKind::ExpectedOnly,
                     );
                     candidate_objectives[candidate.guess_index] = Some(objective.clone());
                 }
@@ -364,12 +450,134 @@ fn validate_objective(state_id: u32, label: &str, objective: &PolicyObjective) -
     if objective.worst_case_depth == 0
         || !objective.expected_guesses.is_finite()
         || objective.expected_guesses < 1.0
+        || objective.expected_guesses > f64::from(objective.worst_case_depth) + 1e-9
     {
         bail!(
             "certificate {} objective is invalid for state {}",
             label,
             state_id
         );
+    }
+    Ok(())
+}
+
+// This checks identities and finite, acyclic references only. It does not establish optimality.
+pub(super) fn validate_structure(
+    runtime: &FormalPolicyRuntime,
+    certificate: &ProofCertificate,
+) -> Result<()> {
+    runtime.validate_metadata()?;
+    validate_header(runtime, certificate)?;
+    if certificate.states.is_empty() || certificate.states.len() > super::MAX_FORMAL_STATES {
+        bail!("certificate state count exceeds formal resource limits");
+    }
+    let model = &runtime.model;
+    let mut keys = HashMap::with_capacity(certificate.states.len());
+    for (position, state) in certificate.states.iter().enumerate() {
+        if state.state_id as usize != position
+            || state.best_guess >= model.guesses.len()
+            || state.candidates.len() != model.guesses.len()
+        {
+            bail!("certificate state id, guess, or candidate coverage is invalid");
+        }
+        validate_answer_indices(state.state_id, &state.answer_indices, model.answers.len())?;
+        validate_objective(state.state_id, "best", &state.best_objective)?;
+        let key = StateKey::from_indices_with_tokens(
+            model.answers.len(),
+            state.answer_indices.iter().map(|index| *index as usize),
+            &model.zobrist,
+        )
+        .with_horizon(state.horizon);
+        super::validate_loaded_state(&key, model)?;
+        super::validate_loaded_objective(&key, &state.best_objective)?;
+        if keys.insert(key, state).is_some() {
+            bail!("certificate repeats an answer state/horizon");
+        }
+        for (guess_index, candidate) in state.candidates.iter().enumerate() {
+            if candidate.guess_index != guess_index {
+                bail!("certificate candidate ids must be ordered and unique");
+            }
+            match &candidate.witness {
+                PersistedCandidateWitness::Infeasible if state.horizon.is_none() => {
+                    bail!("unconstrained infeasible witness")
+                }
+                PersistedCandidateWitness::Infeasible => {}
+                PersistedCandidateWitness::NonProgress { pattern } => {
+                    if *pattern as usize >= PATTERN_SPACE || *pattern == ALL_GREEN_PATTERN {
+                        bail!("invalid non-progress pattern");
+                    }
+                }
+                PersistedCandidateWitness::Equivalent {
+                    representative_guess,
+                } => {
+                    if *representative_guess >= guess_index {
+                        bail!("invalid equivalent candidate reference");
+                    }
+                }
+                PersistedCandidateWitness::Exact {
+                    objective,
+                    children,
+                } => {
+                    super::validate_loaded_objective(
+                        &StateKey::from_indices_with_tokens(
+                            model.answers.len(),
+                            state.answer_indices.iter().map(|index| *index as usize),
+                            &model.zobrist,
+                        )
+                        .with_horizon(state.horizon),
+                        objective,
+                    )?;
+                    if children.len() >= PATTERN_SPACE {
+                        bail!("too many certificate children");
+                    }
+                    let mut seen = [false; PATTERN_SPACE];
+                    for child in children {
+                        if child.pattern as usize >= PATTERN_SPACE
+                            || child.pattern == ALL_GREEN_PATTERN
+                            || std::mem::replace(&mut seen[child.pattern as usize], true)
+                            || child.child_state_id >= state.state_id
+                            || !child.mass.is_finite()
+                            || child.mass <= 0.0
+                            || child.mass > 1.0 + 1e-9
+                        {
+                            bail!("invalid certificate child reference, pattern, or mass");
+                        }
+                        let target = certificate
+                            .states
+                            .get(child.child_state_id as usize)
+                            .ok_or_else(|| anyhow!("certificate child id out of range"))?;
+                        if target.answer_indices.len() >= state.answer_indices.len()
+                            || target.horizon
+                                != state.horizon.and_then(|horizon| horizon.checked_sub(1))
+                            || !same_objective_independent(&child.objective, &target.best_objective)
+                        {
+                            bail!("certificate child is not a matching, strictly smaller state");
+                        }
+                        validate_objective(state.state_id, "child", &child.objective)?;
+                    }
+                }
+            }
+        }
+    }
+    let root = certificate
+        .states
+        .get(certificate.root_state_id as usize)
+        .ok_or_else(|| anyhow!("certificate root id out of range"))?;
+    if keys
+        .get(&runtime.root_state)
+        .is_none_or(|state| state.state_id != root.state_id)
+    {
+        bail!("certificate root does not match the persisted root");
+    }
+    for (key, decision) in &runtime.policy {
+        let state = keys
+            .get(key)
+            .ok_or_else(|| anyhow!("certificate omits a policy state"))?;
+        if state.best_guess != decision.best_guess
+            || !same_objective_independent(&state.best_objective, &decision.objective)
+        {
+            bail!("certificate disagrees with persisted decision");
+        }
     }
     Ok(())
 }
@@ -394,6 +602,49 @@ fn independent_partition(
         partition.mass += runtime.model.prior[*answer_index as usize];
     }
     partitions
+}
+
+// Feasibility is a Boolean AND/OR search, independent of cost minimization and
+// optimizer pruning. It proves rejected horizons without trusting cached values.
+fn can_finish(
+    runtime: &FormalPolicyRuntime,
+    state: &[AnswerId],
+    turns: u8,
+    memo: &mut HashMap<(Vec<AnswerId>, u8), bool>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<bool> {
+    super::check_cancelled(cancelled)?;
+    if turns == 0 {
+        return Ok(false);
+    }
+    let key = (state.to_vec(), turns);
+    if let Some(feasible) = memo.get(&key) {
+        return Ok(*feasible);
+    }
+    let mut feasible = false;
+    for guess in 0..runtime.model.guesses.len() {
+        super::check_cancelled(cancelled)?;
+        let mut all_finish = true;
+        for (pattern, partition) in independent_partition(runtime, state, guess)
+            .iter()
+            .enumerate()
+        {
+            if pattern != ALL_GREEN_PATTERN as usize
+                && let Some(child) = partition
+                && (child.answer_indices.len() >= state.len()
+                    || !can_finish(runtime, &child.answer_indices, turns - 1, memo, cancelled)?)
+            {
+                all_finish = false;
+                break;
+            }
+        }
+        if all_finish {
+            feasible = true;
+            break;
+        }
+    }
+    memo.insert(key, feasible);
+    Ok(feasible)
 }
 
 fn same_partitions_independent(

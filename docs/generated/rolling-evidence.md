@@ -5,17 +5,17 @@ Across 12 non-overlapping development folds (360 scheduled games), the sealed te
 
 | Configuration | Solved | All-game mean | Delta vs baseline | W/T/L | Latency p95 | Guard decision |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `finite_baseline_250ms` | 354/360 | 3.5389 [3.4472, 3.6333] | reference | -- | 29.79 ms | retained |
-| `finite_preordered_250ms` | 360/360 | 3.5833 [3.5055, 3.6694] | +0.0444 [-0.0639, +0.1556] | 95/156/109 | 263.15 ms | rejected: no solve-quality gain |
+| `audit_selected_staged` | 360/360 | 3.1944 [3.1194, 3.2722] | reference | -- | 28.29 ms | retained |
+| `audit_v19b_staged` | 360/360 | 3.1917 [3.1194, 3.2694] | -0.0028 [-0.0222, +0.0167] | 6/347/7 | 27.25 ms | not promoted: improvement uncertain |
 
-| Configuration | Prior top-1/3/5 | Confidence ECE | Search steps P/L/XE/X/F | Recovery/fallback steps |
+| Configuration | Prior top-1/3/5 | Confidence ECE | Search steps P/L/XE/X/F/T | Recovery/fallback steps |
 | --- | ---: | ---: | ---: | ---: |
-| `finite_baseline_250ms` | 0.3%/0.6%/0.6% | 0.0015 [0.0012, 0.0071] | 0/0/0/0/1268 | 0/1268 |
-| `finite_preordered_250ms` | 0.3%/0.6%/0.6% | 0.0015 [0.0012, 0.0071] | 0/0/0/0/1290 | 0/1290 |
+| `audit_selected_staged` | 0.3%/0.6%/0.6% | 0.0017 [0.0013, 0.0077] | 386/139/0/609/0/16 | 36/292 |
+| `audit_v19b_staged` | 0.3%/0.6%/0.6% | 0.0017 [0.0013, 0.0077] | 386/131/0/618/0/14 | 36/297 |
 
 Development decisions:
 
-- `finite_preordered_250ms` is rejected because it did not improve solve quality.
+- `audit_v19b_staged` is retained as a development finalist, not promoted, because the observed improvement's paired interval includes zero.
 
 This development comparison did not access the sealed window and does not establish prospective performance. Any later sealed evaluation requires separate evidence.
 <!-- END GENERATED ROLLING EVIDENCE -->

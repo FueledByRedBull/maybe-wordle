@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    atomic_file::atomic_write,
+    atomic_file::{acquire_edit_lock, atomic_write},
     predictive::{PredictivePolicy, RecoveryPolicy},
 };
 
@@ -271,18 +271,21 @@ impl PriorConfig {
             return Self::load(path);
         }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+        let _edit = acquire_edit_lock(path)?;
+        // Another writer may have published after the first existence check.
+        if path.exists() {
+            return Self::load(path);
         }
 
         let config = Self::default();
+        crate::experiments::validate_registered_predictive_config(&config)?;
         let raw = toml::to_string_pretty(&config).context("failed to serialize default config")?;
-        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+        atomic_write(path, raw.as_bytes())?;
         Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        let _edit = acquire_edit_lock(path)?;
         crate::experiments::validate_predictive_config(self)
             .with_context(|| format!("refusing to save invalid config to {}", path.display()))?;
         let raw = toml::to_string_pretty(self).context("failed to serialize prior config")?;
@@ -309,6 +312,95 @@ mod tests {
     use super::{PriorConfig, SearchPolicyMode};
     use crate::predictive::RecoveryMode;
 
+    #[test]
+    fn full_config_and_policy_round_trips_preserve_every_mapped_field() {
+        fn change_numbers(value: &mut toml::Value) {
+            match value {
+                toml::Value::Table(table) => table
+                    .iter_mut()
+                    .for_each(|(_, value)| change_numbers(value)),
+                toml::Value::Integer(number) => *number += 1,
+                toml::Value::Float(number) => *number = *number * 0.75 + 0.01,
+                toml::Value::Boolean(value) => *value = !*value,
+                _ => {}
+            }
+        }
+        let mut document = toml::Value::try_from(PriorConfig::default()).unwrap();
+        change_numbers(&mut document);
+        let mut config: PriorConfig = document.try_into().unwrap();
+        config.search_policy_mode = SearchPolicyMode::FiniteFastDynamic;
+        config.recovery.mode = RecoveryMode::Strict;
+        config.manual_weights.insert("cigar".to_string(), 1.75);
+        let config_document = toml::Value::try_from(&config).unwrap();
+        let restored_config: PriorConfig =
+            toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            toml::Value::try_from(&restored_config).unwrap(),
+            config_document
+        );
+
+        let policy = config.predictive_policy();
+        let policy_document = toml::Value::try_from(&policy).unwrap();
+        let restored_policy: crate::predictive::PredictivePolicy =
+            toml::from_str(&toml::to_string(&policy).unwrap()).unwrap();
+        assert_eq!(
+            toml::Value::try_from(&restored_policy).unwrap(),
+            policy_document
+        );
+        assert_eq!(
+            toml::Value::try_from(restored_config.predictive_policy()).unwrap(),
+            policy_document
+        );
+
+        let mut mapped = std::collections::BTreeSet::new();
+        for section in ["prior", "search"] {
+            for (name, value) in policy_document[section].as_table().unwrap() {
+                let config_name = if section == "search" && name == "mode" {
+                    "search_policy_mode"
+                } else {
+                    name.as_str()
+                };
+                assert_eq!(&config_document[config_name], value, "{section}.{name}");
+                mapped.insert(config_name.to_string());
+            }
+        }
+        for (policy_name, config_name) in [
+            ("weights", "proxy_weights"),
+            (
+                "small_state_lower_bound_threshold",
+                "proxy_small_state_lower_bound_threshold",
+            ),
+        ] {
+            assert_eq!(
+                policy_document["proxy"][policy_name],
+                config_document[config_name]
+            );
+            mapped.insert(config_name.to_string());
+        }
+        assert_eq!(policy_document["recovery"], config_document["recovery"]);
+        mapped.insert("recovery".to_string());
+        let outside_policy = config_document
+            .as_table()
+            .unwrap()
+            .keys()
+            .filter(|key| !mapped.contains(*key))
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        // These remain in the complete config/artifact identity, outside the policy view.
+        assert_eq!(
+            outside_policy,
+            std::collections::BTreeSet::from([
+                "allow_history_gaps",
+                "fallback_activation_threshold",
+                "fallback_prior_mass",
+                "sync_request_timeout_seconds",
+                "sync_retry_attempts",
+                "sync_retry_backoff_millis",
+                "sync_reverify_days",
+            ])
+        );
+    }
+
     fn shipped_toml() -> toml::Value {
         toml::from_str(include_str!("../config/prior.toml")).expect("parse shipped config")
     }
@@ -319,6 +411,23 @@ mod tests {
     }
 
     #[test]
+    fn initial_config_creation_is_atomic_and_never_publishes_partial_data() {
+        use crate::atomic_file::{AtomicWriteStage, test_hooks::with_failure};
+        let root = crate::test_support::TestDirectory::new("config-interruption");
+        let path = root.path().join("prior.toml");
+        for stage in [
+            AtomicWriteStage::TempCreated,
+            AtomicWriteStage::DataWritten,
+            AtomicWriteStage::BeforeReplace,
+        ] {
+            assert!(with_failure(stage, || PriorConfig::load_or_create(&path)).is_err());
+            assert!(!path.exists(), "failed creation must remain absent");
+        }
+        PriorConfig::load_or_create(&path).expect("create config");
+        PriorConfig::load(&path).expect("complete config");
+    }
+
+    #[test]
     fn shipped_default_is_canonical_for_empty_and_new_configs() {
         let shipped = shipped_toml();
         assert_eq!(effective_toml(&PriorConfig::default()), shipped);
@@ -326,14 +435,8 @@ mod tests {
         let empty: PriorConfig = toml::from_str("").expect("deserialize empty config");
         assert_eq!(effective_toml(&empty), shipped);
 
-        let path = std::env::temp_dir().join(format!(
-            "maybe-wordle-shipped-default-{}-{}.toml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let fixture = crate::test_support::TestDirectory::new("config-fixture");
+        let path = fixture.path().join("prior.toml");
         let created = PriorConfig::load_or_create(&path).expect("create default config");
         assert_eq!(effective_toml(&created), shipped);
         let written = std::fs::read_to_string(&path).expect("read created config");
@@ -635,10 +738,8 @@ mode = "strict"
 
     #[test]
     fn loading_a_hand_edited_config_enforces_registered_bounds() {
-        let root = std::env::temp_dir().join(format!(
-            "maybe-wordle-invalid-prior-config-{}.toml",
-            std::process::id()
-        ));
+        let fixture = crate::test_support::TestDirectory::new("config-fixture");
+        let root = fixture.path().join("prior.toml");
         let invalid = toml::to_string_pretty(&PriorConfig {
             fallback_prior_mass: -0.1,
             ..PriorConfig::default()

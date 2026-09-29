@@ -8,20 +8,16 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    DEFAULT_FORMAL_MODEL_ID, FormalVerificationMode, PolicyArtifactSet, build_optimal_policy,
-    verify_optimal_policy_with_mode,
-};
+use super::{DEFAULT_FORMAL_MODEL_ID, FormalVerificationMode, PolicyArtifactSet, parsing};
 use crate::{
     atomic_file::atomic_write,
-    data::{ProjectPaths, read_word_list},
-    identity::{CanonicalSha256, IDENTITY_FORMAT},
+    data::{ProjectPaths, read_word_list_from, validate_answer_universe},
+    identity::{CanonicalSha256, IDENTITY_FORMAT, is_tagged_digest},
     process_memory::process_memory_snapshot,
 };
 
-const FORMAL_SCALE_FORMAT_VERSION: u32 = 2;
+const FORMAL_SCALE_FORMAT_VERSION: u32 = 3;
 const MAXIMUM_SAFE_SCALE_PREFIX: usize = 16;
-const FULL_MODEL_PROJECTION_ANSWERS: usize = 2_358;
 
 #[derive(Clone, Debug)]
 pub struct FormalScaleRequest {
@@ -66,12 +62,15 @@ pub struct FormalScaleReport {
     pub operating_system: String,
     pub architecture: String,
     pub logical_cpus: usize,
+    #[serde(deserialize_with = "parsing::bounded_vec::<_, _, MAXIMUM_SAFE_SCALE_PREFIX>")]
     pub answer_counts: Vec<usize>,
+    pub source_answer_count: usize,
     pub guess_limit: usize,
     pub maximum_seconds: u64,
     pub maximum_memory_mb: u64,
     pub maximum_disk_mb: u64,
     pub full_model_projection: FormalScaleProjection,
+    #[serde(deserialize_with = "parsing::bounded_vec::<_, _, MAXIMUM_SAFE_SCALE_PREFIX>")]
     pub points: Vec<FormalScalePoint>,
     pub completed: bool,
     pub stopped_reason: Option<String>,
@@ -81,14 +80,20 @@ pub fn benchmark_formal_scale(
     paths: &ProjectPaths,
     request: &FormalScaleRequest,
 ) -> Result<FormalScaleReport> {
+    let run_started = Instant::now();
     validate_request(request)?;
-    let memory = process_memory_snapshot().ok_or_else(|| {
+    process_memory_snapshot().ok_or_else(|| {
         anyhow!(
             "formal scale memory budgets are unsupported on this operating system; supported platforms are Windows, Linux, and macOS"
         )
     })?;
-    let source_guesses = read_word_list(&paths.seed_guesses)?;
-    let source_answers = read_word_list(&paths.seed_answers)?;
+    let raw_guesses = parsing::read_bounded(&paths.seed_guesses, parsing::MAX_INPUT_BYTES)?;
+    let raw_answers = parsing::read_bounded(&paths.seed_answers, parsing::MAX_INPUT_BYTES)?;
+    let source_guesses =
+        read_word_list_from(std::io::Cursor::new(&raw_guesses), &paths.seed_guesses)?;
+    let source_answers =
+        read_word_list_from(std::io::Cursor::new(&raw_answers), &paths.seed_answers)?;
+    validate_answer_universe(&source_guesses, source_answers.iter().map(String::as_str))?;
     let effective_guess_limit = if request.guess_limit == 0 {
         source_guesses.len()
     } else {
@@ -105,8 +110,42 @@ pub fn benchmark_formal_scale(
     if effective_guess_limit < maximum_answer_count {
         bail!("formal scale guess limit must cover every selected answer");
     }
-    let fingerprint = scale_input_fingerprint(paths, request, effective_guess_limit)?;
-    let mut report = load_or_initialize_report(request, effective_guess_limit, &fingerprint)?;
+    if source_answers.len() > parsing::MAX_WORDS
+        || effective_guess_limit > parsing::MAX_WORDS
+        || effective_guess_limit
+            .checked_mul(maximum_answer_count)
+            .is_none_or(|cells| cells > parsing::MAX_PATTERN_CELLS)
+    {
+        bail!("formal scale dimensions exceed formal word-id or pattern-cell limits");
+    }
+    let minimum_build_bytes =
+        super::HOT_TT_BYTES as u64 + (effective_guess_limit * maximum_answer_count) as u64;
+    if minimum_build_bytes > mib(request.maximum_memory_mb) {
+        bail!(
+            "formal scale memory budget is smaller than its transposition table and selected pattern dimensions"
+        );
+    }
+    let fingerprint =
+        scale_input_fingerprint(request, effective_guess_limit, &raw_guesses, &raw_answers)?;
+    let mut report = load_or_initialize_report(
+        request,
+        effective_guess_limit,
+        source_answers.len(),
+        &fingerprint,
+    )?;
+    let previous_millis = report.points.iter().fold(0u128, |total, point| {
+        total
+            .saturating_add(point.build_millis)
+            .saturating_add(point.verify_millis)
+    });
+    let budget = ScaleBudget {
+        started: run_started,
+        previous_millis,
+        maximum_millis: request.maximum_seconds as u128 * 1000,
+        maximum_memory_bytes: mib(request.maximum_memory_mb),
+        sample: std::sync::Mutex::new((None, None)),
+    };
+    let cancelled = || budget.cancelled();
     report.completed = false;
     report.stopped_reason = None;
     let namespace = fingerprint
@@ -115,6 +154,7 @@ pub fn benchmark_formal_scale(
     let scratch_root = paths.root.join("target/formal-scale").join(namespace);
     fs::create_dir_all(&scratch_root)
         .with_context(|| format!("failed to create {}", scratch_root.display()))?;
+    validate_resumed_artifacts(&report, &scratch_root, &source_guesses, &source_answers)?;
 
     for answer_count in request.answer_counts.iter().copied() {
         if report
@@ -140,18 +180,43 @@ pub fn benchmark_formal_scale(
         let guesses = prefix_guess_space(&source_guesses, &answers, effective_guess_limit);
         write_word_list(&point_paths.seed_answers, &answers)?;
         write_word_list(&point_paths.seed_guesses, &guesses)?;
-        atomic_write(&artifacts.prior_spec, b"kind = \"uniform\"\n")?;
+        atomic_write(
+            &artifacts.prior_spec,
+            b"objective = \"lexicographic\"\nkind = \"uniform\"\n",
+        )?;
 
         let build_started = Instant::now();
-        let build = build_optimal_policy(&point_paths, DEFAULT_FORMAL_MODEL_ID)?;
+        let build = match super::build_optimal_policy_controlled(
+            &point_paths,
+            DEFAULT_FORMAL_MODEL_ID,
+            &cancelled,
+        ) {
+            Ok(build) => build,
+            Err(error) if error.downcast_ref::<super::FormalSearchStop>().is_some() => {
+                report.stopped_reason = Some(budget.reason());
+                checkpoint_report(&request.output, &mut report)?;
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
+        };
         let build_millis = build_started.elapsed().as_millis();
         let verify_started = Instant::now();
-        let verify = verify_optimal_policy_with_mode(
+        let verify = match super::verify_optimal_policy_controlled(
             &point_paths,
             DEFAULT_FORMAL_MODEL_ID,
             FormalVerificationMode::Certificate,
-        )?;
+            &cancelled,
+        ) {
+            Ok(verify) => verify,
+            Err(error) if error.downcast_ref::<super::FormalSearchStop>().is_some() => {
+                report.stopped_reason = Some(budget.reason());
+                checkpoint_report(&request.output, &mut report)?;
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
+        };
         let verify_millis = verify_started.elapsed().as_millis();
+        let artifacts = PolicyArtifactSet::published(&point_paths, DEFAULT_FORMAL_MODEL_ID)?;
         let memory = process_memory_snapshot().ok_or_else(|| {
             anyhow!("formal scale memory sampler became unavailable during the run")
         })?;
@@ -172,31 +237,92 @@ pub fn benchmark_formal_scale(
             process_peak_working_set_bytes: memory.peak_working_set_bytes,
             manifest_hash: build.manifest_hash,
         });
-        report.full_model_projection = projection(&report.points);
+        report.full_model_projection = projection(&report.points, report.source_answer_count);
         checkpoint_report(&request.output, &mut report)?;
+        if cancelled() {
+            report.stopped_reason = Some(budget.reason());
+            checkpoint_report(&request.output, &mut report)?;
+            return Ok(report);
+        }
+        if report.points.iter().fold(0u64, |total, point| {
+            total.saturating_add(point.artifact_bytes)
+        }) > mib(request.maximum_disk_mb)
+        {
+            report.stopped_reason = Some("completed artifacts exceed the disk budget".to_string());
+            checkpoint_report(&request.output, &mut report)?;
+            return Ok(report);
+        }
     }
 
     report.completed = true;
     report.stopped_reason = None;
-    report.full_model_projection = projection(&report.points);
+    report.full_model_projection = projection(&report.points, report.source_answer_count);
     checkpoint_report(&request.output, &mut report)?;
-    let final_memory = process_memory_snapshot().unwrap_or(memory);
-    if final_memory.peak_working_set_bytes > mib(request.maximum_memory_mb) {
-        bail!(
-            "formal scale exceeded the {} MiB memory budget",
-            request.maximum_memory_mb
-        );
-    }
     Ok(report)
+}
+
+struct ScaleBudget {
+    started: Instant,
+    previous_millis: u128,
+    maximum_millis: u128,
+    maximum_memory_bytes: u64,
+    sample: std::sync::Mutex<(Option<Instant>, Option<String>)>,
+}
+
+impl ScaleBudget {
+    fn cancelled(&self) -> bool {
+        let mut sample = self
+            .sample
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sample.1.is_some() {
+            return true;
+        }
+        if self
+            .previous_millis
+            .saturating_add(self.started.elapsed().as_millis())
+            >= self.maximum_millis
+        {
+            sample.1 = Some(
+                "cooperative time budget reached during formal build/verification".to_string(),
+            );
+        } else if sample
+            .0
+            .is_none_or(|last| last.elapsed() >= std::time::Duration::from_millis(50))
+        {
+            sample.0 = Some(Instant::now());
+            sample.1 = match process_memory_snapshot() {
+                Some(memory) if memory.peak_working_set_bytes > self.maximum_memory_bytes => Some(
+                    "cooperative process-memory budget reached during formal build/verification"
+                        .to_string(),
+                ),
+                None => Some("formal scale memory sampler became unavailable".to_string()),
+                _ => None,
+            };
+        }
+        sample.1.is_some()
+    }
+
+    fn reason(&self) -> String {
+        self.sample
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .1
+            .clone()
+            .unwrap_or_else(|| "formal scale computation cancelled".to_string())
+    }
 }
 
 fn validate_request(request: &FormalScaleRequest) -> Result<()> {
     if request.answer_counts.is_empty()
+        || request.answer_counts.contains(&0)
         || request.maximum_seconds == 0
         || request.maximum_memory_mb == 0
         || request.maximum_disk_mb == 0
     {
-        bail!("formal scale counts, guess limit, and resource budgets must be positive");
+        bail!(
+            "formal scale answer counts and resource budgets must be positive (guess_limit=0 means all guesses)"
+        );
     }
     if request.answer_counts[0] > 6
         || request
@@ -224,19 +350,21 @@ fn validate_request(request: &FormalScaleRequest) -> Result<()> {
 fn load_or_initialize_report(
     request: &FormalScaleRequest,
     effective_guess_limit: usize,
+    source_answer_count: usize,
     fingerprint: &str,
 ) -> Result<FormalScaleReport> {
     if request.output.exists() {
-        let report: FormalScaleReport = serde_json::from_slice(
-            &fs::read(&request.output)
-                .with_context(|| format!("failed to read {}", request.output.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", request.output.display()))?;
+        let report: FormalScaleReport =
+            parsing::read_json(&request.output, parsing::MAX_JSON_BYTES)
+                .context("invalid formal scale checkpoint; choose a new output path")?;
         if report.format_version != FORMAL_SCALE_FORMAT_VERSION
             || report.identity_format != IDENTITY_FORMAT
             || report.input_fingerprint != fingerprint
             || report.answer_counts != request.answer_counts
             || report.guess_limit != effective_guess_limit
+            || report.source_answer_count != source_answer_count
+            || report.operating_system != std::env::consts::OS
+            || report.architecture != std::env::consts::ARCH
             || report.maximum_seconds != request.maximum_seconds
             || report.maximum_memory_mb != request.maximum_memory_mb
             || report.maximum_disk_mb != request.maximum_disk_mb
@@ -245,6 +373,7 @@ fn load_or_initialize_report(
                 "formal scale checkpoint provenance does not match this run; choose a new output path"
             );
         }
+        validate_checkpoint(&report)?;
         return Ok(report);
     }
     Ok(FormalScaleReport {
@@ -257,11 +386,12 @@ fn load_or_initialize_report(
             .map(usize::from)
             .unwrap_or(1),
         answer_counts: request.answer_counts.clone(),
+        source_answer_count,
         guess_limit: effective_guess_limit,
         maximum_seconds: request.maximum_seconds,
         maximum_memory_mb: request.maximum_memory_mb,
         maximum_disk_mb: request.maximum_disk_mb,
-        full_model_projection: projection(&[]),
+        full_model_projection: projection(&[], source_answer_count),
         points: Vec::new(),
         completed: false,
         stopped_reason: None,
@@ -273,11 +403,10 @@ fn preflight_stop_reason(
     request: &FormalScaleRequest,
     next_answer_count: usize,
 ) -> Option<String> {
-    let elapsed_millis = report
-        .points
-        .iter()
-        .map(|point| point.build_millis + point.verify_millis)
-        .sum::<u128>();
+    let elapsed_millis = report.points.iter().fold(0u128, |sum, point| {
+        sum.saturating_add(point.build_millis)
+            .saturating_add(point.verify_millis)
+    });
     if elapsed_millis >= request.maximum_seconds as u128 * 1_000 {
         return Some(format!(
             "time budget exhausted before {} answers",
@@ -298,7 +427,7 @@ fn preflight_stop_reason(
         .points
         .iter()
         .map(|point| point.artifact_bytes)
-        .sum::<u64>();
+        .fold(0u64, u64::saturating_add);
     if disk_bytes > mib(request.maximum_disk_mb) {
         return Some(format!(
             "disk budget exhausted before {} answers",
@@ -337,6 +466,95 @@ fn preflight_stop_reason(
     None
 }
 
+fn validate_checkpoint(report: &FormalScaleReport) -> Result<()> {
+    if report.source_answer_count == 0
+        || report.logical_cpus == 0
+        || report.points.len() > report.answer_counts.len()
+        || report.completed
+            && (report.points.len() != report.answer_counts.len()
+                || report.stopped_reason.is_some())
+    {
+        bail!("formal scale checkpoint has inconsistent completion or source counts");
+    }
+    for (point, expected_count) in report.points.iter().zip(&report.answer_counts) {
+        if point.answer_count != *expected_count
+            || point.answer_count == 0
+            || point.guess_count != report.guess_limit
+            || point.guess_count < point.answer_count
+            || point.policy_states == 0
+            || point.policy_states > super::MAX_FORMAL_STATES
+            || point.certificate_states < point.policy_states
+            || point.certificate_states > super::MAX_FORMAL_STATES
+            || !point.states_per_second.is_finite()
+            || point.states_per_second <= 0.0
+            || point.certificate_bytes == 0
+            || point.artifact_bytes < point.certificate_bytes
+            || point.scale_checkpoint_bytes == 0
+            || point.scale_checkpoint_bytes > parsing::MAX_JSON_BYTES
+            || point.process_peak_working_set_bytes == 0
+            || !is_tagged_digest(&point.manifest_hash)
+        {
+            bail!(
+                "formal scale checkpoint points must be a valid, unique ordered prefix of requested counts"
+            );
+        }
+        let expected_rate =
+            point.certificate_states as f64 / (point.build_millis.max(1) as f64 / 1000.0);
+        if (expected_rate - point.states_per_second).abs() > expected_rate.max(1.0) * 1e-9 {
+            bail!("formal scale checkpoint has inconsistent throughput");
+        }
+    }
+    let expected = projection(&report.points, report.source_answer_count);
+    if serde_json::to_value(&report.full_model_projection)? != serde_json::to_value(expected)? {
+        bail!("formal scale checkpoint projection does not match its source and points");
+    }
+    Ok(())
+}
+
+fn validate_resumed_artifacts(
+    report: &FormalScaleReport,
+    scratch_root: &Path,
+    source_guesses: &[String],
+    source_answers: &[String],
+) -> Result<()> {
+    for point in &report.points {
+        let paths =
+            ProjectPaths::new(scratch_root.join(format!("answers-{:02}", point.answer_count)));
+        let runtime = super::FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID)
+            .context("formal scale checkpoint references an unavailable or invalid generation")?;
+        let manifest = &runtime.model.manifest;
+        let expected_answers = source_answers.get(..point.answer_count).ok_or_else(|| {
+            anyhow!("formal scale resumed answer count exceeds the selected source")
+        })?;
+        let expected_guesses =
+            prefix_guess_space(source_guesses, expected_answers, report.guess_limit);
+        let artifacts = &runtime.artifacts;
+        let certificate: super::ProofCertificate =
+            parsing::read_json(&artifacts.certificate, parsing::MAX_CERTIFICATE_BYTES)?;
+        if manifest.manifest_hash != point.manifest_hash
+            || manifest.answer_count != point.answer_count
+            || manifest.guess_count != point.guess_count
+            || manifest.answer_hash
+                != crate::identity::tag(&crate::pattern_table::hash_word_list(
+                    expected_answers.iter().map(String::as_str),
+                ))
+            || manifest.guess_hash
+                != crate::identity::tag(&crate::pattern_table::hash_word_list(
+                    expected_guesses.iter().map(String::as_str),
+                ))
+            || runtime.policy.len() != point.policy_states
+            || certificate.state_count != point.certificate_states
+            || file_bytes(&artifacts.certificate)? != point.certificate_bytes
+            || formal_artifact_bytes(artifacts)? != point.artifact_bytes
+        {
+            bail!(
+                "formal scale checkpoint point identity/counts do not match its published artifacts"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn predict_next_millis(points: &[FormalScalePoint], next_answer_count: usize) -> Option<f64> {
     predict_next_metric(points, next_answer_count, |point| {
         point.build_millis.max(1) as f64
@@ -352,25 +570,33 @@ fn predict_next_metric(
     let last_value = metric(last).max(1.0);
     let per_answer_growth = if points.len() >= 2 {
         let previous = &points[points.len() - 2];
-        let answer_delta = (last.answer_count - previous.answer_count) as f64;
+        let delta = last.answer_count.checked_sub(previous.answer_count)?;
+        if delta == 0 {
+            return None;
+        }
+        let answer_delta = delta as f64;
         (last_value / metric(previous).max(1.0))
             .powf(1.0 / answer_delta)
             .max(1.0)
     } else {
         2.0
     };
-    Some(last_value * per_answer_growth.powf((next_answer_count - last.answer_count) as f64))
+    let delta = next_answer_count.checked_sub(last.answer_count)?;
+    if delta == 0 {
+        return None;
+    }
+    Some(last_value * per_answer_growth.powf(delta as f64))
 }
 
-fn projection(points: &[FormalScalePoint]) -> FormalScaleProjection {
+fn projection(points: &[FormalScalePoint], target_answer_count: usize) -> FormalScaleProjection {
     FormalScaleProjection {
-        target_answer_count: FULL_MODEL_PROJECTION_ANSWERS,
-        method: "least-squares linear fit of log10(metric) against pinned answer count".to_string(),
+        target_answer_count,
+        method: "least-squares log10(metric) fit on tiny prefixes; extrapolation is not a full-model runtime guarantee".to_string(),
         source_points: points.len(),
-        projected_log10_seconds: log_linear_projection(points, |point| {
+        projected_log10_seconds: log_linear_projection(points, target_answer_count, |point| {
             point.build_millis.max(1) as f64 / 1_000.0
         }),
-        projected_log10_certificate_bytes: log_linear_projection(points, |point| {
+        projected_log10_certificate_bytes: log_linear_projection(points, target_answer_count, |point| {
             point.certificate_bytes.max(1) as f64
         }),
     }
@@ -378,6 +604,7 @@ fn projection(points: &[FormalScalePoint]) -> FormalScaleProjection {
 
 fn log_linear_projection(
     points: &[FormalScalePoint],
+    target_answer_count: usize,
     metric: impl Fn(&FormalScalePoint) -> f64,
 ) -> Option<f64> {
     if points.len() < 3 {
@@ -409,7 +636,8 @@ fn log_linear_projection(
         .map(|point| (point.answer_count as f64 - mean_x) * (metric(point).log10() - mean_y))
         .sum::<f64>()
         / denominator;
-    Some(mean_y + slope * (FULL_MODEL_PROJECTION_ANSWERS as f64 - mean_x))
+    let projected = mean_y + slope * (target_answer_count as f64 - mean_x);
+    projected.is_finite().then_some(projected)
 }
 
 fn prefix_guess_space(
@@ -437,9 +665,10 @@ fn write_word_list(path: &Path, words: &[String]) -> Result<()> {
 }
 
 fn scale_input_fingerprint(
-    paths: &ProjectPaths,
     request: &FormalScaleRequest,
     effective_guess_limit: usize,
+    raw_guesses: &[u8],
+    raw_answers: &[u8],
 ) -> Result<String> {
     let mut hash = CanonicalSha256::new("maybe-wordle-formal-scale-v1");
     hash.field(&FORMAL_SCALE_FORMAT_VERSION.to_le_bytes())
@@ -450,14 +679,11 @@ fn scale_input_fingerprint(
     for count in &request.answer_counts {
         hash.field(&count.to_le_bytes());
     }
-    for path in [&paths.seed_guesses, &paths.seed_answers] {
-        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        hash.field(&bytes);
-    }
+    hash.field(raw_guesses).field(raw_answers);
     let executable = std::env::current_exe().context("failed to locate current executable")?;
-    let bytes = fs::read(&executable)
-        .with_context(|| format!("failed to read {}", executable.display()))?;
-    hash.field(&bytes);
+    let mut file = fs::File::open(&executable)?;
+    let length = file.metadata()?.len();
+    hash.field_reader(&mut file, length)?;
     Ok(hash.finish_tagged())
 }
 
@@ -524,6 +750,12 @@ mod tests {
             output: PathBuf::from("unused.json"),
         };
         validate_request(&request).expect("valid request");
+        request.guess_limit = 0;
+        validate_request(&request).expect("zero guess limit means all guesses");
+        request.answer_counts = vec![0];
+        assert!(validate_request(&request).is_err());
+        request.answer_counts = vec![0, 2];
+        assert!(validate_request(&request).is_err());
         request.answer_counts = vec![7, 8];
         assert!(validate_request(&request).is_err());
         request.answer_counts = vec![3, 6];
@@ -551,7 +783,8 @@ mod tests {
                 manifest_hash: "test".to_string(),
             })
             .collect::<Vec<_>>();
-        let projection = projection(&points);
+        let projection = projection(&points, 47);
+        assert_eq!(projection.target_answer_count, 47);
         assert!(
             projection
                 .projected_log10_seconds
@@ -562,5 +795,110 @@ mod tests {
                 .projected_log10_certificate_bytes
                 .is_some_and(f64::is_finite)
         );
+    }
+
+    #[test]
+    fn resumed_counts_and_projection_identity_are_validated_before_arithmetic() {
+        let root = crate::test_support::TestDirectory::new("formal-scale-resume");
+        let request = FormalScaleRequest {
+            answer_counts: vec![2, 3, 4],
+            guess_limit: 8,
+            maximum_seconds: 60,
+            maximum_memory_mb: 512,
+            maximum_disk_mb: 512,
+            output: root.path().join("report.json"),
+        };
+        let fingerprint = crate::identity::digest_bytes_tagged("scale-test", b"fixture");
+        let mut baseline = load_or_initialize_report(&request, 8, 47, &fingerprint).unwrap();
+        assert_eq!(baseline.full_model_projection.target_answer_count, 47);
+        baseline.points = [2, 3]
+            .into_iter()
+            .map(|answer_count| FormalScalePoint {
+                answer_count,
+                guess_count: 8,
+                policy_states: answer_count,
+                certificate_states: answer_count,
+                build_millis: 1000,
+                verify_millis: 1,
+                states_per_second: answer_count as f64,
+                certificate_bytes: 10,
+                artifact_bytes: 100,
+                scale_checkpoint_bytes: 100,
+                process_peak_working_set_bytes: 100,
+                manifest_hash: fingerprint.clone(),
+            })
+            .collect();
+        baseline.full_model_projection = projection(&baseline.points, 47);
+        validate_checkpoint(&baseline).unwrap();
+        for mutation in 0..8 {
+            let mut changed = baseline.clone();
+            match mutation {
+                0 => changed.points[1].answer_count = 2,
+                1 => changed.points.swap(0, 1),
+                2 => changed.points[0].answer_count = 0,
+                3 => changed.full_model_projection.target_answer_count = 2358,
+                4 => changed.completed = true,
+                5 => changed.points[0].manifest_hash = "stale".to_string(),
+                6 => changed.points[0].guess_count = 0,
+                _ => changed.points[0].states_per_second = -1.0,
+            }
+            fs::write(&request.output, serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(
+                load_or_initialize_report(&request, 8, 47, &fingerprint).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let mut reversed = baseline.points.clone();
+        reversed.reverse();
+        assert!(predict_next_millis(&reversed, 4).is_none());
+        assert!(predict_next_millis(&baseline.points, 2).is_none());
+        assert!(validate_resumed_artifacts(&baseline, root.path(), &[], &[]).is_err());
+    }
+
+    #[test]
+    fn cooperative_scale_budget_stops_and_checkpoint_retains_completed_points() {
+        let budget = ScaleBudget {
+            started: Instant::now(),
+            previous_millis: 10,
+            maximum_millis: 10,
+            maximum_memory_bytes: u64::MAX,
+            sample: std::sync::Mutex::new((None, None)),
+        };
+        assert!(budget.cancelled());
+        assert!(budget.reason().contains("time budget"));
+        assert!(budget.cancelled(), "cancellation is sticky");
+        let root = crate::test_support::TestDirectory::new("formal-budget-checkpoint");
+        let request = FormalScaleRequest {
+            answer_counts: vec![2, 3],
+            guess_limit: 8,
+            maximum_seconds: 60,
+            maximum_memory_mb: 512,
+            maximum_disk_mb: 512,
+            output: root.path().join("report.json"),
+        };
+        let fingerprint = crate::identity::digest_bytes_tagged("scale-budget", b"fixture");
+        let mut report = load_or_initialize_report(&request, 8, 47, &fingerprint).unwrap();
+        report.points.push(FormalScalePoint {
+            answer_count: 2,
+            guess_count: 8,
+            policy_states: 2,
+            certificate_states: 2,
+            build_millis: 1000,
+            verify_millis: 1,
+            states_per_second: 2.0,
+            certificate_bytes: 10,
+            artifact_bytes: 20,
+            scale_checkpoint_bytes: 0,
+            process_peak_working_set_bytes: 100,
+            manifest_hash: fingerprint.clone(),
+        });
+        report.full_model_projection = projection(&report.points, 47);
+        report.stopped_reason = Some(budget.reason());
+        checkpoint_report(&request.output, &mut report).unwrap();
+        let reloaded = load_or_initialize_report(&request, 8, 47, &fingerprint).unwrap();
+        assert_eq!(reloaded.points.len(), 1);
+        assert_eq!(reloaded.points[0].answer_count, 2);
+        assert!(!reloaded.completed);
+        assert!(reloaded.stopped_reason.unwrap().contains("time budget"));
     }
 }

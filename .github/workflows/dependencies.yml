@@ -1,0 +1,32 @@
+name: Dependency advisories
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/dependencies.yml
+  schedule:
+    - cron: '34 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Install reviewed audit tool
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit the actual lockfile
+        # Maintenance-only exceptions and review conditions: docs/DEPENDENCIES.md.
+        run: >-
+          cargo audit --file Cargo.lock --deny warnings
+          --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192

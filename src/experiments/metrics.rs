@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
@@ -84,19 +84,39 @@ pub struct PredictiveMetrics {
     pub coverage_gaps: usize,
     pub coverage_rate: f64,
     pub solve_rate: f64,
-    pub conditional_mean_guesses: f64,
-    pub conditional_mean_guesses_ci95: MetricInterval,
+    pub modeled_guess_total: usize,
+    pub conditional_mean_guesses: Option<f64>,
+    pub conditional_mean_guesses_ci95: Option<MetricInterval>,
     pub failure_penalty_guesses: f64,
+    pub all_game_penalized_guess_total: f64,
     pub all_game_penalized_mean_guesses: f64,
     pub all_game_penalized_mean_guesses_ci95: MetricInterval,
-    pub median_guesses: f64,
-    pub p90_guesses: usize,
-    pub p95_guesses: usize,
-    pub max_guesses: usize,
+    pub median_guesses: Option<f64>,
+    pub p90_guesses: Option<usize>,
+    pub p95_guesses: Option<usize>,
+    pub max_guesses: Option<usize>,
     pub solved_in_guess_counts: [usize; 6],
     pub coverage_rate_ci95: MetricInterval,
     pub solve_rate_ci95: MetricInterval,
     pub bootstrap: BootstrapConfig,
+}
+
+impl PredictiveMetrics {
+    pub fn conditional_mean_summary(&self) -> String {
+        match self.conditional_mean_guesses {
+            None => format!("unavailable (modeled_games={})", self.modeled_games),
+            Some(mean) => match self.conditional_mean_guesses_ci95 {
+                Some(interval) => format!(
+                    "{mean:.4} [{:.4}, {:.4}] (modeled_games={})",
+                    interval.lower, interval.upper, self.modeled_games
+                ),
+                None => format!(
+                    "{mean:.4} [CI unavailable] (modeled_games={})",
+                    self.modeled_games
+                ),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -178,7 +198,8 @@ pub fn summarize_ranked_probability_observations(
     let expected_calibration_error_ci95 =
         block_bootstrap_ranked_interval(observations, bootstrap, |sample| {
             calibration_error(sample, calibration_bins)
-        });
+        })
+        .context("ranked probability bootstrap produced no finite estimates")?;
 
     Ok(PriorEvidenceMetrics {
         measured_games,
@@ -245,6 +266,11 @@ pub fn summarize_predictive_outcomes(
         .filter_map(|outcome| outcome.guesses.map(|guesses| guesses as f64))
         .collect::<Vec<_>>();
     let modeled_games = modeled.len();
+    let modeled_guess_total = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.guesses)
+        .try_fold(0usize, |total, guesses| total.checked_add(guesses))
+        .context("modeled guess total overflowed")?;
     let solved_games = outcomes
         .iter()
         .filter(|outcome| outcome.status == GameOutcomeStatus::Solved)
@@ -265,7 +291,11 @@ pub fn summarize_predictive_outcomes(
             GameOutcomeStatus::Unsolved | GameOutcomeStatus::CoverageGap => failure_penalty_guesses,
         })
         .collect::<Vec<_>>();
-    let all_game_penalized_mean_guesses = mean(&all_game_values);
+    let all_game_penalized_guess_total = all_game_values.iter().sum::<f64>();
+    if !all_game_penalized_guess_total.is_finite() {
+        bail!("all-game penalized guess total must be finite");
+    }
+    let all_game_penalized_mean_guesses = all_game_penalized_guess_total / scheduled_games as f64;
     let mut sorted_modeled = modeled.clone();
     sorted_modeled.sort_by(f64::total_cmp);
     let solved_in_guess_counts = solved_distribution(outcomes);
@@ -278,21 +308,23 @@ pub fn summarize_predictive_outcomes(
         coverage_gaps,
         coverage_rate: modeled_games as f64 / scheduled_games as f64,
         solve_rate: solved_games as f64 / scheduled_games as f64,
+        modeled_guess_total,
         conditional_mean_guesses,
         conditional_mean_guesses_ci95: block_bootstrap_interval(outcomes, bootstrap, |sample| {
             let values = sample
                 .iter()
                 .filter_map(|outcome| outcome.guesses.map(|guesses| guesses as f64))
                 .collect::<Vec<_>>();
-            (!values.is_empty()).then(|| mean(&values))
+            mean(&values)
         }),
         failure_penalty_guesses,
+        all_game_penalized_guess_total,
         all_game_penalized_mean_guesses,
         all_game_penalized_mean_guesses_ci95: block_bootstrap_interval(
             outcomes,
             bootstrap,
             |sample| {
-                Some(mean(
+                mean(
                     &sample
                         .iter()
                         .map(|outcome| match outcome.status {
@@ -302,13 +334,14 @@ pub fn summarize_predictive_outcomes(
                             }
                         })
                         .collect::<Vec<_>>(),
-                ))
+                )
             },
-        ),
+        )
+        .context("all-game bootstrap produced no finite estimates")?,
         median_guesses: median(&sorted_modeled),
         p90_guesses: integer_quantile(&sorted_modeled, 0.90),
         p95_guesses: integer_quantile(&sorted_modeled, 0.95),
-        max_guesses: sorted_modeled.last().copied().unwrap_or_default() as usize,
+        max_guesses: sorted_modeled.last().map(|value| *value as usize),
         solved_in_guess_counts,
         coverage_rate_ci95: wilson_interval(modeled_games, scheduled_games),
         solve_rate_ci95: wilson_interval(solved_games, scheduled_games),
@@ -356,10 +389,11 @@ impl PairedDifference {
             .iter()
             .filter(|difference| **difference > 0.0)
             .count();
-        let ci95 = block_bootstrap_numeric_interval(&differences, bootstrap);
+        let ci95 = block_bootstrap_numeric_interval(&differences, bootstrap)
+            .context("paired bootstrap produced no finite estimates")?;
 
         Ok(Self {
-            candidate_minus_baseline: mean(&differences),
+            candidate_minus_baseline: mean(&differences).context("paired mean is not finite")?,
             ci95,
             candidate_wins,
             ties,
@@ -415,40 +449,40 @@ fn penalized_value(outcome: &GameOutcome, failure_penalty_guesses: f64) -> f64 {
     }
 }
 
-fn mean(values: &[f64]) -> f64 {
+fn mean(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
-        0.0
-    } else {
-        values.iter().sum::<f64>() / values.len() as f64
+        return None;
     }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    mean.is_finite().then_some(mean)
 }
 
-fn median(sorted: &[f64]) -> f64 {
+fn median(sorted: &[f64]) -> Option<f64> {
     match sorted.len() {
-        0 => 0.0,
-        len if len % 2 == 1 => sorted[len / 2],
-        len => (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0,
+        0 => None,
+        len if len % 2 == 1 => Some(sorted[len / 2]),
+        len => Some((sorted[len / 2 - 1] + sorted[len / 2]) / 2.0),
     }
 }
 
-fn integer_quantile(sorted: &[f64], probability: f64) -> usize {
+fn integer_quantile(sorted: &[f64], probability: f64) -> Option<usize> {
     if sorted.is_empty() {
-        return 0;
+        return None;
     }
     let rank = ((sorted.len() as f64) * probability).ceil() as usize;
-    sorted[rank.saturating_sub(1).min(sorted.len() - 1)] as usize
+    Some(sorted[rank.saturating_sub(1).min(sorted.len() - 1)] as usize)
 }
 
 fn block_bootstrap_interval<F>(
     outcomes: &[GameOutcome],
     config: BootstrapConfig,
     statistic: F,
-) -> MetricInterval
+) -> Option<MetricInterval>
 where
     F: Fn(&[GameOutcome]) -> Option<f64>,
 {
     if outcomes.len() == 1 {
-        return statistic(outcomes).map_or(MetricInterval::point(0.0), MetricInterval::point);
+        return statistic(outcomes).map(MetricInterval::point);
     }
     let mut rng = SplitMix64::new(config.seed);
     let mut sample = Vec::with_capacity(outcomes.len());
@@ -465,9 +499,12 @@ where
     percentile_interval(estimates)
 }
 
-fn block_bootstrap_numeric_interval(values: &[f64], config: BootstrapConfig) -> MetricInterval {
+fn block_bootstrap_numeric_interval(
+    values: &[f64],
+    config: BootstrapConfig,
+) -> Option<MetricInterval> {
     if values.len() == 1 {
-        return MetricInterval::point(values[0]);
+        return Some(MetricInterval::point(values[0]));
     }
     let mut rng = SplitMix64::new(config.seed);
     let mut estimates = Vec::with_capacity(config.resamples);
@@ -494,12 +531,12 @@ fn block_bootstrap_ranked_interval<F>(
     observations: &[RankedProbabilityObservation],
     config: BootstrapConfig,
     statistic: F,
-) -> MetricInterval
+) -> Option<MetricInterval>
 where
     F: Fn(&[RankedProbabilityObservation]) -> f64,
 {
     if observations.len() == 1 {
-        return MetricInterval::point(statistic(observations));
+        return Some(MetricInterval::point(statistic(observations)));
     }
     let mut rng = SplitMix64::new(config.seed);
     let mut sample = Vec::with_capacity(observations.len());
@@ -566,14 +603,17 @@ fn fill_block_sample(
     }
 }
 
-fn percentile_interval(mut estimates: Vec<f64>) -> MetricInterval {
+fn percentile_interval(mut estimates: Vec<f64>) -> Option<MetricInterval> {
     if estimates.is_empty() {
-        return MetricInterval::point(0.0);
+        return None;
+    }
+    if estimates.iter().any(|estimate| !estimate.is_finite()) {
+        return None;
     }
     estimates.sort_by(f64::total_cmp);
     let lower = percentile(&estimates, 0.025);
     let upper = percentile(&estimates, 0.975);
-    MetricInterval { lower, upper }
+    Some(MetricInterval { lower, upper })
 }
 
 fn percentile(sorted: &[f64], probability: f64) -> f64 {
@@ -589,9 +629,7 @@ fn percentile(sorted: &[f64], probability: f64) -> f64 {
 }
 
 fn wilson_interval(successes: usize, trials: usize) -> MetricInterval {
-    if trials == 0 {
-        return MetricInterval::point(0.0);
-    }
+    assert!(trials > 0, "Wilson interval requires a measured population");
     let z = 1.959_963_984_540_054_f64;
     let n = trials as f64;
     let probability = successes as f64 / n;
@@ -658,6 +696,129 @@ mod tests {
     }
 
     #[test]
+    fn all_gap_metrics_serialize_unavailable_modeled_statistics() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).expect("date");
+        let metrics = summarize_predictive_outcomes(
+            &[GameOutcome::coverage_gap(date)],
+            7.0,
+            BootstrapConfig::default(),
+        )
+        .expect("all-gap metrics");
+        assert_eq!(metrics.scheduled_games, 1);
+        assert_eq!(metrics.modeled_games, 0);
+        assert_eq!(metrics.coverage_rate, 0.0);
+        assert_eq!(metrics.solve_rate, 0.0);
+        assert_eq!(metrics.all_game_penalized_mean_guesses, 7.0);
+        let json = serde_json::to_value(&metrics).expect("JSON");
+        for field in [
+            "conditional_mean_guesses",
+            "conditional_mean_guesses_ci95",
+            "median_guesses",
+            "p90_guesses",
+            "p95_guesses",
+            "max_guesses",
+        ] {
+            assert!(
+                json[field].is_null(),
+                "{field} is not measured with zero modeled games"
+            );
+        }
+        let restored: PredictiveMetrics = serde_json::from_value(json).expect("JSON round trip");
+        assert_eq!(restored, metrics);
+        assert_eq!(
+            metrics.conditional_mean_summary(),
+            "unavailable (modeled_games=0)"
+        );
+    }
+
+    #[test]
+    fn additive_totals_match_concatenated_unequal_folds_and_no_solve_fold() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).expect("date");
+        let outcomes = [
+            GameOutcome::solved(date, 1),
+            GameOutcome::unsolved(date + Days::new(1), 6),
+            GameOutcome::solved(date + Days::new(2), 2),
+            GameOutcome::coverage_gap(date + Days::new(3)),
+        ];
+        let config = BootstrapConfig {
+            resamples: 20,
+            block_length: 1,
+            seed: 7,
+        };
+        let folded = [&outcomes[..2], &outcomes[2..3], &outcomes[3..]].map(|fold| {
+            serde_json::to_value(summarize_predictive_outcomes(fold, 7.0, config).expect("fold"))
+                .expect("JSON")
+        });
+        let joined = serde_json::to_value(
+            summarize_predictive_outcomes(&outcomes, 7.0, config).expect("joined"),
+        )
+        .expect("JSON");
+        let guesses: u64 = folded
+            .iter()
+            .map(|fold| {
+                fold["modeled_guess_total"]
+                    .as_u64()
+                    .expect("explicit modeled numerator")
+            })
+            .sum();
+        let penalized: f64 = folded
+            .iter()
+            .map(|fold| {
+                fold["all_game_penalized_guess_total"]
+                    .as_f64()
+                    .expect("explicit all-game numerator")
+            })
+            .sum();
+        assert_eq!(guesses, 9);
+        assert_eq!(penalized, 17.0);
+        assert_eq!(joined["modeled_guess_total"].as_u64(), Some(guesses));
+        assert_eq!(
+            joined["all_game_penalized_guess_total"].as_f64(),
+            Some(penalized)
+        );
+        assert_eq!(joined["conditional_mean_guesses"].as_f64(), Some(3.0));
+    }
+
+    #[test]
+    fn zero_solved_games_still_have_modeled_statistics_when_attempts_exist() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).expect("date");
+        let metrics = summarize_predictive_outcomes(
+            &[
+                GameOutcome::unsolved(date, 6),
+                GameOutcome::coverage_gap(date + Days::new(1)),
+            ],
+            7.0,
+            BootstrapConfig::default(),
+        )
+        .expect("modeled unsolved metrics");
+        assert_eq!(metrics.solved_games, 0);
+        assert_eq!(metrics.modeled_games, 1);
+        assert_eq!(metrics.modeled_guess_total, 6);
+        assert_eq!(metrics.conditional_mean_guesses, Some(6.0));
+        assert_eq!(
+            metrics.conditional_mean_guesses_ci95,
+            Some(MetricInterval::point(6.0))
+        );
+        assert_eq!(metrics.median_guesses, Some(6.0));
+        assert_eq!(metrics.p95_guesses, Some(6));
+        assert_eq!(metrics.all_game_penalized_guess_total, 14.0);
+        assert_eq!(metrics.all_game_penalized_mean_guesses, 7.0);
+    }
+
+    #[test]
+    fn empty_schedules_and_nonfinite_additive_totals_are_rejected() {
+        assert!(summarize_predictive_outcomes(&[], 7.0, BootstrapConfig::default()).is_err());
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).expect("date");
+        let gaps = [
+            GameOutcome::coverage_gap(date),
+            GameOutcome::coverage_gap(date + Days::new(1)),
+        ];
+        assert!(
+            summarize_predictive_outcomes(&gaps, f64::MAX, BootstrapConfig::default()).is_err()
+        );
+    }
+
+    #[test]
     fn metrics_keep_gaps_in_all_game_denominators() {
         let metrics = summarize_predictive_outcomes(
             &outcomes(),
@@ -677,7 +838,7 @@ mod tests {
         assert_eq!(metrics.coverage_gaps, 1);
         assert_eq!(metrics.coverage_rate, 0.8);
         assert_eq!(metrics.solve_rate, 0.6);
-        assert_eq!(metrics.conditional_mean_guesses, 3.75);
+        assert_eq!(metrics.conditional_mean_guesses, Some(3.75));
         assert_eq!(metrics.all_game_penalized_mean_guesses, 4.6);
         assert_eq!(metrics.solved_in_guess_counts, [0, 1, 1, 1, 0, 0]);
     }

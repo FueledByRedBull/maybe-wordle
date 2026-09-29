@@ -1,15 +1,83 @@
 # September predictive release acceptance plan
 
-Status: implementation in progress. This plan consolidates the six source-audit and
+Status: audit remediation locally verified; release/promotion acceptance below
+remains open. This plan consolidates the six source-audit and
 rollout notes supplied on September 7, 2026, against revision `1d607151` and the
 existing uncommitted August work. Historical v20 scores do not validate changed code.
 The release goal includes every requirement below. A checkbox requires recorded
 implementation and verification evidence, not merely a proposed fix.
 
+The September 29 comprehensive audit is tracked in the
+[48-item remediation ledger](superpowers/plans/2026-09-29-audit-remediation.md).
+Its corrections supersede older source-level assumptions here, not the identities
+or outcomes of historical measurements. In particular, formal depth/expectation
+optimization, dynamic dormant-support pruning, shared terminal handling, explicit
+metric populations, sealed-window ownership and independent exhaustive labels
+have changed. Current verification and bounded measurements are recorded below.
+The native GUI remains closed at the user's request; headless geometry
+and state tests do not close the visual/keyboard acceptance gate.
+
 Unlinked `benchmarks/predictive/*.json` filenames below identify local-only raw
 diagnostics, not files guaranteed in a clean checkout. Public redacted evidence
 is linked where available; its aggregate arithmetic can be checked without
 redistributing per-game answer and guess words.
+
+## September 29 audit delivery
+
+The 48-item audit ledger records the implemented corrections and their regression
+evidence. Production remains selected staged v20; this audit does not authorize
+an experimental policy promotion or claim a flat-three average.
+
+The final Windows gate passed Rust 1.97 format, warning-denied locked Clippy,
+603 tests and all 15 benchmark smoke workloads. Final review reproduced empty
+search-regret aggregates displayed as numeric zero; optional JSON values and
+population-labeled CLI output now pass zero/mid/final-deadline regressions and
+the refreshed full gate. The native GUI has not been opened. Hosted three-platform CI,
+native Unix persistence/FIFO and Windows UNC acceptance are not local passes.
+
+The selected-policy first-feedback profiler completed all six fresh/warm top
+1/5/10 calls in 844-1364 ms; each solver clone allocated 290 bytes, and a 10-ms
+cooperative cancellation stopped at 16.49 ms. These single-call diagnostics,
+allocation definitions and executable identity are in [PERFORMANCE.md](PERFORMANCE.md).
+They do not establish a population p95, an OS-cold startup time, or a matched
+speedup against the old executable.
+
+The nine-date seven-profile [timing screen](generated/september-audit-timing-screen-v1.md)
+finished in 19.58 seconds. Its selected-policy 3.0000 mean is not a full-fold
+score. The subsequent 12-fold seven-profile run stopped at the configured
+1,200,021-ms cumulative cap, with a process peak of 229,695,488 bytes. Six complete
+profiles were retained in the local checkpoint; the selected disk-artifact profile
+was incomplete, and no final full-matrix report was published. The checkpoint and
+timeout log remain at `target/evidence-checkpoints/september-audit-seven-profile-v1.json`
+and `target/audit-work/seven-profile.log`. This is an incomplete experiment, not a
+successful release matrix or a reason to bypass its resource limit.
+
+The retained complete artifact-free staged profile solved all 360 games at
+3.194444 guesses. The proxy-only and proxy-with-exact-endgame profiles scored
+3.244444 and 3.200000 respectively, also with 360 solves; those are within-run
+diagnostics, not causal attribution to a particular audit fix. A separately
+completed [paired rolling comparison](generated/rolling-evidence.md) supplies
+the published full-fold selected-policy evidence: selected v20 scored 3.194444
+and exploratory v19b 3.191667, both 360/360 with no gaps or failures. The paired
+v19b-minus-selected interval is [-0.022222, +0.016667], with 6/347/7 wins/ties/losses;
+v19b is not promoted. All 720 paths and outcomes match the earlier post-layout
+replay. Current measured per-move p95 was 28.29/27.25 ms, not a matched speedup
+claim. No consumed or reserved seal was evaluated by these audit runs.
+
+These measurements bind audit CLI SHA-256
+`9490EAA144801EEDBD0809016100C135EFB635047CCFA5B73893D16A48D5454D`.
+They precede the final reporting-only correction to empty search-regret summaries;
+no gameplay ranking, data, configuration or benchmark calculation changed in that
+correction. The delivered executable's separate identity is in `dist/SHA256SUMS.txt`.
+Do not relabel the measured binary as that later build or infer a new speedup.
+
+The final release GUI and CLI are retained in `dist` with checksums and build
+notes; their Windows subsystems are 2 (GUI, no console) and 3 (CLI). CLI help,
+both exact CI documentation commands, public redaction and local Markdown links
+pass. Verified Cargo profile cleanup removed 8.2 GiB of debug and 1.1 GiB of
+release output while preserving dist, data, evidence and checkpoints. Publication
+was authorized after this local handoff; hosted acceptance is recorded by the CI
+run for the published commit, not inferred from these Windows checks.
 
 ## Decision contract
 
@@ -55,6 +123,9 @@ evaluate the same objective. Formal proof remains optional research.
 - [x] Implement finite one/two-turn terminal decisions for the declared objective and
   compare with an independent tiny-state exhaustive normal/hard-mode oracle, including
   duplicate-letter legality and deliberately different optimal moves by horizon.
+  The dynamic two-answer direct shortcut now requires empty dormant fallback
+  support; a lower activation threshold can otherwise reactivate answers after
+  the first miss. A failing-before/passing-after threshold-one oracle test guards it.
 - [x] Finite policies evaluate shortlisted moves by grouped rollout of a complete
   inexpensive baseline policy; include its own move. Compare with the corrected
   baseline at identical prior, rules, dates, book policy and time budget. Keep
@@ -143,6 +214,10 @@ evaluate the same objective. Formal proof remains optional research.
 - [ ] Run conditional cohorts in cost order, only Pareto finalists in small multi-seed
   joint refinement, then all common development folds and seven-profile evidence. Freeze
   exact executable/config/data/rules/date/book/budget identities and per-game outcomes.
+- [x] Complete the seven-profile incumbent/baseline development matrix under the
+  roughly 20-minute ceiling. The rebuilt current-executable 12-fold rerun covered
+  2,520/2,520 profile-games in about 11.1 minutes with zero failures and gaps; it does not
+  substitute for a future qualified finalist's paired promotion gate.
 - [x] Validate atomic identity-bound per-profile checkpoints and progress/ETA with fresh,
   resumed and isolated-result agreement plus rejection of changed sources/config/data,
   evaluation plans, policies and overlapping completed units.
@@ -150,19 +225,28 @@ evaluate the same objective. Formal proof remains optional research.
 ## 5. Information boundaries and maintenance
 
 - [ ] Preserve development cutoff August 26 and exclude both consumed June 18-July 17
-  and declared August 28-September 26 windows from tuning. Record frozen-candidate dates
+  and declared August 28-September 26 windows as tuning/validation targets;
+  consumed answers may remain chronological training history for later dates.
+  Record frozen-candidate dates
   and window consumption. A candidate selected after a window starts must not be called
   prospectively frozen before it. Declare a later prospective confirmation if necessary.
   Future outcomes are an external dependency, never a reason to fabricate completion.
 - [x] Validate upstream history words/dates before persistence; preserve useful fetch/decode
   error categories. Audit cache payload integrity and the independent oracle trust boundary;
   input hashes and in-range bytes alone do not prove an uncorrupted feedback payload.
-- [ ] Verify removal of the obsolete Python entry point with deterministic archive retained,
+- [x] Verify removal of the obsolete Python entry point with deterministic archive retained,
   untracked reproducible formal table, Rust 1.97 manifest/CI/docs contract, official checkout
   upgrade and dependency-alert status. Resolve actionable findings without exposing secrets.
-- [ ] Validate the resident-set sampler on native macOS before claiming platform validation.
-  Inspect whether supported headless platforms need CI coverage/GUI feature separation;
-  implement only where the actual supported build contract requires it.
+- [x] Validate the resident-set sampler on native macOS before claiming platform validation.
+  The `macos-memory` CI job passed on `23a73e0`; this does not validate the macOS GUI.
+- [x] Inspect whether supported headless platforms need CI coverage/GUI feature separation.
+  The README explicitly packages Windows GUI/CLI executables but does not
+  promise a GUI-free Linux or macOS build. CLI arguments avoid launching
+  `eframe`, although the dependency and GUI module remain unconditional.
+  The added Linux CI job checks Rust compilation with that dependency; it
+  does not link or run a headless CLI, and its hosted result awaits a
+  user-authorized push. No feature split is justified by the current
+  documented contract; this inspection is not a Linux runtime claim.
 - [x] Keep the small independent formal oracle and proof tests. Larger proof work requires
   a concrete feasibility improvement; tiny-universe exponential extrapolation is not a
   theorem about Wordle strategy construction.
@@ -185,7 +269,7 @@ evaluate the same objective. Formal proof remains optional research.
   GUI/console subsystems, smoke-test the runnable distribution, then safely remove
   rebuildable release artifacts after required evidence/checkpoints are preserved.
   Native visual/keyboard acceptance remains a separate unchecked gate above.
-- [ ] Inspect the entire intentional diff and repository hygiene. Do not stage, commit or
+- [x] Inspect the entire intentional diff and repository hygiene. Do not stage, commit or
   push until explicitly authorized. Record any prospective-holdout/native-platform blocker
   honestly; neither a negative optimization result nor an unmet 3.0 aspiration is a defect.
 
@@ -1146,7 +1230,7 @@ The two candidate TOMLs differ only in `search_policy_mode`; their recorded
 prior evidence is identical. The first comparison (`benchmarks/predictive/september-finite-matched-budget-current-v1.json`)
 and fresh-label repeat (`benchmarks/predictive/september-finite-matched-budget-current-repeat-v1.json`)
 have the same input fingerprint, code revision, fold plan and profile config
-fingerprints. Their dates exclude the consumed June 18-July 17 window and
+fingerprints. Their target dates exclude the consumed June 18-July 17 window and
 the reserved August 28-September 26 seal. Both declare `sealed_test_evaluated:
 false`. The artifact audit matched every date/target pair and recomputed the
 penalty-seven means from all 360 game outcomes.
@@ -1213,8 +1297,9 @@ and a fresh-label Fast repeat reusing its identity-checked staged baseline (`ben
 Each profile covers the same 360 dated targets in the declared development
 folds, from 2025-07-03 through 2026-08-26. The artifacts have matching
 source/input, plan and config fingerprints, aligned date/target pairs, zero
-coverage gaps and `sealed_test_evaluated: false`; neither uses the consumed
-June 18-July 17 window or reserved August 28-September 26 seal. Independent
+coverage gaps and `sealed_test_evaluated: false`; neither evaluates the consumed
+June 18-July 17 window or reserved August 28-September 26 seal as targets.
+Earlier consumed answers may still be chronological training history. Independent
 per-game penalty-seven sums, paired win/tie/loss counts and dates match the
 reported aggregates. The staged baseline paths were identical on reuse.
 
@@ -1901,11 +1986,11 @@ of the current executable. No new costly study was run here.
 
 The later survival folds can include the consumed June 18-July 17 outcomes as
 chronological training labels while excluding that interval from validation
-targets. This is not future-target leakage, but whether the earlier seal may
-be used in later supervised fitting is an unresolved interpretation of the
-"no further tuning" rule. Owner direction was requested; do not silently
-filter ordinary history or treat the narrower validation-only reading as
-approved.
+targets. This is not future-target leakage. On September 27 the owner approved
+this chronological-training-only interpretation: the interval may train
+later-date models but must never become a new tuning or validation target.
+The ruling confirms existing fold behavior; it does not promote the survival
+model or change any historical evaluation result.
 
 The current-source `dist` CLI (SHA-256
 `ECFEE91B8199956E327954BD5E5BE233F07129A8C2CDE3D6F4612CA740B46B72`)
@@ -1986,6 +2071,8 @@ test-first parse failure, then removed; the seven existing config tests and
 config changed. A future diagnostic must count staged proposal time in the
 same request budget, retain hard-mode legality, and compare paired play on
 allowed dates before any score claim.
+This records the September 26 status; the bounded September 28 seed
+counterfactual below was negative and did not become a production mode.
 
 The seven-profile 2,520-game run still projects about 46.5 minutes from the
 current-source 63-game probe, requiring at least a 2.33x speedup to fit the
@@ -2015,7 +2102,8 @@ profile; `dist` hashes still match `BUILD-INFO.txt`, and the evidence and
 rolling checkpoint directories remain under `target/`.
 
 The CI evidence gap above was then repaired locally without publishing raw
-answer/path words. `scripts/redact_public_evidence.ps1` produced two public
+answer/path words. At this checkpoint,
+`scripts/redact_public_evidence.ps1` produced two public
 copies under `docs/evidence/` for the current selected-policy benchmark and
 the earlier finite rolling comparison. The script preserves dates, outcomes,
 numeric calibration, path lengths and source/config identity, replaces each
@@ -2039,8 +2127,9 @@ recorded in the handoff below. No raw JSON was staged or published.
 On `master`, the worktree remains dirty and unstaged. The private benchmark
 JSONs remain local. Tracked documentation no longer links to untracked raw
 predictive JSON; those filenames are plain local-only provenance. Links to the
-new release ledger, aggregate generated summaries, experiment configs, and two
-redacted evidence copies are intentional prospective release dependencies and
+new release ledger, aggregate generated summaries, experiment configs, and the
+two redacted evidence copies then available are intentional prospective
+release dependencies and
 must be included together if a commit is authorized. The 32 generated
 September summaries contain aggregate metrics, not per-game target/path words.
 Two explicit target-answer names were removed from this ledger; remaining
@@ -2139,3 +2228,758 @@ and `42D3FB6846CF7ECB22647F7692109AABE9678040644870A015B2ACF13CC37D81`.
 Both copied hashes matched the release outputs, CLI help passed, and the GUI
 remained running through a three-second startup smoke. No candidate policy,
 score, or prospective-validation claim changed.
+
+### September 27 current-executable dynamic-policy disagreement check
+
+The retained Windows CLI at revision `23a73e0` repeated the selected-staged
+versus `finite_fast_dynamic` matrix on July 28-August 26 development dates
+with books disabled. It finished 60 profile-games in 67.48 seconds, within the
+20-minute ceiling, and did not evaluate the declared seal. The full word-bearing
+report is local-only at
+`benchmarks/predictive/september-dynamic-finite-current-30day-v1.json`
+(SHA-256
+`281F1EA0D4FD9109FF241165C9F88DFF2B7A6859364D5B755BFCE2C337D25BEC`).
+Its source revision is recorded with `code_dirty=true`, so this is a diagnostic,
+not a clean-source release artifact. No production config changed.
+
+Both profiles solved 30/30 without coverage gaps. Staged scored 3.3333
+all-game guesses at 21.52 ms per-move p95; dynamic finite scored 3.4000 at
+256.20 ms. The paired finite-minus-staged difference was +0.0667 guesses,
+95% block-bootstrap interval [-0.1333,+0.2667], with 4/21/5
+wins/ties/losses. All 60 per-game paths and outcomes matched the
+earlier-source artifact exactly.
+All first guesses matched; 25 games first disagreed at guess two and five
+never disagreed. Each divergent finite choice had `deadline` status and only
+an `upper_bound` top-candidate value; those 25 games split 4 finite wins,
+16 ties, and five staged wins. Later turns after a divergent guess do not
+represent shared states. This replay does not establish a turn/state class
+where a live finite router improves the guarded outcome on the observed paths.
+The fixed-belief regret tool still cannot serve as an exact dynamic-belief
+reference; the separate opt-in same-state diagnostic and its narrow scope are
+recorded below. No switch is implemented or claimed from this result.
+
+### September 27 remaining performance and seven-profile gate check
+
+The focused Rust 1.97 Criterion four-feedback benchmark passed on the current
+source at revision `23a73e0`: its slope estimates were 0.302 ms for history,
+13.399 ms for preview and 18.275 ms for full staged suggestions. The 4.88 ms
+full-minus-preview difference is not native paint time, and removing that
+refinement without replacement would remove exact-cost details exposed in
+the CLI and GUI.
+No solver code or selected config changed.
+
+A current-executable `benchmark-evidence` run covered the seven-profile matrix
+on July 28-August 5 only. It completed 63/63 profile-games in 64.57 seconds,
+with `sealed_test_evaluated=false`. The word-bearing raw diagnostic remains
+local at `target/evidence-checkpoints/september-seven-profile-runtime-current-v1.json`
+(SHA-256 `616AFF4DB0E830147D25959EA618E837F40BEB0D55DAD30FC6F163152D6A956F`).
+The two staged profiles took 21.5 and 23.6 seconds, about 70% of the total;
+a linear full-matrix projection remains above 40 minutes and is not a full
+run. Their nine-game paths matched, but the artifact modes differ and the
+current checkpoint protocol cannot merge independently run profile reports.
+An eight-Rayon-worker repeat of the same nine-day slice took 64.17 seconds
+versus 64.57 seconds with 16 workers; input/matrix identities and all game
+paths matched. Thread-count tuning therefore provides no material reduction.
+At this earlier probe, the effective Rayon count was logged but omitted from
+checkpoint identity and artifact metadata. Time/memory ceilings appear in the
+final artifact but are also omitted from checkpoint identity, so resumed
+profiles could have run under different ceilings. Keep all three values fixed
+across a resumed run; the checkpoint format must reject changed-resource
+resume explicitly.
+The seven-profile acceptance gate remains open under the 20-minute ceiling.
+
+The focused GUI regression suite passed 22/22 tests. A retained `dist` GUI
+startup smoke succeeded, but this Windows session's computer-control service
+did not expose any native windows, so compact-width, 135% text, keyboard and
+end-to-end accessibility acceptance remain unverified here.
+
+### September 27 prospective-freeze workflow audit
+
+`freeze-candidate` freezes the candidate in a current-schema rolling
+comparison only with full coverage, zero failures and a paired upper
+confidence bound below zero. The current v19b comparison does not qualify
+and cannot freeze the selected staged incumbent; a fresh eligible comparison
+with staged as its candidate would be required. `evaluate-sealed` is tied to
+the prior global once-only marker, already consumed for the June 18-July 17
+test. The current implementation preflights source/plan identity, solver setup,
+and exact date coverage before atomically reserving that marker with exclusive
+creation. It still must not be repurposed for a later window as-is.
+No held-out outcomes were inspected or evaluated in this audit.
+
+A genuinely later window requires a distinct dated freeze and consumption
+record, the same complete-date preflight and irreversible exclusive reservation
+for a distinct per-window marker, and fresh plan/source identities. If a valid
+candidate is frozen by September 27, before the September 28 target is
+available, September 28-October 27 is the conservative earliest 30-day
+window; a later freeze shifts it. The development cutoff remains August 26;
+the old August 28-September 26 seal must not become development tuning data.
+No candidate has been frozen and no prospective window has been consumed.
+
+Phase handoff: `master` at `23a73e0` has only documentation tracked edits in
+`TODO.md`, `docs/PERFORMANCE.md`, and this ledger. The focused Rust 1.97 GUI
+suite (22 tests), four-feedback Criterion run, both nine-day runtime probes,
+artifact identity/path comparison and `git diff --check` passed. The new
+runtime-probe reports remain private under `target/`; both ignored `dist`
+executables remain. Next:
+resolve the consumed-window training-history rule, design a complete-date
+prospective preflight and dated freeze record, and profile the staged exact
+metric rescans before changing solver behavior. The native UI gate and full
+seven-profile run remain open; no commit or push was made.
+
+### September 27 checkpoint resource-identity correction
+
+Evidence checkpoint schema/hash domain v4 now records and binds the effective
+Rayon worker count and maximum time/memory ceilings. A resumed run rejects
+changed resource settings or a v3 checkpoint before accepting its completed
+profile prefix. A raw v3 JSON regression checks the explicit unsupported-schema
+error, and a malformed v4 JSON lacking resource fields cannot resume. The
+final benchmark artifact schema remains v7; its resource budget is recorded,
+but its effective Rayon worker count still resides only in the run log and
+checkpoint. Existing v3 checkpoints remain private evidence but cannot resume
+under v4; this is not a seven-profile completion or a solver-score change.
+
+After the change, `cargo +1.97.0 fmt --check`, warnings-denied all-target
+Clippy, `cargo +1.97.0 test --all-targets` (318 library, 30 CLI, 6 integration,
+14 predictive-characterization tests and benchmark smokes), and
+`git diff --check` passed. The source change is confined to
+`src/solver/eval.rs`; the prior runtime probes and retained `dist` executables
+still reflect the preceding binary. No rebuild, freeze, sealed evaluation,
+commit, or push occurred. The next prospective design must require complete
+date coverage before marker creation and exclusive per-window acquisition;
+the existing global marker remains completed for the old test.
+
+### September 27 maintenance and native-window recheck
+
+The obsolete Python optimizer is absent, and the deterministic archive check
+passes. The formal pattern table is untracked and reproducible. Cargo declares
+Rust 1.97, CI pins 1.97.0 and uses `actions/checkout@v7`. A local
+`cargo audit --no-fetch` found no vulnerabilities (only unmaintained-crate
+warnings). A fresh read-only GitHub check reported zero open Dependabot alerts;
+CI for `23a73e0` completed successfully in both the Windows `rust` and native
+`macos-memory` jobs. This closes those maintenance and macOS-sampler checks,
+not macOS GUI validation or the separate Linux/headless build-contract question.
+
+The retained Windows GUI launched and exposed one `Maybe Wordle` window. Its
+accessibility tree named the controls and represented board cells as text, not
+buttons. The Windows helper could capture that tree but could not activate the
+window; the screenshot showed the desktop. A refreshed window selection and
+one raise/retry also failed. Pixel layout and keyboard behavior therefore
+remain unverified. No in-app controls were changed; no new benchmark, sealed
+evaluation, commit or push occurred. Branch `master` remains at `23a73e0`
+with the earlier checkpoint/source and documentation edits; `dist` is preserved
+but predates the checkpoint-v4 source change. Next: decide the headless support contract,
+obtain a usable native GUI interaction session, and continue the candidate
+and prospective gates without opening protected dates.
+
+### September 27 sealed-marker preflight hardening
+
+The existing, consumed once-only evaluator now builds its solver and checks
+for exactly one history date on every day of the declared inclusive window
+before creating a marker. Marker acquisition uses exclusive `create_new`,
+followed by a file sync and, on Unix, a parent-directory sync; a failed
+post-acquisition write or sync remains fail-closed. Toy regressions cover
+missing/duplicate dates and two simultaneous acquisition attempts. No real
+sealed or prospective evaluation ran. This fixes the old evaluator's preflight
+and race defects, but does not introduce a dated prospective freeze/marker or
+change the incumbent promotion rule. Windows new-file pathname durability
+across power loss remains unproven; see [`PERSISTENCE.md`](PERSISTENCE.md).
+
+With this source change, Rust 1.97 formatting, warnings-denied all-target
+Clippy, and all-target tests passed (320 library, 30 CLI, 6 integration,
+14 predictive-characterization tests plus benchmark smokes). Public evidence
+redaction and both CI documentation verifiers passed, as did `git diff --check`.
+The source edit is still only `src/solver/eval.rs`; `dist` still contains the
+earlier runnable executables and must be rebuilt after source work is final.
+The full seven-profile gate, selected-policy candidate, native GUI acceptance
+and prospective freeze/evaluation remain open. No staging, commit or push.
+
+The proposed bucket-size zero-failure certificate was audited but not run as
+a study. The existing CLI does not report eligibility; a temporary diagnostic
+could count selected staged moves on allowed development states, but that would
+not enumerate alternative legal roots or prove a better choice. The 14,855-
+survivor opening state already exceeds the certificate's 1,211-survivor
+six-turn ceiling. No production routing change follows from this audit.
+
+### September 27 dynamic-finite fallback partition experiment
+
+The opt-in finite kernel now groups dormant fallback answers by feedback once
+per candidate guess and passes the corresponding bucket to each positive-mass
+non-green child. It preserves the existing activation, recovery, hard-mode and
+memo transitions; direct child calls still perform their own checked fallback
+scan. The TDD duplicate-letter regression failed on the preceding code at
+work unit 31 under a 30-unit cap, then passed with three distinct matching
+fallback branches and a 42-unit cap. All 27 finite-module tests passed on Rust
+1.97. An independent read-only review found no correctness defect. It did
+flag that eager bucketing may waste work if an early branch prunes; a
+completed value is unchanged, but the bounded search may stop at a different
+root because work and elapsed time have changed.
+
+The matched retrospective matrix was
+`config/experiments/september-dynamic-finite-matched.json`, July 28-August 26,
+30 development dates, a 300-second evidence ceiling, and unchanged
+config/matrix/history snapshot/resource settings. The old release CLI SHA-256
+was `3F6409143FF9545DCBA54741E90F5EBDE19D736FFCF55A6F6386D4F616C2DDAD`;
+the changed CLI was
+`5824C5643F1D70A76670069DCB01B22973B79FCFFE15D8B381C9C07FC37C5897`.
+After a Clippy-only annotation, the final rebuilt CLI was
+`BA31A05334B38A77A567DAA027109D29068A89B37B45C9D29133C9535DF78C0A`;
+it received its own matched replay. All four accepted reports are private
+under `target/diagnostics/` with `fallback-partition-` filenames; they
+contain word-bearing paths and are not public artifacts.
+An initial old-binary run exited 1 after all games because its source
+identity changed while a test fixture was edited; it was discarded. The
+source was then held fixed and the clean old-binary run completed before
+the changed binary was built. All four accepted reports have
+`sealed_test_evaluated=false`, 30/30 solves and zero coverage gaps/failures
+for both profiles. The old and first changed run had 30/30 matching dates,
+targets, and staged paths.
+
+| Executable/run | Staged mean | Dynamic finite mean | Finite minus staged, 95% paired interval | Finite per-move p95 | Mean finite work units/step |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Old, clean baseline | 3.3333 | 3.4000 | +0.0667 [-0.1333,+0.2667] | 258.56 ms | 8.40M |
+| One-pass partition | 3.3333 | 3.3000 | -0.0333 [-0.2333,+0.1333] | 260.68 ms | 7.78M |
+| Same changed binary, repeat | 3.3333 | 3.2667 | -0.0667 [-0.3333,+0.1667] | 264.54 ms | 7.65M |
+| Final rebuilt CLI | 3.3333 | 3.3667 | +0.0333 [-0.2000,+0.2333] | 263.28 ms | 7.53M |
+
+The changed run's finite first move differed from the old run in all 30
+games, and its paired old-to-new outcome was seven improved, 17 tied, six
+worse. The two changed-binary repeats matched 27/30 finite paths and first
+moves; the final rebuild matched 28/30 paths against the first changed run
+and did not retain its point-score lead. This is deadline-sensitive search,
+not a changed belief formula; all paired intervals still cross zero. The
+finite p95 remains roughly ten times
+the staged p95 and near the unchanged 250 ms root deadline. This retains a
+justified opt-in work reduction, but does not establish a selected-policy
+score or latency win, permit promotion, or approach a validated flat-three
+mean. The same-state dynamic-regret diagnostic is now available for small
+development states; the seven-profile and prospective release gates remain
+open.
+
+After the code change, `cargo +1.97.0 fmt --check`, warnings-denied all-target
+Clippy, and `cargo +1.97.0 test --all-targets --quiet` passed (321 library,
+30 CLI, 6 integration and 14 predictive-characterization tests plus benchmark
+smokes). Clippy initially exited 1 for the new eighth transition argument;
+a targeted lint explanation resolved it, without changing runtime behavior.
+Both Windows release executables were rebuilt from the final source and copied
+to ignored `dist/`; copy hashes match the release outputs (GUI
+`DE3BA0B5F339F8DED4F1B8F8206F5FFCD04D19441F90447FBF62AF75EDEA4D8F`,
+CLI `BA31A05334B38A77A567DAA027109D29068A89B37B45C9D29133C9535DF78C0A`).
+Their PE subsystems are GUI 2 and console 3, and the retained CLI help runs.
+The native GUI attempt was stopped by the user before a trustworthy layout
+capture, so its remaining narrow/enlarged-text/accessibility acceptance stays
+open. After dry-run scope and reparse-point checks, profile-scoped Cargo
+cleanup removed 2,556 release files (1.1 GiB) and 6,975 dev files (6.8
+GiB). Ignored `dist/`, diagnostics, Criterion data and identity-bound
+checkpoints were retained. No staging, commit, push, seal evaluation, or
+candidate promotion occurred.
+
+Earlier phase handoff (at that checkpoint): `master` was at `23a73e0` with eight modified tracked
+files, no staged files, and local `AGENTS.md` plus 94 private predictive JSON
+reports still untracked. The independent final checkpoint/sealed-evaluator
+review found no correctness issue. The last code change passed Rust 1.97
+formatting, warnings-denied Clippy and all-target tests; after the final
+documentation edits, both retained-CLI evidence verifiers, public redaction,
+105 local documentation links and `git diff --check` passed. Cleanup preserved
+`dist/`, diagnostics, rolling/evidence checkpoints and Criterion data. Next:
+obtain an uninterrupted native narrow/enlarged-text GUI pass, resolve the
+consumed-window training-history rule and prospective-control choice, find a
+candidate that clears the paired quality/resource guards, then run the
+seven-profile gate only if its projected wall time meets the user's limit.
+
+### September 27 same-state dynamic-regret spot checks
+
+The opt-in `same-state-dynamic-regret` command requires a staged config and an
+explicit development date/turn. It replays the artifact-free staged path to
+that turn, then compares the staged and `finite_fast_dynamic` choices at the
+same dynamic belief against an exact full-legal-root reference. Exact
+references are available only when combined active plus dormant-fallback
+support is at most six; the path and reference share one wall-clock budget.
+These isolated decisions are diagnostic, not whole-policy, prospective, or
+promotion evidence. Raw reports and target words are omitted here.
+
+| Development date / turn | Active survivors | Choice comparison | Exact-state result |
+| --- | ---: | --- | --- |
+| 2026-08-24 / 4 | 6 (dormant: 0) | Different | Staged: failure 0, attempts +0.1114125; dynamic: both 0 |
+| 2026-08-24 / 5 | 3 | Different | Zero regret |
+| 2026-08-26 / 5 | 4 | Same | Zero regret |
+| 2026-08-06 / 4 | 5 | Same | Zero regret |
+
+An August 7 turn-4 invocation with a five-second shared budget exited with a
+global-deadline error before producing a usable report. It is not a solver-
+quality result and contributes no regret evidence. The observed exact cases do
+not justify a production change. States above the six-survivor limit and
+broader score, latency, seven-profile, and prospective gates remain unresolved.
+
+An evenly spaced turn-four screen used the retained CLI SHA-256
+`2F5EA98E232BA52AF2F12964C0233F446153CD92B6B10D480830B7EB4022E4F7`
+and `config/prior.toml` on ten allowed development dates, July 30 through
+August 26 at three-day intervals. Each invocation had a 15-second shared
+budget; the two deadline-only replays were retried at 45 seconds without
+changing source or config. Eight staged paths had already solved before turn
+four, August 20 had four combined survivors and both choices had zero exact
+regret, and August 26 had eleven survivors, above the exact-reference limit.
+The screen therefore found no additional exact disagreement to justify a
+router. Solved-before-turn and oversized cases are not zero-regret samples;
+the raw summary-only reports remain under ignored `target/diagnostics/`.
+
+Current phase handoff: the opt-in same-state diagnostic and documentation are
+uncommitted. Rust 1.97 all-target tests passed (325 library, 31 CLI, 6
+integration, and 14 predictive-characterization tests plus benchmark smokes).
+The retained GUI and CLI hashes are
+`33C13CAD8AEB218C909D35D1F46ED47FCA114FCDA7842F9C73B028BCB136F98A` and
+`2F5EA98E232BA52AF2F12964C0233F446153CD92B6B10D480830B7EB4022E4F7`.
+Documentation checks passed: public-evidence redaction, both CI evidence-docs
+verifiers, and `git diff --check`. The first unpinned verifier invocation used
+Rust 1.94 and failed the crate's Rust 1.97 minimum; both checks passed when
+rerun with `+1.97.0`. Cargo's checked, profile-scoped cleanup removed 6,585
+dev files (6.4 GiB) and 2,115 release files (851.5 MiB), while retaining both
+`dist` executables, diagnostics, checkpoints and Criterion data. The new Linux
+CLI CI job has not been validated by hosted CI and remains pending push. The
+six-support limit, seven-profile and prospective gates remain open; no candidate
+ promotion, commit, or push occurred.
+
+### September 27 consumed-history decision and legacy CLI guard
+
+The owner approved using the consumed June 18-July 17 outcomes only as
+chronological training history for later target dates. They remain excluded
+from new tuning and validation targets; the existing rolling-fold construction
+already follows this distinction. The older `backtest` and `experiments` CLI
+commands now require both date bounds and validate the declared development
+policy before constructing a solver or loading answer history. Shared policy
+regressions reject overlap with the consumed interval and the reserved seal,
+while asserting that the latest allowed fold includes the consumed dates in
+its earlier training range. No protected target run was made.
+
+The changed source passed Rust 1.97 warnings-denied Clippy, formatting, and
+all-target tests (326 library, 32 CLI, 6 integration, 14 predictive
+characterization, and benchmark smokes). Public evidence redaction and both
+CI generated-document verifiers passed. This protects legacy evaluation
+entry points; it does not create a later prospective freeze, qualify a new
+policy, or change the selected solver.
+
+### September 27 staged zero-failure certificate screen
+
+The new opt-in `staged-zero-failure-certificate` command replays artifact-free
+selected staged decisions on explicit allowed development dates. For a chosen
+root with remaining horizon `h`, it rejects dormant fallback at the root and
+in every non-green exact child; each child must have at most `h-1` active
+answers, all dictionary-guessable and hard-mode legal, with positive modeled
+weight so later sequential replies remain usable. This is a sufficient
+modeled-failure-zero witness for that selected root only, not a global action
+optimum, a compact stored proof, or coverage of out-of-support answers. The
+diagnostic leaves production routing and prior configuration unchanged.
+
+The current-source August 20 one-day smoke had 1/1 history date and game
+replayed, four selected/evaluated roots, zero certified, three dormant-support
+and one unstable-modeled-support rejections, no coverage/replay failures, and
+`complete=true` in 2.2 seconds. A July 28-August 5 screen declared nine dates
+and found all nine in history but reached its four-minute budget after seven
+games were fully replayed (eighth started). It checked 22 roots: zero
+certified, 15 dormant-support and seven unstable-modeled-support rejections;
+`deadline_reached=true`, `complete=false`, no history gaps, duplicates,
+unsupported targets or replay failures. These are local aggregate diagnostics
+under ignored `target/diagnostics/`; no target/path words are published here.
+The partial screen is not a nine-day rate or a quality comparison, and provides
+no case for production routing or a flat-three claim. The seven-profile,
+prospective and native UI release gates remain open.
+
+### September 27 distinct prospective-window workflow
+
+`freeze-prospective` and `evaluate-prospective` are separate from the
+historical `freeze-candidate` / `evaluate-sealed` path and leave the declared
+August 28-September 26 seal unchanged. The new freeze reuses the development
+winner guard: complete coverage, zero failures, and a paired 95% upper bound
+strictly below zero. It creates an immutable, versioned record containing the
+validated inner freeze identity, UTC freeze timestamp, and the next 30-day
+window. Freeze schema v2 also requires exact daily history after the
+development cutoff through the UTC freeze date and binds a digest of those
+chronological training rows. At freeze time, the history must not already
+contain a target in the future window. The UTC day after the final window date
+must begin before evaluation.
+
+Evaluation checks the source/executable, pre-window history, and canonical development plan,
+reconstructs the frozen configuration, verifies exactly one history row per
+window date, and digests those rows before acquiring markers. A global
+one-window reservation prevents overlapping or repeated future windows; a
+date-named `create_new` marker records the selected window and digest without
+target words. The source and window data are checked again immediately before
+report publication. Any failure after acquisition leaves the window reserved;
+the private report defaults to ignored `target/diagnostics/`, and output
+aliases of the registry or marker, including their directory, reject before
+acquisition. The report and
+completed marker are atomically replaced. The
+synthetic identity, date-boundary, marker-race, and mutation regressions pass
+on Rust 1.97; the pre-window digest rejects changed, missing, or duplicate
+same-day training rows. No protected answers were used in tests, no real window was
+frozen or evaluated, and no prospective score exists. The current v19b
+comparison's paired upper interval remains above zero, so eligibility—not
+the mechanism—is the next blocker.
+
+### September 27 timed gate probe and integration checkpoint
+
+The opt-in `MAYBE_WORDLE_EVIDENCE_TIMING=1` release build, before the
+prospective-history identity fix, repeated the seven
+profiles on the same nine allowed July 28-August 5 development dates with 16
+Rayon workers, a 180-second cap, and private outputs under
+`target/diagnostics/` and `target/evidence-checkpoints/`. All 63 profile-games
+completed in 73.2 seconds; no seal or prospective target was evaluated. About
+71.7 seconds were game simulation, including roughly 49 seconds in the two
+staged profiles. Setup, reporting, validation, and checkpoint I/O were small.
+The earlier 64.57-second repeat and this timed repeat vary, but both project
+well above the 20-minute full-matrix ceiling; neither is a measured full run
+or score improvement. A nine-game `3.0000` staged mean is not a flat-three
+release result.
+
+After the prospective history-identity correction, Rust 1.97 formatting,
+warning-denied all-target Clippy, and all-target tests passed: 349 library,
+34 CLI, six integration, and 14 predictive-characterization tests, plus the
+benchmark harnesses. The historical Optuna archive, public redaction, and
+both generated-evidence verifiers passed after the prose alignment. The worktree remains
+uncommitted, and no real prospective freeze/consumption or production promotion
+has occurred. Native GUI interaction, a qualifying candidate, the full
+seven-profile gate, and hosted Linux CI remain open.
+
+Final local handoff for this checkpoint: `master` is still `23a73e0`, with
+13 modified tracked files, no staged files, and 95 untracked files (94
+private predictive JSON reports and the local `AGENTS.md`). The final locked
+Rust 1.97 release build produced `dist/maybe-wordle.exe` (GUI subsystem 2,
+SHA-256 `2B8E238C6833F08D4EE68613A7927CD07C7C4D3C24B4862091C03B8761A8655A`)
+and `dist/maybe-wordle-cli.exe` (console subsystem 3, SHA-256
+`4F9CEF8D39083EBC5E146084BF5154064BB44F3270768D1924321CFD90F1EF7A`).
+The CLI help launched; no native GUI acceptance was claimed. Profile-scoped
+Cargo cleanup removed 6,981 dev files (6.9 GiB) and 2,115 release files
+(853.4 MiB), retaining `dist/`, private diagnostics, and checkpoints. The
+public documentation verifiers, historical archive check, local link review,
+and diff whitespace check passed. No staging, commit, push, candidate
+promotion, or protected-window evaluation occurred.
+
+### September 27 final diff and test-isolation review
+
+Independent read-only reviews covered the tracked source, CI, test, and
+documentation diff. They found no confirmed remaining source regression. One
+prospective marker-race test reused a fixed scratch pathname: a stale marker
+reproduced a failure, then a process/timestamp-unique root made the same test
+pass. The test fixture was removed. The historical consumed sealed report's
+missing separate sealed-window source digest/recheck is now distinguished from
+the stronger prospective workflow in [`PERSISTENCE.md`](PERSISTENCE.md); the
+consumed test was not rerun. Documentation wording now distinguishes
+future-window recording from evaluation-time reservation, training history
+from forbidden validation targets, and measured from universal work savings.
+
+Rust 1.97 formatting, warnings-denied all-target Clippy, and all-target tests
+pass (349 library, 34 CLI, six integration, 14 predictive-characterization,
+plus benchmark harnesses). Both public evidence-document verifiers, public
+redaction, the legacy Optuna archive check, and `git diff --check` pass after
+the documentation corrections. The rebuilt ignored Windows distribution has
+GUI/console subsystem 2/3 and SHA-256
+`8EADC4FC363A35A90A44E2CCEBE25DB541B7F99998461AC5EBC762B1841A7768` /
+`BA03DBEF5F3A930FEE84E385200E3376E9FE054F683FEDAA6468BAD9933B7D23`;
+CLI help starts. Checked profile-scoped cleanup removed 5,727 debug files
+(5.7 GiB) and 2,115 release files (853.4 MiB), preserving `dist/` and private
+evidence/checkpoints. `master` remains at `23a73e0` with 13 modified tracked
+files, no staged files, and 95 untracked items: 94 word-bearing raw reports
+plus local `AGENTS.md`. An eventual release commit must exclude those local
+items. No selected-policy promotion, full seven-profile gate, real prospective
+freeze/evaluation, native compact/accessibility GUI acceptance, hosted Linux
+CI, commit, or push is claimed.
+
+### September 27 matched per-turn search probe
+
+The current-source release CLI repeated all seven profiles over the permitted
+July 28-August 5 development slice with 16 Rayon workers and identical
+180-second/4,096-MiB budgets. Timing-off and opt-in per-turn-timing runs
+completed 63/63 profile-games in 80.62 and 85.42 seconds respectively. Their
+input, matrix and config identities, all seven backtest summaries and every
+per-game payload matched exactly. The selected staged profile took about
+29.2 seconds in the timed run. Its 27 suggestion calls summed to 90.99 seconds
+across parallel games; three second-turn lookahead calls at 71, 71 and 103
+survivors accounted for 71.70 seconds of that summed call time. The slowest
+single call took 28.62 seconds. These overlapping call durations cannot be
+added into profile wall time; the pair also does not isolate logging overhead.
+The nine-game staged mean of 3.0000 is not a release mean or new candidate
+result. The timing-off slice projects about 54 minutes for the full 2,520-game
+matrix, still above the user's roughly 20-minute ceiling. Per-turn logs contain
+turn, survivor count, regime and duration but no target or guess words; raw
+reports remain ignored and private under `target/diagnostics/`. The next
+performance question is which lookahead child computation dominates; no
+kernel change or full-matrix run is justified by this coarse probe alone.
+
+A subsequent one-profile selected-staged diagnostic, using a different
+single-profile matrix and newer timing-only source, took 28.31 seconds. Its
+config fingerprint, backtest summary and all nine game payloads matched the
+selected row of the seven-profile report; the overall matrix/input identity
+necessarily differs. The 32 emitted search-stage lines summed to 69.76
+seconds in 176 lookahead roots, of which 69.37 seconds were inside 4,678
+small-child exact-search calls. Larger-child metric scans totaled 84 ms;
+coverage rounded to 0 ms at the log's millisecond resolution. These are
+overlapping call times, not additive wall time, but they identify recursive
+exact child search as the dominant measured bottleneck. A recursive-bound
+trial is pending path-equivalence and speed checks, with no production
+promotion or full-matrix claim.
+
+The first recursive-bound trial reused the existing admissible per-root
+bucket bound and `1e-10` margin after a finite incumbent. The same nine-date
+selected-profile run fell from 28.31 to 15.68 seconds, with identical
+configuration, backtest summary and all nine game payloads. Summed lookahead
+and exact-child times fell from 69.76/69.37 to 39.45/39.00 seconds. A
+timing-off seven-profile repeat completed in 46.52 seconds versus the
+80.62-second pre-bound pair, with unchanged matrix/config fingerprints, all
+seven summaries and all 63 game payloads. This is one local before/after
+slice, not a new solver score or proof of population latency. Its linear
+full-matrix projection is about 31 minutes, still above the roughly 20-minute
+ceiling; the full 2,520-game gate was not launched.
+
+### September 27-28 exact-search speedup and complete development gate
+
+The later recursive exact-search candidate ordering tries the highest-positive-
+mass answer first (stable lowest-index tie), while retaining all candidates.
+On the same nine allowed July 28-August 5 dates, the selected profile fell
+from 15.68 to 5.69 seconds after ordering. Seven profiles took 17.98 and
+17.96 seconds on two separate repeats, versus 80.62 seconds before the bound
+and ordering changes. Matrix/config fingerprints, all seven summaries and all
+63 game payloads matched. This demonstrates speed without changed decisions
+on the matched slice, not an improved mean score.
+
+With that measured runtime below the user's roughly 20-minute full-run ceiling,
+the current-schema development gate ran to completion using the final source
+and retained release CLI: 12 allowed folds, seven distinct profiles, and
+2,520/2,520 profile-games. The runner reported 834.39 seconds generation
+compute and 834.57 seconds wall time (13.91 minutes); peak process working
+set was 203,927,552 bytes (194.5 MiB) under the 4,096-MiB cap. Every profile
+had 360/360 scheduled and modeled games, 360/360 solves, zero failures and
+zero coverage gaps. The all-game means were previous-release 3.3306, uniform
+entropy 3.5694, cooldown entropy 3.4889, weighted proxy-only 3.2444,
+proxy-plus-exact-endgame 3.2000, staged without artifacts 3.1944, and selected
+staged with disk artifacts 3.1944. The latter two had identical 360 game paths
+on this run but remain separate artifact-mode profiles. Selected p95 suggestion
+latency was 30.57 ms, and its initial log loss/Brier were 6.6703/0.9987.
+The report's `sealed_test_evaluated` field is false; the consumed June
+validation targets and reserved August-September seal were not evaluated.
+The private source and checkpoint are under `target/diagnostics/` and
+`target/evidence-checkpoints/`. This is retrospective development evidence,
+not a new prospective result or a demonstrated score improvement over the
+selected policy. It does not qualify v19b or any other candidate for a freeze.
+
+Rust 1.97 formatting, warning-denied all-target Clippy, and all-target tests
+passed after the final search edit (351 library, 34 CLI, six integration and
+14 predictive-characterization tests, plus benchmark harnesses). The Windows
+distribution was rebuilt from that source; its GUI and CLI SHA-256 digests are
+`B20B0468D8F0AA023721BC1104753A384FD438853D5B30E2E6B3577C543201A9`
+and `EF6639CFF025848E8F6C5B3296012B6444440E1E2B82C2F6110765002EF34BEA`.
+Independent review found the recursive bound admissible and the answer-first
+ordering traversal-only; no blocking correctness or word-privacy issue was
+found. It noted that the pre-existing pooled prefix-bound scan checks
+cancellation only after its candidate-by-survivor pass, a nonblocking delay
+under the current production limits. The new
+[redacted public artifact](evidence/september-seven-profile-current-full-public-v1.json)
+and [source-backed table](generated/september-seven-profile-current-full-v1.md)
+pass their local redaction and documentation verifiers. Final hygiene and
+native compact/accessibility GUI acceptance are
+separate checks; this paragraph does not claim they passed. No commit or push
+was made.
+
+Final local handoff for this checkpoint: on `master` at `23a73e0`, the
+worktree has 15 modified tracked files, 97 untracked entries and nothing
+staged. The new public JSON (about 1.65 MB) and generated Markdown are the
+only new publication inputs; the word-bearing report and checkpoint remain
+ignored under `target/`, alongside older local raw diagnostics. Before
+cleanup, Rust 1.97 full code gates passed on the final source. After the docs
+update, redaction checked all three public artifacts, both CI-equivalent
+source-backed document verifiers passed, all 112 relative links in the five
+edited Markdown documents resolved, and `git diff --check` passed. The
+rebuilt CLI still launches, and the GUI/CLI binaries retain subsystem 2/3
+and the hashes above. Verified profile-scoped Cargo cleanup removed 6,817
+debug files (6.7 GiB) and 2,115 release files (853.6 MiB), preserving
+`dist/`, private evidence and checkpoints. Hosted CI, native compact/enlarged-
+text and accessibility GUI acceptance, a qualifying six-turn candidate,
+and real prospective confirmation remain open. No files were staged,
+committed or pushed.
+
+### September 28 same-state turn-four development diagnostic
+
+The retained CLI ran `same-state-dynamic-regret` on each July 28-August 26
+development date at turn four, with a five-second per-date shared budget and
+private summary-only output under `target/diagnostics/`. Eighteen paths had
+already solved before that turn; four initially exceeded the short budget,
+then all four reported already solved when retried at 30 seconds. The final
+classification is therefore 22 solved-before-turn-four, six exact-reference
+states with one to six combined active/dormant survivors, and two unresolved
+states above the six-answer reference limit (supports seven and eleven).
+No consumed June validation targets or reserved August-September seal were
+used. Each report binds the current source/config/data identity.
+
+Only one exact state yielded different choices: August 24, support six and
+three turns remaining. Both choices had zero exact-reference modeled failure
+regret; staged had +0.1114125 expected-attempt regret and dynamic finite had
+zero. The other five exact-state choices agreed and had zero regret. This is
+one local decision-quality signal, not an observed all-game improvement, a
+general turn-four routing class, a runtime pass, or a reason to change the
+selected policy. The eight not-yet-solved states are too few, with two lacking
+exact reference, to infer a score gain. The staged-root-seed hypothesis was
+tested separately below; it did not qualify for a policy rollout.
+
+The same cohort's two surviving turn-five paths were also checked at the
+30-second cap. Six of the eight turn-four survivors had already solved by
+turn five. August 24 had three active answers and different staged/dynamic
+actions, but both matched the exact two-turn optimum; August 26 had four
+active answers and the actions agreed at zero regret. This tiny conditional
+sample does not validate the terminal rule generally, but it supplies no
+new reason to replace it. The unresolved objective gap is earlier in play.
+
+### September 28 staged-root-seed counterfactual
+
+A temporary, opt-in finite-search diagnostic inserted the selected staged
+action after the state-local baseline without removing original proposals.
+It compared unseeded and seeded dynamic-belief finite choices on the same
+staged-replayed state, with 4,000,000 work units and a five-second safety
+deadline per finite arm. The shared report cap was 30 seconds. A unit test
+checked legal insertion, completed evaluation and original-root retention;
+another rejected invalid seeds. Both passed before the screen.
+
+The development screen covered five spaced turn-one dates and all 30
+July 28-August 26 dates at turn two. At turn three, 28 dates remained
+eligible and two had already solved. At turn four, eight remained eligible
+and 22 had already solved. Thus 71 eligible state evaluations completed the
+seeded root. Unseeded and seeded finite choices were identical in all 71;
+their result quality, stopping reason, and modeled failure/attempt values
+also matched to 1e-12. Eighteen states had exact small-state references;
+53 exceeded the six-answer reference support limit. The raw summary-only
+experimental reports remain ignored under `target/diagnostics/`; no target
+words were published. The diagnostic-only code was removed after the
+negative result, leaving the selected policy unchanged. The retained `dist`
+binaries were subsequently rebuilt from the restored source, as recorded
+below.
+
+This is a bounded proposal-screen result, not a whole-game score comparison,
+proof of global optimality on the larger states, or evidence about a higher
+work budget. The staged seed was supplied for free after its separate
+calculation, so the screen does not establish a viable full-request latency.
+It gives no reason to promote a seeded finite route or spend
+another seven-profile run on that route. Earlier-turn six-turn optimization
+remains open.
+
+### September 28 rebuilt-executable evidence and local handoff
+
+After removing the negative seed trial, Rust 1.97 formatting, warning-denied
+all-target Clippy, and all-target tests passed (351 library, 34 CLI, six
+integration, 14 predictive-characterization, plus benchmark harnesses). Both
+Windows release binaries were rebuilt from that source and copied to the
+ignored `dist/`: GUI subsystem 2, SHA-256
+`CF680A4F478A0CCFB2A435A853A788A7E613A10499D32897597C63E31880A691`;
+CLI subsystem 3, SHA-256
+`50BD7AB8B54312F476C428084D667606679310C62F95EA2E5E61E548F4DEDA97`.
+Both copied hashes matched their release outputs and the CLI help launched.
+`dist/BUILD-INFO.txt` records this build. Native compact/enlarged-text and
+accessibility GUI acceptance is still open; no visual acceptance is inferred
+from the PE subsystem check.
+
+Because executable bytes changed, a new private seven-profile development
+run was made with the retained CLI and a separate checkpoint. It completed
+all 2,520/2,520 profile-games over the same 12 allowed folds in about 15.12
+minutes (907.38 seconds generation compute), within the 1,200-second and
+4,096-MiB caps. Peak process working set was 203,755,520 bytes (194.3 MiB).
+All seven profiles solved 360/360 with zero failures and coverage gaps;
+selected staged remained 3.1944 all-game mean and 29.72 ms shared-process
+suggestion p95. The old and new reports agreed on all 2,520 targets,
+outcomes, guess paths, prior strata and posterior-calibration rows. Config and
+matrix fingerprints and selected ranges agreed; the input fingerprint changed
+because it includes the executable. The preceding private report was copied
+to a separate archive before the new report became the canonical redaction
+source. The new public redaction and generated README fragment were refreshed;
+the three-artifact redaction check, both source-backed document checks and
+112 relative Markdown links passed. The consumed validation and declared
+seal remain unused as new targets; no candidate was frozen.
+
+The Cargo profile clean dry runs scoped 6,497 dev files (6.5 GiB) and 2,115
+release files (853.6 MiB) to rebuildable outputs. No reparse points were
+found under those profile directories. The corresponding clean commands
+removed only those files while preserving `dist/`, the private reports and
+checkpoints under `target/`, and the redacted public evidence. This is the
+current local checkpoint, not a release or permission to commit or push.
+The selected staged policy still lacks an early-turn six-turn objective
+qualification; native compact/accessibility GUI acceptance and genuinely
+prospective confirmation remain open. Hosted CI for this uncommitted work is
+also unavailable until a user-authorized push.
+
+### September 28 turn-three same-state development screen
+
+The retained CLI (SHA-256
+`50BD7AB8B54312F476C428084D667606679310C62F95EA2E5E61E548F4DEDA97`)
+ran the opt-in dynamic-regret diagnostic at turn three on every July
+28-August 26 development date, with a 15-second per-date shared cap. The 28
+summary-only private reports have one input/config/source identity and a
+combined 67.38 seconds of measured generation time. Two dates were already
+solved before turn three; the CLI returned exit 1 with
+`selected turn occurs after the staged path was solved` and produced no report.
+These are not solver failures or zero-regret samples.
+
+Twelve states had exact full-legal-root references at one to five combined
+active/dormant answers. Staged and `finite_fast_dynamic` chose the same action
+in all twelve, with zero modeled failure and expected-attempt regret for each.
+Sixteen states exceeded the six-answer exact-reference limit. Four of those
+had different actions, all without an exact regret value; the disagreements
+include dormant fallback support or a larger active set. This complete
+normal-mode turn-three screen narrows the unresolved objective gap to larger
+states, but does not show a score gain, qualify a router, validate recursive
+hard-mode behavior, or authorize production promotion. No consumed validation
+or reserved seal targets were evaluated. The raw reports remain under ignored
+`target/diagnostics/`.
+
+### September 28 dynamic exact-shortcut correction and current build
+
+An independent source audit found that the finite kernel's direct two-active-
+answer `Exact` shortcut could claim zero modeled failure after a first miss
+even when that miss would activate dormant fallback answers. A threshold-one
+dynamic-oracle regression failed before the correction: the shortcut returned
+zero failure risk where the oracle returned 0.0586543. The shortcut now runs
+for a single legal active answer, or for two legal active answers only when
+the dynamic belief has no dormant fallback survivors. The regression passes;
+Rust 1.97 formatting, warning-denied all-target Clippy and all-target tests
+also pass (352 library, 34 CLI, six integration and 14 predictive-
+characterization tests, plus benchmark harnesses). This repairs the modeled
+finite continuation in low-threshold configurations. It does not change the
+selected staged policy. Under the selected threshold-four configuration,
+ordinary and recursive feedback transitions activate matching dormant words
+before a two-active-plus-dormant node is reached, so the prior same-state
+references known to use that config are not semantically invalidated. Other
+historical reports retain their recorded executable identity; no blanket
+fresh-source claim is made for them.
+
+The rebuilt Windows GUI/CLI binaries were copied to retained `dist/` from the
+release outputs. Their SHA-256 digests are respectively
+`D83A91D9D1F76F8594473837DB4F2C8DCD8BBD87271C3C8F817D67E5D61E3675`
+and `D2F3DF1B9B5D53FC6B49BA017CE5C4AEE985584DE34237C6B7FF407C928D39CD`;
+both copies match their release outputs. The PE subsystems are GUI 2 and
+console 3, and CLI help launched. Per the user's request, the GUI was left
+closed, so narrow/enlarged-text and accessibility acceptance remain open.
+
+A fresh current-CLI matched July 28-August 26 dynamic-finite diagnostic
+solved 30/30 with zero coverage gaps for each profile: selected staged
+3.3333, opt-in `finite_fast_dynamic` 3.3667, finite-minus-staged paired
+interval [-0.1333,+0.1667] around +0.0333. Their shared-process p95
+suggestion latencies were 22.68 and 265.31 ms. Compared with the earlier
+pre-fix executable's final matched report, staged kept all 30 paths; finite
+kept only one path while six outcomes improved, five worsened and 19 retained
+the same guess count. Both finite reports had the same 3.3667 point mean.
+The bounded root deadline and changed executable preclude attributing those
+individual path differences to the shortcut fix; there is no demonstrated
+score or latency win and no promotion.
+
+The current-binary seven-profile matrix completed all 2,520 profile-games
+over the 12 permitted development folds in 665.16 seconds (about 11.1
+minutes), under the 1,200-second and 4,096-MiB caps, with a 191.5-MiB peak
+process working set. Every profile solved 360/360 with zero failures and
+coverage gaps. Selected staged remained 3.1944 with 21.83-ms shared-process
+suggestion p95. Relative to the preceding 15.12-minute executable, all
+2,520 inputs, game paths, outcomes, prior strata and posterior-calibration
+rows matched; config/matrix identities and selected ranges also matched.
+The input fingerprint changed with the executable. None of the seven
+profiles uses dynamic finite search, so neither the unchanged score nor
+the shorter elapsed time demonstrates benefit from this correctness fix.
+The previous private source report was archived separately under `target/`
+before the current report became the canonical redaction input. The public
+copy and README table were regenerated from it; all three redactions and
+both CI-equivalent source-backed documentation checks pass. The consumed
+validation targets and reserved seal remain untouched as new targets.
+Native GUI acceptance, a qualifying early-turn six-turn candidate, genuinely
+prospective confirmation and hosted CI remain open. No commit or push was made.

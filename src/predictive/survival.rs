@@ -516,13 +516,6 @@ pub fn build_fold_training_inputs(
     Ok(data)
 }
 
-pub fn prepare_fold_training_inputs(
-    observations: &[SurvivalObservation],
-    fold: FoldSpec,
-) -> SurvivalResult<FoldTrainingData> {
-    build_fold_training_inputs(observations, fold)
-}
-
 fn fingerprint_observations(fold: &FoldSpec, observations: &[SurvivalObservation]) -> String {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, &fold.id);
@@ -690,6 +683,29 @@ pub struct SurvivalPrediction {
     pub reusable_weight: f64,
     pub never_used_weight: f64,
     pub historically_used_mass_fraction: f64,
+}
+
+impl SurvivalPrediction {
+    pub fn validate(&self) -> SurvivalResult<()> {
+        for (name, value) in [
+            ("hazard", self.hazard),
+            ("survival", self.survival),
+            ("reuse_probability", self.reuse_probability),
+            ("reusable_weight", self.reusable_weight),
+            ("never_used_weight", self.never_used_weight),
+            (
+                "historically_used_mass_fraction",
+                self.historically_used_mass_fraction,
+            ),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(SurvivalError::Numeric(format!(
+                    "prediction {name} must be finite and in [0, 1]"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Fitted discrete-time model.  It is an experimental artifact and does not
@@ -924,16 +940,19 @@ impl SurvivalModel {
         }
         self.config.validate()?;
         validate_policy_eras(&self.policy_eras)?;
-        if self.era_ids.is_empty() {
-            return Err(SurvivalError::InvalidArtifact(
-                "model must contain at least one era id".to_string(),
-            ));
-        }
-        if self.era_ids.iter().any(|id| id.trim().is_empty())
-            || self.era_ids.windows(2).any(|pair| pair[0] == pair[1])
+        if self
+            .policy_eras
+            .windows(2)
+            .any(|pair| pair[0].start >= pair[1].start)
+            || !self
+                .era_ids
+                .iter()
+                .map(String::as_str)
+                .eq(self.policy_eras.iter().map(|era| era.id.as_str()))
         {
             return Err(SurvivalError::InvalidArtifact(
-                "model era ids must be non-empty and unique".to_string(),
+                "model era basis must exactly match the chronologically ordered policy eras"
+                    .to_string(),
             ));
         }
         let expected_dimension = self.config.basis_degree + self.era_ids.len();
@@ -950,15 +969,25 @@ impl SurvivalModel {
             || self.mass.never_used < 0.0
             || self.mass.reused < 0.0
             || self.mass.right_censored < 0.0
+            || !self.mass.total().is_finite()
             || self.mass.total() <= 0.0
         {
             return Err(SurvivalError::InvalidArtifact(
                 "model mass summary must be finite and positive".to_string(),
             ));
         }
-        if self.training_observations == 0 && self.training_rows != 0 {
+        if self.training_observations == 0
+            || self.training_rows == 0
+            || self.mass.reused + self.mass.right_censored <= 0.0
+        {
             return Err(SurvivalError::InvalidArtifact(
-                "training rows cannot exist without observations".to_string(),
+                "inference requires training observations, nonzero risk rows and at-risk mass"
+                    .to_string(),
+            ));
+        }
+        if !self.converged {
+            return Err(SurvivalError::InvalidArtifact(
+                "hazard fit did not converge; model is ineligible for inference".to_string(),
             ));
         }
         validate_fingerprint(&self.training_fingerprint, "training")
@@ -966,14 +995,6 @@ impl SurvivalModel {
 
     pub fn mass_summary(&self) -> MassSummary {
         self.mass
-    }
-
-    pub fn hazard_score(&self, elapsed_days: f64, policy_era: &str) -> f64 {
-        self.predict(elapsed_days, policy_era).hazard
-    }
-
-    pub fn reusable_weight(&self, elapsed_days: f64, policy_era: &str) -> f64 {
-        self.predict(elapsed_days, policy_era).reusable_weight
     }
 
     pub fn try_predict(
@@ -992,7 +1013,12 @@ impl SurvivalModel {
                 "unknown policy era {policy_era}"
             )));
         }
-        let elapsed = elapsed_days.min(self.config.max_interval_days as f64);
+        if elapsed_days > self.config.max_interval_days as f64 {
+            return Err(SurvivalError::InvalidInput(
+                "survival prediction interval exceeds configured range".to_string(),
+            ));
+        }
+        let elapsed = elapsed_days;
         let hazard = sigmoid_clamped(
             dot(
                 &self.coefficients,
@@ -1005,7 +1031,7 @@ impl SurvivalModel {
                 ),
             ),
             self.config.min_probability,
-        );
+        )?;
         let days = elapsed.ceil() as usize;
         let mut log_survival = 0.0;
         for day in 0..days {
@@ -1021,7 +1047,7 @@ impl SurvivalModel {
                     ),
                 ),
                 self.config.min_probability,
-            );
+            )?;
             log_survival += (1.0 - day_hazard).ln();
             if log_survival < -745.0 {
                 log_survival = -745.0;
@@ -1034,14 +1060,16 @@ impl SurvivalModel {
         let historically_used_mass_fraction = self.mass.historically_used_fraction();
         let reusable_weight = (hazard * historically_used_mass_fraction).clamp(0.0, 1.0);
         let never_used_weight = self.mass.never_used_fraction().clamp(0.0, 1.0);
-        Ok(SurvivalPrediction {
+        let prediction = SurvivalPrediction {
             hazard,
             survival,
             reuse_probability,
             reusable_weight,
             never_used_weight,
             historically_used_mass_fraction,
-        })
+        };
+        prediction.validate()?;
+        Ok(prediction)
     }
 
     /// Predict reuse across a dated interval, applying the policy era in force
@@ -1080,7 +1108,7 @@ impl SurvivalModel {
                 ),
             ),
             self.config.min_probability,
-        );
+        )?;
         let mut log_survival = 0.0;
         for offset in 0..elapsed {
             let risk_date = last_use
@@ -1105,7 +1133,7 @@ impl SurvivalModel {
                     ),
                 ),
                 self.config.min_probability,
-            );
+            )?;
             log_survival += (1.0 - day_hazard).ln();
             if log_survival < -745.0 {
                 log_survival = -745.0;
@@ -1114,48 +1142,16 @@ impl SurvivalModel {
         }
         let survival = log_survival.exp().clamp(0.0, 1.0);
         let historically_used_mass_fraction = self.mass.historically_used_fraction();
-        Ok(SurvivalPrediction {
+        let prediction = SurvivalPrediction {
             hazard,
             survival,
             reuse_probability: (1.0 - survival).clamp(0.0, 1.0) * historically_used_mass_fraction,
             reusable_weight: (hazard * historically_used_mass_fraction).clamp(0.0, 1.0),
             never_used_weight: self.mass.never_used_fraction().clamp(0.0, 1.0),
             historically_used_mass_fraction,
-        })
-    }
-
-    /// Panic-free convenience inference.  Invalid elapsed values are treated
-    /// as time zero; callers that need diagnostics should use `try_predict`.
-    pub fn predict(&self, elapsed_days: f64, policy_era: &str) -> SurvivalPrediction {
-        let elapsed = if elapsed_days.is_finite() && elapsed_days >= 0.0 {
-            elapsed_days
-        } else {
-            0.0
         };
-        self.try_predict(elapsed, policy_era)
-            .unwrap_or_else(|_| SurvivalPrediction {
-                hazard: 0.5,
-                survival: 1.0,
-                reuse_probability: 0.0,
-                reusable_weight: 0.0,
-                never_used_weight: self.mass.never_used_fraction(),
-                historically_used_mass_fraction: self.mass.historically_used_fraction(),
-            })
-    }
-
-    pub fn score_for_status(
-        &self,
-        status: ObservationStatus,
-        elapsed_days: f64,
-        policy_era: &str,
-    ) -> f64 {
-        let prediction = self.predict(elapsed_days, policy_era);
-        match status {
-            ObservationStatus::NeverUsed => prediction.never_used_weight,
-            ObservationStatus::Reused | ObservationStatus::RightCensored => {
-                prediction.reusable_weight
-            }
-        }
+        prediction.validate()?;
+        Ok(prediction)
     }
 }
 
@@ -1217,7 +1213,9 @@ fn fit_coefficients(
 ) -> SurvivalResult<(Vec<f64>, bool)> {
     let mut coefficients = vec![0.0; dimension];
     if rows.is_empty() {
-        return Ok((coefficients, true));
+        return Err(SurvivalError::InvalidInput(
+            "cannot fit a hazard model without risk rows".to_string(),
+        ));
     }
     let mut converged = false;
     for _ in 0..config.max_iterations {
@@ -1349,9 +1347,13 @@ fn sigmoid(value: f64) -> f64 {
     }
 }
 
-fn sigmoid_clamped(value: f64, floor: f64) -> f64 {
-    let value = if value.is_finite() { value } else { 0.0 };
-    sigmoid(value.clamp(-40.0, 40.0)).clamp(floor, 1.0 - floor)
+fn sigmoid_clamped(value: f64, floor: f64) -> SurvivalResult<f64> {
+    if !value.is_finite() {
+        return Err(SurvivalError::Numeric(
+            "non-finite hazard linear predictor".to_string(),
+        ));
+    }
+    Ok(sigmoid(value.clamp(-40.0, 40.0)).clamp(floor, 1.0 - floor))
 }
 
 /// Provenance required for an artifact to be auditable and fold-local.
@@ -1549,12 +1551,7 @@ impl SurvivalArtifact {
     }
 
     pub fn promotion_allowed(&self) -> bool {
-        self.promotion.enabled
-            && self
-                .promotion
-                .evidence_gate
-                .validate_for_promotion()
-                .is_ok()
+        self.promotion.enabled && self.validate().is_ok()
     }
 
     pub fn to_json(&self) -> SurvivalResult<String> {
@@ -1804,6 +1801,170 @@ mod tests {
             fold_id: "fold-1".to_string(),
             training_cutoff: date(10),
         }
+    }
+
+    fn fitted_model() -> SurvivalModel {
+        SurvivalModel::fit_with_policy_eras(
+            &[SurvivalObservation::reused_observation(
+                "word",
+                date(1),
+                date(3),
+                "legacy",
+            )],
+            &[era()],
+            &SurvivalConfig::default(),
+        )
+        .expect("toy model")
+    }
+
+    #[test]
+    fn inference_rejects_invalid_inputs_models_and_overflow() {
+        let model = fitted_model();
+        for elapsed in [-1.0, f64::NAN, f64::INFINITY, 10_001.0] {
+            assert!(
+                model.try_predict(elapsed, "legacy").is_err(),
+                "elapsed {elapsed}"
+            );
+        }
+        assert!(model.try_predict(1.0, "unknown").is_err());
+        let mut invalid = model.clone();
+        invalid.schema_version += 1;
+        assert!(invalid.try_predict(1.0, "legacy").is_err());
+        invalid = model.clone();
+        invalid.coefficients.pop();
+        assert!(invalid.try_predict(1.0, "legacy").is_err());
+        invalid = model.clone();
+        invalid.coefficients[0] = f64::NAN;
+        assert!(invalid.try_predict(1.0, "legacy").is_err());
+        invalid = model.clone();
+        invalid.coefficients.fill(f64::MAX);
+        assert!(invalid.try_predict(10_000.0, "legacy").is_err());
+        assert!(invalid.try_predict_interval(date(1), date(19)).is_err());
+        invalid = model;
+        invalid.mass.reused = f64::MAX;
+        invalid.mass.never_used = f64::MAX;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn era_basis_must_exactly_match_canonical_policy_order() {
+        let mut model = fitted_model();
+        model.policy_eras = vec![
+            PolicyEra::new("a", date(1), Some(date(5))),
+            PolicyEra::new("b", date(5), Some(date(10))),
+            PolicyEra::new("c", date(10), None),
+        ];
+        model.era_ids = vec!["a".into(), "b".into(), "c".into()];
+        model
+            .coefficients
+            .resize(model.config.basis_degree + 3, 0.0);
+        assert!(model.validate().is_ok());
+        for ids in [["a", "b", "a"], ["b", "a", "c"], ["a", "b", "unknown"]] {
+            model.era_ids = ids.map(str::to_string).to_vec();
+            assert!(model.validate().is_err(), "ids {ids:?}");
+        }
+        model.era_ids = vec!["a".into(), "b".into(), "c".into()];
+        model.policy_eras.swap(0, 1);
+        assert!(model.validate().is_err());
+    }
+
+    #[test]
+    fn no_risk_or_nonconverged_models_are_ineligible() {
+        assert!(
+            SurvivalModel::fit_with_policy_eras(
+                &[SurvivalObservation::never_used("word", date(2), "legacy")],
+                &[era()],
+                &SurvivalConfig::default(),
+            )
+            .is_err()
+        );
+        let config = SurvivalConfig {
+            max_iterations: 1,
+            ..SurvivalConfig::default()
+        };
+        assert!(
+            SurvivalModel::fit_with_policy_eras(
+                &[SurvivalObservation::reused_observation(
+                    "word",
+                    date(1),
+                    date(3),
+                    "legacy"
+                )],
+                &[era()],
+                &config,
+            )
+            .is_err()
+        );
+        let mut model = fitted_model();
+        model.converged = false;
+        assert!(model.try_predict(1.0, "legacy").is_err());
+        model.converged = true;
+        model.training_rows = 0;
+        assert!(model.try_predict(1.0, "legacy").is_err());
+        model.training_rows = 1;
+        model.mass = MassSummary {
+            never_used: 1.0,
+            reused: 0.0,
+            right_censored: 0.0,
+        };
+        assert!(model.try_predict(1.0, "legacy").is_err());
+    }
+
+    #[test]
+    fn prediction_validation_checks_every_field() {
+        let prediction = fitted_model()
+            .try_predict(2.0, "legacy")
+            .expect("prediction");
+        for index in 0..6 {
+            for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+                let mut candidate = prediction.clone();
+                let fields = [
+                    &mut candidate.hazard,
+                    &mut candidate.survival,
+                    &mut candidate.reuse_probability,
+                    &mut candidate.reusable_weight,
+                    &mut candidate.never_used_weight,
+                    &mut candidate.historically_used_mass_fraction,
+                ];
+                *fields.into_iter().nth(index).expect("field") = invalid;
+                assert!(candidate.validate().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_requires_a_valid_model_even_with_complete_gate() {
+        let model = fitted_model();
+        let fingerprint = model.training_fingerprint.clone();
+        let mut artifact = SurvivalArtifact::new(
+            model,
+            "toy",
+            LeftTruncationMetadata::default(),
+            provenance(fingerprint),
+        );
+        artifact.promotion = PromotionMetadata {
+            enabled: true,
+            evidence_gate: EvidenceGateMetadata {
+                gate_id: "toy".into(),
+                validation_folds: 1,
+                fold_ids: vec!["fold-1".into()],
+                source_identity: "toy-source".into(),
+                coverage_ok: true,
+                failure_count: 0,
+                held_out: true,
+                paired_solve_quality_ok: true,
+                latency_ok: true,
+                memory_ok: true,
+                sealed_window_untouched: true,
+                approved_by: "test".into(),
+            },
+        };
+        assert!(artifact.promotion_allowed());
+        artifact.model.era_ids[0] = "unknown".into();
+        assert!(!artifact.promotion_allowed());
+        assert!(
+            SurvivalArtifact::from_json(&serde_json::to_string(&artifact).expect("json")).is_err()
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use super::{PredictivePromotionSource, RecoveryMode};
 pub enum PredictiveArtifactState {
     ExactDateArtifact,
     RecentOpenerArtifact,
+    RecentReplyArtifact,
     LiveSessionFallback,
     NoPredictiveArtifactAvailable,
 }
@@ -13,6 +14,7 @@ impl PredictiveArtifactState {
         match self {
             Self::ExactDateArtifact => "Using exact-date predictive artifact",
             Self::RecentOpenerArtifact => "Using recent opener artifact",
+            Self::RecentReplyArtifact => "Using recent reply artifact",
             Self::LiveSessionFallback => "Using live session fallback",
             Self::NoPredictiveArtifactAvailable => "No predictive artifact available",
         }
@@ -20,7 +22,9 @@ impl PredictiveArtifactState {
 
     pub fn compute_text(self) -> &'static str {
         match self {
-            Self::ExactDateArtifact | Self::RecentOpenerArtifact => "disk-backed",
+            Self::ExactDateArtifact | Self::RecentOpenerArtifact | Self::RecentReplyArtifact => {
+                "disk-backed"
+            }
             Self::LiveSessionFallback => "live session fallback",
             Self::NoPredictiveArtifactAvailable => "no predictive artifact available",
         }
@@ -31,6 +35,7 @@ impl PredictiveArtifactState {
             Some(PredictivePromotionSource::ExactDateOpenerArtifact)
             | Some(PredictivePromotionSource::ReplyBook) => Self::ExactDateArtifact,
             Some(PredictivePromotionSource::RecentOpenerArtifact) => Self::RecentOpenerArtifact,
+            Some(PredictivePromotionSource::RecentReplyBook) => Self::RecentReplyArtifact,
             Some(PredictivePromotionSource::SessionRootFallback)
             | Some(PredictivePromotionSource::SessionReplyFallback)
             | Some(PredictivePromotionSource::SessionThirdFallback) => Self::LiveSessionFallback,

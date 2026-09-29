@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::scoring::ALL_GREEN_PATTERN;
 
-pub const EXHAUSTIVE_COST_FORMAT_VERSION: u32 = 1;
+pub const EXHAUSTIVE_COST_FORMAT_VERSION: u32 = 2;
 pub const REPLAY_IDENTITY_FORMAT_VERSION: u32 = 1;
 
 /// A state partition used by the exhaustive graph.  Survivor ids and weights are
@@ -281,7 +281,18 @@ pub struct BellmanSolution {
 /// continuation cost zero.  A branch that leaves a state unchanged is treated as
 /// an invalid (infinite) action and is excluded from the finite training rows.
 pub fn exhaustive_bellman(nodes: &[BellmanStateNode]) -> Result<BellmanSolution> {
+    exhaustive_bellman_with_row_limit(nodes, usize::MAX)
+}
+
+fn exhaustive_bellman_with_row_limit(
+    nodes: &[BellmanStateNode],
+    maximum_rows: usize,
+) -> Result<BellmanSolution> {
     ensure!(!nodes.is_empty(), "Bellman graph must not be empty");
+    ensure!(
+        nodes.len() <= maximum_rows,
+        "Bellman states require more finite rows than the row budget"
+    );
     let mut graph = BTreeMap::new();
     for node in nodes {
         node.validate()?;
@@ -324,6 +335,10 @@ pub fn exhaustive_bellman(nodes: &[BellmanStateNode]) -> Result<BellmanSolution>
         for action in &node.actions {
             let cost = action_cost(&state_id, action, &graph, &mut memo, &mut visiting)?;
             if cost.is_finite() {
+                ensure!(
+                    action_costs.len().saturating_add(finite.len()) < maximum_rows,
+                    "Bellman actions exceed row budget"
+                );
                 finite.push((action.guess.clone(), cost));
             }
         }
@@ -846,8 +861,6 @@ impl ReplayIdentityInput {
     }
 }
 
-pub type ReplayIdentityInputs = ReplayIdentityInput;
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DatasetProvenance {
     pub dataset_id: String,
@@ -886,7 +899,16 @@ impl DatasetProvenance {
             self.cutoff_start <= self.cutoff_end,
             "provenance cutoff range is inverted"
         );
-        self.replay_identity.validate()
+        self.replay_identity.validate()?;
+        ensure!(
+            self.source_data_fingerprint == self.replay_identity.source_data_fingerprint,
+            "provenance source data fingerprint disagrees with replay identity"
+        );
+        ensure!(
+            self.config_fingerprint == self.replay_identity.config_fingerprint,
+            "provenance config fingerprint disagrees with replay identity"
+        );
+        Ok(())
     }
 
     pub fn replay_digest(&self) -> Result<String> {
@@ -968,6 +990,8 @@ pub struct ExhaustiveCostCheckpoint {
     pub budget: ResourceBudget,
     pub progress: ExhaustiveProgress,
     pub completed_state_ids: Vec<String>,
+    /// Recorded only after the teacher finishes all selected actions for a state.
+    pub completed_state_row_counts: BTreeMap<String, usize>,
     pub rows: Vec<ExhaustiveCostRow>,
 }
 
@@ -980,31 +1004,26 @@ impl ExhaustiveCostCheckpoint {
             EXHAUSTIVE_COST_FORMAT_VERSION
         );
         ensure!(
-            !self.replay_identity_digest.trim().is_empty(),
-            "checkpoint replay digest is empty"
+            self.replay_identity_digest.len() == 64
+                && self
+                    .replay_identity_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "checkpoint replay digest must be a lowercase SHA-256 hex digest"
         );
-        self.budget.validate()?;
         ensure!(
             self.completed_state_ids
-                .windows(2)
-                .all(|pair| pair[0] < pair[1]),
-            "checkpoint state ids must be strictly sorted"
+                .iter()
+                .eq(self.completed_state_row_counts.keys()),
+            "checkpoint completed ids must exactly match sorted completion-count keys"
         );
-        ensure!(
-            self.progress.rows_emitted == self.rows.len(),
-            "checkpoint progress row count disagrees with rows"
-        );
-        ensure!(
-            self.progress.states_evaluated == self.completed_state_ids.len(),
-            "checkpoint progress state count disagrees with completed state ids"
-        );
-        ensure!(
-            self.rows.len() <= self.budget.maximum_rows,
-            "checkpoint exceeds row budget"
-        );
-        for row in &self.rows {
-            row.validate(splits)?;
-        }
+        validate_completed_rows(
+            &self.rows,
+            splits,
+            &self.completed_state_row_counts,
+            &self.budget,
+            &self.progress,
+        )?;
         Ok(())
     }
 }
@@ -1016,6 +1035,7 @@ pub struct ExhaustiveCostDatasetArtifact {
     pub split: DatasetSplitMetadata,
     pub budget: ResourceBudget,
     pub progress: ExhaustiveProgress,
+    pub completed_state_row_counts: BTreeMap<String, usize>,
     pub rows: Vec<ExhaustiveCostRow>,
     #[serde(default)]
     pub checkpoint: Option<ExhaustiveCostCheckpoint>,
@@ -1030,39 +1050,37 @@ impl ExhaustiveCostDatasetArtifact {
             EXHAUSTIVE_COST_FORMAT_VERSION
         );
         self.provenance.validate()?;
-        self.split.validate()?;
-        self.budget.validate()?;
         ensure!(
-            self.rows.len() <= self.budget.maximum_rows,
-            "dataset exceeds row budget"
+            self.progress.complete,
+            "a final dataset must be complete; retain partial work as a checkpoint"
         );
-        ensure!(
-            self.progress.rows_emitted == self.rows.len(),
-            "progress row count disagrees with dataset"
-        );
-        let mut keys = BTreeSet::new();
-        let mut previous = None::<String>;
+        validate_completed_rows(
+            &self.rows,
+            &self.split,
+            &self.completed_state_row_counts,
+            &self.budget,
+            &self.progress,
+        )?;
         for row in &self.rows {
-            row.validate(&self.split)?;
+            let date = row.state.date.expect("validated dated row");
             ensure!(
-                keys.insert(row.key()),
-                "duplicate dataset row {}",
-                row.key()
+                date >= self.provenance.cutoff_start && date <= self.provenance.cutoff_end,
+                "row {} date lies outside provenance cutoffs",
+                row.state.state_id
             );
-            let key = row.key();
-            if let Some(previous) = previous {
-                ensure!(
-                    previous < key,
-                    "dataset rows must be deterministically sorted by state/guess"
-                );
-            }
-            previous = Some(key);
         }
         if let Some(checkpoint) = &self.checkpoint {
             checkpoint.validate(&self.split)?;
             ensure!(
                 checkpoint.replay_identity_digest == self.provenance.replay_digest()?,
                 "checkpoint replay identity does not match dataset provenance"
+            );
+            ensure!(
+                checkpoint.budget == self.budget
+                    && checkpoint.progress == self.progress
+                    && checkpoint.rows == self.rows
+                    && checkpoint.completed_state_row_counts == self.completed_state_row_counts,
+                "attached checkpoint does not exactly describe the dataset"
             );
         }
         Ok(())
@@ -1088,15 +1106,132 @@ impl ExhaustiveCostDatasetArtifact {
         canonical.checkpoint = None;
         let bytes = serde_json::to_vec(&canonical)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"maybe-wordle-exhaustive-cost-artifact-v1");
+        hasher.update(b"maybe-wordle-exhaustive-cost-artifact-v2");
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
         Ok(crate::identity::hex(&hasher.finalize()))
     }
+}
 
-    pub fn rows_for_split(&self, split: DatasetSplit) -> impl Iterator<Item = &ExhaustiveCostRow> {
-        self.rows.iter().filter(move |row| row.split == split)
+fn validate_completed_rows(
+    rows: &[ExhaustiveCostRow],
+    splits: &DatasetSplitMetadata,
+    completed_counts: &BTreeMap<String, usize>,
+    budget: &ResourceBudget,
+    progress: &ExhaustiveProgress,
+) -> Result<()> {
+    splits.validate()?;
+    budget.validate()?;
+    ensure!(rows.len() <= budget.maximum_rows, "rows exceed row budget");
+    ensure!(
+        completed_counts.len() <= budget.maximum_states,
+        "completed states exceed state budget"
+    );
+    ensure!(
+        completed_counts.values().all(|count| *count > 0),
+        "completed states must have at least one action row"
+    );
+    let mut actual_counts = BTreeMap::new();
+    let mut previous: Option<&ExhaustiveCostRow> = None;
+    for row in rows {
+        row.validate(splits)?;
+        if let Some(previous) = previous {
+            ensure!(
+                (&previous.state.state_id, &previous.guess) < (&row.state.state_id, &row.guess),
+                "rows must have unique keys and be sorted by state/guess"
+            );
+            if previous.state.state_id == row.state.state_id {
+                ensure!(
+                    previous.state == row.state && previous.split == row.split,
+                    "rows disagree on state description or split for {}",
+                    row.state.state_id
+                );
+            }
+        }
+        *actual_counts
+            .entry(row.state.state_id.clone())
+            .or_insert(0usize) += 1;
+        previous = Some(row);
     }
+    ensure!(
+        &actual_counts == completed_counts,
+        "rows do not exactly match completed-state row counts"
+    );
+    ensure!(
+        progress.rows_emitted == rows.len() && progress.states_evaluated == completed_counts.len(),
+        "progress counts disagree with completed states and rows"
+    );
+    ensure!(
+        progress.last_state_id.as_ref() == completed_counts.keys().next_back(),
+        "progress last state disagrees with completed states"
+    );
+    ensure!(
+        !progress.phase.trim().is_empty() && progress.complete == (progress.phase == "complete"),
+        "progress phase disagrees with completion status"
+    );
+    ensure!(
+        !progress.complete || (!rows.is_empty() && progress.stop_reason.is_none()),
+        "complete progress requires rows and no stop reason"
+    );
+    ensure!(
+        progress
+            .stop_reason
+            .as_ref()
+            .is_none_or(|reason| !reason.trim().is_empty()),
+        "stop reason must not be blank"
+    );
+    let explicitly_stopped = !progress.complete && progress.stop_reason.is_some();
+    ensure!(
+        explicitly_stopped || progress.elapsed_ms <= budget.maximum_seconds.saturating_mul(1_000),
+        "progress exceeds elapsed-time budget"
+    );
+    if let Some(limit) = budget.maximum_memory_bytes {
+        ensure!(
+            rows.is_empty() || progress.peak_memory_bytes.is_some(),
+            "memory-budgeted progress must include measured peak memory"
+        );
+        ensure!(
+            explicitly_stopped || progress.peak_memory_bytes.is_none_or(|peak| peak <= limit),
+            "progress exceeds memory budget"
+        );
+    }
+    Ok(())
+}
+
+/// Validate one completed state's rows against the independently reconstructed
+/// state and finite teacher action identities. Pass only that state's rows;
+/// checkpoint validation alone cannot establish which actions the teacher selected.
+/// Validate the checkpoint first for schema, numeric and cross-state invariants.
+pub fn validate_completed_state_rows(
+    rows: &[ExhaustiveCostRow],
+    expected_state: &ExactState,
+    expected_split: DatasetSplit,
+    expected_guesses: &[String],
+) -> Result<()> {
+    expected_state.validate()?;
+    let expected = expected_guesses.iter().collect::<BTreeSet<_>>();
+    ensure!(
+        !expected.is_empty()
+            && expected.len() == expected_guesses.len()
+            && expected.iter().all(|guess| !guess.trim().is_empty()),
+        "expected teacher actions must be nonempty and unique"
+    );
+    let mut canonical_state = expected_state.clone();
+    for weight in &mut canonical_state.survivor_weights {
+        *weight = canonical_evidence_float(*weight);
+    }
+    canonical_state.validate()?;
+    let actual = rows.iter().map(|row| &row.guess).collect::<BTreeSet<_>>();
+    ensure!(
+        rows.len() == expected.len() && actual == expected,
+        "completed state action identities disagree with teacher"
+    );
+    ensure!(
+        rows.iter()
+            .all(|row| row.state == canonical_state && row.split == expected_split),
+        "completed state description or split disagrees with reconstructed state"
+    );
+    Ok(())
 }
 
 /// Materialize all finite action costs from a solved Bellman graph.  This is the
@@ -1109,6 +1244,8 @@ pub fn build_exhaustive_cost_dataset(
     split: DatasetSplitMetadata,
     budget: ResourceBudget,
 ) -> Result<ExhaustiveCostDatasetArtifact> {
+    #[cfg(test)]
+    MATERIALIZED_ACTION_VISITS.set(0);
     let started = Instant::now();
     budget.validate()?;
     provenance.validate()?;
@@ -1117,16 +1254,17 @@ pub fn build_exhaustive_cost_dataset(
         nodes.len() <= budget.maximum_states,
         "Bellman graph exceeds state budget"
     );
-    let recomputed = exhaustive_bellman(nodes)?;
+    ensure!(
+        solution.action_costs.len() <= budget.maximum_rows,
+        "supplied Bellman actions exceed row budget"
+    );
+    let recomputed = exhaustive_bellman_with_row_limit(nodes, budget.maximum_rows)?;
     ensure!(
         &recomputed == solution,
         "supplied Bellman solution does not match the graph"
     );
-    let mut rows = Vec::new();
-    let node_map = nodes
-        .iter()
-        .map(|node| (node.state.state_id.as_str(), node))
-        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::with_capacity(recomputed.action_costs.len());
+    let mut node_map = BTreeMap::new();
     for node in nodes {
         ensure!(
             started.elapsed().as_secs() <= budget.maximum_seconds,
@@ -1142,36 +1280,32 @@ pub fn build_exhaustive_cost_dataset(
             );
         }
         let row_split = split.classify(&node.state)?;
-        for action in &node.actions {
-            let Some(cost) = recomputed
-                .action_costs
-                .iter()
-                .find(|entry| entry.state_id == node.state.state_id && entry.guess == action.guess)
-                .map(|entry| entry.exact_continuation_cost)
-            else {
-                continue;
-            };
-            let mut row = ExhaustiveCostRow {
-                state: node.state.clone(),
-                guess: action.guess.clone(),
-                exact_continuation_cost: cost,
-                feature_values: Vec::new(),
-                baseline_proxy_cost: None,
-                split: row_split,
-            };
-            row.canonicalize_numeric_values();
-            rows.push(row);
-        }
+        node_map.insert(node.state.state_id.as_str(), (&node.state, row_split));
     }
-    rows.sort_by_key(|row| row.key());
-    ensure!(
-        rows.len() <= budget.maximum_rows,
-        "Bellman rows exceed row budget"
-    );
-    ensure!(
-        node_map.len() == nodes.len(),
-        "Bellman graph contains duplicate state ids"
-    );
+    let mut completed_state_row_counts = BTreeMap::new();
+    // exhaustive_bellman has already established unique, sorted action keys.
+    for action in &recomputed.action_costs {
+        ensure!(
+            rows.len() < budget.maximum_rows,
+            "Bellman rows exceed row budget"
+        );
+        #[cfg(test)]
+        MATERIALIZED_ACTION_VISITS.set(MATERIALIZED_ACTION_VISITS.get() + 1);
+        let (state, row_split) = node_map[action.state_id.as_str()];
+        let mut row = ExhaustiveCostRow {
+            state: state.clone(),
+            guess: action.guess.clone(),
+            exact_continuation_cost: action.exact_continuation_cost,
+            feature_values: Vec::new(),
+            baseline_proxy_cost: None,
+            split: row_split,
+        };
+        row.canonicalize_numeric_values();
+        rows.push(row);
+        *completed_state_row_counts
+            .entry(action.state_id.clone())
+            .or_insert(0usize) += 1;
+    }
     let progress = ExhaustiveProgress {
         phase: "complete".to_string(),
         states_evaluated: nodes.len(),
@@ -1193,11 +1327,17 @@ pub fn build_exhaustive_cost_dataset(
         split,
         budget,
         progress,
+        completed_state_row_counts,
         rows,
         checkpoint: None,
     };
     artifact.validate()?;
     Ok(artifact)
+}
+
+#[cfg(test)]
+thread_local! {
+    static MATERIALIZED_ACTION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1240,6 +1380,415 @@ mod tests {
             cutoff_end: NaiveDate::from_ymd_opt(2024, 1, 3).expect("date"),
             replay_identity: identity(),
         }
+    }
+
+    fn dataset() -> ExhaustiveCostDatasetArtifact {
+        let split = DatasetSplitMetadata::chronological(ChronologicalSplitMetadata {
+            train_end: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            validation_start: NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            validation_end: NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            test_start: NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
+            test_end: NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
+        })
+        .unwrap();
+        let rows = [("s", "a"), ("s", "b"), ("t", "a")]
+            .into_iter()
+            .map(|(id, guess)| ExhaustiveCostRow {
+                state: state(id, "2024-01-01", "trajectory", 0, &[1]),
+                guess: guess.to_string(),
+                exact_continuation_cost: 1.0,
+                feature_values: vec![0.5],
+                baseline_proxy_cost: Some(1.0),
+                split: DatasetSplit::Train,
+            })
+            .collect::<Vec<_>>();
+        ExhaustiveCostDatasetArtifact {
+            format_version: EXHAUSTIVE_COST_FORMAT_VERSION,
+            provenance: provenance(),
+            split,
+            budget: ResourceBudget::default(),
+            progress: ExhaustiveProgress {
+                phase: "complete".into(),
+                states_evaluated: 2,
+                rows_emitted: 3,
+                last_state_id: Some("t".into()),
+                complete: true,
+                ..ExhaustiveProgress::default()
+            },
+            completed_state_row_counts: BTreeMap::from([("s".into(), 2), ("t".into(), 1)]),
+            rows,
+            checkpoint: None,
+        }
+    }
+
+    fn checkpoint(artifact: &ExhaustiveCostDatasetArtifact) -> ExhaustiveCostCheckpoint {
+        ExhaustiveCostCheckpoint {
+            format_version: EXHAUSTIVE_COST_FORMAT_VERSION,
+            replay_identity_digest: artifact.provenance.replay_digest().unwrap(),
+            budget: artifact.budget,
+            progress: artifact.progress.clone(),
+            completed_state_row_counts: artifact.completed_state_row_counts.clone(),
+            completed_state_ids: vec!["s".into(), "t".into()],
+            rows: artifact.rows.clone(),
+        }
+    }
+
+    #[test]
+    fn provenance_rejects_disagreement_with_replay_identity() {
+        let mut artifact = dataset();
+        artifact.validate().unwrap();
+        artifact.provenance.source_data_fingerprint = "other-data".into();
+        assert!(artifact.validate().is_err());
+        let mut artifact = dataset();
+        artifact.provenance.config_fingerprint = "other-config".into();
+        assert!(artifact.validate().is_err());
+    }
+
+    #[test]
+    fn rows_for_one_state_must_describe_the_identical_state() {
+        let mutations: [fn(&mut ExhaustiveCostRow); 4] = [
+            |row| row.state.survivor_weights[0] = 2.0,
+            |row| row.state.trajectory_id = "different".into(),
+            |row| row.state.step_index += 1,
+            |row| {
+                row.state.date = Some(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap());
+                row.split = DatasetSplit::Validation;
+            },
+        ];
+        for mutate in mutations {
+            let mut artifact = dataset();
+            mutate(&mut artifact.rows[1]);
+            assert!(artifact.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_rows_must_exactly_cover_completed_states() {
+        let artifact = dataset();
+        let mut checkpoint = checkpoint(&artifact);
+        checkpoint.validate(&artifact.split).unwrap();
+        checkpoint.rows.pop();
+        checkpoint.progress.rows_emitted = checkpoint.rows.len();
+        assert!(checkpoint.validate(&artifact.split).is_err());
+    }
+
+    #[test]
+    fn checkpoint_rejects_duplicate_rows() {
+        let artifact = dataset();
+        let mut checkpoint = checkpoint(&artifact);
+        checkpoint.rows.insert(1, checkpoint.rows[0].clone());
+        checkpoint.progress.rows_emitted = checkpoint.rows.len();
+        assert!(checkpoint.validate(&artifact.split).is_err());
+    }
+
+    #[test]
+    fn dataset_rejects_false_progress_and_attached_checkpoint() {
+        let mut artifact = dataset();
+        artifact.progress.states_evaluated = 99;
+        assert!(artifact.validate().is_err());
+        let mut artifact = dataset();
+        artifact.budget.maximum_states = 1;
+        assert!(artifact.validate().is_err());
+        let mut artifact = dataset();
+        let mut attached = checkpoint(&artifact);
+        attached.rows[0].exact_continuation_cost = 2.0;
+        artifact.checkpoint = Some(attached);
+        assert!(artifact.validate().is_err());
+    }
+
+    #[test]
+    fn row_budget_is_checked_before_bellman_recomputation() {
+        let mut nodes = vec![BellmanStateNode {
+            state: state("s", "2024-01-01", "t", 0, &[1]),
+            actions: ["a", "b"]
+                .map(|guess| BellmanAction {
+                    guess: guess.into(),
+                    outcomes: vec![BellmanOutcome::solved(242, 1.0)],
+                })
+                .to_vec(),
+        }];
+        let solution = exhaustive_bellman(&nodes).unwrap();
+        nodes[0].state.survivor_weights[0] = f64::NAN;
+        let artifact = dataset();
+        let error = build_exhaustive_cost_dataset(
+            &nodes,
+            &solution,
+            artifact.provenance,
+            artifact.split,
+            ResourceBudget {
+                maximum_rows: 1,
+                ..ResourceBudget::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("row budget"), "{error}");
+        assert_eq!(MATERIALIZED_ACTION_VISITS.get(), 0);
+    }
+
+    #[test]
+    fn checkpoint_rejects_partial_state_deletion_even_with_updated_total() {
+        let artifact = dataset();
+        let mut checkpoint = checkpoint(&artifact);
+        checkpoint.rows.remove(0);
+        checkpoint.progress.rows_emitted = checkpoint.rows.len();
+        assert!(checkpoint.validate(&artifact.split).is_err());
+        let mut artifact = dataset();
+        artifact.rows.remove(0);
+        artifact.progress.rows_emitted = artifact.rows.len();
+        assert!(artifact.validate().is_err());
+    }
+
+    #[test]
+    fn checkpoint_ids_counts_and_rows_cannot_name_different_states() {
+        let artifact = dataset();
+        let original = checkpoint(&artifact);
+        for ids in [
+            vec!["s".into()],
+            vec!["s".into(), "unknown".into()],
+            vec!["t".into(), "s".into()],
+            vec!["s".into(), "s".into()],
+        ] {
+            let mut checkpoint = original.clone();
+            checkpoint.completed_state_ids = ids;
+            assert!(checkpoint.validate(&artifact.split).is_err());
+        }
+        let mut checkpoint = original.clone();
+        checkpoint.completed_state_row_counts.insert("s".into(), 0);
+        assert!(checkpoint.validate(&artifact.split).is_err());
+        let mut checkpoint = original;
+        checkpoint.rows.last_mut().unwrap().state.state_id = "unknown".into();
+        assert!(checkpoint.validate(&artifact.split).is_err());
+    }
+
+    #[test]
+    fn progress_and_provenance_bounds_are_checked_at_load() {
+        let mutations: [fn(&mut ExhaustiveCostDatasetArtifact); 7] = [
+            |artifact| artifact.progress.last_state_id = Some("unknown".into()),
+            |artifact| artifact.progress.stop_reason = Some("stopped".into()),
+            |artifact| artifact.progress.complete = false,
+            |artifact| artifact.progress.elapsed_ms = artifact.budget.maximum_seconds * 1_000 + 1,
+            |artifact| artifact.budget.maximum_memory_bytes = Some(1),
+            |artifact| {
+                artifact.budget.maximum_memory_bytes = Some(1);
+                artifact.progress.peak_memory_bytes = Some(2);
+            },
+            |artifact| {
+                artifact.provenance.cutoff_start = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()
+            },
+        ];
+        for mutate in mutations {
+            let mut artifact = dataset();
+            mutate(&mut artifact);
+            let serialized = serde_json::to_string(&artifact).unwrap();
+            assert!(ExhaustiveCostDatasetArtifact::from_json(&serialized).is_err());
+        }
+        let artifact = dataset();
+        let mut checkpoint = checkpoint(&artifact);
+        checkpoint.rows.clear();
+        checkpoint.completed_state_ids.clear();
+        checkpoint.completed_state_row_counts.clear();
+        checkpoint.progress = ExhaustiveProgress::default();
+        checkpoint.validate(&artifact.split).unwrap();
+    }
+
+    #[test]
+    fn schema_two_requires_authoritative_completion_counts() {
+        let artifact = dataset();
+        let mut value = serde_json::to_value(&artifact).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("completed_state_row_counts");
+        assert!(ExhaustiveCostDatasetArtifact::from_json(&value.to_string()).is_err());
+        let mut artifact = artifact;
+        artifact.format_version = 1;
+        assert!(artifact.validate().is_err());
+    }
+
+    #[test]
+    fn stopped_incomplete_checkpoint_retains_actual_overrun_without_becoming_complete() {
+        let artifact = dataset();
+        let mut stopped = checkpoint(&artifact);
+        stopped.progress.phase = "interrupted".into();
+        stopped.progress.complete = false;
+        stopped.progress.elapsed_ms = stopped.budget.maximum_seconds * 1_000 + 1;
+        stopped.budget.maximum_memory_bytes = Some(1);
+        stopped.progress.peak_memory_bytes = Some(2);
+        stopped.progress.stop_reason =
+            Some("offline evaluation exceeded its resource budget".into());
+        stopped.validate(&artifact.split).unwrap();
+        stopped.progress.stop_reason = None;
+        assert!(stopped.validate(&artifact.split).is_err());
+        stopped.progress.complete = true;
+        stopped.progress.phase = "complete".into();
+        stopped.progress.stop_reason = Some("exhausted".into());
+        assert!(stopped.validate(&artifact.split).is_err());
+    }
+
+    #[test]
+    fn matching_attached_checkpoint_round_trips_without_changing_digest() {
+        let mut artifact = dataset();
+        let digest = artifact.digest_hex().unwrap();
+        artifact.checkpoint = Some(checkpoint(&artifact));
+        let decoded =
+            ExhaustiveCostDatasetArtifact::from_json(&artifact.to_json().unwrap()).unwrap();
+        assert_eq!(artifact, decoded);
+        assert_eq!(decoded.digest_hex().unwrap(), digest);
+    }
+
+    #[test]
+    fn reconstructed_state_and_teacher_action_set_are_required_for_resume() {
+        let artifact = dataset();
+        let rows = &artifact.rows[..2];
+        let state = &rows[0].state;
+        let actions = vec!["a".into(), "b".into()];
+        validate_completed_state_rows(rows, state, DatasetSplit::Train, &actions).unwrap();
+        for actions in [
+            vec!["a".into()],
+            vec!["a".into(), "other".into()],
+            vec!["a".into(), "a".into()],
+        ] {
+            assert!(
+                validate_completed_state_rows(rows, state, DatasetSplit::Train, &actions).is_err()
+            );
+        }
+        let mut changed = state.clone();
+        changed.survivor_weights[0] = 2.0;
+        assert!(
+            validate_completed_state_rows(rows, &changed, DatasetSplit::Train, &actions).is_err()
+        );
+        assert!(
+            validate_completed_state_rows(rows, state, DatasetSplit::Validation, &actions).is_err()
+        );
+        assert!(
+            validate_completed_state_rows(&artifact.rows, state, DatasetSplit::Train, &actions)
+                .is_err()
+        );
+    }
+
+    fn terminal_graph(states: usize, actions: usize) -> Vec<BellmanStateNode> {
+        (0..states)
+            .map(|index| BellmanStateNode {
+                state: state(
+                    &format!("s{index:04}"),
+                    "2024-01-01",
+                    "trajectory",
+                    0,
+                    &[index as u32],
+                ),
+                actions: (0..actions)
+                    .map(|guess| BellmanAction {
+                        guess: format!("g{guess:04}"),
+                        outcomes: vec![BellmanOutcome::solved(242, 1.0)],
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keyed_materialization_visits_each_action_once_and_is_order_independent() {
+        for states in [16, 32, 64, 128] {
+            let mut nodes = terminal_graph(states, 8);
+            let solution = exhaustive_bellman(&nodes).unwrap();
+            let fixture = dataset();
+            let artifact = build_exhaustive_cost_dataset(
+                &nodes,
+                &solution,
+                fixture.provenance.clone(),
+                fixture.split.clone(),
+                fixture.budget,
+            )
+            .unwrap();
+            assert_eq!(MATERIALIZED_ACTION_VISITS.get(), states * 8);
+            assert_eq!(artifact.rows.len(), states * 8);
+            assert!(
+                artifact
+                    .rows
+                    .iter()
+                    .all(|row| row.exact_continuation_cost == 1.0)
+            );
+            let expected = nodes
+                .iter()
+                .flat_map(|node| {
+                    node.actions
+                        .iter()
+                        .map(|action| (node.state.state_id.clone(), action.guess.clone()))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                artifact
+                    .rows
+                    .iter()
+                    .map(|row| (row.state.state_id.clone(), row.guess.clone()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            nodes.reverse();
+            for node in &mut nodes {
+                node.actions.reverse();
+            }
+            let reordered = build_exhaustive_cost_dataset(
+                &nodes,
+                &solution,
+                fixture.provenance,
+                fixture.split,
+                fixture.budget,
+            )
+            .unwrap();
+            assert_eq!(MATERIALIZED_ACTION_VISITS.get(), states * 8);
+            assert_eq!(artifact.rows, reordered.rows);
+            assert_eq!(
+                artifact.digest_hex().unwrap(),
+                reordered.digest_hex().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_recomputation_cannot_trust_an_underreported_solution() {
+        let nodes = terminal_graph(2, 8);
+        let mut solution = exhaustive_bellman(&nodes).unwrap();
+        solution.action_costs.clear();
+        let fixture = dataset();
+        let error = build_exhaustive_cost_dataset(
+            &nodes,
+            &solution,
+            fixture.provenance,
+            fixture.split,
+            ResourceBudget {
+                maximum_rows: 4,
+                ..ResourceBudget::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("row budget"), "{error}");
+        assert_eq!(MATERIALIZED_ACTION_VISITS.get(), 0);
+    }
+
+    #[test]
+    fn graph_verification_still_rejects_duplicate_and_changed_actions() {
+        let nodes = terminal_graph(2, 2);
+        let solution = exhaustive_bellman(&nodes).unwrap();
+        let mut duplicate = nodes.clone();
+        duplicate[0].actions.push(nodes[0].actions[0].clone());
+        assert!(exhaustive_bellman(&duplicate).is_err());
+        let mut duplicate = nodes.clone();
+        duplicate.push(nodes[0].clone());
+        assert!(exhaustive_bellman(&duplicate).is_err());
+        let mut wrong = solution;
+        wrong.action_costs[0].exact_continuation_cost = 2.0;
+        let fixture = dataset();
+        assert!(
+            build_exhaustive_cost_dataset(
+                &nodes,
+                &wrong,
+                fixture.provenance,
+                fixture.split,
+                fixture.budget
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1333,6 +1882,7 @@ mod tests {
                 stop_reason: None,
             },
             rows: vec![row],
+            completed_state_row_counts: BTreeMap::from([("s".into(), 1)]),
             checkpoint: None,
         };
         let json = artifact.to_json().expect("json");
