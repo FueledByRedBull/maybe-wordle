@@ -10,7 +10,12 @@ evidence and rebuilt `dist` are recorded in the ledger. The audit rolling replay
 reproduces all 720 prior selected/v19b paths and outcomes: 3.194444/3.191667, both
 360/360 solved, paired interval crossing zero. The full seven-profile matrix hit
 its 20-minute cap and is explicitly incomplete; its nine-date timing screen is
-not a substitute. Native GUI and hosted platform acceptance remain open.
+not a substitute. Hosted Windows/Linux/macOS tests, builds and CLI smoke
+[passed for `d2024bd`](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36591624931).
+Native interactive GUI and real Windows UNC-share acceptance remain open.
+The ledger also records local cleanup of ignored `dist`/`target` during
+publication: executables and hosted logs were restored, but earlier local-only
+checkpoints were not. The interrupted seven-profile attempt cannot be resumed locally.
 
 The predictive solver is the primary product. [September release acceptance](docs/SEPTEMBER_RELEASE.md)
 is the detailed requirement and evidence ledger. Keep the declared August 28-September 26
@@ -22,8 +27,29 @@ Historical production scores (12-fold development mean 3.1778; once-only sealed 
 
 ## Solver and evaluation
 
+- [x] Diagnose the flat-three gap using retained attempts and an all-legal-root
+  second-turn scan; see the [September 29 score diagnosis](docs/superpowers/plans/2026-09-29-score-diagnosis.md).
+  All twelve five/six-guess games are out of core. Coverage-first improvements
+  can sacrifice immediate solves; the complete scan is modeled local evidence,
+  while the empirical shadow replay stopped at 15 games and proves no score gain.
+- [x] Screen the resulting tail-belief and continuation-cost hypotheses. On 36
+  preselected dates, early uniform activation completed 33 games (+1 guess on
+  matched pairs), chronological lexical weighting completed 35 (tied), and
+  coverage-plus-immediate-solve ranking completed all 36 (tied). The first two
+  hit three/one ten-second request limits. Full staged-continuation comparisons
+  exhausted their budget on all 16 differing nominations, retaining the current
+  move with roughly 3.1x total runtime. No candidate qualified for a full replay
+  or promotion; this bounded research reached a practical plateau, not a proof
+  that sub-three performance is impossible. See the linked diagnosis for limits.
 - [ ] Find a predictive candidate that improves the guarded outcome before
-  changing selected v20. The earlier 12-fold terminal-rule replay gives
+  changing selected v20. Reopen research only with evidence for a stronger
+  date-safe answer-likelihood signal or a cheaper trustworthy continuation-value
+  comparison. Earlier whole-tail activation and weak lexical weights did not
+  qualify; the tested rollout budget yielded no complete value comparison,
+  and larger budgets remain unvalidated. Keep belief and
+  action-rule ablations separate; the diagnosis establishes neither a sub-three
+  lower bound nor a gain.
+  The earlier 12-fold terminal-rule replay gives
   selected staged 360/360 solves at 3.1944 and exploratory v19b 360/360 at
   3.1917 on the 12 allowed development folds, both with zero coverage gaps.
   Selected staged still uses unlimited-horizon ranking before the final two
@@ -299,7 +325,7 @@ Historical production scores (12-fold development mean 3.1778; once-only sealed 
   release-decision arithmetic, generated-doc check, local links and historical
   archive pass; do not treat older artifacts as changed-code validation.
   Rust 1.97 format, warnings-denied Clippy and all-target tests were rerun
-  after the CI correction; review its small final diff before repushing.
+  after the CI correction; the small final diff was reviewed before publication.
   Both retained `dist` executables are runnable, and the GUI passed the
   unlocked-desktop interaction subset above. Keep `dist` and evidence
   checkpoints.
@@ -331,13 +357,17 @@ Historical production scores (12-fold development mean 3.1778; once-only sealed 
   interval and reserved seal before solver/history loading. The shared policy
   test confirms the latest fold may still train chronologically on the consumed
   interval. This is leakage prevention, not a new score result.
-- [x] Inspect the integration push's CI and dependency-alert results. The
-  macOS job passed and no Dependabot alerts remained open, but Windows CI
-  exposed a CRLF-only predictive documentation comparison. The narrow
-  verifier correction and regression tests pass locally; its new CI run must
-  pass before calling the push green. Keep native GUI, prospective, and
-  candidate-specific paired/promotion validation gates open rather than
-  treating the integration push as release acceptance.
+- [x] Inspect the integration push's CI and dependency-alert results. The earlier
+  Windows CRLF-only documentation failure was corrected. The September 29 audit
+  push then exposed Linux fixture deadlines exhausted by test-executable hashing;
+  line-table-only test debug information reduced the overhead, and the three-platform
+  matrix passed for `d2024bd` (linked above). A later `ef9c13c` run still hit two
+  Linux completion deadlines after replay, so CI additionally optimizes only its
+  SHA-256 dependency; assertions, solver optimization and deadlines are unchanged.
+  Every published head must pass the matrix. The [dependency audit](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36590284316)
+  passed on the unchanged lockfile with its two documented maintenance exceptions.
+  Keep native GUI, real UNC-share, prospective and candidate-specific paired/promotion
+  validation gates open rather than treating the integration push as full release acceptance.
 
 Formal expansion remains conditional on a concrete feasibility improvement;
 it is not a prerequisite for a useful predictive release.
