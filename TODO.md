@@ -27,8 +27,29 @@ Historical production scores (12-fold development mean 3.1778; once-only sealed 
 
 ## Solver and evaluation
 
+- [x] Diagnose the flat-three gap using retained attempts and an all-legal-root
+  second-turn scan; see the [September 29 score diagnosis](docs/superpowers/plans/2026-09-29-score-diagnosis.md).
+  All twelve five/six-guess games are out of core. Coverage-first improvements
+  can sacrifice immediate solves; the complete scan is modeled local evidence,
+  while the empirical shadow replay stopped at 15 games and proves no score gain.
+- [x] Screen the resulting tail-belief and continuation-cost hypotheses. On 36
+  preselected dates, early uniform activation completed 33 games (+1 guess on
+  matched pairs), chronological lexical weighting completed 35 (tied), and
+  coverage-plus-immediate-solve ranking completed all 36 (tied). The first two
+  hit three/one ten-second request limits. Full staged-continuation comparisons
+  exhausted their budget on all 16 differing nominations, retaining the current
+  move with roughly 3.1x total runtime. No candidate qualified for a full replay
+  or promotion; this bounded research reached a practical plateau, not a proof
+  that sub-three performance is impossible. See the linked diagnosis for limits.
 - [ ] Find a predictive candidate that improves the guarded outcome before
-  changing selected v20. The earlier 12-fold terminal-rule replay gives
+  changing selected v20. Reopen research only with evidence for a stronger
+  date-safe answer-likelihood signal or a cheaper trustworthy continuation-value
+  comparison. Earlier whole-tail activation and weak lexical weights did not
+  qualify; the tested rollout budget yielded no complete value comparison,
+  and larger budgets remain unvalidated. Keep belief and
+  action-rule ablations separate; the diagnosis establishes neither a sub-three
+  lower bound nor a gain.
+  The earlier 12-fold terminal-rule replay gives
   selected staged 360/360 solves at 3.1944 and exploratory v19b 360/360 at
   3.1917 on the 12 allowed development folds, both with zero coverage gaps.
   Selected staged still uses unlimited-horizon ranking before the final two
