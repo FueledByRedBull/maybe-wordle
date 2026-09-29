@@ -177,8 +177,19 @@ failing fixtures, with zero failures or ignored tests; its library suite took
 88.17 seconds versus 243.73 seconds in the failing run. Unix symlink, directory-sync
 and FIFO regressions also passed on Linux and macOS. The unchanged lockfile passed
 the separate [dependency audit](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36590284316)
-with only the two documented maintenance exceptions. This closes hosted acceptance,
-not native GUI interaction, real UNC-share durability or the separate research gates.
+with only the two documented maintenance exceptions. These checks do not establish
+native GUI interaction, real UNC-share durability or the separate research gates.
+
+The documentation-only `ef9c13c` [repeat run](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36593982576)
+passed Windows/macOS but exposed remaining Linux timing instability: 534 library
+tests passed, and two staged-certificate fixtures completed their expected replay
+counters but exceeded their 10-second budgets during final executable rehashing.
+The smaller debug payload alone was therefore insufficient. The CI test command
+now also applies `profile.test.package.sha2.opt-level=3` to the existing non-generic
+SHA-256 compression implementation. Application code remains unoptimized; all
+assertions, overflow checks, concurrency, content rechecks and deadlines remain
+unchanged. No dependency version or release-build setting changed. Every published
+head still requires its own successful matrix; a prior pass does not erase this failure.
 
 ### Local artifact recovery
 

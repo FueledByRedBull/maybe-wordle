@@ -339,9 +339,11 @@ Historical production scores (12-fold development mean 3.1778; once-only sealed 
 - [x] Inspect the integration push's CI and dependency-alert results. The earlier
   Windows CRLF-only documentation failure was corrected. The September 29 audit
   push then exposed Linux fixture deadlines exhausted by test-executable hashing;
-  line-table-only test debug information fixed that overhead without changing
-  assertions or deadlines. The three-platform matrix passed for `d2024bd` (linked
-  above), and the [dependency audit](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36590284316)
+  line-table-only test debug information reduced the overhead, and the three-platform
+  matrix passed for `d2024bd` (linked above). A later `ef9c13c` run still hit two
+  Linux completion deadlines after replay, so CI additionally optimizes only its
+  SHA-256 dependency; assertions, solver optimization and deadlines are unchanged.
+  Every published head must pass the matrix. The [dependency audit](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36590284316)
   passed on the unchanged lockfile with its two documented maintenance exceptions.
   Keep native GUI, real UNC-share, prospective and candidate-specific paired/promotion
   validation gates open rather than treating the integration push as full release acceptance.

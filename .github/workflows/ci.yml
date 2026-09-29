@@ -32,7 +32,9 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --locked --all-targets
+        # Full-file identity checks need optimized SHA-256 even in debug test builds.
+        # Only this dependency is optimized; application assertions and deadlines stay intact.
+        run: cargo test --locked --all-targets --config 'profile.test.package.sha2.opt-level=3'
       - name: Build CLI and GUI without opening a window
         run: cargo build --locked --bins
       - name: CLI smoke

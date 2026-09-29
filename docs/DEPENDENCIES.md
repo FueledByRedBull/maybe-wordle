@@ -7,9 +7,13 @@ interactive GUI acceptance is separate and is not implied by a headless build.
 
 CI uses Cargo's `line-tables-only` test debug information. This retains file/line
 backtraces but avoids repeatedly hashing bulky embedded DWARF in the executable
-identity checks. Test assertions, overflow checks, optimization and cumulative
-resource deadlines are unchanged; release builds and the application are unaffected.
-See [Cargo profile debug settings](https://doc.rust-lang.org/cargo/reference/profiles.html#debug).
+identity checks. The test command additionally applies
+`--config 'profile.test.package.sha2.opt-level=3'`: only the existing SHA-256
+dependency is optimized to reduce full-file hashing overhead in tiny fixture budgets.
+Application test code stays unoptimized. Debug assertions, overflow checks,
+test concurrency, executable-content rechecks and cumulative deadlines are unchanged;
+release builds, dependency versions and application behavior are unaffected.
+See [Cargo profile debug settings and package overrides](https://doc.rust-lang.org/cargo/reference/profiles.html).
 
 The independent dependency workflow runs on relevant pull requests, weekly and
 on demand. It installs the pinned `cargo-audit` 0.22.2 with its lockfile, checks
