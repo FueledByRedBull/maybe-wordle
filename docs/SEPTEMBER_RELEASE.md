@@ -1,6 +1,6 @@
 # September predictive release acceptance plan
 
-Status: audit remediation locally verified; release/promotion acceptance below
+Status: audit remediation locally and hosted-CI verified; release/promotion acceptance below
 remains open. This plan consolidates the six source-audit and
 rollout notes supplied on September 7, 2026, against revision `1d607151` and the
 existing uncommitted August work. Historical v20 scores do not validate changed code.
@@ -32,8 +32,10 @@ The final Windows gate passed Rust 1.97 format, warning-denied locked Clippy,
 603 tests and all 15 benchmark smoke workloads. Final review reproduced empty
 search-regret aggregates displayed as numeric zero; optional JSON values and
 population-labeled CLI output now pass zero/mid/final-deadline regressions and
-the refreshed full gate. The native GUI has not been opened. Hosted three-platform CI,
-native Unix persistence/FIFO and Windows UNC acceptance are not local passes.
+the refreshed full gate. Hosted Windows/Linux/macOS tests, binary builds and CLI
+smoke [passed for `d2024bd`](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36591624931),
+including Unix-gated persistence, symlink and FIFO regressions. Native interactive
+GUI and real Windows UNC-share acceptance remain unrun; the GUI has not been opened.
 
 The selected-policy first-feedback profiler completed all six fresh/warm top
 1/5/10 calls in 844-1364 ms; each solver clone allocated 290 bytes, and a 10-ms
@@ -47,12 +49,14 @@ finished in 19.58 seconds. Its selected-policy 3.0000 mean is not a full-fold
 score. The subsequent 12-fold seven-profile run stopped at the configured
 1,200,021-ms cumulative cap, with a process peak of 229,695,488 bytes. Six complete
 profiles were retained in the local checkpoint; the selected disk-artifact profile
-was incomplete, and no final full-matrix report was published. The checkpoint and
-timeout log remain at `target/evidence-checkpoints/september-audit-seven-profile-v1.json`
-and `target/audit-work/seven-profile.log`. This is an incomplete experiment, not a
-successful release matrix or a reason to bypass its resource limit.
+was incomplete, and no final full-matrix report was published. The checkpoint at
+`target/evidence-checkpoints/september-audit-seven-profile-v1.json` and timeout log
+at `target/audit-work/seven-profile.log` were removed from the working tree during
+local cleanup. They were not recovered; this attempt
+is no longer locally resumable. The earlier recorded outcome remains an incomplete
+experiment, not a successful release matrix or a reason to bypass its resource limit.
 
-The retained complete artifact-free staged profile solved all 360 games at
+The completed artifact-free staged profile solved all 360 games at
 3.194444 guesses. The proxy-only and proxy-with-exact-endgame profiles scored
 3.244444 and 3.200000 respectively, also with 360 solves; those are within-run
 diagnostics, not causal attribution to a particular audit fix. A separately
@@ -76,8 +80,13 @@ notes; their Windows subsystems are 2 (GUI, no console) and 3 (CLI). CLI help,
 both exact CI documentation commands, public redaction and local Markdown links
 pass. Verified Cargo profile cleanup removed 8.2 GiB of debug and 1.1 GiB of
 release output while preserving dist, data, evidence and checkpoints. Publication
-was authorized after this local handoff; hosted acceptance is recorded by the CI
-run for the published commit, not inferred from these Windows checks.
+was authorized after this local handoff; the linked hosted acceptance is evidence
+for `d2024bd`, not inferred from local Windows checks. After local cleanup removed
+`dist` and `target`, an offline release rebuild restored the executables
+from unchanged application source. Their new hashes are in `dist/SHA256SUMS.txt`;
+hosted logs were downloaded again, but older local-only checkpoints and logs
+remain missing. The audit ledger records this recovery without relabeling the
+benchmark executable identity.
 
 ## Decision contract
 
@@ -243,10 +252,10 @@ evaluate the same objective. Formal proof remains optional research.
   The README explicitly packages Windows GUI/CLI executables but does not
   promise a GUI-free Linux or macOS build. CLI arguments avoid launching
   `eframe`, although the dependency and GUI module remain unconditional.
-  The added Linux CI job checks Rust compilation with that dependency; it
-  does not link or run a headless CLI, and its hosted result awaits a
-  user-authorized push. No feature split is justified by the current
-  documented contract; this inspection is not a Linux runtime claim.
+  The September 29 matrix passed all-target tests, linked both binaries and
+  ran CLI help on Windows, Linux and macOS for `d2024bd`, without opening a
+  GUI window. No feature split is justified by the current documented contract;
+  headless tests and CLI smoke do not establish native GUI usability.
 - [x] Keep the small independent formal oracle and proof tests. Larger proof work requires
   a concrete feasibility improvement; tiny-universe exponential extrapolation is not a
   theorem about Wordle strategy construction.
