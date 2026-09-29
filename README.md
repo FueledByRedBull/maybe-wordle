@@ -24,8 +24,11 @@ The audit rolling comparison retains a 3.1944 mean and 360/360 solves for select
 v20; it establishes no score gain or flat-three result. Measurements and historical
 tables retain their recorded executable identities; the final reporting-only
 regret fix is identified separately in the release ledger.
-The production configuration has not been promoted or retuned. Native GUI
-acceptance and hosted cross-platform CI remain open; this GUI was left closed.
+The production configuration has not been promoted or retuned. Hosted Windows,
+Linux and macOS tests, binary builds and CLI smoke
+[passed for `d2024bd`](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36591624931).
+Native interactive GUI and real Windows UNC-share acceptance remain open;
+the GUI was left closed.
 Dependency checks and their limited maintenance exceptions are documented in
 [DEPENDENCIES.md](docs/DEPENDENCIES.md).
 
