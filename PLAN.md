@@ -3,8 +3,10 @@
 > 2026-09-29: [The audit remediation ledger](docs/superpowers/plans/2026-09-29-audit-remediation.md)
 > records implementation and local verification for all 48 September 28 review
 > findings, including 603 passing tests and the unchanged selected-policy rolling
-> score. Native GUI/platform acceptance and candidate-promotion research remain
-> open in TODO. Earlier checkpoints retain their original evidence scope.
+> score. Hosted Windows/Linux/macOS tests, builds and CLI smoke
+> [passed for `d2024bd`](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36591624931).
+> Native interactive GUI, real UNC-share acceptance and candidate-promotion research
+> remain open in TODO. Earlier checkpoints retain their original evidence scope.
 
 > 2026-09-27 prospective-workflow checkpoint: a distinct immutable freeze and
 > once-only 30-day UTC evaluation path is implemented with synthetic tests.
