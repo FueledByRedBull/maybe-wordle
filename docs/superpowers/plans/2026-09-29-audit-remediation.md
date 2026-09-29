@@ -159,3 +159,14 @@ outputs remain local; only reviewed redacted evidence is included. Intermediate
 worker/checkpoint notes are retained in ignored task evidence rather than release
 history. Hosted acceptance belongs to the CI run for the published commit; local
 Windows checks above do not imply a cross-platform pass.
+
+The first published-source run (`3ef8978`) passed Windows/macOS and the separate
+dependency audit, but Linux failed four library tests with exhausted fixture
+deadlines. The teacher fixture spent 32.4 seconds before its tiny search and only
+0.1 seconds collecting/solving states; identity rechecking then took another
+14.3 seconds. Both preflight paths hash the complete test executable. CI now
+tests with line-table-only debug information to avoid embedded-DWARF hashing
+overhead while retaining file/line backtraces and every original assertion,
+deadline and executable-content check. The
+[failing run](https://github.com/FueledByRedBull/maybe-wordle/actions/runs/36590240153) is retained;
+the follow-up run must pass before declaring hosted acceptance complete.

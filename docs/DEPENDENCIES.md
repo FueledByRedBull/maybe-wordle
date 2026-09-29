@@ -5,6 +5,12 @@
 checks run on Windows, Linux and macOS without opening a native window. Native
 interactive GUI acceptance is separate and is not implied by a headless build.
 
+CI uses Cargo's `line-tables-only` test debug information. This retains file/line
+backtraces but avoids repeatedly hashing bulky embedded DWARF in the executable
+identity checks. Test assertions, overflow checks, optimization and cumulative
+resource deadlines are unchanged; release builds and the application are unaffected.
+See [Cargo profile debug settings](https://doc.rust-lang.org/cargo/reference/profiles.html#debug).
+
 The independent dependency workflow runs on relevant pull requests, weekly and
 on demand. It installs the pinned `cargo-audit` 0.22.2 with its lockfile, checks
 this repository's complete lockfile against current RustSec data, and fails on
