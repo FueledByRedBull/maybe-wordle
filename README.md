@@ -13,6 +13,23 @@
 > This project does not.
 > It models modern NYT Wordle as a moving target: historical answers are fetched from the live daily endpoint, candidate answers are seeded from pinned community lists, and the app can switch between a fast heuristic predictive solver and a certificate-checked fixed-model policy builder.
 
+## October 5 research close-out
+
+Selected staged v20 remains the default: no experimental policy or fitted prior
+demonstrated a qualifying score/reliability/latency improvement. The sub-three
+research is closed without achieving that target. Proven exact-search speedups
+remain; private experimental hooks are no longer part of normal builds/tests.
+The [close-out](docs/superpowers/plans/2026-10-03-subthree-research.md) separates
+the uncertain 3.1472 research result from shipped performance and preserves the
+evidence needed to avoid repeating rejected experiments.
+
+The completed seven-profile development matrix covered 2,520 profile-games with
+zero failures/gaps; selected v20 scored 3.1944 over 360 games with 21.83-ms
+shared-process suggestion p95. These are existing, executable-bound measurements,
+not a new benchmark or a promise about future answers. The earlier timed-out
+matrix was superseded by that complete run, not retroactively marked successful.
+See [remaining acceptance limits](TODO.md) and the [release ledger](docs/SEPTEMBER_RELEASE.md).
+
 ## September 29 audit build
 
 The [September 29 audit remediation](docs/superpowers/plans/2026-09-29-audit-remediation.md)
@@ -194,9 +211,9 @@ The [September acceptance plan](docs/SEPTEMBER_RELEASE.md) puts shared game sema
 and bounded search before further tuning. Live requests now name the puzzle date and
 derive history through the preceding day; effective model identities exclude future
 history. Current source has correctness changes and is not validated by the old v20
-scores. The retained `dist/` executables are the pre-audit build until the final
-verified rebuild; that does not make the experimental finite policy
-a release candidate.
+scores. The audit executables were rebuilt; the local `dist/BUILD-INFO.txt` and
+`dist/SHA256SUMS.txt` identify the retained distribution. Rebuilding does not make
+the experimental finite policy a release candidate.
 The GUI starts without a console window. A native accessibility-tree check
 found the Play controls and separate board/suggestions panels, while a locked
 desktop prevented a visual/keyboard pass; that gate remains open. The finite

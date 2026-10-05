@@ -1,7 +1,16 @@
 # September predictive release acceptance plan
 
-Status: audit remediation locally and hosted-CI verified; release/promotion acceptance below
-remains open. This plan consolidates the six source-audit and
+Current close-out, October 5: retain staged v20 and the verified exact-search
+speedups. The owner ended speculative sub-three research without a qualified
+replacement or an under-three result. The [concise research close-out](superpowers/plans/2026-10-03-subthree-research.md)
+records what was retained and archived. The later seven-profile matrix completed
+2,520/2,520 games in 665.16 seconds with no failures/gaps; older interrupted
+attempts below remain historical failures, not the current matrix status.
+Native narrow/enlarged-text/accessibility and real UNC-share acceptance remain
+open; no new policy is promoted and no seal is consumed.
+
+Audit remediation was locally and hosted-CI verified; remaining release/promotion
+acceptance limits below are not silently passed. This plan consolidates the six source-audit and
 rollout notes supplied on September 7, 2026, against revision `1d607151` and the
 existing uncommitted August work. Historical v20 scores do not validate changed code.
 The release goal includes every requirement below. A checkbox requires recorded

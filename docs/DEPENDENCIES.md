@@ -31,9 +31,10 @@ have no unknown vulnerabilities.
 
 ## Reviewed maintenance warnings
 
-The 2026-09-29 check of the actual lockfile with cargo-audit 0.22.2 found **zero
-known vulnerability advisories** and the two maintenance warnings below.
-Database revision: `f23b768236fe2880e4cfa167da662cad8ca79240`.
+The 2026-10-05 close-out check of the actual lockfile with cargo-audit 0.22.2
+passed the warning-denied command with exactly the two documented maintenance
+exceptions below. No new application dependencies or exceptions were added.
+Database revision: `ef6173cbc5c50ec8166f9a5b28f07834144373ee`.
 
 | Advisory | Locked package | Review and disposition |
 | --- | --- | --- |
