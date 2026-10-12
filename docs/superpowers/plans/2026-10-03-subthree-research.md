@@ -250,17 +250,70 @@ anything or changes the selected configuration.
   [EXPERIMENTS.md](../../EXPERIMENTS.md), with the generated evidence blocks
   unchanged.
 
+## October 12 follow-up and re-freeze
+
+Later on 2026-10-12 the owner asked for further source and dependency
+changes. Any such change voids a prospective freeze, so the 04:17Z freeze
+above was replaced before its window opened. No window data existed yet, and
+the configuration, the comparison baseline and the window are the same, so
+this is the same test made on a different build. Where this section differs
+from the close-out pass above, this section is current.
+
+- **Typed CLI arguments.** Dates are parsed by the argument parser, and solver
+  mode, merge strategy, weight mode, model variant, study stage and study
+  strategy are enumerated values. Every spelling accepted before still works
+  (`_` or `-`, any letter case, the documented aliases). An invalid value is
+  now rejected by the parser with its own wording and exit code 2 instead
+  of 1.
+- **Two experiment commands removed.** `learned-proxy-experiment` and
+  `survival-experiment` are gone together with the code only they used. Both
+  experiments had closed as not promoted; their result files and write-ups
+  stay, and the code last exists in commit `7539f30`. The other research
+  commands are kept because they reproduce the retained evidence. After all
+  of this section's changes `src/` is a net 6,654 lines smaller.
+- **Dependencies.** The three open Dependabot updates (`rayon` 1.12.0, `serde`
+  1.0.229, `toml` 1.0.6) and `eframe` 0.36.2 are in, and `quinn-proto`, which
+  is locked but never compiled, moved to 0.11.19 after five advisories against
+  it were published during the day. The audit passes with one exception
+  instead of two. See [DEPENDENCIES.md](../../DEPENDENCIES.md).
+- **Native GUI acceptance.** Repeated on the final build with the desktop
+  unlocked, including the keyboard pass that was missing above: 38 named
+  controls, five distinct tile names, no control outside the window in the
+  four layouts, and focus back in the Guess field after Enter. The new
+  renderer and text stack showed no visible difference from the morning build
+  beyond default widget styling. See
+  [EXPERIMENTS.md](../../EXPERIMENTS.md#october-12-native-acceptance).
+- **Gates.** Formatting, warning-denied Clippy, 535 tests and 15 benchmark
+  smokes pass on the final source; the count fell from 591 because tests of
+  the removed code went with it. One characterization test failed once on a
+  Windows file-replace error while the machine was busy with other work and
+  passed on the rerun.
+- **Re-freeze.** On the final CLI (SHA-256 `858956b9c06c8b8a...`), selected
+  v20 against the previous release again gave 1,150 guesses over the 360
+  development games versus 1,199, with the same paired difference and
+  interval, and matched the published September audit outcome on every date.
+  The configuration fingerprint is unchanged. Unchanged v20 was frozen again
+  at 2026-10-12T22:26Z for 2026-10-13 through 2026-11-11; the
+  [freeze record](../../../benchmarks/predictive/prospective-frozen-v1.json)
+  at the same path replaces the earlier one. The rules are as stated above:
+  one evaluation, on or after 2026-11-12 UTC, with that executable and with
+  `src/`, `tests/`, `Cargo.toml`, `Cargo.lock`, `config/evaluation.toml` and
+  `data/seed/` untouched until then.
+
 Still open:
 
 - Evaluate the prospective freeze once, on or after 2026-11-12.
-- Repeat the keyboard pass on the final build, and run a screen reader
-  (Narrator or NVDA) over the GUI.
+- Run a screen reader (Narrator or NVDA) over the GUI.
 - Test persistence on a share hosted by another machine.
-- Update `eframe` to 0.36 and reassess the dependency exceptions, after the
-  prospective evaluation and no later than 2027-02-01.
+- Reassess the remaining dependency exception on the next GUI or lockfile
+  update and no later than 2027-02-01.
 
 On 2026-10-12 the directory `target/subthree-research` named under
 "Evidence and recovery" was not present on the owner's machine, so the private
-close-out evidence and its hashes could not be rechecked. Whether it was moved
-or removed is not known. The kill-test evidence is under
-`target/oracle-membership-killtest/`.
+close-out evidence and its hashes could not be rechecked. The owner believes it
+was deleted by accident. It was not in the Recycle Bin and no moved copy was
+found under the owner's projects folder, so treat the private narrative, the
+four source snapshots, the old TODO, `research-working-tree.patch` and
+`preservation.json` as lost; the recovery steps above can no longer be
+followed. This ledger and the committed history are the surviving record. The
+kill-test evidence is under `target/oracle-membership-killtest/`.

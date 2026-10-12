@@ -365,7 +365,7 @@ Run `cargo run -- <command> --help` for options.
 | Data and models | `sync-data`, `build-model`, `add-manual`, `reconcile-seeds`, `merge-seeds`, `build-predictive-opener`, `build-predictive-replies` |
 | Formal solver | `build-optimal-policy`, `verify-optimal-policy`, `formal-scale` |
 | Evaluation and evidence | `backtest`, `experiments`, `evaluation-plan`, `benchmark`, `benchmark-evidence`, `benchmark-evidence-docs`, `rolling-compare`, `rolling-evidence-docs` |
-| Research studies | `study-run`, `tune-prior`, `fit-proxy-weights`, `parameter-registry`, `predictive-ablations`, `prior-ablations`, `evaluate-live-config`, `three-guess-gap`, `four-guess-openers`, `learned-proxy-experiment`, `survival-experiment`, `search-regret`, `same-state-dynamic-regret`, `staged-zero-failure-certificate` |
+| Research studies | `study-run`, `tune-prior`, `fit-proxy-weights`, `parameter-registry`, `predictive-ablations`, `prior-ablations`, `evaluate-live-config`, `three-guess-gap`, `four-guess-openers`, `search-regret`, `same-state-dynamic-regret`, `staged-zero-failure-certificate` |
 | Once-only evaluations | `freeze-candidate`, `evaluate-sealed`, `freeze-prospective`, `evaluate-prospective` |
 
 `backtest` and `experiments` require an explicit range inside declared
@@ -382,7 +382,7 @@ data/derived/ generated model files, pattern table and predictive books (ignored
 data/formal/  formal artifacts by model id (generated files ignored)
 src/          main.rs (CLI), gui.rs and gui/ (GUI), solver.rs and solver/ (search, evaluation),
               predictive/ (policies and state), formal.rs and formal/ (builder and verifier),
-              scoring.rs, model.rs, pattern_table.rs, atomic_file.rs, experiments/, research.rs
+              scoring.rs, model.rs, pattern_table.rs, atomic_file.rs, experiments/
 tests/        integration and predictive characterization tests
 benches/      Criterion benchmarks and the performance profile
 benchmarks/   retained machine-readable evidence

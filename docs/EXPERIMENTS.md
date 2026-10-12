@@ -280,6 +280,8 @@ independent proof or a new solve-quality score. Its finite reference is
 fixed-belief-only and must not be treated as validation of `finite_fast_dynamic`;
 use the matched dynamic-belief evidence above for that mode.
 
+Both commands described next, and the code only they used, were removed on 2026-10-12 after research closed; they last exist in commit `7539f30`. The retained result files are unchanged.
+
 The 2026-08-02 learned-model audit added two development-only commands. `learned-proxy-experiment` samples three chronological, trajectory-disjoint splits, records exact continuation costs for a deterministic proxy/entropy/worst-bucket/solve-probability guess mixture, fits a standardized residual ridge model on train rows only, selects its regularization on validation, and reports an untouched inner development test. Exact-state work is atomically checkpointed after every state; resume rejects different source/config/executable/sampling identities, reports ETA, and preserves a stable semantic dataset digest by canonicalizing evidence precision. The fresh Rust 1.97 release run produced 401 exact rows across 24 states in `8.275` seconds, plus about `1.4` seconds for the same-window production/proxy/lookahead reference audit. Baseline and learned rows both had zero top-choice regret on validation and test, but pairwise accuracy fell from `0.9527` to `0.9419` on validation and from `0.9773` to `0.9712` on test; inner-test MAE also rose from `0.002990` to `0.005397`. The five-state production/proxy/lookahead reference happened to have zero regret for all three policies, which is reassuring but far too small for promotion. The learned model is therefore not promoted. See [`learned-proxy-experiment-v1.json`](../benchmarks/predictive/learned-proxy-experiment-v1.json) and its replayable [`learned-proxy-dataset-v1.json`](../benchmarks/predictive/learned-proxy-dataset-v1.json).
 
 `survival-experiment` fits a fold-local, policy-era-aware discrete-time reuse model with right censoring, explicit never-used mass, left truncation, regularized smooth time effects, and era-preserving elapsed-time offsets. Identical day/era exposures are aggregated as weighted binomial rows without changing the likelihood. Across all 12 development folds (360 games), the Rust 1.97 release run completed in `81.768` seconds and found only 26 fold-local reuse events. Survival log loss was `6.750447` versus `6.690665` for the selected logistic curve; Brier was `0.998692788` versus `0.998682995`, with the same 23 prior-support gaps. A bounded paired proxy-policy solve audit covered all 360 games without predictive books: the logistic baseline scored `3.4250` failure-penalized mean guesses with 3 unsolved games, while survival scored `3.4444` with 1 unsolved game; conditional means were `3.4171` and `3.4415`. The survival path also had the higher maximum fold p95 (`1982.4` ms versus `1689.0` ms). This audit isolates the prior while staying bounded; it does not replace the required production lookahead/exact gate. The survival model is not promoted. See [`survival-experiment-v1.json`](../benchmarks/predictive/survival-experiment-v1.json).
@@ -379,8 +381,10 @@ CLI and GUI predictive mode are intentionally conservative:
 
 ### October 12 native acceptance
 
-Run through UI Automation against the packaged Windows build (GUI SHA-256
-`5d2d9d0ba06aa63d...`):
+Run through UI Automation and sent keystrokes against the packaged Windows
+build after the `eframe` 0.36.2 update (GUI SHA-256 `c954cf6e7219ac07...`),
+with the desktop unlocked. The same pass on the earlier `eframe` 0.32.3 build
+of that day gave the same results.
 
 - All 38 buttons, text fields, combo boxes and sliders in the default window
   expose a non-empty name. The five
@@ -390,13 +394,14 @@ Run through UI Automation against the packaged Windows build (GUI SHA-256
   minimum, at 100% and at 135% text.
 - The sort indicator reads `asc` or `desc`; the bundled fonts have no arrow
   glyphs, so the earlier arrows rendered as boxes.
-- Keyboard, on the build before these fixes: typing, Tab order, Enter-to-apply
-  and Space on buttons worked, and focus was lost after Enter. The fix returns
-  focus to the Guess field.
-- By design, Ctrl+Z (undo a row) and Esc (reset) act only when no text field
-  has focus; the on-screen hint now says so.
+- Keyboard: typing a guess and feedback and pressing Enter applies the row and
+  returns focus to the Guess field, so the next row can be typed without
+  navigating. Tab moved through the first 21 controls in visual order, and
+  Space activates a focused button.
+- By design, Ctrl+Z (undo a row) and Esc (clear the row being typed) act only
+  when no text field has focus; the on-screen hint says so. Esc inside a text
+  field leaves the field, after which Ctrl+Z undid a row.
+- Window captures at each size show the light theme and legible text with the
+  wgpu renderer.
 
-Not confirmed on the final build: the keyboard pass and the per-size
-screenshots could not be repeated because the desktop session was locked, so
-the focus fix is covered only by code review. Not done at all: a screen-reader
-pass with Narrator or NVDA.
+Not done: a screen-reader pass with Narrator or NVDA.

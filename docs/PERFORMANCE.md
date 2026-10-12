@@ -156,7 +156,7 @@ This diagnostic is not part of the canonical allocator benchmark artifact and is
 
 ## Learned-model experiment runtime
 
-The 2026-08-02 release runs are bounded development diagnostics, not interactive suggestion benchmarks:
+The 2026-08-02 release runs are bounded development diagnostics, not interactive suggestion benchmarks. Both commands were removed on 2026-10-12 and last exist in commit `7539f30`; the timings below are the retained record:
 
 | Command | Work | Release wall time | Result |
 | --- | --- | ---: | --- |
