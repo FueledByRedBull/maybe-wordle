@@ -146,6 +146,11 @@ pub fn benchmark_formal_scale(
         sample: std::sync::Mutex::new((None, None)),
     };
     let cancelled = || budget.cancelled();
+    let stop = |mut report: FormalScaleReport, reason: String| -> Result<FormalScaleReport> {
+        report.stopped_reason = Some(reason);
+        checkpoint_report(&request.output, &mut report)?;
+        Ok(report)
+    };
     report.completed = false;
     report.stopped_reason = None;
     let namespace = fingerprint
@@ -165,9 +170,7 @@ pub fn benchmark_formal_scale(
             continue;
         }
         if let Some(reason) = preflight_stop_reason(&report, request, answer_count) {
-            report.stopped_reason = Some(reason);
-            checkpoint_report(&request.output, &mut report)?;
-            return Ok(report);
+            return stop(report, reason);
         }
 
         let point_root = scratch_root.join(format!("answers-{answer_count:02}"));
@@ -193,9 +196,7 @@ pub fn benchmark_formal_scale(
         ) {
             Ok(build) => build,
             Err(error) if error.downcast_ref::<super::FormalSearchStop>().is_some() => {
-                report.stopped_reason = Some(budget.reason());
-                checkpoint_report(&request.output, &mut report)?;
-                return Ok(report);
+                return stop(report, budget.reason());
             }
             Err(error) => return Err(error),
         };
@@ -209,9 +210,7 @@ pub fn benchmark_formal_scale(
         ) {
             Ok(verify) => verify,
             Err(error) if error.downcast_ref::<super::FormalSearchStop>().is_some() => {
-                report.stopped_reason = Some(budget.reason());
-                checkpoint_report(&request.output, &mut report)?;
-                return Ok(report);
+                return stop(report, budget.reason());
             }
             Err(error) => return Err(error),
         };
@@ -240,17 +239,16 @@ pub fn benchmark_formal_scale(
         report.full_model_projection = projection(&report.points, report.source_answer_count);
         checkpoint_report(&request.output, &mut report)?;
         if cancelled() {
-            report.stopped_reason = Some(budget.reason());
-            checkpoint_report(&request.output, &mut report)?;
-            return Ok(report);
+            return stop(report, budget.reason());
         }
         if report.points.iter().fold(0u64, |total, point| {
             total.saturating_add(point.artifact_bytes)
         }) > mib(request.maximum_disk_mb)
         {
-            report.stopped_reason = Some("completed artifacts exceed the disk budget".to_string());
-            checkpoint_report(&request.output, &mut report)?;
-            return Ok(report);
+            return stop(
+                report,
+                "completed artifacts exceed the disk budget".to_string(),
+            );
         }
     }
 
@@ -455,7 +453,11 @@ fn preflight_stop_reason(
             predicted_artifact_bytes / (1024.0 * 1024.0)
         ));
     }
-    if let Some(predicted_millis) = predict_next_millis(&report.points, next_answer_count) {
+    if let Some(predicted_millis) =
+        predict_next_metric(&report.points, next_answer_count, |point| {
+            point.build_millis.max(1) as f64
+        })
+    {
         let remaining_millis = request.maximum_seconds as f64 * 1_000.0 - elapsed_millis as f64;
         if predicted_millis * 1.25 > remaining_millis {
             return Some(format!(
@@ -553,12 +555,6 @@ fn validate_resumed_artifacts(
         }
     }
     Ok(())
-}
-
-fn predict_next_millis(points: &[FormalScalePoint], next_answer_count: usize) -> Option<f64> {
-    predict_next_metric(points, next_answer_count, |point| {
-        point.build_millis.max(1) as f64
-    })
 }
 
 fn predict_next_metric(
@@ -711,10 +707,6 @@ fn file_bytes(path: &Path) -> Result<u64> {
 }
 
 fn checkpoint_report(path: &Path, report: &mut FormalScaleReport) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     for _ in 0..4 {
         let bytes = serde_json::to_vec_pretty(report).context("serialize formal scale report")?;
         let length = bytes.len() as u64;
@@ -850,8 +842,9 @@ mod tests {
         }
         let mut reversed = baseline.points.clone();
         reversed.reverse();
-        assert!(predict_next_millis(&reversed, 4).is_none());
-        assert!(predict_next_millis(&baseline.points, 2).is_none());
+        let millis = |point: &FormalScalePoint| point.build_millis.max(1) as f64;
+        assert!(predict_next_metric(&reversed, 4, millis).is_none());
+        assert!(predict_next_metric(&baseline.points, 2, millis).is_none());
         assert!(validate_resumed_artifacts(&baseline, root.path(), &[], &[]).is_err());
     }
 

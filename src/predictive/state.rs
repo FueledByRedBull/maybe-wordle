@@ -20,16 +20,6 @@ impl PredictiveArtifactState {
         }
     }
 
-    pub fn compute_text(self) -> &'static str {
-        match self {
-            Self::ExactDateArtifact | Self::RecentOpenerArtifact | Self::RecentReplyArtifact => {
-                "disk-backed"
-            }
-            Self::LiveSessionFallback => "live session fallback",
-            Self::NoPredictiveArtifactAvailable => "no predictive artifact available",
-        }
-    }
-
     pub fn from_promotion_source(source: Option<PredictivePromotionSource>) -> Self {
         match source {
             Some(PredictivePromotionSource::ExactDateOpenerArtifact)

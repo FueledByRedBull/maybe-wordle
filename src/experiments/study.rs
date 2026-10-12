@@ -769,14 +769,6 @@ impl StudyState {
         Ok(())
     }
 
-    pub fn completed_identities(&self) -> HashSet<&str> {
-        self.trials
-            .iter()
-            .filter(|trial| trial.status == TrialStatus::Complete)
-            .map(|trial| trial.identity.as_str())
-            .collect()
-    }
-
     pub fn best_completed(&self) -> Option<&StudyTrial> {
         self.trials
             .iter()

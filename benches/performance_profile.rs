@@ -19,7 +19,7 @@ use maybe_wordle::{
     identity::{CanonicalSha256, IDENTITY_FORMAT},
     predictive::{PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode},
     scoring::{ALL_GREEN_PATTERN, format_feedback_trits, parse_feedback, score_guess},
-    solver::{FiniteSearchOptions, FiniteSearchQuality, FiniteSearchReason, SolveState, Solver},
+    solver::{FiniteSearchOptions, SolveState, Solver},
 };
 use serde::Serialize;
 
@@ -780,11 +780,11 @@ fn profile_sample(response: &PredictiveSuggestResponse, wall_ms: f64) -> Result<
         top_guess: top.map(|suggestion| suggestion.word.clone()),
         top_quality: top
             .and_then(|suggestion| suggestion.finite_value)
-            .map(|value| finite_quality_label(value.quality).to_string()),
-        finite_status: search
-            .map(|search| finite_reason_label(search.reason))
-            .unwrap_or("Missing")
-            .to_string(),
+            .map(|value| format!("{:?}", value.quality)),
+        finite_status: search.map_or_else(
+            || "Missing".to_string(),
+            |search| format!("{:?}", search.reason),
+        ),
         support_candidate_count: response.candidates.len(),
         fallback_candidate_count,
         candidate_probability_sum: probability_sum,
@@ -795,23 +795,6 @@ fn profile_sample(response: &PredictiveSuggestResponse, wall_ms: f64) -> Result<
         cache_hits: search.map_or(0, |search| search.cache_hits),
         proposal_sampled: search.is_some_and(|search| search.proposal_sampled),
     })
-}
-
-fn finite_quality_label(quality: FiniteSearchQuality) -> &'static str {
-    match quality {
-        FiniteSearchQuality::Heuristic => "Heuristic",
-        FiniteSearchQuality::UpperBound => "UpperBound",
-        FiniteSearchQuality::Exact => "Exact",
-    }
-}
-
-fn finite_reason_label(reason: FiniteSearchReason) -> &'static str {
-    match reason {
-        FiniteSearchReason::Complete => "Complete",
-        FiniteSearchReason::Deadline => "Deadline",
-        FiniteSearchReason::Cancelled => "Cancelled",
-        FiniteSearchReason::NodeBudget => "NodeBudget",
-    }
 }
 
 fn percentile(sorted: &[f64], quantile: f64) -> f64 {

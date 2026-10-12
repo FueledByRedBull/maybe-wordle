@@ -52,13 +52,13 @@ impl Solver {
         as_of: NaiveDate,
         config_toml: &str,
     ) -> PredictiveBookIdentity {
-        let policy = self.config.predictive_policy();
+        let policy_id = crate::predictive::PREDICTIVE_POLICY_ID;
         let model_manifest_hash = self.predictive_model_manifest_hash(as_of, config_toml);
         let mut fingerprint =
             crate::identity::CanonicalSha256::new("maybe-wordle-predictive-book-config-v4");
         fingerprint
             .field(model_manifest_hash.as_bytes())
-            .field(policy.policy_id.as_bytes())
+            .field(policy_id.as_bytes())
             .field(self.mode.label().as_bytes())
             .field(self.variant.label().as_bytes())
             .field(as_of.to_string().as_bytes())
@@ -66,7 +66,7 @@ impl Solver {
         PredictiveBookIdentity {
             manifest_version: 3,
             model_manifest_hash,
-            policy_id: policy.policy_id,
+            policy_id: policy_id.to_string(),
             mode: self.mode.label().to_string(),
             variant: self.variant.label().to_string(),
             config_fingerprint: fingerprint.finish_hex(),

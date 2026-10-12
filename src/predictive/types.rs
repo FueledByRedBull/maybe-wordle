@@ -188,9 +188,3 @@ pub struct PredictiveSuggestResponse {
     pub history_snapshot_date: Option<NaiveDate>,
     pub history_snapshot_hash: String,
 }
-
-impl PredictiveSuggestResponse {
-    pub fn artifact_state(&self) -> PredictiveArtifactState {
-        self.artifact_state
-    }
-}

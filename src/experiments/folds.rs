@@ -185,6 +185,7 @@ impl EvaluationPolicy {
     }
 }
 
+#[cfg(test)]
 pub fn build_rolling_origin_plan(
     history: DateRange,
     config: RollingOriginConfig,

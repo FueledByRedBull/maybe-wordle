@@ -1,7 +1,7 @@
 //! Experimental, leakage-safe discrete-time survival model for answer reuse.
 //!
 //! This module is deliberately separate from the production logistic prior.  It
-//! provides the data preparation, fit, scoring, and evidence containers needed
+//! provides the data preparation, fit, and scoring needed
 //! to evaluate a survival/reuse hypothesis without changing the current solver
 //! behaviour.  Dates are represented as half-open risk intervals: an interval
 //! `[entry_date, exit_date)` contributes one risk row per day and, when
@@ -29,7 +29,6 @@ pub enum SurvivalError {
     InvalidInput(String),
     Leakage(String),
     InvalidArtifact(String),
-    Serialization(String),
     Numeric(String),
 }
 
@@ -39,7 +38,6 @@ impl fmt::Display for SurvivalError {
             Self::InvalidInput(message) => write!(f, "invalid survival input: {message}"),
             Self::Leakage(message) => write!(f, "survival fold leakage: {message}"),
             Self::InvalidArtifact(message) => write!(f, "invalid survival artifact: {message}"),
-            Self::Serialization(message) => write!(f, "survival serialization error: {message}"),
             Self::Numeric(message) => write!(f, "survival numeric error: {message}"),
         }
     }
@@ -91,22 +89,6 @@ pub struct SurvivalObservation {
 
 fn default_mass() -> f64 {
     1.0
-}
-
-impl Default for SurvivalObservation {
-    fn default() -> Self {
-        Self {
-            word: String::new(),
-            entry_date: DEFAULT_DATE,
-            exit_date: DEFAULT_DATE,
-            reused: false,
-            never_used: true,
-            policy_era: "default".to_string(),
-            left_truncated: false,
-            elapsed_offset_days: 0,
-            mass: 1.0,
-        }
-    }
 }
 
 impl SurvivalObservation {
@@ -166,13 +148,9 @@ impl SurvivalObservation {
         }
     }
 
+    #[cfg(test)]
     pub fn with_mass(mut self, mass: f64) -> Self {
         self.mass = mass;
-        self
-    }
-
-    pub fn with_left_truncation(mut self, left_truncated: bool) -> Self {
-        self.left_truncated = left_truncated;
         self
     }
 
@@ -307,27 +285,6 @@ pub struct LeftTruncationMetadata {
     pub origin: NaiveDate,
     pub retained_pre_origin: bool,
     pub description: String,
-}
-
-impl Default for LeftTruncationMetadata {
-    fn default() -> Self {
-        Self {
-            origin: DEFAULT_DATE,
-            retained_pre_origin: false,
-            description: "No pre-origin rows retained".to_string(),
-        }
-    }
-}
-
-impl LeftTruncationMetadata {
-    pub fn validate(&self) -> SurvivalResult<()> {
-        if self.description.trim().is_empty() {
-            return Err(SurvivalError::InvalidArtifact(
-                "left-truncation description must not be empty".to_string(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Chronological training/validation boundary used for deterministic folds.
@@ -725,23 +682,6 @@ pub struct SurvivalModel {
 }
 
 impl SurvivalModel {
-    pub fn fit(
-        observations: &[SurvivalObservation],
-        config: &SurvivalConfig,
-    ) -> SurvivalResult<Self> {
-        config.validate()?;
-        for observation in observations {
-            observation.validate()?;
-        }
-        if observations.is_empty() {
-            return Err(SurvivalError::InvalidInput(
-                "cannot fit survival model with no observations".to_string(),
-            ));
-        }
-        let eras = derive_policy_eras(observations)?;
-        Self::fit_with_policy_eras(observations, &eras, config)
-    }
-
     pub fn fit_with_policy_eras(
         observations: &[SurvivalObservation],
         policy_eras: &[PolicyEra],
@@ -993,10 +933,7 @@ impl SurvivalModel {
         validate_fingerprint(&self.training_fingerprint, "training")
     }
 
-    pub fn mass_summary(&self) -> MassSummary {
-        self.mass
-    }
-
+    #[cfg(test)]
     pub fn try_predict(
         &self,
         elapsed_days: f64,
@@ -1153,29 +1090,6 @@ impl SurvivalModel {
         prediction.validate()?;
         Ok(prediction)
     }
-}
-
-fn derive_policy_eras(observations: &[SurvivalObservation]) -> SurvivalResult<Vec<PolicyEra>> {
-    let mut starts = BTreeMap::<String, NaiveDate>::new();
-    for observation in observations {
-        starts
-            .entry(observation.policy_era.clone())
-            .and_modify(|date| *date = (*date).min(observation.entry_date))
-            .or_insert(observation.entry_date);
-    }
-    let mut ordered = starts
-        .into_iter()
-        .map(|(id, start)| (start, id))
-        .collect::<Vec<_>>();
-    ordered.sort();
-    let mut eras = Vec::with_capacity(ordered.len());
-    for index in 0..ordered.len() {
-        let (start, id) = &ordered[index];
-        let end = ordered.get(index + 1).map(|(next, _)| *next);
-        eras.push(PolicyEra::new(id.clone(), *start, end));
-    }
-    validate_policy_eras(&eras)?;
-    Ok(eras)
 }
 
 #[derive(Clone, Debug)]
@@ -1356,430 +1270,6 @@ fn sigmoid_clamped(value: f64, floor: f64) -> SurvivalResult<f64> {
     Ok(sigmoid(value.clamp(-40.0, 40.0)).clamp(floor, 1.0 - floor))
 }
 
-/// Provenance required for an artifact to be auditable and fold-local.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SurvivalProvenance {
-    pub input_fingerprint: String,
-    pub code_revision: String,
-    pub fold_id: String,
-    pub training_cutoff: NaiveDate,
-}
-
-impl Default for SurvivalProvenance {
-    fn default() -> Self {
-        Self {
-            input_fingerprint: String::new(),
-            code_revision: String::new(),
-            fold_id: String::new(),
-            training_cutoff: DEFAULT_DATE,
-        }
-    }
-}
-
-impl SurvivalProvenance {
-    pub fn validate(&self) -> SurvivalResult<()> {
-        validate_fingerprint(&self.input_fingerprint, "artifact input")?;
-        if self.code_revision.trim().is_empty() {
-            return Err(SurvivalError::InvalidArtifact(
-                "artifact code_revision must not be empty".to_string(),
-            ));
-        }
-        if self.fold_id.trim().is_empty() {
-            return Err(SurvivalError::InvalidArtifact(
-                "artifact fold_id must not be empty".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Evidence metadata is mandatory in the serialized schema.  The default is
-/// intentionally not promotable; callers must provide held-out evidence.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct EvidenceGateMetadata {
-    pub gate_id: String,
-    pub validation_folds: usize,
-    pub fold_ids: Vec<String>,
-    pub source_identity: String,
-    pub coverage_ok: bool,
-    pub failure_count: usize,
-    pub held_out: bool,
-    pub paired_solve_quality_ok: bool,
-    pub latency_ok: bool,
-    pub memory_ok: bool,
-    pub sealed_window_untouched: bool,
-    pub approved_by: String,
-}
-
-impl EvidenceGateMetadata {
-    pub fn validate_for_promotion(&self) -> SurvivalResult<()> {
-        if self.gate_id.trim().is_empty() {
-            return Err(SurvivalError::InvalidArtifact(
-                "promotion evidence gate id is required".to_string(),
-            ));
-        }
-        if self.validation_folds == 0 {
-            return Err(SurvivalError::InvalidArtifact(
-                "promotion evidence must include validation folds".to_string(),
-            ));
-        }
-        let unique_folds = self.fold_ids.iter().collect::<BTreeSet<_>>();
-        if self.fold_ids.len() != self.validation_folds
-            || unique_folds.len() != self.fold_ids.len()
-            || self.fold_ids.iter().any(|id| id.trim().is_empty())
-        {
-            return Err(SurvivalError::InvalidArtifact(
-                "promotion evidence fold identities are missing or inconsistent".to_string(),
-            ));
-        }
-        if self.source_identity.trim().is_empty() {
-            return Err(SurvivalError::InvalidArtifact(
-                "promotion evidence source identity is required".to_string(),
-            ));
-        }
-        if !self.coverage_ok
-            || self.failure_count != 0
-            || !self.held_out
-            || !self.paired_solve_quality_ok
-            || !self.latency_ok
-            || !self.memory_ok
-            || !self.sealed_window_untouched
-        {
-            return Err(SurvivalError::InvalidArtifact(
-                "promotion evidence must pass held-out solve-quality, coverage, failure, latency, memory, and sealed-window gates"
-                    .to_string(),
-            ));
-        }
-        if self.approved_by.trim().is_empty() {
-            return Err(SurvivalError::InvalidArtifact(
-                "promotion evidence approver is required".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PromotionMetadata {
-    pub enabled: bool,
-    pub evidence_gate: EvidenceGateMetadata,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SurvivalMetadata {
-    pub schema_version: u32,
-    pub model_version: String,
-    pub policy_eras: Vec<PolicyEra>,
-    pub left_truncation: LeftTruncationMetadata,
-    pub provenance: SurvivalProvenance,
-}
-
-impl SurvivalMetadata {
-    pub fn validate(&self) -> SurvivalResult<()> {
-        if self.schema_version != SURVIVAL_SCHEMA_VERSION {
-            return Err(SurvivalError::InvalidArtifact(format!(
-                "unsupported artifact schema version {}",
-                self.schema_version
-            )));
-        }
-        if self.model_version.trim().is_empty() {
-            return Err(SurvivalError::InvalidArtifact(
-                "artifact model_version must not be empty".to_string(),
-            ));
-        }
-        validate_policy_eras(&self.policy_eras)?;
-        self.left_truncation.validate()?;
-        self.provenance.validate()
-    }
-}
-
-/// Persistable model + metadata.  `promotion.enabled` remains false unless a
-/// caller explicitly opts in and supplies an evidence gate.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SurvivalArtifact {
-    pub schema_version: u32,
-    pub model: SurvivalModel,
-    pub metadata: SurvivalMetadata,
-    pub promotion: PromotionMetadata,
-}
-
-impl SurvivalArtifact {
-    pub fn new(
-        model: SurvivalModel,
-        model_version: impl Into<String>,
-        left_truncation: LeftTruncationMetadata,
-        provenance: SurvivalProvenance,
-    ) -> Self {
-        let policy_eras = model.policy_eras.clone();
-        Self {
-            schema_version: SURVIVAL_SCHEMA_VERSION,
-            model,
-            metadata: SurvivalMetadata {
-                schema_version: SURVIVAL_SCHEMA_VERSION,
-                model_version: model_version.into(),
-                policy_eras,
-                left_truncation,
-                provenance,
-            },
-            promotion: PromotionMetadata::default(),
-        }
-    }
-
-    pub fn validate(&self) -> SurvivalResult<()> {
-        if self.schema_version != SURVIVAL_SCHEMA_VERSION {
-            return Err(SurvivalError::InvalidArtifact(format!(
-                "unsupported artifact schema version {}",
-                self.schema_version
-            )));
-        }
-        self.model.validate()?;
-        self.metadata.validate()?;
-        if self.metadata.policy_eras != self.model.policy_eras {
-            return Err(SurvivalError::InvalidArtifact(
-                "artifact metadata policy eras do not match model eras".to_string(),
-            ));
-        }
-        if self.metadata.provenance.input_fingerprint != self.model.training_fingerprint {
-            return Err(SurvivalError::InvalidArtifact(
-                "artifact provenance fingerprint does not match fitted training inputs".to_string(),
-            ));
-        }
-        if self.promotion.enabled {
-            self.promotion.evidence_gate.validate_for_promotion()?;
-        }
-        Ok(())
-    }
-
-    pub fn promotion_allowed(&self) -> bool {
-        self.promotion.enabled && self.validate().is_ok()
-    }
-
-    pub fn to_json(&self) -> SurvivalResult<String> {
-        self.validate()?;
-        serde_json::to_string_pretty(self)
-            .map_err(|error| SurvivalError::Serialization(error.to_string()))
-    }
-
-    pub fn from_json(json: &str) -> SurvivalResult<Self> {
-        let artifact = serde_json::from_str::<Self>(json)
-            .map_err(|error| SurvivalError::Serialization(error.to_string()))?;
-        artifact.validate()?;
-        Ok(artifact)
-    }
-}
-
-/// A pair of probabilities for one held-out outcome.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BinaryComparisonRow {
-    pub observed: bool,
-    pub survival_probability: f64,
-    pub logistic_probability: f64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CalibrationBin {
-    pub index: usize,
-    pub lower: f64,
-    pub upper: f64,
-    pub count: usize,
-    pub mean_prediction: f64,
-    pub observed_rate: f64,
-    pub absolute_gap: f64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CalibrationSummary {
-    pub bins: Vec<CalibrationBin>,
-    pub expected_calibration_error: f64,
-    pub maximum_calibration_gap: f64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BinaryMetrics {
-    pub count: usize,
-    pub log_loss: f64,
-    pub brier: f64,
-    pub calibration: CalibrationSummary,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ModelComparison {
-    pub survival: BinaryMetrics,
-    pub logistic_baseline: BinaryMetrics,
-    pub delta_log_loss: f64,
-    pub delta_brier: f64,
-}
-
-pub fn compare_against_logistic_baseline(
-    rows: &[BinaryComparisonRow],
-) -> SurvivalResult<ModelComparison> {
-    compare_with_calibration_bins(rows, 10)
-}
-
-pub fn compare_with_calibration_bins(
-    rows: &[BinaryComparisonRow],
-    calibration_bins: usize,
-) -> SurvivalResult<ModelComparison> {
-    if rows.is_empty() {
-        return Err(SurvivalError::InvalidInput(
-            "cannot compare models with no outcomes".to_string(),
-        ));
-    }
-    if calibration_bins == 0 {
-        return Err(SurvivalError::InvalidInput(
-            "calibration bin count must be positive".to_string(),
-        ));
-    }
-    let survival = metrics_for(
-        rows.iter()
-            .map(|row| (row.survival_probability, row.observed))
-            .collect::<Vec<_>>()
-            .as_slice(),
-        calibration_bins,
-    )?;
-    let logistic_baseline = metrics_for(
-        rows.iter()
-            .map(|row| (row.logistic_probability, row.observed))
-            .collect::<Vec<_>>()
-            .as_slice(),
-        calibration_bins,
-    )?;
-    Ok(ModelComparison {
-        delta_log_loss: survival.log_loss - logistic_baseline.log_loss,
-        delta_brier: survival.brier - logistic_baseline.brier,
-        survival,
-        logistic_baseline,
-    })
-}
-
-pub fn metrics_for_probabilities(
-    probabilities: &[(f64, bool)],
-    calibration_bins: usize,
-) -> SurvivalResult<BinaryMetrics> {
-    metrics_for(probabilities, calibration_bins)
-}
-
-fn metrics_for(
-    probabilities: &[(f64, bool)],
-    calibration_bins: usize,
-) -> SurvivalResult<BinaryMetrics> {
-    if probabilities.is_empty() {
-        return Err(SurvivalError::InvalidInput(
-            "cannot score an empty probability set".to_string(),
-        ));
-    }
-    if calibration_bins == 0 {
-        return Err(SurvivalError::InvalidInput(
-            "calibration bin count must be positive".to_string(),
-        ));
-    }
-    let mut log_loss = 0.0;
-    let mut brier = 0.0;
-    for (probability, observed) in probabilities {
-        validate_probability(*probability)?;
-        let target = if *observed { 1.0 } else { 0.0 };
-        let bounded = probability.clamp(1e-12, 1.0 - 1e-12);
-        log_loss += if *observed {
-            -bounded.ln()
-        } else {
-            -(1.0 - bounded).ln()
-        };
-        brier += (bounded - target).powi(2);
-    }
-    let count = probabilities.len();
-    let bins = calibration_primitives(probabilities, calibration_bins)?;
-    let expected_calibration_error = bins
-        .iter()
-        .map(|bin| bin.count as f64 / count as f64 * bin.absolute_gap)
-        .sum();
-    let maximum_calibration_gap = bins.iter().map(|bin| bin.absolute_gap).fold(0.0, f64::max);
-    Ok(BinaryMetrics {
-        count,
-        log_loss: log_loss / count as f64,
-        brier: brier / count as f64,
-        calibration: CalibrationSummary {
-            bins,
-            expected_calibration_error,
-            maximum_calibration_gap,
-        },
-    })
-}
-
-pub fn calibration_primitives(
-    probabilities: &[(f64, bool)],
-    calibration_bins: usize,
-) -> SurvivalResult<Vec<CalibrationBin>> {
-    if calibration_bins == 0 {
-        return Err(SurvivalError::InvalidInput(
-            "calibration bin count must be positive".to_string(),
-        ));
-    }
-    let mut counts = vec![0usize; calibration_bins];
-    let mut prediction_sums = vec![0.0; calibration_bins];
-    let mut outcome_sums = vec![0.0; calibration_bins];
-    for (probability, observed) in probabilities {
-        validate_probability(*probability)?;
-        let index =
-            ((*probability * calibration_bins as f64).floor() as usize).min(calibration_bins - 1);
-        counts[index] += 1;
-        prediction_sums[index] += *probability;
-        outcome_sums[index] += if *observed { 1.0 } else { 0.0 };
-    }
-    let mut bins = Vec::with_capacity(calibration_bins);
-    for index in 0..calibration_bins {
-        let count = counts[index];
-        let mean_prediction = if count == 0 {
-            0.0
-        } else {
-            prediction_sums[index] / count as f64
-        };
-        let observed_rate = if count == 0 {
-            0.0
-        } else {
-            outcome_sums[index] / count as f64
-        };
-        bins.push(CalibrationBin {
-            index,
-            lower: index as f64 / calibration_bins as f64,
-            upper: (index + 1) as f64 / calibration_bins as f64,
-            count,
-            mean_prediction,
-            observed_rate,
-            absolute_gap: (mean_prediction - observed_rate).abs(),
-        });
-    }
-    Ok(bins)
-}
-
-pub fn logistic_baseline_probability(
-    elapsed_days: f64,
-    midpoint_days: f64,
-    slope: f64,
-    floor: f64,
-) -> SurvivalResult<f64> {
-    if !elapsed_days.is_finite()
-        || !midpoint_days.is_finite()
-        || !slope.is_finite()
-        || !floor.is_finite()
-        || !(0.0..0.5).contains(&floor)
-    {
-        return Err(SurvivalError::InvalidInput(
-            "logistic baseline parameters must be finite and have floor in [0, .5)".to_string(),
-        ));
-    }
-    let linear = (slope * (elapsed_days - midpoint_days)).clamp(-40.0, 40.0);
-    Ok((floor + (1.0 - floor) * sigmoid(linear)).clamp(floor, 1.0 - 1e-12))
-}
-
-fn validate_probability(probability: f64) -> SurvivalResult<()> {
-    if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
-        return Err(SurvivalError::InvalidInput(format!(
-            "probability must be finite and in [0, 1], got {probability}"
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
@@ -1792,15 +1282,6 @@ mod tests {
 
     fn era() -> PolicyEra {
         PolicyEra::new("legacy", date(1), Some(date(20)))
-    }
-
-    fn provenance(fingerprint: String) -> SurvivalProvenance {
-        SurvivalProvenance {
-            input_fingerprint: fingerprint,
-            code_revision: "test-revision".to_string(),
-            fold_id: "fold-1".to_string(),
-            training_cutoff: date(10),
-        }
     }
 
     fn fitted_model() -> SurvivalModel {
@@ -1933,41 +1414,6 @@ mod tests {
     }
 
     #[test]
-    fn promotion_requires_a_valid_model_even_with_complete_gate() {
-        let model = fitted_model();
-        let fingerprint = model.training_fingerprint.clone();
-        let mut artifact = SurvivalArtifact::new(
-            model,
-            "toy",
-            LeftTruncationMetadata::default(),
-            provenance(fingerprint),
-        );
-        artifact.promotion = PromotionMetadata {
-            enabled: true,
-            evidence_gate: EvidenceGateMetadata {
-                gate_id: "toy".into(),
-                validation_folds: 1,
-                fold_ids: vec!["fold-1".into()],
-                source_identity: "toy-source".into(),
-                coverage_ok: true,
-                failure_count: 0,
-                held_out: true,
-                paired_solve_quality_ok: true,
-                latency_ok: true,
-                memory_ok: true,
-                sealed_window_untouched: true,
-                approved_by: "test".into(),
-            },
-        };
-        assert!(artifact.promotion_allowed());
-        artifact.model.era_ids[0] = "unknown".into();
-        assert!(!artifact.promotion_allowed());
-        assert!(
-            SurvivalArtifact::from_json(&serde_json::to_string(&artifact).expect("json")).is_err()
-        );
-    }
-
-    #[test]
     fn fold_clips_future_event_without_label_leakage() {
         let observations = vec![
             SurvivalObservation::reused_observation("a", date(1), date(10), "legacy"),
@@ -2066,63 +1512,5 @@ mod tests {
             .expect("dated prediction");
         assert!(prediction.hazard.is_finite());
         assert!((0.0..=1.0).contains(&prediction.survival));
-    }
-
-    #[test]
-    fn artifact_is_not_promotable_without_evidence_gate() {
-        let observations = vec![SurvivalObservation::reused_observation(
-            "a",
-            date(1),
-            date(3),
-            "legacy",
-        )];
-        let model = SurvivalModel::fit_with_policy_eras(
-            &observations,
-            &[era()],
-            &SurvivalConfig::default(),
-        )
-        .expect("model");
-        let fingerprint = model.training_fingerprint.clone();
-        let artifact = SurvivalArtifact::new(
-            model,
-            "survival-experimental-v1",
-            LeftTruncationMetadata::default(),
-            provenance(fingerprint),
-        );
-        assert!(!artifact.promotion.enabled);
-        assert!(!artifact.promotion_allowed());
-        assert!(artifact.validate().is_ok());
-        let json = artifact.to_json().expect("json");
-        assert!(!json.contains("\"enabled\": true"));
-        assert!(SurvivalArtifact::from_json(&json).is_ok());
-    }
-
-    #[test]
-    fn comparison_reports_log_loss_brier_and_calibration() {
-        let rows = vec![
-            BinaryComparisonRow {
-                observed: true,
-                survival_probability: 0.8,
-                logistic_probability: 0.6,
-            },
-            BinaryComparisonRow {
-                observed: false,
-                survival_probability: 0.2,
-                logistic_probability: 0.4,
-            },
-        ];
-        let comparison = compare_against_logistic_baseline(&rows).expect("metrics");
-        assert_eq!(comparison.survival.count, 2);
-        assert!(comparison.survival.log_loss < comparison.logistic_baseline.log_loss);
-        assert!(comparison.survival.brier < comparison.logistic_baseline.brier);
-        assert_eq!(comparison.survival.calibration.bins.len(), 10);
-    }
-
-    #[test]
-    fn logistic_baseline_is_stable_at_extreme_inputs() {
-        let probability =
-            logistic_baseline_probability(1e9, 0.0, 100.0, 0.01).expect("probability");
-        assert!((0.0..=1.0).contains(&probability));
-        assert!(probability.is_finite());
     }
 }

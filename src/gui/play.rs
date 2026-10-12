@@ -37,7 +37,7 @@ impl WordleGuiApp {
                             format!(
                                 "{}  {}  solve {:.3}  H {:.3}  cost {}",
                                 suggestion.word.to_ascii_uppercase(),
-                                suggestion_method(suggestion),
+                                suggestion.value_kind.label(),
                                 suggestion.solve_probability,
                                 suggestion.entropy,
                                 format_suggestion_cost(suggestion)
@@ -78,7 +78,11 @@ impl WordleGuiApp {
                     }
                 }
                 GuiSolverMode::FormalOptimal => {
-                    for suggestion in &self.formal_suggestions {
+                    for suggestion in self
+                        .formal_explanation
+                        .iter()
+                        .flat_map(|explanation| &explanation.tied_moves)
+                    {
                         ui.label(format!(
                             "{} · worst {} · expected {:.6}",
                             suggestion.word.to_ascii_uppercase(),
@@ -108,7 +112,7 @@ impl WordleGuiApp {
             let formal_available = self.formal_solver.is_some();
             let previous_mode = self.mode;
             ui.label("Tool");
-            egui::ComboBox::from_id_salt("solver-mode")
+            let tool = egui::ComboBox::from_id_salt("solver-mode")
                 .selected_text(self.mode.label(formal_available))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
@@ -128,9 +132,11 @@ impl WordleGuiApp {
                             GuiSolverMode::FormalOptimal.label(formal_available),
                         );
                     }
-                });
+                })
+                .response;
+            name_combo_box(&tool, "Tool", self.mode.label(formal_available));
             if !formal_available {
-                ui.label(RichText::new(formal_unavailable_text()).small().weak());
+                ui.label(RichText::new(FORMAL_UNAVAILABLE_TEXT).small().weak());
             }
             if self.mode != previous_mode {
                 self.schedule_recompute();
@@ -139,7 +145,7 @@ impl WordleGuiApp {
                 ui.separator();
                 let previous_profile = self.search_profile;
                 ui.label("Profile");
-                egui::ComboBox::from_id_salt("predictive-search-profile")
+                let profile = egui::ComboBox::from_id_salt("predictive-search-profile")
                     .selected_text(self.search_profile.label())
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
@@ -157,7 +163,9 @@ impl WordleGuiApp {
                             GuiSearchProfile::FiniteStrong,
                             GuiSearchProfile::FiniteStrong.label(),
                         );
-                    });
+                    })
+                    .response;
+                name_combo_box(&profile, "Profile", self.search_profile.label());
                 if self.search_profile != previous_profile {
                     self.schedule_recompute();
                 }
@@ -166,7 +174,7 @@ impl WordleGuiApp {
 
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label("Date");
+            let date_label = ui.label("Date");
             let mut date_changed = false;
             ui.add_enabled_ui(self.mode == GuiSolverMode::Predictive, |ui| {
                 date_changed = ui
@@ -174,6 +182,7 @@ impl WordleGuiApp {
                         [120.0, 24.0],
                         egui::TextEdit::singleline(&mut self.date_text),
                     )
+                    .labelled_by(date_label.id)
                     .changed();
             });
             if self.mode == GuiSolverMode::FormalOptimal {
@@ -186,8 +195,12 @@ impl WordleGuiApp {
                     ui.label(format!("model {}", DEFAULT_FORMAL_MODEL_ID));
                 }
             }
-            ui.label("Top");
-            let top_changed = ui.add(egui::Slider::new(&mut self.top, 3..=20)).changed();
+            // The count lives in the label so no unnamed value spinner is exposed.
+            let top_label = ui.label(format!("Top {}", self.top));
+            let top_changed = ui
+                .add(egui::Slider::new(&mut self.top, 3..=20).show_value(false))
+                .labelled_by(top_label.id)
+                .changed();
             if ui
                 .add_enabled(self.can_apply_row(), egui::Button::new("Apply row"))
                 .clicked()
@@ -223,26 +236,32 @@ impl WordleGuiApp {
 
         ui.add_space(16.0);
         let mut keyboard_apply = false;
+        let mut guess_id = None;
         ui.horizontal_wrapped(|ui| {
-            ui.label("Guess");
-            let response = ui.add_sized(
-                [120.0, 30.0],
-                egui::TextEdit::singleline(&mut self.current_guess).hint_text("e.g. crane"),
-            );
+            let guess_label = ui.label("Guess");
+            let response = ui
+                .add_sized(
+                    [120.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.current_guess).hint_text("e.g. crane"),
+                )
+                .labelled_by(guess_label.id);
+            guess_id = Some(response.id);
             if response.changed() {
                 self.apply_board_action(BoardAction::ReplaceGuess(self.current_guess.clone()));
             }
             keyboard_apply |=
                 response.lost_focus() && ctx.input(|input| input.key_pressed(egui::Key::Enter));
 
-            ui.label("Feedback");
+            let feedback_label = ui.label("Feedback");
             let mut edited_feedback = self.feedback_code.clone();
-            let feedback_response = ui.add_sized(
-                [88.0, 30.0],
-                egui::TextEdit::singleline(&mut edited_feedback)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text("01210"),
-            );
+            let feedback_response = ui
+                .add_sized(
+                    [88.0, 30.0],
+                    egui::TextEdit::singleline(&mut edited_feedback)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("01210"),
+                )
+                .labelled_by(feedback_label.id);
             if feedback_response.changed() {
                 self.update_feedback_code(edited_feedback);
             }
@@ -258,17 +277,25 @@ impl WordleGuiApp {
                     .nth(index)
                     .map(|character| character.to_ascii_uppercase().to_string())
                     .unwrap_or_else(|| " ".to_string());
-                let label = format!("{letter}\n{}", feedback_accessible_label(*value));
-                if ui
-                    .add_sized(
-                        [58.0, 58.0],
-                        egui::Button::new(
-                            RichText::new(label).size(15.0).strong().color(foreground),
-                        )
+                let state = feedback_accessible_label(*value);
+                let label = format!("{letter}\n{state}");
+                let tile = ui.add_sized(
+                    [58.0, 58.0],
+                    egui::Button::new(RichText::new(label).size(15.0).strong().color(foreground))
                         .fill(color),
+                );
+                // Five tiles can share one visible label; name the position for assistive tech.
+                tile.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        format!(
+                            "{}: {state}",
+                            format!("Letter {} {}", index + 1, letter.trim()).trim_end()
+                        ),
                     )
-                    .clicked()
-                {
+                });
+                if tile.clicked() {
                     clicked_tile = Some(index);
                 }
             }
@@ -278,6 +305,10 @@ impl WordleGuiApp {
         });
         if keyboard_apply && self.can_apply_row() {
             self.commit_current_row();
+            // Enter drops text focus; return it so the next row can be typed straight away.
+            if let Some(guess_id) = guess_id {
+                ctx.memory_mut(|memory| memory.request_focus(guess_id));
+            }
         }
         if let Err(error) = parse_feedback(&self.feedback_code) {
             ui.colored_label(
@@ -287,7 +318,7 @@ impl WordleGuiApp {
         }
         ui.label(
             RichText::new(
-                "Keyboard: type five feedback symbols (0/1/2 or b/y/g) and press Enter. Tile labels supplement color; repeated letters must match Wordle exactly.",
+                "Keyboard: type five feedback symbols (0/1/2 or b/y/g) and press Enter. Outside a text field, Ctrl+Z undoes a row and Esc resets. Tile labels supplement color; repeated letters must match Wordle exactly.",
             )
             .small()
             .color(Color32::from_rgb(92, 72, 54)),
@@ -315,7 +346,7 @@ impl WordleGuiApp {
                 }) {
                     predictive_finite_banner_text(self.search_profile)
                 } else {
-                    predictive_banner_text(self.predictive_artifact_state)
+                    self.predictive_artifact_state.banner_text()
                 };
                 ui.label(RichText::new(banner).color(Color32::from_rgb(92, 72, 54)));
                 if let Some(execution) = &self.predictive_execution {
@@ -561,7 +592,7 @@ impl WordleGuiApp {
                                                         ui.label("unevaluated");
                                                     }
                                                 } else {
-                                                    ui.label(suggestion_method(suggestion));
+                                                    ui.label(suggestion.value_kind.label());
                                                     ui.label(format!(
                                                         "{:.3}",
                                                         suggestion.solve_probability
@@ -619,7 +650,11 @@ impl WordleGuiApp {
                         }
                     }
                     GuiSolverMode::FormalOptimal => {
-                        for suggestion in &self.formal_suggestions {
+                        for suggestion in self
+                            .formal_explanation
+                            .iter()
+                            .flat_map(|explanation| &explanation.tied_moves)
+                        {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     RichText::new(suggestion.word.to_ascii_uppercase())
@@ -637,12 +672,7 @@ impl WordleGuiApp {
                                 ));
                                 ui.label(format!(
                                     "buckets {}",
-                                    suggestion
-                                        .bucket_sizes
-                                        .iter()
-                                        .map(|size| size.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(",")
+                                    join_bucket_sizes(&suggestion.bucket_sizes)
                                 ));
                             });
                             ui.separator();
@@ -652,6 +682,16 @@ impl WordleGuiApp {
             });
         });
     }
+}
+
+/// egui gives a combo box without a trailing label an empty accessible name, which overrides
+/// `labelled_by`; name it directly and expose the selection as its value.
+fn name_combo_box(response: &egui::Response, name: &str, selected: &str) {
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, name);
+        info.current_text_value = Some(selected.to_string());
+        info
+    });
 }
 
 pub(super) fn show_suggestion_inspector(
@@ -689,7 +729,7 @@ pub(super) fn show_suggestion_inspector(
     } else {
         ui.label(format!(
             "{} ranking · solve probability {:.4} · entropy {:.4} bits · expected remaining {:.2}",
-            suggestion_method(suggestion),
+            suggestion.value_kind.label(),
             suggestion.solve_probability,
             suggestion.entropy,
             suggestion.expected_remaining
@@ -713,7 +753,7 @@ pub(super) fn show_suggestion_inspector(
         if matches!(suggestion.value_kind, SuggestionValueKind::Finite(_)) {
             "bounded finite search (predictive books not used)"
         } else {
-            predictive_banner_text(artifact_state)
+            artifact_state.banner_text()
         },
         recovery_mode.map_or("not active", RecoveryMode::label)
     ));
@@ -753,11 +793,13 @@ pub(super) fn show_candidate_browser(
     let mut copy = false;
     let mut filter_changed = false;
     ui.horizontal(|ui| {
+        let filter_label = ui.label("Filter");
         filter_changed = ui
             .add_sized(
                 [180.0, 24.0],
                 egui::TextEdit::singleline(filter).hint_text("Filter answers"),
             )
+            .labelled_by(filter_label.id)
             .changed();
         copy = ui.button("Copy CSV").clicked();
     });
@@ -886,7 +928,7 @@ pub(super) fn show_history_timeline(ui: &mut egui::Ui, observations: &[(String, 
     }
     ui.horizontal_wrapped(|ui| {
         for (index, (guess, pattern)) in observations.iter().enumerate() {
-            let code = feedback_code(decode_feedback(*pattern));
+            let code = format_feedback_trits(*pattern);
             egui::Frame::default()
                 .fill(Color32::from_rgb(239, 228, 211))
                 .corner_radius(5.0)

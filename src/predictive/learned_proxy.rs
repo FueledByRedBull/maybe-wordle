@@ -196,17 +196,6 @@ pub struct ProxyModelProvenance {
     pub feature_schema_digest: String,
 }
 
-impl Default for ProxyModelProvenance {
-    fn default() -> Self {
-        Self {
-            dataset_identity: "unspecified".to_string(),
-            replay_identity: "unspecified".to_string(),
-            split_policy: "train_only".to_string(),
-            feature_schema_digest: "unspecified".to_string(),
-        }
-    }
-}
-
 impl ProxyModelProvenance {
     pub fn validate(&self) -> Result<()> {
         for (label, value) in [
@@ -333,11 +322,13 @@ impl LearnedProxyModel {
         Ok(ProxyPrediction { score, residual })
     }
 
+    #[cfg(test)]
     pub fn to_json(&self) -> Result<String> {
         self.validate()?;
         Ok(serde_json::to_string_pretty(self)?)
     }
 
+    #[cfg(test)]
     pub fn from_json(source: &str) -> Result<Self> {
         let model: Self = serde_json::from_str(source)?;
         model.validate()?;
@@ -359,6 +350,7 @@ pub struct ProxyModelArtifact {
     pub evaluation: Option<ProxyRankingMetrics>,
 }
 
+#[cfg(test)]
 impl ProxyModelArtifact {
     pub fn validate(&self) -> Result<()> {
         ensure!(

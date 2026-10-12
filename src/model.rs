@@ -278,33 +278,36 @@ pub fn weight_snapshot_for_mode(
     let last_seen = seen_dates.last().copied();
     let seen_count = seen_dates.len();
     let eligible = record.in_seed || record.manual_entry || !seen_dates.is_empty();
+    let seed_or_history_weight = if record.in_seed || record.manual_entry {
+        config.base_seed_weight
+    } else if !seen_dates.is_empty() {
+        config.base_history_only_weight
+    } else {
+        0.0
+    };
+    let with_recency = |recency_weight: f64| {
+        (
+            seed_or_history_weight,
+            recency_weight,
+            seed_or_history_weight * recency_weight * record.manual_weight,
+        )
+    };
 
     let (base_weight, recency_weight, final_weight) = match mode {
         WeightMode::Uniform => {
             let base_weight = if eligible { 1.0 } else { 0.0 };
             (base_weight, 1.0, base_weight)
         }
-        WeightMode::CooldownOnly => {
-            let base_weight = if record.in_seed || record.manual_entry {
-                config.base_seed_weight
-            } else if !seen_dates.is_empty() {
-                config.base_history_only_weight
-            } else {
-                0.0
-            };
-            let recency_weight = if let Some(last_seen) = last_seen {
-                let days_since_last_seen = (as_of - last_seen).num_days();
-                if days_since_last_seen < config.cooldown_days {
-                    config.cooldown_floor
-                } else {
-                    1.0
-                }
+        WeightMode::CooldownOnly => with_recency(if let Some(last_seen) = last_seen {
+            let days_since_last_seen = (as_of - last_seen).num_days();
+            if days_since_last_seen < config.cooldown_days {
+                config.cooldown_floor
             } else {
                 1.0
-            };
-            let final_weight = base_weight * recency_weight * record.manual_weight;
-            (base_weight, recency_weight, final_weight)
-        }
+            }
+        } else {
+            1.0
+        }),
         WeightMode::EmpiricalFrequency | WeightMode::RegularizedFrequency => {
             let smoothing = usize::from(mode == WeightMode::RegularizedFrequency);
             let base_weight = if eligible {
@@ -314,56 +317,34 @@ pub fn weight_snapshot_for_mode(
             };
             (base_weight, 1.0, base_weight * record.manual_weight)
         }
-        WeightMode::UsedUnused | WeightMode::RecencyBuckets => {
-            let base_weight = if record.in_seed || record.manual_entry {
-                config.base_seed_weight
-            } else if !seen_dates.is_empty() {
-                config.base_history_only_weight
-            } else {
-                0.0
-            };
-            let recency_weight = match mode {
-                WeightMode::UsedUnused => {
-                    if seen_dates.is_empty() {
-                        1.0
-                    } else {
-                        config.cooldown_floor
-                    }
-                }
-                WeightMode::RecencyBuckets => last_seen
-                    .map(|last_seen| recency_bucket_weight(config, (as_of - last_seen).num_days()))
-                    .unwrap_or(1.0),
-                _ => unreachable!("combined arm only contains experimental modes"),
-            };
-            let final_weight = base_weight * recency_weight * record.manual_weight;
-            (base_weight, recency_weight, final_weight)
-        }
-        WeightMode::Weighted => {
-            let base_weight = if record.in_seed || record.manual_entry {
-                config.base_seed_weight
-            } else if !seen_dates.is_empty() {
-                config.base_history_only_weight
-            } else {
-                0.0
-            };
-            let recency_weight = if let Some(last_seen) = last_seen {
-                let days_since_last_seen = (as_of - last_seen).num_days();
-                if days_since_last_seen < config.cooldown_days {
-                    config.cooldown_floor
+        WeightMode::UsedUnused | WeightMode::RecencyBuckets => with_recency(match mode {
+            WeightMode::UsedUnused => {
+                if seen_dates.is_empty() {
+                    1.0
                 } else {
                     config.cooldown_floor
-                        + (1.0 - config.cooldown_floor)
-                            / (1.0
-                                + (-config.logistic_k
-                                    * ((days_since_last_seen as f64) - config.midpoint_days))
-                                    .exp())
                 }
+            }
+            WeightMode::RecencyBuckets => last_seen
+                .map(|last_seen| recency_bucket_weight(config, (as_of - last_seen).num_days()))
+                .unwrap_or(1.0),
+            _ => unreachable!("combined arm only contains experimental modes"),
+        }),
+        WeightMode::Weighted => with_recency(if let Some(last_seen) = last_seen {
+            let days_since_last_seen = (as_of - last_seen).num_days();
+            if days_since_last_seen < config.cooldown_days {
+                config.cooldown_floor
             } else {
-                1.0
-            };
-            let final_weight = base_weight * recency_weight * record.manual_weight;
-            (base_weight, recency_weight, final_weight)
-        }
+                config.cooldown_floor
+                    + (1.0 - config.cooldown_floor)
+                        / (1.0
+                            + (-config.logistic_k
+                                * ((days_since_last_seen as f64) - config.midpoint_days))
+                                .exp())
+            }
+        } else {
+            1.0
+        }),
     };
 
     WeightSnapshot {

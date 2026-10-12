@@ -43,7 +43,12 @@ fn weighted_nine_answer_policy_uses_child_depth_slack() {
     assert_eq!(suggestion[0].word, "sware");
     assert_eq!(suggestion[0].objective.worst_case_depth, 3);
     assert!((suggestion[0].objective.expected_guesses - 66.0 / 57.0).abs() < 1e-12);
-    verify_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).expect("independent certificate");
+    verify_optimal_policy_with_mode(
+        &paths,
+        DEFAULT_FORMAL_MODEL_ID,
+        FormalVerificationMode::Certificate,
+    )
+    .expect("independent certificate");
 }
 
 #[test]
@@ -340,8 +345,6 @@ fn builder(model: FormalModel) -> FormalPolicyBuilder<'static> {
         hot_tt: HotTranspositionTable::new(1024 * 1024),
         deduped_signatures: 0,
         bound_hits: 0,
-        root_refinement_pruned: 0,
-        local_refinement_pruned: 0,
         partition_calls: 0,
         quick_plan_calls: 0,
         started,

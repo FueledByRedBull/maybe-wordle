@@ -63,7 +63,6 @@ impl HistoryCoverage {
 pub(super) struct LoadedWorkspace {
     pub(super) config: PriorConfig,
     pub(super) predictive_solver: Solver,
-    pub(super) formal_solver: Option<FormalPolicyRuntime>,
 }
 
 pub(super) fn load_workspace(paths: &ProjectPaths) -> Result<LoadedWorkspace> {
@@ -73,7 +72,6 @@ pub(super) fn load_workspace(paths: &ProjectPaths) -> Result<LoadedWorkspace> {
     Ok(LoadedWorkspace {
         config,
         predictive_solver,
-        formal_solver: None,
     })
 }
 
@@ -84,7 +82,7 @@ pub(super) enum MaybeWordleApp {
 
 impl MaybeWordleApp {
     pub(super) fn load_or_setup(paths: ProjectPaths) -> Self {
-        let mut app = SetupApp::new(paths, String::new());
+        let mut app = SetupApp::new(paths);
         app.start(SetupAction::RetryLoad);
         Self::Loading(Box::new(app))
     }
@@ -137,10 +135,10 @@ pub(super) struct SetupApp {
 }
 
 impl SetupApp {
-    pub(super) fn new(paths: ProjectPaths, error: String) -> Self {
+    pub(super) fn new(paths: ProjectPaths) -> Self {
         Self {
             paths,
-            error,
+            error: String::new(),
             progress: "Model data is not ready yet.".to_string(),
             running: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -411,7 +409,6 @@ pub(super) enum WorkerPayload {
     },
     Formal {
         explanation: FormalStateExplanation,
-        suggestions: Vec<FormalSuggestion>,
     },
 }
 
@@ -461,15 +458,16 @@ impl WordleGuiApp {
             search_profile: self.search_profile,
         };
         self.computing = true;
-        self.status = GuiStatus::Loading(if self.mode == GuiSolverMode::Predictive {
-            if let Some(options) = self.search_profile.finite_options(&self.predictive_solver) {
+        // The artifact route is only known once the response arrives.
+        self.status = GuiStatus::Loading(
+            if self.mode == GuiSolverMode::Predictive
+                && let Some(options) = self.search_profile.finite_options(&self.predictive_solver)
+            {
                 predictive_finite_compute_status(self.search_profile, options)
             } else {
-                predictive_compute_status(self.predictive_artifact_state)
-            }
-        } else {
-            "Computing...".to_string()
-        });
+                "Computing...".to_string()
+            },
+        );
         self.current_request = Some(request.clone());
         if let Err(error) = self
             .request_sender
@@ -521,7 +519,6 @@ impl WordleGuiApp {
                     self.predictive_candidates = candidates;
                     self.selected_suggestion = None;
                     self.absurdle_suggestions.clear();
-                    self.formal_suggestions.clear();
                     self.formal_explanation = None;
                     self.status = self
                         .history_coverage
@@ -540,14 +537,10 @@ impl WordleGuiApp {
                     self.absurdle_suggestions = suggestions;
                     self.predictive_suggestions.clear();
                     self.predictive_candidates.clear();
-                    self.formal_suggestions.clear();
                     self.formal_explanation = None;
                     self.status = GuiStatus::Ready;
                 }
-                Ok(WorkerPayload::Formal {
-                    explanation,
-                    suggestions,
-                }) => {
+                Ok(WorkerPayload::Formal { explanation }) => {
                     let alternatives_limited = explanation.alternatives_status
                         == FormalAlternativesStatus::WorkLimitReached;
                     self.surviving_count = explanation.surviving_answers;
@@ -558,7 +551,6 @@ impl WordleGuiApp {
                     self.predictive_finite_search = None;
                     self.predictive_execution = None;
                     self.formal_explanation = Some(explanation);
-                    self.formal_suggestions = suggestions;
                     self.predictive_suggestions.clear();
                     self.predictive_candidates.clear();
                     self.absurdle_suggestions.clear();
@@ -580,7 +572,6 @@ impl WordleGuiApp {
     }
 
     pub(super) fn retry_worker(&mut self) {
-        self.request_sender = None;
         let worker = spawn_worker(self.predictive_solver.clone(), self.formal_solver.clone());
         self.install_worker(worker);
     }
@@ -785,11 +776,7 @@ pub(super) fn compute_worker_payload(
                 DEFAULT_FORMAL_ALTERNATIVE_PARTITIONS,
                 cancelled,
             )?;
-            let suggestions = explanation.tied_moves.clone();
-            Ok(WorkerPayload::Formal {
-                explanation,
-                suggestions,
-            })
+            Ok(WorkerPayload::Formal { explanation })
         }
     }
 }

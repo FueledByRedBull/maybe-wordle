@@ -50,11 +50,7 @@ fn fixture() -> (
         "objective = \"lexicographic\"\nkind = \"uniform\"\n",
     )
     .unwrap();
-    let summary = build_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).unwrap();
-    assert!(
-        summary.build_millis
-            >= summary.solve_millis + summary.certificate_millis + summary.persistence_millis
-    );
+    build_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).unwrap();
     let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).unwrap();
     (root, paths, runtime)
 }

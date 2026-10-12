@@ -280,7 +280,7 @@ pub fn run_survival_experiment(
     solver: &Solver,
 ) -> Result<SurvivalExperimentReport> {
     let started = Instant::now();
-    let executable_fingerprint = crate::solver::predictive_executable_fingerprint()?;
+    let executable_fingerprint = crate::solver::current_executable_fingerprint()?;
     let mut history = read_history_jsonl(&paths.raw_history)?;
     history.sort_by_key(|entry| entry.print_date);
     ensure!(
@@ -297,10 +297,8 @@ pub fn run_survival_experiment(
         history.first().expect("non-empty").print_date,
         history.last().expect("non-empty").print_date,
     )?;
-    let source_identity = crate::solver::predictive_development_source_identity(
-        paths,
-        evaluation_plan.development.end,
-    )?;
+    let source_identity =
+        crate::solver::development_source_identity(paths, evaluation_plan.development.end)?;
     let support = read_word_list(&paths.seed_answers)?;
     ensure!(
         !support.is_empty(),
@@ -441,7 +439,7 @@ pub fn run_survival_experiment(
         "The sealed 2026-06-18 through 2026-07-17 outcomes remain excluded from tuning."
             .to_string(),
     );
-    crate::solver::ensure_predictive_development_source_identity(
+    crate::solver::ensure_development_source_identity(
         paths,
         evaluation_plan.development.end,
         &source_identity,

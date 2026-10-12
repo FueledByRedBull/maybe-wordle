@@ -11,7 +11,7 @@ use crate::{
     config::PriorConfig,
     data::{NytDailyEntry, ProjectPaths, read_history_jsonl},
     experiments::{
-        BootstrapConfig, DateRange, EvaluationPolicy, GameOutcome, RankedProbabilityObservation,
+        BootstrapConfig, DateRange, EvaluationPolicy, RankedProbabilityObservation,
         default_diagnostic_suite, summarize_predictive_outcomes,
         summarize_ranked_probability_observations,
     },
@@ -732,13 +732,7 @@ impl Solver {
             .iter()
             .map(|run| ExperimentGameResult {
                 target: run.target.clone(),
-                outcome: if run.steps.is_empty() {
-                    GameOutcome::coverage_gap(run.date)
-                } else if run.solved {
-                    GameOutcome::solved(run.date, run.steps.len())
-                } else {
-                    GameOutcome::unsolved(run.date, run.steps.len())
-                },
+                outcome: run.outcome(),
                 path: run.steps.iter().map(|step| step.guess.clone()).collect(),
                 finite_search_steps: run
                     .steps
@@ -899,13 +893,7 @@ impl Solver {
             .iter()
             .map(|run| ExperimentGameResult {
                 target: run.target.clone(),
-                outcome: if run.steps.is_empty() {
-                    GameOutcome::coverage_gap(run.date)
-                } else if run.solved {
-                    GameOutcome::solved(run.date, run.steps.len())
-                } else {
-                    GameOutcome::unsolved(run.date, run.steps.len())
-                },
+                outcome: run.outcome(),
                 path: run.steps.iter().map(|step| step.guess.clone()).collect(),
                 finite_search_steps: run
                     .steps

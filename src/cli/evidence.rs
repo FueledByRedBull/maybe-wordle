@@ -9,10 +9,7 @@ pub(super) fn benchmark_docs(
     readme: &Path,
     update: bool,
 ) -> Result<()> {
-    let bytes = std::fs::read(evidence)
-        .with_context(|| format!("failed to read {}", evidence.display()))?;
-    let artifact: maybe_wordle::solver::PredictiveEvidenceArtifact = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", evidence.display()))?;
+    let artifact: maybe_wordle::solver::PredictiveEvidenceArtifact = super::read_json(evidence)?;
     let generated = Solver::render_development_evidence_markdown(&artifact)?;
     let readme_text = std::fs::read_to_string(readme)
         .with_context(|| format!("failed to read {}", readme.display()))?;
@@ -49,12 +46,7 @@ pub(super) fn rolling_docs(
 ) -> Result<()> {
     let comparisons = comparison
         .iter()
-        .map(|path| {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            serde_json::from_slice::<maybe_wordle::solver::RollingComparisonArtifact>(&bytes)
-                .with_context(|| format!("failed to parse {}", path.display()))
-        })
+        .map(|path| super::read_json::<maybe_wordle::solver::RollingComparisonArtifact>(path))
         .collect::<Result<Vec<_>>>()?;
     let generated = Solver::render_rolling_comparison_markdown(&comparisons)?;
     let readme_text = std::fs::read_to_string(readme)

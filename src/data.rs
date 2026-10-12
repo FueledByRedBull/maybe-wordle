@@ -301,14 +301,6 @@ fn read_history_jsonl_bytes(bytes: &[u8]) -> Result<Vec<NytDailyEntry>> {
     Ok(entries)
 }
 
-pub fn sync_nyt_history(
-    paths: &ProjectPaths,
-    config: &PriorConfig,
-    today: NaiveDate,
-) -> Result<SyncSummary> {
-    sync_nyt_history_cancellable(paths, config, today, &|| false)
-}
-
 /// Cancels between requests and during retry waits; an in-flight request remains
 /// bounded by `sync_request_timeout_seconds`. Partial/cancelled syncs never publish.
 pub fn sync_nyt_history_cancellable(

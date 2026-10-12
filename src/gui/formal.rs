@@ -9,7 +9,7 @@ impl WordleGuiApp {
                     FormalAvailability::Unavailable(_) => "FORMAL ARTIFACTS UNAVAILABLE",
                     _ => "FORMAL ARTIFACTS MISSING",
                 }).monospace().strong());
-                ui.label(formal_unavailable_text());
+                ui.label(FORMAL_UNAVAILABLE_TEXT);
                 match &self.formal_availability {
                     FormalAvailability::Loading => { ui.spinner(); ui.label("Validating optional formal artifacts…"); }
                     FormalAvailability::Unavailable(error) => { ui.colored_label(Color32::from_rgb(150, 45, 45), error); }
@@ -51,7 +51,11 @@ impl WordleGuiApp {
             });
         }
         ui.add_space(12.0);
-        for suggestion in &self.formal_suggestions {
+        for suggestion in self
+            .formal_explanation
+            .iter()
+            .flat_map(|explanation| &explanation.tied_moves)
+        {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new(suggestion.word.to_ascii_uppercase())

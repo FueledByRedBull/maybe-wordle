@@ -89,13 +89,12 @@ pub fn is_tagged_digest(value: &str) -> bool {
 }
 
 pub fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
+    use std::fmt::Write;
+    let output = String::with_capacity(bytes.len() * 2);
+    bytes.iter().fold(output, |mut output, byte| {
+        let _ = write!(output, "{byte:02x}");
+        output
+    })
 }
 
 #[cfg(test)]

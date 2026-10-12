@@ -61,27 +61,24 @@ pub fn score_guess(guess: &str, answer: &str) -> u8 {
     let guess = guess.as_bytes();
     let answer = answer.as_bytes();
 
-    #[cfg(debug_assertions)]
-    {
-        debug_assert_eq!(
-            guess.len(),
-            WORD_LENGTH,
-            "guess must contain exactly {WORD_LENGTH} bytes"
-        );
-        debug_assert_eq!(
-            answer.len(),
-            WORD_LENGTH,
-            "answer must contain exactly {WORD_LENGTH} bytes"
-        );
-        debug_assert!(
-            guess.iter().all(|byte| byte.is_ascii_lowercase()),
-            "guess must contain only lowercase ASCII bytes"
-        );
-        debug_assert!(
-            answer.iter().all(|byte| byte.is_ascii_lowercase()),
-            "answer must contain only lowercase ASCII bytes"
-        );
-    }
+    debug_assert_eq!(
+        guess.len(),
+        WORD_LENGTH,
+        "guess must contain exactly {WORD_LENGTH} bytes"
+    );
+    debug_assert_eq!(
+        answer.len(),
+        WORD_LENGTH,
+        "answer must contain exactly {WORD_LENGTH} bytes"
+    );
+    debug_assert!(
+        guess.iter().all(|byte| byte.is_ascii_lowercase()),
+        "guess must contain only lowercase ASCII bytes"
+    );
+    debug_assert!(
+        answer.iter().all(|byte| byte.is_ascii_lowercase()),
+        "answer must contain only lowercase ASCII bytes"
+    );
 
     let mut feedback = [0u8; WORD_LENGTH];
     let mut counts = [0u8; 26];

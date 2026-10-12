@@ -66,7 +66,7 @@ impl WordleGuiApp {
                     }) {
                         predictive_finite_banner_text(self.search_profile)
                     } else {
-                        predictive_banner_text(self.predictive_artifact_state)
+                        self.predictive_artifact_state.banner_text()
                     },
                 );
                 if let Some(search) = &self.predictive_finite_search {

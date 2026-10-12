@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     atomic_file::{acquire_edit_lock, atomic_write},
-    predictive::{PredictivePolicy, RecoveryPolicy},
+    predictive::RecoveryPolicy,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -292,10 +292,6 @@ impl PriorConfig {
         atomic_write(path, raw.as_bytes())
     }
 
-    pub fn predictive_policy(&self) -> PredictivePolicy {
-        PredictivePolicy::from(self)
-    }
-
     fn normalize_manual_keys(&mut self) {
         self.manual_weights = self
             .manual_weights
@@ -313,7 +309,7 @@ mod tests {
     use crate::predictive::RecoveryMode;
 
     #[test]
-    fn full_config_and_policy_round_trips_preserve_every_mapped_field() {
+    fn full_config_round_trip_preserves_every_field() {
         fn change_numbers(value: &mut toml::Value) {
             match value {
                 toml::Value::Table(table) => table
@@ -337,67 +333,6 @@ mod tests {
         assert_eq!(
             toml::Value::try_from(&restored_config).unwrap(),
             config_document
-        );
-
-        let policy = config.predictive_policy();
-        let policy_document = toml::Value::try_from(&policy).unwrap();
-        let restored_policy: crate::predictive::PredictivePolicy =
-            toml::from_str(&toml::to_string(&policy).unwrap()).unwrap();
-        assert_eq!(
-            toml::Value::try_from(&restored_policy).unwrap(),
-            policy_document
-        );
-        assert_eq!(
-            toml::Value::try_from(restored_config.predictive_policy()).unwrap(),
-            policy_document
-        );
-
-        let mut mapped = std::collections::BTreeSet::new();
-        for section in ["prior", "search"] {
-            for (name, value) in policy_document[section].as_table().unwrap() {
-                let config_name = if section == "search" && name == "mode" {
-                    "search_policy_mode"
-                } else {
-                    name.as_str()
-                };
-                assert_eq!(&config_document[config_name], value, "{section}.{name}");
-                mapped.insert(config_name.to_string());
-            }
-        }
-        for (policy_name, config_name) in [
-            ("weights", "proxy_weights"),
-            (
-                "small_state_lower_bound_threshold",
-                "proxy_small_state_lower_bound_threshold",
-            ),
-        ] {
-            assert_eq!(
-                policy_document["proxy"][policy_name],
-                config_document[config_name]
-            );
-            mapped.insert(config_name.to_string());
-        }
-        assert_eq!(policy_document["recovery"], config_document["recovery"]);
-        mapped.insert("recovery".to_string());
-        let outside_policy = config_document
-            .as_table()
-            .unwrap()
-            .keys()
-            .filter(|key| !mapped.contains(*key))
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        // These remain in the complete config/artifact identity, outside the policy view.
-        assert_eq!(
-            outside_policy,
-            std::collections::BTreeSet::from([
-                "allow_history_gaps",
-                "fallback_activation_threshold",
-                "fallback_prior_mass",
-                "sync_request_timeout_seconds",
-                "sync_retry_attempts",
-                "sync_retry_backoff_millis",
-                "sync_reverify_days",
-            ])
         );
     }
 

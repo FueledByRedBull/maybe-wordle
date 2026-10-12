@@ -31,7 +31,7 @@ use crate::{
     experiments::predictive_parameter_registry,
     formal::{
         DEFAULT_FORMAL_ALTERNATIVE_PARTITIONS, DEFAULT_FORMAL_MODEL_ID, FormalAlternativesStatus,
-        FormalPolicyRuntime, FormalStateExplanation, FormalSuggestion, artifacts_exist,
+        FormalPolicyRuntime, FormalStateExplanation, artifacts_exist, join_bucket_sizes,
     },
     game::{self, GameRules, GameStatus},
     model::build_model_artifacts,
@@ -39,7 +39,7 @@ use crate::{
         PredictiveArtifactState, PredictiveCandidateSummary, PredictiveStateSummary,
         PredictiveSuggestRequest, PredictiveSuggestionMode, RecoveryMode,
     },
-    scoring::{decode_feedback, parse_feedback},
+    scoring::{decode_feedback, encode_feedback, format_feedback_trits, parse_feedback},
     solver::{
         AbsurdleSuggestion, FiniteSearchCandidate, FiniteSearchOptions, FiniteSearchQuality,
         FiniteSearchReason, FiniteSearchResult, SolveState, Solver, Suggestion,
@@ -196,13 +196,6 @@ fn reduce_board_draft(current: &BoardDraft, action: BoardAction) -> BoardDraft {
     next
 }
 
-fn feedback_code(feedback: [u8; 5]) -> String {
-    feedback
-        .into_iter()
-        .map(|value| char::from(b'0' + value))
-        .collect()
-}
-
 impl GuiSolverMode {
     fn label(self, formal_available: bool) -> &'static str {
         match self {
@@ -234,7 +227,6 @@ struct WordleGuiApp {
     predictive_candidates: Vec<PredictiveCandidateSummary>,
     candidate_filter: String,
     absurdle_suggestions: Vec<AbsurdleSuggestion>,
-    formal_suggestions: Vec<FormalSuggestion>,
     surviving_count: usize,
     total_weight: f64,
     predictive_recovery_mode: Option<RecoveryMode>,
@@ -272,7 +264,7 @@ impl WordleGuiApp {
         self.current_guess = next.guess;
         self.current_feedback = next.feedback;
         if changes_feedback {
-            self.feedback_code = feedback_code(self.current_feedback);
+            self.feedback_code = format_feedback_trits(encode_feedback(self.current_feedback));
         }
     }
 
@@ -287,20 +279,15 @@ impl WordleGuiApp {
         let LoadedWorkspace {
             config,
             predictive_solver,
-            formal_solver,
         } = workspace;
         let date_text = Solver::today().format("%Y-%m-%d").to_string();
         let mode = GuiSolverMode::Predictive;
-        let worker = spawn_worker(predictive_solver.clone(), formal_solver.clone());
+        let worker = spawn_worker(predictive_solver.clone(), None);
         let mut app = Self {
             config,
             predictive_solver,
-            formal_availability: if formal_solver.is_some() {
-                FormalAvailability::Ready
-            } else {
-                FormalAvailability::Absent
-            },
-            formal_solver,
+            formal_availability: FormalAvailability::Absent,
+            formal_solver: None,
             formal_receiver: None,
             formal_cancel: Arc::new(AtomicBool::new(false)),
             workspace_view: WorkspaceView::Play,
@@ -316,7 +303,6 @@ impl WordleGuiApp {
             predictive_candidates: Vec::new(),
             candidate_filter: String::new(),
             absurdle_suggestions: Vec::new(),
-            formal_suggestions: Vec::new(),
             surviving_count: 0,
             total_weight: 0.0,
             predictive_recovery_mode: None,
@@ -347,7 +333,6 @@ impl WordleGuiApp {
         self.predictive_suggestions.clear();
         self.predictive_candidates.clear();
         self.absurdle_suggestions.clear();
-        self.formal_suggestions.clear();
         self.formal_explanation = None;
         self.selected_suggestion = None;
         self.surviving_count = 0;
@@ -427,10 +412,11 @@ impl WordleGuiApp {
         if self.suggestion_sort == sort {
             format!(
                 "{label} {}",
+                // ASCII: the bundled fonts have no arrow glyphs.
                 if self.suggestion_sort_descending {
-                    "↓"
+                    "desc"
                 } else {
-                    "↑"
+                    "asc"
                 }
             )
         } else {
@@ -513,12 +499,13 @@ impl eframe::App for WordleGuiApp {
                         }
                     }
                     ui.separator();
-                    ui.label(RichText::new("Text").small());
+                    let text_label = ui.label(RichText::new("Text").small());
                     ui.add(
                         egui::Slider::new(&mut self.text_scale, 0.85..=1.35)
                             .show_value(false)
                             .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
-                    );
+                    )
+                    .labelled_by(text_label.id);
                 });
                 ui.add_space(12.0);
 
@@ -582,7 +569,6 @@ impl eframe::App for WordleGuiApp {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GuiSurfaceState {
-    MissingData,
     Loading,
     Empty,
     Normal,
@@ -593,7 +579,6 @@ enum GuiSurfaceState {
 impl GuiSurfaceState {
     fn label(self) -> &'static str {
         match self {
-            Self::MissingData => "missing data",
             Self::Loading => "loading",
             Self::Empty => "empty",
             Self::Normal => "normal",
@@ -604,15 +589,12 @@ impl GuiSurfaceState {
 }
 
 fn gui_surface_state(
-    missing_data: bool,
     computing: bool,
     status: &GuiStatus,
     recovery: Option<RecoveryMode>,
     suggestion_count: usize,
 ) -> GuiSurfaceState {
-    if missing_data {
-        GuiSurfaceState::MissingData
-    } else if computing {
+    if computing {
         GuiSurfaceState::Loading
     } else if status.is_error() {
         GuiSurfaceState::Error
@@ -718,10 +700,6 @@ fn sorted_predictive_indices(
         }
     });
     indices
-}
-
-fn suggestion_method(suggestion: &Suggestion) -> &'static str {
-    suggestion.value_kind.label()
 }
 
 fn finite_quality_label(quality: FiniteSearchQuality) -> &'static str {
@@ -835,14 +813,6 @@ fn tile_label_and_color(value: u8) -> (&'static str, Color32, Color32) {
     }
 }
 
-fn predictive_banner_text(state: PredictiveArtifactState) -> &'static str {
-    state.banner_text()
-}
-
-fn predictive_compute_status(state: PredictiveArtifactState) -> String {
-    format!("Computing... {}", state.compute_text())
-}
-
 fn predictive_reply_book_text(
     observation_count: usize,
     state: PredictiveArtifactState,
@@ -858,9 +828,7 @@ fn predictive_reply_book_text(
     }
 }
 
-fn formal_unavailable_text() -> &'static str {
-    "Formal artifacts missing; run build-optimal-policy first."
-}
+const FORMAL_UNAVAILABLE_TEXT: &str = "Formal artifacts missing; run build-optimal-policy first.";
 
 #[cfg(test)]
 mod tests {
@@ -881,10 +849,10 @@ mod tests {
         FiniteSearchResult, GuiSearchProfile, GuiSolverMode, GuiStatus, GuiSurfaceState,
         LatestWorkerDispatcher, LatestWorkerQueue, Solver, Suggestion, WorkerPayload,
         WorkerRequest, feedback_accessible_label, feedback_marker, finite_quality_label,
-        formal_unavailable_text, format_finite_expected_attempts, format_finite_failure_risk,
-        gui_surface_state, is_compact_layout, predictive_banner_text, predictive_compute_status,
-        predictive_finite_banner_text, predictive_registry_summary, predictive_reply_book_text,
-        predictive_response_status, reduce_board_draft, spawn_worker, worker_request_cancelled,
+        format_finite_expected_attempts, format_finite_failure_risk, gui_surface_state,
+        is_compact_layout, predictive_finite_banner_text, predictive_registry_summary,
+        predictive_reply_book_text, predictive_response_status, reduce_board_draft, spawn_worker,
+        worker_request_cancelled,
     };
 
     fn worker_fixture_solver() -> (Solver, crate::test_support::TestDirectory) {
@@ -926,19 +894,7 @@ mod tests {
         let state = solver.initial_state(NaiveDate::from_ymd_opt(2026, 7, 26).unwrap());
         let mut row = solver.suggestions(&state, 1).unwrap().remove(0);
         row.exact_cost = Some(2.0);
-        assert!(super::suggestion_method(&row).contains("proxy"));
-        for kind in [
-            super::SuggestionValueKind::Lookahead,
-            super::SuggestionValueKind::ContinuationEstimate,
-            super::SuggestionValueKind::ExactAction,
-            super::SuggestionValueKind::Finite(FiniteSearchQuality::Heuristic),
-            super::SuggestionValueKind::Finite(FiniteSearchQuality::UpperBound),
-            super::SuggestionValueKind::Finite(FiniteSearchQuality::Exact),
-            super::SuggestionValueKind::Terminal,
-        ] {
-            row.value_kind = kind;
-            assert_eq!(super::suggestion_method(&row), kind.label());
-        }
+        assert!(row.value_kind.label().contains("proxy"));
     }
 
     #[test]
@@ -947,9 +903,8 @@ mod tests {
             let decoded = crate::scoring::decode_feedback(pattern);
             let expected = [1u8, 3, 9, 27, 81].map(|power| (pattern / power) % 3);
             assert_eq!(decoded, expected);
-            let code = super::feedback_code(decoded);
+            let code = super::format_feedback_trits(super::encode_feedback(decoded));
             assert_eq!(crate::scoring::parse_feedback(&code).unwrap(), pattern);
-            assert_eq!(code, crate::scoring::format_feedback_trits(pattern));
         }
     }
 
@@ -1002,7 +957,6 @@ mod tests {
         let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
             config: solver.config.clone(),
             predictive_solver: solver,
-            formal_solver: None,
         });
         app.current_guess = "cigar".to_string();
         for invalid in ["0", "", "byg", "2222!2"] {
@@ -1027,7 +981,6 @@ mod tests {
         let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
             config: solver.config.clone(),
             predictive_solver: solver,
-            formal_solver: None,
         });
         app.date_text = "2026-07-26".to_string();
         for guess in ["zzzzz", "cig"] {
@@ -1061,7 +1014,6 @@ mod tests {
         let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
             config: solver.config.clone(),
             predictive_solver: solver,
-            formal_solver: None,
         });
         let (sender, receiver) = mpsc::channel();
         app.response_receiver = receiver;
@@ -1080,8 +1032,7 @@ mod tests {
     #[test]
     fn slow_loading_first_frame_and_close_do_not_wait_for_a_worker_result() {
         let root = crate::test_support::TestDirectory::new("gui-loading");
-        let mut setup =
-            super::SetupApp::new(crate::data::ProjectPaths::new(root.path()), String::new());
+        let mut setup = super::SetupApp::new(crate::data::ProjectPaths::new(root.path()));
         let (sender, receiver) = mpsc::channel();
         setup.running = true;
         setup.receiver = Some(receiver);
@@ -1105,7 +1056,6 @@ mod tests {
         let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
             config: solver.config.clone(),
             predictive_solver: solver,
-            formal_solver: None,
         });
         app.install_worker(Err(anyhow::anyhow!("injected thread spawn failure")));
         assert!(app.request_sender.is_none());
@@ -1306,7 +1256,6 @@ mod tests {
         let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
             config: solver.config.clone(),
             predictive_solver: solver,
-            formal_solver: None,
         });
         let request = app.current_request.clone().expect("initial request");
         let payload =
@@ -1407,7 +1356,6 @@ mod tests {
         let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
             config: solver.config.clone(),
             predictive_solver: solver,
-            formal_solver: None,
         });
         let mut stale = app.current_request.clone().unwrap();
         stale.date_text = "2000-01-01".into();
@@ -1451,8 +1399,7 @@ mod tests {
     #[test]
     fn setup_disconnect_is_not_an_infinite_loading_state() {
         let root = crate::test_support::TestDirectory::new("gui-setup-disconnect");
-        let mut app =
-            super::SetupApp::new(crate::data::ProjectPaths::new(root.path()), String::new());
+        let mut app = super::SetupApp::new(crate::data::ProjectPaths::new(root.path()));
         let (sender, receiver) = mpsc::channel();
         app.receiver = Some(receiver);
         app.running = true;
@@ -1471,7 +1418,6 @@ mod tests {
         let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
             config: solver.config.clone(),
             predictive_solver: solver,
-            formal_solver: None,
         });
         app.surviving_count = 32;
         app.total_weight = 1.0;
@@ -1522,7 +1468,6 @@ mod tests {
         let mut app = super::WordleGuiApp::new(super::LoadedWorkspace {
             config: solver.config.clone(),
             predictive_solver: solver,
-            formal_solver: None,
         });
         app.predictive_execution = Some(response.execution);
         app.surviving_count = response.state.surviving;
@@ -1715,26 +1660,21 @@ mod tests {
     }
 
     #[test]
-    fn rendered_surface_states_cover_setup_loading_normal_recovery_and_error() {
+    fn rendered_surface_states_cover_loading_normal_recovery_and_error() {
         assert_eq!(
-            gui_surface_state(true, false, &GuiStatus::Ready, None, 0),
-            GuiSurfaceState::MissingData
-        );
-        assert_eq!(
-            gui_surface_state(false, true, &GuiStatus::Ready, None, 0),
+            gui_surface_state(true, &GuiStatus::Ready, None, 0),
             GuiSurfaceState::Loading
         );
         assert_eq!(
-            gui_surface_state(false, false, &GuiStatus::Ready, None, 0),
+            gui_surface_state(false, &GuiStatus::Ready, None, 0),
             GuiSurfaceState::Empty
         );
         assert_eq!(
-            gui_surface_state(false, false, &GuiStatus::Ready, None, 3),
+            gui_surface_state(false, &GuiStatus::Ready, None, 3),
             GuiSurfaceState::Normal
         );
         assert_eq!(
             gui_surface_state(
-                false,
                 false,
                 &GuiStatus::Ready,
                 Some(crate::predictive::RecoveryMode::EpsilonRepair),
@@ -1743,13 +1683,7 @@ mod tests {
             GuiSurfaceState::Recovery
         );
         assert_eq!(
-            gui_surface_state(
-                false,
-                false,
-                &GuiStatus::WorkerError("bad model".into()),
-                None,
-                0
-            ),
+            gui_surface_state(false, &GuiStatus::WorkerError("bad model".into()), None, 0),
             GuiSurfaceState::Error
         );
     }
@@ -1783,32 +1717,20 @@ mod tests {
     #[test]
     fn predictive_banner_text_matches_artifact_state() {
         assert_eq!(
-            predictive_banner_text(PredictiveArtifactState::ExactDateArtifact),
+            PredictiveArtifactState::ExactDateArtifact.banner_text(),
             "Using exact-date predictive artifact"
         );
         assert_eq!(
-            predictive_banner_text(PredictiveArtifactState::RecentOpenerArtifact),
+            PredictiveArtifactState::RecentOpenerArtifact.banner_text(),
             "Using recent opener artifact"
         );
         assert_eq!(
-            predictive_banner_text(PredictiveArtifactState::LiveSessionFallback),
+            PredictiveArtifactState::LiveSessionFallback.banner_text(),
             "Using live session fallback"
         );
         assert_eq!(
-            predictive_banner_text(PredictiveArtifactState::NoPredictiveArtifactAvailable),
+            PredictiveArtifactState::NoPredictiveArtifactAvailable.banner_text(),
             "No predictive artifact available"
-        );
-    }
-
-    #[test]
-    fn predictive_compute_status_includes_path_hint() {
-        assert_eq!(
-            predictive_compute_status(PredictiveArtifactState::ExactDateArtifact),
-            "Computing... disk-backed"
-        );
-        assert_eq!(
-            predictive_compute_status(PredictiveArtifactState::LiveSessionFallback),
-            "Computing... live session fallback"
         );
     }
 
@@ -1921,14 +1843,6 @@ mod tests {
         assert!(model_metadata.contains("normal-mode future replies"));
         drop(solver);
         drop(root);
-    }
-
-    #[test]
-    fn formal_unavailable_text_is_actionable() {
-        assert_eq!(
-            formal_unavailable_text(),
-            "Formal artifacts missing; run build-optimal-policy first."
-        );
     }
 
     #[test]
@@ -2084,7 +1998,6 @@ mod tests {
                 predictive_candidates: Vec::new(),
                 candidate_filter: String::new(),
                 absurdle_suggestions: Vec::new(),
-                formal_suggestions: Vec::new(),
                 surviving_count: 1,
                 total_weight: 1.0,
                 predictive_recovery_mode: None,
@@ -2112,6 +2025,7 @@ mod tests {
                 eframe::egui::vec2(width, 1400.0),
             );
             let context = eframe::egui::Context::default();
+            context.enable_accesskit();
             let mut frame = eframe::Frame::_new_kittest();
             let output = context.run(
                 eframe::egui::RawInput {
@@ -2120,6 +2034,37 @@ mod tests {
                 },
                 |context| eframe::App::update(&mut app, context, &mut frame),
             );
+
+            // Assistive technology needs a name for every input and a position for each tile.
+            use eframe::egui::accesskit::Role;
+            let update = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("accessibility tree");
+            for (_, node) in &update.nodes {
+                if matches!(
+                    node.role(),
+                    Role::TextInput | Role::Slider | Role::ComboBox | Role::SpinButton
+                ) {
+                    // An explicit label wins over `labelled_by`, so an empty one is unnamed.
+                    assert!(
+                        match node.label() {
+                            Some(label) => !label.is_empty(),
+                            None => !node.labelled_by().is_empty(),
+                        },
+                        "unnamed {:?} control",
+                        node.role()
+                    );
+                }
+            }
+            let tile_names = update
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| node.label())
+                .filter(|label| label.starts_with("Letter "))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(tile_names.len(), 5, "feedback tiles need distinct names");
 
             let text_rect = |needle: &str| {
                 output.shapes.iter().find_map(|shape| match &shape.shape {
@@ -2255,7 +2200,6 @@ mod tests {
             predictive_candidates: Vec::new(),
             candidate_filter: String::new(),
             absurdle_suggestions: Vec::new(),
-            formal_suggestions: Vec::new(),
             surviving_count: 0,
             total_weight: 0.0,
             predictive_recovery_mode: None,

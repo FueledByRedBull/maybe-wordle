@@ -13,15 +13,15 @@ use maybe_wordle::{
     SOLVER_THREAD_STACK_BYTES,
     atomic_file::atomic_write,
     config::PriorConfig,
-    data::{ProjectPaths, SyncSummary, sync_nyt_history},
+    data::{ProjectPaths, SyncSummary, sync_nyt_history_cancellable},
     experiments::{
         DateRange, EvaluationPolicy, RollingOriginConfig, StudyFoldSelection, StudySearchStrategy,
         StudySpec, StudyStage, build_declared_rolling_origin_plan, predictive_parameter_registry,
     },
     formal::{
         DEFAULT_FORMAL_MODEL_ID, FormalAlternativesStatus, FormalPolicyRuntime, FormalScaleRequest,
-        FormalVerificationMode, benchmark_formal_scale, build_optimal_policy,
-        parse_observations as parse_formal_observations, verify_optimal_policy_with_mode,
+        FormalVerificationMode, benchmark_formal_scale, build_optimal_policy, join_bucket_sizes,
+        verify_optimal_policy_with_mode,
     },
     game::{GameRules, GameStatus, status as game_status, try_append_observation},
     gui::run_gui,
@@ -851,7 +851,7 @@ fn run() -> Result<()> {
     match cli.command {
         Command::SyncData { strict, through } => {
             let through = parse_or_today(through.as_deref())?;
-            let summary = sync_nyt_history(&paths, &config, through)?;
+            let summary = sync_nyt_history_cancellable(&paths, &config, through, &|| false)?;
             println!("{}", format_sync_summary(&summary));
             if !summary.changed_dates.is_empty() {
                 println!(
@@ -1062,7 +1062,7 @@ fn run() -> Result<()> {
                     solver.suggest_predictive(request)?
                 };
                 for warning in
-                    predictive_warning_lines(as_of, &observations, predictive_mode, hard, &response)
+                    predictive_warning_lines(as_of, &observations, predictive_mode, &response)
                 {
                     eprintln!("warning: {warning}");
                 }
@@ -1132,34 +1132,9 @@ fn run() -> Result<()> {
                 }
                 reject_hard_mode_for_non_predictive(hard, "formal-optimal")?;
                 reject_live_fallback_for_non_predictive(live_fallback, "formal-optimal")?;
-                let observations = parse_formal_observations(&guess, &feedback)?;
+                let observations = Solver::parse_observations(&guess, &feedback)?;
                 let runtime = FormalPolicyRuntime::load(&paths, &model)?;
-                let state = runtime.apply_history(&observations)?;
-                println!(
-                    "mode=formal-optimal model={} manifest={} surviving={}",
-                    runtime.manifest().model_id,
-                    runtime.manifest().manifest_hash,
-                    state.count()
-                );
-                let explanation = runtime.explain_state(&state, top)?;
-                println!(
-                    "alternatives={}",
-                    formal_alternatives_label(explanation.alternatives_status)
-                );
-                for suggestion in explanation.tied_moves {
-                    println!(
-                        "{} worst_case_depth={} expected_guesses={:.6} bucket_sizes={}",
-                        suggestion.word,
-                        suggestion.objective.worst_case_depth,
-                        suggestion.objective.expected_guesses,
-                        suggestion
-                            .bucket_sizes
-                            .iter()
-                            .map(|size| size.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                }
+                print_formal_state(&runtime, &observations, top)?;
             }
         },
         Command::SolveInteractive {
@@ -1191,13 +1166,9 @@ fn run() -> Result<()> {
                         force_in_two_only: false,
                         mode: predictive_mode,
                     })?;
-                    for warning in predictive_warning_lines(
-                        as_of,
-                        &observations,
-                        predictive_mode,
-                        hard,
-                        &response,
-                    ) {
+                    for warning in
+                        predictive_warning_lines(as_of, &observations, predictive_mode, &response)
+                    {
                         eprintln!("warning: {warning}");
                     }
                     println!(
@@ -1216,42 +1187,20 @@ fn run() -> Result<()> {
                         println!("{}", format_predictive_suggestion(&suggestion));
                     }
 
-                    print!("guess (blank to stop): ");
-                    io::stdout().flush().context("failed to flush stdout")?;
-                    let Some(guess) = read_line(&mut io::stdin().lock())? else {
-                        break;
-                    };
-                    if guess.trim().is_empty() {
-                        break;
-                    }
-                    let guess = match normalize_interactive_guess(&guess, |candidate| {
-                        solver.has_guess(candidate)
-                    }) {
-                        Ok(guess) => guess,
-                        Err(error) => {
-                            println!("error: {error}");
-                            continue;
-                        }
-                    };
-                    if hard && let Some(error) = solver.hard_mode_violation(&observations, &guess) {
-                        println!("error: {error}");
-                        continue;
-                    }
-
-                    print!("feedback (01020 or bgybb): ");
-                    io::stdout().flush().context("failed to flush stdout")?;
-                    let Some(feedback) = read_line(&mut io::stdin().lock())? else {
-                        break;
-                    };
-                    match try_append_observation(
-                        &observations,
-                        &guess,
-                        &feedback,
+                    if !read_interactive_turn(
+                        &mut observations,
                         GameRules::Wordle,
+                        |candidate| solver.has_guess(candidate),
+                        |history, guess| {
+                            if hard {
+                                solver.hard_mode_violation(history, guess)
+                            } else {
+                                None
+                            }
+                        },
                         |next| solver.validate_game_history(as_of, next, hard).map(|_| ()),
-                    ) {
-                        Ok(next) => observations = next,
-                        Err(error) => println!("error: {error}"),
+                    )? {
+                        break;
                     }
                 }
             }
@@ -1273,38 +1222,14 @@ fn run() -> Result<()> {
                         println!("{}", format_absurdle_suggestion(&suggestion));
                     }
 
-                    print!("guess (blank to stop): ");
-                    io::stdout().flush().context("failed to flush stdout")?;
-                    let Some(guess) = read_line(&mut io::stdin().lock())? else {
-                        break;
-                    };
-                    if guess.trim().is_empty() {
-                        break;
-                    }
-                    let guess = match normalize_interactive_guess(&guess, |candidate| {
-                        solver.has_guess(candidate)
-                    }) {
-                        Ok(guess) => guess,
-                        Err(error) => {
-                            println!("error: {error}");
-                            continue;
-                        }
-                    };
-
-                    print!("feedback (01020 or bgybb): ");
-                    io::stdout().flush().context("failed to flush stdout")?;
-                    let Some(feedback) = read_line(&mut io::stdin().lock())? else {
-                        break;
-                    };
-                    match try_append_observation(
-                        &observations,
-                        &guess,
-                        &feedback,
+                    if !read_interactive_turn(
+                        &mut observations,
                         GameRules::Absurdle,
+                        |candidate| solver.has_guess(candidate),
+                        |_, _| None,
                         |next| solver.absurdle_apply_history(next).map(|_| ()),
-                    ) {
-                        Ok(next) => observations = next,
-                        Err(error) => println!("error: {error}"),
+                    )? {
+                        break;
                     }
                 }
             }
@@ -1320,65 +1245,16 @@ fn run() -> Result<()> {
                         println!("game={}", terminal.label());
                         break;
                     }
-                    let state = runtime.apply_history(&observations)?;
-                    println!(
-                        "mode=formal-optimal model={} manifest={} surviving={}",
-                        runtime.manifest().model_id,
-                        runtime.manifest().manifest_hash,
-                        state.count()
-                    );
-                    let explanation = runtime.explain_state(&state, top)?;
-                    println!(
-                        "alternatives={}",
-                        formal_alternatives_label(explanation.alternatives_status)
-                    );
-                    for suggestion in explanation.tied_moves {
-                        println!(
-                            "{} worst_case_depth={} expected_guesses={:.6} bucket_sizes={}",
-                            suggestion.word,
-                            suggestion.objective.worst_case_depth,
-                            suggestion.objective.expected_guesses,
-                            suggestion
-                                .bucket_sizes
-                                .iter()
-                                .map(|size| size.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        );
-                    }
+                    print_formal_state(&runtime, &observations, top)?;
 
-                    print!("guess (blank to stop): ");
-                    io::stdout().flush().context("failed to flush stdout")?;
-                    let Some(guess) = read_line(&mut io::stdin().lock())? else {
-                        break;
-                    };
-                    if guess.trim().is_empty() {
-                        break;
-                    }
-                    let guess = match normalize_interactive_guess(&guess, |candidate| {
-                        runtime.has_guess(candidate)
-                    }) {
-                        Ok(guess) => guess,
-                        Err(error) => {
-                            println!("error: {error}");
-                            continue;
-                        }
-                    };
-
-                    print!("feedback (01020 or bgybb): ");
-                    io::stdout().flush().context("failed to flush stdout")?;
-                    let Some(feedback) = read_line(&mut io::stdin().lock())? else {
-                        break;
-                    };
-                    match try_append_observation(
-                        &observations,
-                        &guess,
-                        &feedback,
+                    if !read_interactive_turn(
+                        &mut observations,
                         GameRules::Wordle,
+                        |candidate| runtime.has_guess(candidate),
+                        |_, _| None,
                         |next| runtime.apply_history(next).map(|_| ()),
-                    ) {
-                        Ok(next) => observations = next,
-                        Err(error) => println!("error: {error}"),
+                    )? {
+                        break;
                     }
                 }
             }
@@ -1389,7 +1265,7 @@ fn run() -> Result<()> {
             top,
             model,
         } => {
-            let observations = parse_formal_observations(&guess, &feedback)?;
+            let observations = Solver::parse_observations(&guess, &feedback)?;
             let runtime = FormalPolicyRuntime::load(&paths, &model)?;
             let state = runtime.apply_history(&observations)?;
             let explanation = runtime.explain_state(&state, top)?;
@@ -1405,12 +1281,7 @@ fn run() -> Result<()> {
                 explanation.best_guess,
                 explanation.objective.worst_case_depth,
                 explanation.objective.expected_guesses,
-                explanation
-                    .bucket_sizes
-                    .iter()
-                    .map(|size| size.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
+                join_bucket_sizes(&explanation.bucket_sizes)
             );
             for tied in explanation.tied_moves {
                 println!(
@@ -1418,11 +1289,7 @@ fn run() -> Result<()> {
                     tied.word,
                     tied.objective.worst_case_depth,
                     tied.objective.expected_guesses,
-                    tied.bucket_sizes
-                        .iter()
-                        .map(|size| size.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    join_bucket_sizes(&tied.bucket_sizes)
                 );
             }
         }
@@ -1437,11 +1304,7 @@ fn run() -> Result<()> {
             let from = parse_date(Some(&from))?.expect("--from is required by clap");
             let to = parse_date(Some(&to))?.expect("--to is required by clap");
             let requested = validate_development_target_range(&paths, from, to, "backtest")?;
-            let backtest_config = backtest_config
-                .as_deref()
-                .map(PriorConfig::load)
-                .transpose()?
-                .unwrap_or_else(|| config.clone());
+            let backtest_config = load_config_or(backtest_config.as_deref(), &config)?;
             let solver = Solver::from_paths(&paths, &backtest_config)?;
             let report = solver.backtest_detailed(requested.start, requested.end, top)?;
             let stats = &report.summary;
@@ -1605,10 +1468,8 @@ fn run() -> Result<()> {
             json,
         } => {
             let evaluation_config = PriorConfig::load(std::path::Path::new(&config_path))?;
-            let from = NaiveDate::parse_from_str(&from, "%Y-%m-%d")
-                .with_context(|| format!("invalid date '{}'", from))?;
-            let to = NaiveDate::parse_from_str(&to, "%Y-%m-%d")
-                .with_context(|| format!("invalid date '{}'", to))?;
+            let from = parse_date(Some(&from))?.expect("--from is required by clap");
+            let to = parse_date(Some(&to))?.expect("--to is required by clap");
             if from > to {
                 bail!("--from cannot be after --to");
             }
@@ -1633,10 +1494,8 @@ fn run() -> Result<()> {
             }
         }
         Command::ThreeGuessGap { from, to, top } => {
-            let from = NaiveDate::parse_from_str(&from, "%Y-%m-%d")
-                .with_context(|| format!("invalid date '{}'", from))?;
-            let to = NaiveDate::parse_from_str(&to, "%Y-%m-%d")
-                .with_context(|| format!("invalid date '{}'", to))?;
+            let from = parse_date(Some(&from))?.expect("--from is required by clap");
+            let to = parse_date(Some(&to))?.expect("--to is required by clap");
             if from > to {
                 bail!("--from cannot be after --to");
             }
@@ -1673,10 +1532,8 @@ fn run() -> Result<()> {
             top,
             opener,
         } => {
-            let from = NaiveDate::parse_from_str(&from, "%Y-%m-%d")
-                .with_context(|| format!("invalid date '{}'", from))?;
-            let to = NaiveDate::parse_from_str(&to, "%Y-%m-%d")
-                .with_context(|| format!("invalid date '{}'", to))?;
+            let from = parse_date(Some(&from))?.expect("--from is required by clap");
+            let to = parse_date(Some(&to))?.expect("--to is required by clap");
             if from > to {
                 bail!("--from cannot be after --to");
             }
@@ -1847,11 +1704,7 @@ fn run() -> Result<()> {
             output_config,
             top,
         } => {
-            let study_base_config = base_config
-                .as_deref()
-                .map(PriorConfig::load)
-                .transpose()?
-                .unwrap_or_else(|| config.clone());
+            let study_base_config = load_config_or(base_config.as_deref(), &config)?;
             let summary = Solver::run_predictive_study(
                 &paths,
                 &study_base_config,
@@ -2056,11 +1909,7 @@ fn run() -> Result<()> {
             hard_mode,
             output,
         } => {
-            let audit_config = audit_config
-                .as_deref()
-                .map(PriorConfig::load)
-                .transpose()?
-                .unwrap_or_else(|| config.clone());
+            let audit_config = load_config_or(audit_config.as_deref(), &config)?;
             let from = parse_date(Some(&from))?
                 .ok_or_else(|| anyhow!("--from is required for search-regret"))?;
             let to = parse_date(Some(&to))?
@@ -2144,11 +1993,7 @@ fn run() -> Result<()> {
             maximum_seconds,
             output,
         } => {
-            let audit_config = audit_config
-                .as_deref()
-                .map(PriorConfig::load)
-                .transpose()?
-                .unwrap_or_else(|| config.clone());
+            let audit_config = load_config_or(audit_config.as_deref(), &config)?;
             let date = parse_date(Some(&date))?
                 .ok_or_else(|| anyhow!("--date is required for same-state-dynamic-regret"))?;
             let solver = Solver::from_paths(&paths, &audit_config)?;
@@ -2190,11 +2035,7 @@ fn run() -> Result<()> {
                 to,
                 "staged zero-failure certificate",
             )?;
-            let audit_config = audit_config
-                .as_deref()
-                .map(PriorConfig::load)
-                .transpose()?
-                .unwrap_or_else(|| config.clone());
+            let audit_config = load_config_or(audit_config.as_deref(), &config)?;
             let solver = Solver::from_paths(&paths, &audit_config)?;
             let report = solver.staged_zero_failure_certificate_report(
                 &paths,
@@ -2233,13 +2074,7 @@ fn run() -> Result<()> {
                 SolverMode::Predictive => {
                     let solver = Solver::from_paths(&paths, &config)?;
                     let state = solver.initial_state(Solver::today());
-                    let mut elapsed = std::time::Duration::ZERO;
-                    for _ in 0..runs {
-                        let started = std::time::Instant::now();
-                        let _ = solver.suggestions(&state, 10)?;
-                        elapsed += started.elapsed();
-                    }
-                    let average_ms = elapsed.as_secs_f64() * 1000.0 / runs as f64;
+                    let average_ms = average_ms(runs, || solver.suggestions(&state, 10).map(drop))?;
                     println!(
                         "mode=predictive runs={} surviving={} pattern_table_bytes={} average_ms={:.3}",
                         runs,
@@ -2251,13 +2086,9 @@ fn run() -> Result<()> {
                 SolverMode::Absurdle => {
                     let solver = Solver::from_paths(&paths, &config)?;
                     let state = solver.absurdle_initial_state();
-                    let mut elapsed = std::time::Duration::ZERO;
-                    for _ in 0..runs {
-                        let started = std::time::Instant::now();
-                        let _ = solver.absurdle_suggestions_for_state(&state, 10)?;
-                        elapsed += started.elapsed();
-                    }
-                    let average_ms = elapsed.as_secs_f64() * 1000.0 / runs as f64;
+                    let average_ms = average_ms(runs, || {
+                        solver.absurdle_suggestions_for_state(&state, 10).map(drop)
+                    })?;
                     println!(
                         "mode=absurdle runs={} surviving={} pattern_table_bytes={} average_ms={:.3}",
                         runs,
@@ -2269,13 +2100,7 @@ fn run() -> Result<()> {
                 SolverMode::FormalOptimal => {
                     let runtime = FormalPolicyRuntime::load(&paths, &model)?;
                     let state = runtime.initial_state();
-                    let mut elapsed = std::time::Duration::ZERO;
-                    for _ in 0..runs {
-                        let started = std::time::Instant::now();
-                        let _ = runtime.suggest(&state, 10)?;
-                        elapsed += started.elapsed();
-                    }
-                    let average_ms = elapsed.as_secs_f64() * 1000.0 / runs as f64;
+                    let average_ms = average_ms(runs, || runtime.suggest(&state, 10).map(drop))?;
                     println!(
                         "mode=formal-optimal runs={} surviving={} states={} average_ms={:.3}",
                         runs,
@@ -2357,22 +2182,11 @@ fn run() -> Result<()> {
             output,
             baseline_artifact,
         } => {
-            let rolling_baseline = baseline_config
-                .as_deref()
-                .map(PriorConfig::load)
-                .transpose()?
-                .unwrap_or_else(|| config.clone());
+            let rolling_baseline = load_config_or(baseline_config.as_deref(), &config)?;
             let candidate = PriorConfig::load(&candidate_config)?;
             let reusable = baseline_artifact
                 .as_deref()
-                .map(|path| {
-                    let bytes = std::fs::read(path)
-                        .with_context(|| format!("failed to read {}", path.display()))?;
-                    serde_json::from_slice::<maybe_wordle::solver::RollingComparisonArtifact>(
-                        &bytes,
-                    )
-                    .with_context(|| format!("failed to parse {}", path.display()))
-                })
+                .map(read_json::<maybe_wordle::solver::RollingComparisonArtifact>)
                 .transpose()?;
             let artifact = Solver::build_rolling_config_comparison(
                 &paths,
@@ -2413,10 +2227,6 @@ fn run() -> Result<()> {
             } else {
                 paths.root.join(output)
             };
-            if let Some(parent) = output.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
             atomic_write(
                 &output,
                 &serde_json::to_vec_pretty(&frozen)
@@ -2433,11 +2243,7 @@ fn run() -> Result<()> {
             );
         }
         Command::EvaluateSealed { frozen, output } => {
-            let bytes = std::fs::read(&frozen)
-                .with_context(|| format!("failed to read {}", frozen.display()))?;
-            let frozen: maybe_wordle::solver::FrozenPredictiveCandidate =
-                serde_json::from_slice(&bytes)
-                    .with_context(|| format!("failed to parse {}", frozen.display()))?;
+            let frozen: maybe_wordle::solver::FrozenPredictiveCandidate = read_json(&frozen)?;
             let report =
                 Solver::evaluate_frozen_candidate_on_sealed_test(&paths, &frozen, &output)?;
             println!(
@@ -2481,11 +2287,7 @@ fn run() -> Result<()> {
             );
         }
         Command::EvaluateProspective { frozen, output } => {
-            let bytes = std::fs::read(&frozen)
-                .with_context(|| format!("failed to read {}", frozen.display()))?;
-            let frozen: maybe_wordle::solver::ProspectiveFrozenCandidate =
-                serde_json::from_slice(&bytes)
-                    .with_context(|| format!("failed to parse {}", frozen.display()))?;
+            let frozen: maybe_wordle::solver::ProspectiveFrozenCandidate = read_json(&frozen)?;
             let report = Solver::evaluate_prospective_candidate(&paths, &frozen, &output)?;
             println!(
                 "prospective_games={} solved={} failures={} coverage_gaps={} all_game_mean={:.4} ci95={:.4}..{:.4} latency_p95_ms={:.3} evaluated_once=true window={}..{} output={}",
@@ -2554,6 +2356,29 @@ fn parse_date(raw: Option<&str>) -> Result<Option<NaiveDate>> {
     .transpose()
 }
 
+fn load_config_or(path: Option<&Path>, default: &PriorConfig) -> Result<PriorConfig> {
+    Ok(path
+        .map(PriorConfig::load)
+        .transpose()?
+        .unwrap_or_else(|| default.clone()))
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn average_ms(runs: usize, mut run: impl FnMut() -> Result<()>) -> Result<f64> {
+    let mut elapsed = std::time::Duration::ZERO;
+    for _ in 0..runs {
+        let started = std::time::Instant::now();
+        run()?;
+        elapsed += started.elapsed();
+    }
+    Ok(elapsed.as_secs_f64() * 1000.0 / runs as f64)
+}
+
 fn validate_development_target_range(
     paths: &ProjectPaths,
     from: NaiveDate,
@@ -2617,6 +2442,35 @@ fn formal_alternatives_label(status: FormalAlternativesStatus) -> &'static str {
     }
 }
 
+fn print_formal_state(
+    runtime: &FormalPolicyRuntime,
+    observations: &[(String, u8)],
+    top: usize,
+) -> Result<()> {
+    let state = runtime.apply_history(observations)?;
+    println!(
+        "mode=formal-optimal model={} manifest={} surviving={}",
+        runtime.manifest().model_id,
+        runtime.manifest().manifest_hash,
+        state.count()
+    );
+    let explanation = runtime.explain_state(&state, top)?;
+    println!(
+        "alternatives={}",
+        formal_alternatives_label(explanation.alternatives_status)
+    );
+    for suggestion in explanation.tied_moves {
+        println!(
+            "{} worst_case_depth={} expected_guesses={:.6} bucket_sizes={}",
+            suggestion.word,
+            suggestion.objective.worst_case_depth,
+            suggestion.objective.expected_guesses,
+            join_bucket_sizes(&suggestion.bucket_sizes)
+        );
+    }
+    Ok(())
+}
+
 fn format_predictive_context(puzzle_date: NaiveDate, history_cutoff: NaiveDate) -> String {
     format!("puzzle_date={puzzle_date} history_cutoff={history_cutoff}")
 }
@@ -2672,7 +2526,6 @@ fn predictive_warning_lines(
     as_of: NaiveDate,
     observations: &[(String, u8)],
     mode: PredictiveSuggestionMode,
-    _hard_mode: bool,
     response: &PredictiveSuggestResponse,
 ) -> Vec<String> {
     if response.execution.route == maybe_wordle::predictive::PredictiveRegime::Finite {
@@ -2754,6 +2607,46 @@ where
         return Err(format!("unknown guess: {}", normalized));
     }
     Ok(normalized)
+}
+
+/// Prompts for one guess and its feedback; returns `false` once the session should stop.
+fn read_interactive_turn(
+    observations: &mut Vec<(String, u8)>,
+    rules: GameRules,
+    has_guess: impl FnOnce(&str) -> bool,
+    hard_mode_violation: impl FnOnce(&[(String, u8)], &str) -> Option<String>,
+    validate: impl FnOnce(&[(String, u8)]) -> Result<()>,
+) -> Result<bool> {
+    print!("guess (blank to stop): ");
+    io::stdout().flush().context("failed to flush stdout")?;
+    let Some(guess) = read_line(&mut io::stdin().lock())? else {
+        return Ok(false);
+    };
+    if guess.trim().is_empty() {
+        return Ok(false);
+    }
+    let guess = match normalize_interactive_guess(&guess, has_guess) {
+        Ok(guess) => guess,
+        Err(error) => {
+            println!("error: {error}");
+            return Ok(true);
+        }
+    };
+    if let Some(error) = hard_mode_violation(observations, &guess) {
+        println!("error: {error}");
+        return Ok(true);
+    }
+
+    print!("feedback (01020 or bgybb): ");
+    io::stdout().flush().context("failed to flush stdout")?;
+    let Some(feedback) = read_line(&mut io::stdin().lock())? else {
+        return Ok(false);
+    };
+    match try_append_observation(observations, &guess, &feedback, rules, validate) {
+        Ok(next) => *observations = next,
+        Err(error) => println!("error: {error}"),
+    }
+    Ok(true)
 }
 
 fn format_predictive_suggestion(suggestion: &maybe_wordle::solver::Suggestion) -> String {
@@ -3406,7 +3299,6 @@ mod tests {
             response.puzzle_date,
             &[("crane".to_string(), 17)],
             maybe_wordle::predictive::PredictiveSuggestionMode::Full,
-            true,
             &response,
         );
         assert!(
@@ -3433,7 +3325,6 @@ mod tests {
             response.puzzle_date,
             &[("crane".to_string(), 17)],
             maybe_wordle::predictive::PredictiveSuggestionMode::Full,
-            false,
             &response,
         );
         assert_eq!(warnings.len(), 1);

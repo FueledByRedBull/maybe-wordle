@@ -36,10 +36,6 @@ impl Default for RecoveryPolicy {
 }
 
 impl RecoveryPolicy {
-    pub fn label(&self) -> &'static str {
-        self.mode.label()
-    }
-
     pub fn repair_weight(&self, seed_weight: f64, support_size: usize) -> f64 {
         match self.mode {
             RecoveryMode::Strict => 0.0,
@@ -58,9 +54,5 @@ impl RecoveryPolicy {
                 }
             }
         }
-    }
-
-    pub fn needs_repair(&self, total_weight: f64) -> bool {
-        total_weight <= 0.0
     }
 }

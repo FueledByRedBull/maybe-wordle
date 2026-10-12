@@ -23,7 +23,12 @@ fn fixture() -> (TestDirectory, FormalPolicyRuntime) {
     .unwrap();
     let built = build_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).unwrap();
     assert_eq!(built.root_best_guess, "abxyz");
-    verify_optimal_policy(&paths, DEFAULT_FORMAL_MODEL_ID).unwrap();
+    verify_optimal_policy_with_mode(
+        &paths,
+        DEFAULT_FORMAL_MODEL_ID,
+        FormalVerificationMode::Certificate,
+    )
+    .unwrap();
     let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).unwrap();
     (root, runtime)
 }
@@ -52,8 +57,6 @@ fn equivalent_probe_dedup_keeps_lexical_representative() {
         hot_tt: HotTranspositionTable::new(4096),
         deduped_signatures: 0,
         bound_hits: 0,
-        root_refinement_pruned: 0,
-        local_refinement_pruned: 0,
         partition_calls: 0,
         quick_plan_calls: 0,
         started,

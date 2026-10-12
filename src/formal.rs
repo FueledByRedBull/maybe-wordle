@@ -18,7 +18,7 @@ use crate::{
     identity::{CanonicalSha256, digest_bytes_tagged, tag},
     model::AnswerRecord,
     pattern_table::{PatternTable, hash_word_list},
-    scoring::{ALL_GREEN_PATTERN, PATTERN_SPACE, format_feedback_letters, parse_feedback},
+    scoring::{ALL_GREEN_PATTERN, PATTERN_SPACE, format_feedback_letters},
     small_state::{SMALL_STATE_TABLE_VERSION, SmallStateTable},
 };
 
@@ -191,12 +191,7 @@ pub struct BuildOptimalSummary {
     pub solved_states: usize,
     pub deduped_signatures: u64,
     pub bound_hits: u64,
-    pub root_refinement_pruned: u64,
-    pub local_refinement_pruned: u64,
     pub build_millis: u128,
-    pub solve_millis: u128,
-    pub certificate_millis: u128,
-    pub persistence_millis: u128,
     pub root_best_guess: String,
     pub root_objective: PolicyObjective,
 }
@@ -303,17 +298,6 @@ impl PolicyArtifactSet {
     pub fn published(paths: &ProjectPaths, model_id: &str) -> Result<Self> {
         generation::resolve(paths, model_id)
     }
-
-    pub fn exists(&self) -> bool {
-        self.manifest.exists()
-            && self.values.exists()
-            && self.policy.exists()
-            && self.metadata.exists()
-            && self.certificate.exists()
-            && self.small_state_table.exists()
-            && self.pattern_table.exists()
-            && self.prior_spec.exists()
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -418,8 +402,6 @@ struct FormalPolicyBuilder<'a> {
     hot_tt: HotTranspositionTable,
     deduped_signatures: u64,
     bound_hits: u64,
-    root_refinement_pruned: u64,
-    local_refinement_pruned: u64,
     partition_calls: u64,
     quick_plan_calls: u64,
     started: Instant,
@@ -680,13 +662,7 @@ impl<'a> IndependentExactSolver<'a> {
                 best_guess: guess_index,
             };
             if best.as_ref().is_none_or(|current| {
-                compare_stored_with_kind(
-                    &candidate,
-                    current,
-                    &self.model.guesses,
-                    FormalObjectiveKind::ExpectedOnly,
-                )
-                .is_lt()
+                compare_stored(&candidate, current, &self.model.guesses).is_lt()
             }) {
                 best = Some(candidate);
             }
@@ -728,8 +704,6 @@ fn build_optimal_policy_controlled(
         hot_tt: HotTranspositionTable::new(HOT_TT_BYTES),
         deduped_signatures: 0,
         bound_hits: 0,
-        root_refinement_pruned: 0,
-        local_refinement_pruned: 0,
         partition_calls: 0,
         quick_plan_calls: 0,
         started,
@@ -759,14 +733,13 @@ fn build_optimal_policy_controlled(
         solved_states: builder.memo.len(),
         deduped_signatures: builder.deduped_signatures,
         bound_hits: builder.bound_hits,
-        root_refinement_pruned: builder.root_refinement_pruned,
-        local_refinement_pruned: builder.local_refinement_pruned,
+        root_refinement_pruned: 0,
+        local_refinement_pruned: 0,
         solve_millis,
         certificate_millis,
         pre_publish_millis: total_started.elapsed().as_millis(),
         root_objective: root_state.objective.clone(),
     };
-    let persistence_started = Instant::now();
     generation::publish(
         &builder.model,
         &builder.memo,
@@ -776,26 +749,16 @@ fn build_optimal_policy_controlled(
         total_started,
         cancelled,
     )?;
-    let persistence_millis = persistence_started.elapsed().as_millis();
     Ok(BuildOptimalSummary {
         model_id: builder.model.manifest.model_id.clone(),
         manifest_hash: builder.model.manifest.manifest_hash.clone(),
         solved_states: builder.memo.len(),
         deduped_signatures: builder.deduped_signatures,
         bound_hits: builder.bound_hits,
-        root_refinement_pruned: builder.root_refinement_pruned,
-        local_refinement_pruned: builder.local_refinement_pruned,
         build_millis: total_started.elapsed().as_millis(),
-        solve_millis,
-        certificate_millis,
-        persistence_millis,
         root_best_guess: builder.model.guesses[root_state.best_guess].clone(),
         root_objective: root_state.objective,
     })
-}
-
-pub fn verify_optimal_policy(paths: &ProjectPaths, model_id: &str) -> Result<VerifySummary> {
-    verify_optimal_policy_with_mode(paths, model_id, FormalVerificationMode::Certificate)
 }
 
 pub fn verify_optimal_policy_with_mode(
@@ -861,7 +824,7 @@ fn verify_optimal_policy_controlled(
             cached_states += 1;
             let size = state.count();
             if size <= 6 {
-                let independent = runtime.solve_state_independent(state)?;
+                let independent = IndependentExactSolver::new(&runtime.model).solve(state)?;
                 if !same_decision(&independent, stored) {
                     bail!(
                         "independent verification failed for size {} state {}",
@@ -1363,7 +1326,7 @@ impl FormalPolicyRuntime {
         if state.horizon == Some(0) {
             bail!("formal policy has exhausted its remaining horizon");
         }
-        let total_mass = self.state_mass(&state);
+        let total_mass = state_total_mass(&state, &self.model.prior);
         let mut scratch = PartitionScratch::default();
         let mut signature_map: HashMap<PartitionFingerprint, Vec<usize>> = HashMap::new();
         let mut evaluations = Vec::new();
@@ -1413,14 +1376,8 @@ impl FormalPolicyRuntime {
             evaluation_buckets.push(buckets);
             evaluations.push(built);
         }
-        evaluations[usize::from(primary_guess.is_some())..].sort_by(|left, right| {
-            compare_evaluations_with_kind(
-                left,
-                right,
-                &self.model.guesses,
-                FormalObjectiveKind::ExpectedOnly,
-            )
-        });
+        evaluations[usize::from(primary_guess.is_some())..]
+            .sort_by(|left, right| compare_evaluations(left, right, &self.model.guesses));
         Ok(evaluations)
     }
 
@@ -1433,10 +1390,6 @@ impl FormalPolicyRuntime {
             objective: best.objective.clone(),
             best_guess: best.guess_index,
         })
-    }
-
-    fn solve_state_independent(&self, state: &StateKey) -> Result<StoredState> {
-        IndependentExactSolver::new(&self.model).solve(state)
     }
 
     fn build_guess_evaluation(
@@ -1492,12 +1445,6 @@ impl FormalPolicyRuntime {
             bucket_sizes,
         }))
     }
-
-    fn state_mass(&self, state: &StateKey) -> f64 {
-        let mut total = 0.0;
-        state.for_each_index(|index| total += self.model.prior[index]);
-        total
-    }
 }
 
 impl FormalPolicyBuilder<'_> {
@@ -1549,7 +1496,7 @@ impl FormalPolicyBuilder<'_> {
         }
 
         let quick_plans = self.collect_quick_plans_for_state(state)?;
-        let total_mass = self.state_mass(state);
+        let total_mass = state_total_mass(state, &self.model.prior);
         let mut best: Option<StoredState> = None;
         for plan in &quick_plans {
             self.check_cancelled()?;
@@ -1624,13 +1571,7 @@ impl FormalPolicyBuilder<'_> {
                 best_guess: plan.guess_index,
             };
             if best.as_ref().is_none_or(|current| {
-                compare_stored_with_kind(
-                    &candidate,
-                    current,
-                    &self.model.guesses,
-                    FormalObjectiveKind::ExpectedOnly,
-                )
-                .is_lt()
+                compare_stored(&candidate, current, &self.model.guesses).is_lt()
             }) {
                 best = Some(candidate);
             }
@@ -1665,7 +1606,7 @@ impl FormalPolicyBuilder<'_> {
     fn collect_quick_plans_for_state(&mut self, state: &StateKey) -> Result<Vec<GuessQuickPlan>> {
         self.quick_plan_calls += 1;
         self.maybe_report_progress("search");
-        let total_mass = self.state_mass(state);
+        let total_mass = state_total_mass(state, &self.model.prior);
         let mut raw_plans = (0..self.model.guesses.len())
             .into_par_iter()
             .map_init(
@@ -1778,12 +1719,6 @@ impl FormalPolicyBuilder<'_> {
         )
     }
 
-    fn state_mass(&self, state: &StateKey) -> f64 {
-        let mut total = 0.0;
-        state.for_each_index(|index| total += self.model.prior[index]);
-        total
-    }
-
     fn maybe_report_progress(&mut self, phase: &str) {
         if !progress_enabled() {
             return;
@@ -1799,14 +1734,12 @@ impl FormalPolicyBuilder<'_> {
         }
         self.last_progress = Instant::now();
         eprintln!(
-            "formal-progress phase={} elapsed_ms={} memo={} deduped_signatures={} bound_hits={} root_refinement_pruned={} local_refinement_pruned={} quick_plan_calls={} partition_calls={}",
+            "formal-progress phase={} elapsed_ms={} memo={} deduped_signatures={} bound_hits={} root_refinement_pruned=0 local_refinement_pruned=0 quick_plan_calls={} partition_calls={}",
             phase,
             self.started.elapsed().as_millis(),
             self.memo.len(),
             self.deduped_signatures,
             self.bound_hits,
-            self.root_refinement_pruned,
-            self.local_refinement_pruned,
             self.quick_plan_calls,
             self.partition_calls
         );
@@ -1891,17 +1824,11 @@ impl StateKey {
             let mut inline = [0u16; STATE_INLINE_CAPACITY];
             let mut slot = 0usize;
             let mut hash = 0u64;
-            for (word_index, word) in words.iter().copied().enumerate() {
-                let mut bits = word;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    let index = (word_index * 64) + bit;
-                    inline[slot] = index as u16;
-                    slot += 1;
-                    hash ^= zobrist[index];
-                    bits &= bits - 1;
-                }
-            }
+            for_each_set_bit(&words, |index| {
+                inline[slot] = index as u16;
+                slot += 1;
+                hash ^= zobrist[index];
+            });
             Self {
                 storage: StateStorage::Inline {
                     len: count as u8,
@@ -1913,14 +1840,7 @@ impl StateKey {
             }
         } else {
             let mut hash = 0u64;
-            for (word_index, word) in words.iter().copied().enumerate() {
-                let mut bits = word;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    hash ^= zobrist[(word_index * 64) + bit];
-                    bits &= bits - 1;
-                }
-            }
+            for_each_set_bit(&words, |index| hash ^= zobrist[index]);
             Self {
                 storage: StateStorage::Bitset(words.into_boxed_slice()),
                 count,
@@ -1955,16 +1875,7 @@ impl StateKey {
                     f(*index as usize);
                 }
             }
-            StateStorage::Bitset(words) => {
-                for (word_index, word) in words.iter().copied().enumerate() {
-                    let mut bits = word;
-                    while bits != 0 {
-                        let bit = bits.trailing_zeros() as usize;
-                        f((word_index * 64) + bit);
-                        bits &= bits - 1;
-                    }
-                }
-            }
+            StateStorage::Bitset(words) => for_each_set_bit(words, f),
         }
     }
 
@@ -2013,21 +1924,21 @@ impl StateKey {
         if answer_count == 0 || answer_count > u16::MAX as usize || zobrist.len() != answer_count {
             bail!("unsupported formal answer dimensions");
         }
-        let horizon = match read_u16(reader)? {
+        let horizon = match u16::from_le_bytes(read_array(reader)?) {
             u16::MAX => None,
             value if value > 0 && value <= u8::MAX as u16 => Some(value as u8),
             _ => bail!("invalid formal state horizon"),
         };
-        let tag = read_u8(reader)?;
+        let [tag] = read_array(reader)?;
         let state = match tag {
             STATE_TAG_INLINE => {
-                let len = read_u16(reader)? as usize;
+                let len = u16::from_le_bytes(read_array(reader)?) as usize;
                 if len == 0 || len > INLINE_STATE_THRESHOLD || len > answer_count {
                     bail!("invalid inline formal state length");
                 }
                 let mut indices = Vec::with_capacity(len);
                 for _ in 0..len {
-                    let index = read_u16(reader)? as usize;
+                    let index = u16::from_le_bytes(read_array(reader)?) as usize;
                     if index >= answer_count
                         || indices.last().is_some_and(|previous| *previous >= index)
                     {
@@ -2038,7 +1949,7 @@ impl StateKey {
                 Self::from_indices_with_tokens(answer_count, indices, zobrist)
             }
             STATE_TAG_BITSET => {
-                let word_count = read_u16(reader)? as usize;
+                let word_count = u16::from_le_bytes(read_array(reader)?) as usize;
                 if word_count != answer_count.div_ceil(64) {
                     bail!("unexpected tagged state word count");
                 }
@@ -2096,16 +2007,19 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn indices_from_words(words: &[u64]) -> Vec<usize> {
-    let mut indices = Vec::new();
+fn for_each_set_bit(words: &[u64], mut f: impl FnMut(usize)) {
     for (word_index, word) in words.iter().copied().enumerate() {
         let mut bits = word;
         while bits != 0 {
-            let bit = bits.trailing_zeros() as usize;
-            indices.push((word_index * 64) + bit);
+            f((word_index * 64) + bits.trailing_zeros() as usize);
             bits &= bits - 1;
         }
     }
+}
+
+fn indices_from_words(words: &[u64]) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for_each_set_bit(words, |index| indices.push(index));
     indices
 }
 
@@ -2353,17 +2267,21 @@ fn read_values(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, Pol
     if manifest_hash != model.manifest.manifest_hash {
         bail!("stale values file: {}", path.display());
     }
-    let count = bounded_record_count(read_u64(&mut reader)?, file_length, 24)?;
-    let word_count = read_u32(&mut reader)? as usize;
+    let count = bounded_record_count(
+        u64::from_le_bytes(read_array(&mut reader)?),
+        file_length,
+        24,
+    )?;
+    let word_count = u32::from_le_bytes(read_array(&mut reader)?) as usize;
     if word_count != model.answers.len().div_ceil(64) {
         bail!("unexpected state word count in {}", path.display());
     }
     let mut values = HashMap::with_capacity(count);
     for _ in 0..count {
-        let state_hash = read_u64(&mut reader)?;
+        let state_hash = u64::from_le_bytes(read_array(&mut reader)?);
         let state = StateKey::read_tagged(&mut reader, model.answers.len(), &model.zobrist)?;
-        let worst_case_depth = read_u8(&mut reader)?;
-        let expected_guesses = read_f64(&mut reader)?;
+        let [worst_case_depth] = read_array(&mut reader)?;
+        let expected_guesses = f64::from_le_bytes(read_array(&mut reader)?);
         validate_loaded_state(&state, model)?;
         validate_loaded_objective(
             &state,
@@ -2406,17 +2324,21 @@ fn read_policy(path: &Path, model: &FormalModel) -> Result<HashMap<StateKey, usi
     if manifest_hash != model.manifest.manifest_hash {
         bail!("stale policy file: {}", path.display());
     }
-    let count = bounded_record_count(read_u64(&mut reader)?, file_length, 19)?;
-    let word_count = read_u32(&mut reader)? as usize;
+    let count = bounded_record_count(
+        u64::from_le_bytes(read_array(&mut reader)?),
+        file_length,
+        19,
+    )?;
+    let word_count = u32::from_le_bytes(read_array(&mut reader)?) as usize;
     if word_count != model.answers.len().div_ceil(64) {
         bail!("unexpected state word count in {}", path.display());
     }
     let mut policies = HashMap::with_capacity(count);
     for _ in 0..count {
-        let state_hash = read_u64(&mut reader)?;
+        let state_hash = u64::from_le_bytes(read_array(&mut reader)?);
         let state = StateKey::read_tagged(&mut reader, model.answers.len(), &model.zobrist)?;
         validate_loaded_state(&state, model)?;
-        let best_guess = read_u32(&mut reader)? as usize;
+        let best_guess = u32::from_le_bytes(read_array(&mut reader)?) as usize;
         if best_guess >= model.guesses.len() {
             bail!(
                 "policy references invalid guess index in {}",
@@ -2492,7 +2414,7 @@ fn reject_trailing_bytes(reader: &mut impl Read) -> Result<()> {
 fn read_state_words(reader: &mut impl Read, word_count: usize) -> Result<Vec<u64>> {
     let mut words = Vec::with_capacity(word_count);
     for _ in 0..word_count {
-        words.push(read_u64(reader)?);
+        words.push(u64::from_le_bytes(read_array(reader)?));
     }
     Ok(words)
 }
@@ -2507,34 +2429,10 @@ fn read_tagged_digest(reader: &mut impl Read) -> Result<String> {
     Ok(digest.to_string())
 }
 
-fn read_u8(reader: &mut impl Read) -> Result<u8> {
-    let mut bytes = [0u8; 1];
+fn read_array<const N: usize>(reader: &mut impl Read) -> Result<[u8; N]> {
+    let mut bytes = [0u8; N];
     reader.read_exact(&mut bytes)?;
-    Ok(bytes[0])
-}
-
-fn read_u32(reader: &mut impl Read) -> Result<u32> {
-    let mut bytes = [0u8; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_u16(reader: &mut impl Read) -> Result<u16> {
-    let mut bytes = [0u8; 2];
-    reader.read_exact(&mut bytes)?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn read_u64(reader: &mut impl Read) -> Result<u64> {
-    let mut bytes = [0u8; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_f64(reader: &mut impl Read) -> Result<f64> {
-    let mut bytes = [0u8; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(f64::from_le_bytes(bytes))
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -2730,7 +2628,7 @@ fn partition_guess_with_scratch(
             let offset = pattern * word_count;
             PartitionBucket {
                 pattern: pattern as u8,
-                state: state_key_from_words(
+                state: StateKey::from_words_with_tokens(
                     scratch.words[offset..offset + word_count].to_vec(),
                     zobrist,
                 ),
@@ -2749,10 +2647,6 @@ fn partition_guess_with_scratch(
         bail!("guess partition unexpectedly empty");
     }
     Ok(built)
-}
-
-fn state_key_from_words(words: Vec<u64>, zobrist: &[u64]) -> StateKey {
-    StateKey::from_words_with_tokens(words, zobrist)
 }
 
 fn partition_fingerprint_from_buckets(buckets: &[PartitionBucket]) -> PartitionFingerprint {
@@ -2804,40 +2698,27 @@ fn state_total_mass(state: &StateKey, prior: &[f64]) -> f64 {
     total
 }
 
-fn compare_stored_with_kind(
+fn compare_stored(
     left: &StoredState,
     right: &StoredState,
     guesses: &[String],
-    kind: FormalObjectiveKind,
 ) -> std::cmp::Ordering {
-    compare_objective_with_kind(&left.objective, &right.objective, kind)
+    compare_objective(&left.objective, &right.objective)
         .then_with(|| guesses[left.best_guess].cmp(&guesses[right.best_guess]))
 }
 
-fn compare_objective_with_kind(
-    left: &PolicyObjective,
-    right: &PolicyObjective,
-    kind: FormalObjectiveKind,
-) -> std::cmp::Ordering {
-    match kind {
-        FormalObjectiveKind::Lexicographic => left
-            .worst_case_depth
-            .cmp(&right.worst_case_depth)
-            .then_with(|| left.expected_guesses.total_cmp(&right.expected_guesses)),
-        FormalObjectiveKind::ExpectedOnly => left
-            .expected_guesses
-            .total_cmp(&right.expected_guesses)
-            .then_with(|| left.worst_case_depth.cmp(&right.worst_case_depth)),
-    }
+fn compare_objective(left: &PolicyObjective, right: &PolicyObjective) -> std::cmp::Ordering {
+    left.expected_guesses
+        .total_cmp(&right.expected_guesses)
+        .then_with(|| left.worst_case_depth.cmp(&right.worst_case_depth))
 }
 
-fn compare_evaluations_with_kind(
+fn compare_evaluations(
     left: &GuessEvaluation,
     right: &GuessEvaluation,
     guesses: &[String],
-    kind: FormalObjectiveKind,
 ) -> std::cmp::Ordering {
-    compare_objective_with_kind(&left.objective, &right.objective, kind)
+    compare_objective(&left.objective, &right.objective)
         .then_with(|| guesses[left.guess_index].cmp(&guesses[right.guess_index]))
 }
 
@@ -2927,15 +2808,12 @@ fn same_objective(left: &PolicyObjective, right: &PolicyObjective) -> bool {
         && (left.expected_guesses - right.expected_guesses).abs() < 1e-9
 }
 
-pub fn parse_observations(guesses: &[String], feedbacks: &[String]) -> Result<Vec<(String, u8)>> {
-    if guesses.len() != feedbacks.len() {
-        bail!("--guess and --feedback must appear the same number of times");
-    }
-    guesses
+pub fn join_bucket_sizes(sizes: &[usize]) -> String {
+    sizes
         .iter()
-        .zip(feedbacks)
-        .map(|(guess, feedback)| Ok((guess.trim().to_ascii_lowercase(), parse_feedback(feedback)?)))
-        .collect()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -3034,7 +2912,7 @@ mod tests {
                 let offset = pattern * word_count;
                 PartitionBucket {
                     pattern: pattern as u8,
-                    state: state_key_from_words(
+                    state: StateKey::from_words_with_tokens(
                         words[offset..offset + word_count].to_vec(),
                         zobrist,
                     ),
@@ -3517,8 +3395,8 @@ mod tests {
         let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("load");
         let root_state = runtime.initial_state();
         let exact = runtime.evaluate_state_exact(&root_state).expect("exact");
-        let independent = runtime
-            .solve_state_independent(&root_state)
+        let independent = IndependentExactSolver::new(&runtime.model)
+            .solve(&root_state)
             .expect("independent");
         assert!(same_decision(&exact, &independent));
         let _ = std::fs::remove_dir_all(&root);
@@ -3544,8 +3422,8 @@ mod tests {
         let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("load");
         let root_state = runtime.initial_state();
         let exact = runtime.evaluate_state_exact(&root_state).expect("exact");
-        let independent = runtime
-            .solve_state_independent(&root_state)
+        let independent = IndependentExactSolver::new(&runtime.model)
+            .solve(&root_state)
             .expect("independent");
         assert!(same_decision(&exact, &independent));
         let certificate =
@@ -3623,8 +3501,6 @@ mod tests {
                 hot_tt: HotTranspositionTable::new(1024 * 1024),
                 deduped_signatures: 0,
                 bound_hits: 0,
-                root_refinement_pruned: 0,
-                local_refinement_pruned: 0,
                 partition_calls: 0,
                 quick_plan_calls: 0,
                 started,
@@ -3636,16 +3512,8 @@ mod tests {
                 .solve(&state)
                 .expect("exhaustive");
             assert!(same_decision(&built, &exhaustive));
-            assert_eq!(builder.root_refinement_pruned, 0);
-            assert_eq!(builder.local_refinement_pruned, 0);
             let _ = std::fs::remove_dir_all(root);
         }
-    }
-
-    #[test]
-    fn parse_observations_rejects_length_mismatch() {
-        let error = parse_observations(&["crane".into()], &[]).expect_err("must fail");
-        assert!(error.to_string().contains("same number"));
     }
 
     #[test]
@@ -3664,7 +3532,7 @@ mod tests {
         let runtime = FormalPolicyRuntime::load(&paths, DEFAULT_FORMAL_MODEL_ID).expect("load");
         let observations = vec![(
             "cigar".to_string(),
-            parse_feedback("ggggg").expect("feedback"),
+            crate::scoring::parse_feedback("ggggg").expect("feedback"),
         )];
         let state = runtime.apply_history(&observations).expect("state");
         assert_eq!(state.count(), 1);

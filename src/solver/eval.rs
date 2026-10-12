@@ -1243,10 +1243,6 @@ fn validate_exact_date_coverage(
 }
 
 impl Solver {
-    pub fn solve_target(&self, target: &str, date: NaiveDate, top: usize) -> Result<SolveRun> {
-        Ok(self.solve_target_detailed(target, date, top)?.into())
-    }
-
     pub fn solve_target_detailed(
         &self,
         target: &str,
@@ -1463,10 +1459,6 @@ impl Solver {
             steps,
             solved: false,
         })
-    }
-
-    pub fn backtest(&self, from: NaiveDate, to: NaiveDate, top: usize) -> Result<BacktestStats> {
-        Ok(self.backtest_detailed(from, to, top)?.summary)
     }
 
     pub fn backtest_detailed(
@@ -3879,17 +3871,6 @@ impl Solver {
         top: usize,
         book_usage: PredictiveBookUsage,
     ) -> Result<DetailedBacktestReport> {
-        self.backtest_detailed_with_book_usage_and_progress(from, to, top, book_usage, None)
-    }
-
-    fn backtest_detailed_with_book_usage_and_progress(
-        &self,
-        from: NaiveDate,
-        to: NaiveDate,
-        top: usize,
-        book_usage: PredictiveBookUsage,
-        progress: Option<&(dyn Fn(usize, usize) + Sync)>,
-    ) -> Result<DetailedBacktestReport> {
         let games = self
             .history_dates
             .iter()
@@ -3900,7 +3881,7 @@ impl Solver {
             bail!("no games found in the requested backtest range");
         }
 
-        self.backtest_selected_games_with_progress(&games, top, book_usage, progress)
+        self.backtest_selected_games_with_progress(&games, top, book_usage, None)
     }
 
     #[cfg(test)]
@@ -4072,14 +4053,7 @@ impl Solver {
                 forced: &[],
             },
         )?;
-        let outcome = if run.steps.is_empty() {
-            GameOutcome::coverage_gap(entry.print_date)
-        } else if run.solved {
-            GameOutcome::solved(entry.print_date, run.steps.len())
-        } else {
-            GameOutcome::unsolved(entry.print_date, run.steps.len())
-        };
-        Ok((outcome, run))
+        Ok((run.outcome(), run))
     }
 
     fn solve_backtest_entry_proxy(
@@ -4105,14 +4079,7 @@ impl Solver {
                 forced: &[],
             },
         )?;
-        let outcome = if run.steps.is_empty() {
-            GameOutcome::coverage_gap(entry.print_date)
-        } else if run.solved {
-            GameOutcome::solved(entry.print_date, run.steps.len())
-        } else {
-            GameOutcome::unsolved(entry.print_date, run.steps.len())
-        };
-        Ok((outcome, run))
+        Ok((run.outcome(), run))
     }
 
     pub(super) fn backtest_selected_games_with_progress(
@@ -4221,14 +4188,7 @@ impl Solver {
                 cancelled,
             },
         )?;
-        let outcome = if run.steps.is_empty() {
-            GameOutcome::coverage_gap(entry.print_date)
-        } else if run.solved {
-            GameOutcome::solved(entry.print_date, run.steps.len())
-        } else {
-            GameOutcome::unsolved(entry.print_date, run.steps.len())
-        };
-        Ok((outcome, run))
+        Ok((run.outcome(), run))
     }
 
     pub fn hard_case_report(&self, top: usize) -> Result<HardCaseReport> {
@@ -4291,34 +4251,20 @@ impl Solver {
         top: usize,
         book_usage: PredictiveBookUsage,
     ) -> Result<ExperimentResult> {
-        self.experiment_report_with_book_usage_and_progress(from, to, top, book_usage, None)
-    }
-
-    fn experiment_report_with_book_usage_and_progress(
-        &self,
-        from: NaiveDate,
-        to: NaiveDate,
-        top: usize,
-        book_usage: PredictiveBookUsage,
-        progress: Option<&(dyn Fn(usize, usize) + Sync)>,
-    ) -> Result<ExperimentResult> {
         let games = self
             .history_dates
             .iter()
             .filter(|entry| entry.print_date >= from && entry.print_date <= to)
             .collect::<Vec<_>>();
 
-        self.experiment_report_for_selected_games_with_book_usage_and_progress(
-            &games, top, book_usage, progress,
-        )
+        self.experiment_report_for_selected_games_with_book_usage(&games, top, book_usage)
     }
 
-    fn experiment_report_for_selected_games_with_book_usage_and_progress(
+    fn experiment_report_for_selected_games_with_book_usage(
         &self,
         games: &[&NytDailyEntry],
         top: usize,
         book_usage: PredictiveBookUsage,
-        progress: Option<&(dyn Fn(usize, usize) + Sync)>,
     ) -> Result<ExperimentResult> {
         let mut timing = NoopEvidenceTiming;
         self.experiment_report_for_selected_games_with_book_usage_and_progress_and_timing(
@@ -4326,7 +4272,7 @@ impl Solver {
             top,
             book_usage,
             EvaluationControl {
-                progress,
+                progress: None,
                 cancelled: &|| false,
             },
             None,
@@ -4420,13 +4366,7 @@ impl Solver {
                     self.posterior_calibration_for_run(run)?;
                 Ok(ExperimentGameResult {
                     target: run.target.clone(),
-                    outcome: if run.steps.is_empty() {
-                        GameOutcome::coverage_gap(run.date)
-                    } else if run.solved {
-                        GameOutcome::solved(run.date, run.steps.len())
-                    } else {
-                        GameOutcome::unsolved(run.date, run.steps.len())
-                    },
+                    outcome: run.outcome(),
                     path: run.steps.iter().map(|step| step.guess.clone()).collect(),
                     finite_search_steps: run
                         .steps
@@ -4449,15 +4389,7 @@ impl Solver {
         let outcomes = detailed
             .runs
             .iter()
-            .map(|run| {
-                if run.steps.is_empty() {
-                    GameOutcome::coverage_gap(run.date)
-                } else if run.solved {
-                    GameOutcome::solved(run.date, run.steps.len())
-                } else {
-                    GameOutcome::unsolved(run.date, run.steps.len())
-                }
-            })
+            .map(DetailedSolveRun::outcome)
             .collect::<Vec<_>>();
         let failure_penalty_sensitivity = [6.0, 7.0, 8.0]
             .into_iter()
@@ -4556,65 +4488,6 @@ impl Solver {
             report_started.elapsed(),
         );
         Ok(result)
-    }
-
-    pub fn build_development_evidence(
-        paths: &ProjectPaths,
-        config: &PriorConfig,
-        from: NaiveDate,
-        to: NaiveDate,
-        top: usize,
-    ) -> Result<PredictiveEvidenceArtifact> {
-        Self::build_development_evidence_with_budget(
-            paths,
-            config,
-            from,
-            to,
-            top,
-            EvidenceResourceBudget::default(),
-        )
-    }
-
-    pub fn build_development_evidence_with_budget(
-        paths: &ProjectPaths,
-        config: &PriorConfig,
-        from: NaiveDate,
-        to: NaiveDate,
-        top: usize,
-        resource_budget: EvidenceResourceBudget,
-    ) -> Result<PredictiveEvidenceArtifact> {
-        Self::build_development_evidence_with_checkpoint(
-            paths,
-            config,
-            from,
-            to,
-            top,
-            resource_budget,
-            None,
-        )
-    }
-
-    pub fn build_development_evidence_with_checkpoint(
-        paths: &ProjectPaths,
-        config: &PriorConfig,
-        from: NaiveDate,
-        to: NaiveDate,
-        top: usize,
-        resource_budget: EvidenceResourceBudget,
-        checkpoint_path: Option<&Path>,
-    ) -> Result<PredictiveEvidenceArtifact> {
-        if from > to {
-            bail!("evidence start date cannot be after end date");
-        }
-        Self::build_development_evidence_with_selection(
-            paths,
-            config,
-            EvidenceDateSelection::Range(DateRange::new(from, to)?),
-            top,
-            resource_budget,
-            None,
-            checkpoint_path,
-        )
     }
 
     pub fn build_development_evidence_with_selection(
@@ -5307,13 +5180,7 @@ impl Solver {
             checkpoint.games.extend(report.runs.iter().map(|run| {
                 ExperimentGameResult {
                     target: run.target.clone(),
-                    outcome: if run.steps.is_empty() {
-                        GameOutcome::coverage_gap(run.date)
-                    } else if run.solved {
-                        GameOutcome::solved(run.date, run.steps.len())
-                    } else {
-                        GameOutcome::unsolved(run.date, run.steps.len())
-                    },
+                    outcome: run.outcome(),
                     path: run.steps.iter().map(|step| step.guess.clone()).collect(),
                     finite_search_steps: run
                         .steps
@@ -7049,11 +6916,10 @@ impl Solver {
             .iter()
             .filter(|entry| dates.contains(&entry.print_date))
             .collect::<Vec<_>>();
-        let report = solver.experiment_report_for_selected_games_with_book_usage_and_progress(
+        let report = solver.experiment_report_for_selected_games_with_book_usage(
             &games,
             5,
             PredictiveBookUsage::None,
-            None,
         )?;
         let to = *dates
             .last()
@@ -7738,7 +7604,7 @@ fn filesystem_tree_bytes(path: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
-pub(super) fn development_source_identity(
+pub(crate) fn development_source_identity(
     paths: &ProjectPaths,
     development_cutoff: NaiveDate,
 ) -> Result<String> {
@@ -7800,7 +7666,7 @@ fn rolling_source_identity_with_history_cutoff(
     Ok(hash.finish_tagged())
 }
 
-pub(super) fn current_executable_fingerprint() -> Result<String> {
+pub(crate) fn current_executable_fingerprint() -> Result<String> {
     let executable = std::env::current_exe().context("failed to locate the current executable")?;
     let mut hash = crate::identity::CanonicalSha256::new("maybe-wordle-executable-v1");
     hash_identity_file(&mut hash, &executable)?;
@@ -7817,7 +7683,7 @@ fn hash_identity_file(hash: &mut crate::identity::CanonicalSha256, path: &Path) 
     Ok(())
 }
 
-pub(super) fn ensure_development_source_identity(
+pub(crate) fn ensure_development_source_identity(
     paths: &ProjectPaths,
     development_cutoff: NaiveDate,
     expected: &str,
@@ -10426,11 +10292,10 @@ mod tests {
             editor: None,
         };
         let report = solver
-            .experiment_report_for_selected_games_with_book_usage_and_progress(
+            .experiment_report_for_selected_games_with_book_usage(
                 &[&gap],
                 3,
                 PredictiveBookUsage::None,
-                None,
             )
             .unwrap();
         assert_eq!(report.backtest.canonical.scheduled_games, 1);
@@ -10460,11 +10325,10 @@ mod tests {
             .initial_prior_metrics(&measured.solution, measured.print_date)
             .unwrap();
         let mixed = solver
-            .experiment_report_for_selected_games_with_book_usage_and_progress(
+            .experiment_report_for_selected_games_with_book_usage(
                 &[&gap, &measured],
                 3,
                 PredictiveBookUsage::None,
-                None,
             )
             .unwrap();
         assert_eq!(mixed.backtest.canonical.scheduled_games, 2);

@@ -61,29 +61,14 @@ pub use finite::{
 };
 
 use self::books::write_predictive_artifact;
-#[allow(unused_imports)]
-use self::state::{hard_mode_violation_message as hard_mode_violation, *};
-#[allow(unused_imports)]
-use self::{eval::*, ranking::*, search::*};
+#[cfg(test)]
+use self::eval::*;
+use self::state::*;
+use self::{ranking::*, search::*};
 
-pub(crate) fn predictive_development_source_identity(
-    paths: &ProjectPaths,
-    development_cutoff: NaiveDate,
-) -> Result<String> {
-    development_source_identity(paths, development_cutoff)
-}
-
-pub(crate) fn predictive_executable_fingerprint() -> Result<String> {
-    current_executable_fingerprint()
-}
-
-pub(crate) fn ensure_predictive_development_source_identity(
-    paths: &ProjectPaths,
-    development_cutoff: NaiveDate,
-    expected: &str,
-) -> Result<()> {
-    ensure_development_source_identity(paths, development_cutoff, expected)
-}
+pub(crate) use self::eval::{
+    current_executable_fingerprint, development_source_identity, ensure_development_source_identity,
+};
 
 const HARD_MODE_WORD_LENGTH: usize = 5;
 #[derive(Clone, Debug)]
@@ -129,20 +114,6 @@ pub struct SolveState {
     pub modeled_total_weight: f64,
     pub total_weight: f64,
     pub recovery_mode_used: Option<RecoveryMode>,
-}
-
-#[derive(Clone, Debug)]
-pub struct SolveStep {
-    pub guess: String,
-    pub feedback: u8,
-}
-
-#[derive(Clone, Debug)]
-pub struct SolveRun {
-    pub target: String,
-    pub date: NaiveDate,
-    pub steps: Vec<SolveStep>,
-    pub solved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -209,20 +180,14 @@ pub struct DetailedSolveRun {
     pub solved: bool,
 }
 
-impl From<DetailedSolveRun> for SolveRun {
-    fn from(value: DetailedSolveRun) -> Self {
-        Self {
-            target: value.target,
-            date: value.date,
-            steps: value
-                .steps
-                .into_iter()
-                .map(|step| SolveStep {
-                    guess: step.guess,
-                    feedback: step.feedback,
-                })
-                .collect(),
-            solved: value.solved,
+impl DetailedSolveRun {
+    fn outcome(&self) -> GameOutcome {
+        if self.steps.is_empty() {
+            GameOutcome::coverage_gap(self.date)
+        } else if self.solved {
+            GameOutcome::solved(self.date, self.steps.len())
+        } else {
+            GameOutcome::unsolved(self.date, self.steps.len())
         }
     }
 }
@@ -1734,12 +1699,13 @@ mod tests {
         compare_absurdle_suggestions, compare_exact_costs, compare_final_turn,
         compare_forced_openers, compare_guess_metrics, compare_guess_metrics_for_state,
         compare_lookahead, compare_suggestions, compare_suggestions_for_state,
-        count_masked_letters, exact_suggestion_mode, hard_mode_violation, known_absent_letter_mask,
+        count_masked_letters, exact_suggestion_mode, known_absent_letter_mask,
         predictive_search_mode, should_replace_forced_opener, should_use_final_turn_objective,
         should_use_second_guess_coverage,
     };
 
     use super::books::write_predictive_artifact;
+    use super::state::hard_mode_violation_message as hard_mode_violation;
 
     pub(super) fn test_solver(words: &[&str]) -> Solver {
         test_solver_with_answer_count(words, words.len())

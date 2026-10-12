@@ -3,7 +3,6 @@ use super::*;
 impl WordleGuiApp {
     pub(super) fn show_diagnostics_panel(&mut self, ui: &mut egui::Ui) {
         let surface = gui_surface_state(
-            false,
             self.computing,
             &self.status,
             self.predictive_recovery_mode,
@@ -30,7 +29,7 @@ impl WordleGuiApp {
                 {
                     predictive_finite_banner_text(self.search_profile)
                 } else {
-                    predictive_banner_text(self.predictive_artifact_state)
+                    self.predictive_artifact_state.banner_text()
                 },
             );
             diagnostic_badge(ui, "SURVIVORS", &self.surviving_count.to_string());

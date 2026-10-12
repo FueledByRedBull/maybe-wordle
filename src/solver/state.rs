@@ -600,26 +600,6 @@ impl Solver {
             .suggestions)
     }
 
-    pub fn suggestions_for_history_hard_mode(
-        &self,
-        as_of: NaiveDate,
-        observations: &[(String, u8)],
-        top: usize,
-    ) -> Result<Vec<Suggestion>> {
-        Ok(self
-            .suggest_predictive(PredictiveSuggestRequest {
-                puzzle_date: as_of
-                    .succ_opt()
-                    .ok_or_else(|| anyhow!("history cutoff has no following puzzle date"))?,
-                observations,
-                top,
-                hard_mode: true,
-                force_in_two_only: false,
-                mode: PredictiveSuggestionMode::Full,
-            })?
-            .suggestions)
-    }
-
     pub fn suggestions_for_history_disk_books_only(
         &self,
         as_of: NaiveDate,
@@ -660,21 +640,6 @@ impl Solver {
                 mode: PredictiveSuggestionMode::FastDiskOnly,
             })?
             .suggestions)
-    }
-
-    pub fn force_in_two_suggestions_for_history_disk_books_only(
-        &self,
-        as_of: NaiveDate,
-        observations: &[(String, u8)],
-        top: usize,
-    ) -> Result<Vec<Suggestion>> {
-        self.suggestions_for_history_disk_books_only_with_filters(
-            as_of,
-            observations,
-            top,
-            false,
-            true,
-        )
     }
 
     pub fn absurdle_suggestions(
