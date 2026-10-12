@@ -1,5 +1,13 @@
 # Predictive score diagnosis: 29 September 2026
 
+Status: superseded by the October 5 close-out and the October 12
+oracle-membership kill-test, which scored 3.1583 with each answer's pool
+membership known; see the
+[close-out ledger](2026-10-03-subthree-research.md#october-12-oracle-membership-kill-test).
+The kill-test also bounds the "causal cost of delayed activation" question
+listed as open below: with membership known, the 28 new-word games fell only
+from 124 to 116 guesses.
+
 ## Decision
 
 Keep selected v20 unchanged. The retained 360-game development mean is 3.194444;

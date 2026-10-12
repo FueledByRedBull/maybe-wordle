@@ -5,6 +5,13 @@ was not achieved; the app goal is paused rather than falsely marked successful.
 The owner requested keeping the best verified score/latency balance and closing
 the speculative work. No new source screen, fit or gameplay run is queued.
 
+October 12 update: an oracle kill-test confirmed the close-out and set the
+reopening bar, and the owner asked for the open product items to be finished.
+Unchanged selected v20 is frozen for one prospective window, 2026-10-13
+through 2026-11-11. See the
+[kill-test](#october-12-oracle-membership-kill-test) and the
+[October 12 close-out pass](#october-12-close-out-pass).
+
 ## Product decision
 
 Keep selected staged v20 in `config/prior.toml`. No research candidate met all
@@ -47,6 +54,76 @@ did not establish a deployable benefit. The approximately 49x acceleration of
 GUI latency or gameplay-score improvement. Repeated negative trials and flat
 time curves motivated this close-out, not a proof that under three is impossible.
 
+## October 12 oracle-membership kill-test
+
+Question: would the selected policy average at most three guesses if it knew
+which pool each answer came from (never-used list word, reused answer or new
+word) but not the word itself?
+
+A temporary in-crate test hook replayed the same 360 development games
+artifact-free with top 5. It was removed after the run; application source
+again matches the committed tree. The control arm reproduced the retained
+seven-profile selected outcomes on all 360 games. Two oracle arms were scored:
+a state restricted to the target's pool, and the production state shape with
+out-of-pool in-list words demoted to the cooldown-floor weight. For new-word
+games the pool-only state is the only oracle arm. History on disk ended on
+2026-08-26 and the hook asserted fold membership, so the reserved seal was not
+touched.
+
+| Answer pool | Games | Production | Oracle, same state shape | Oracle, pool-only state |
+| --- | ---: | ---: | ---: | ---: |
+| Never-used list word | 315 | 967 (3.0698) | 971 (3.0825) | 1,000 (3.1746) |
+| Reused answer | 17 | 59 (3.4706) | 50 (2.9412) | 49 (2.8824) |
+| New word | 28 | 124 (4.4286) | 116 (4.1429) | 116 (4.1429) |
+| All | 360 | 1,150 (3.1944) | 1,137 (3.1583) | 1,165 (3.2361) |
+
+A flat three needs at most 1,080 guesses. The same-shape oracle is 57 short and
+its paired difference from production is -0.0361 guesses, 95% interval
+[-0.0778, +0.0056]. Taking the best arm in every row still leaves 1,132.
+
+- Pool membership is worth about 13 of the 70 guesses needed. For never-used
+  answers, production's cooldown floor already acts as the membership oracle.
+- The pool-only state loses 0.1048 guesses per game on never-used answers,
+  interval [0.0254, 0.1841], with nearly the same belief. Production plays one
+  opener in all 332 in-list games; the pool-only arm chose eight different
+  openers, none equal to it, and left more in-pool candidates (mean 26.75
+  versus 24.59, median 22 versus 18). The selected configuration is coupled to
+  near-zero-weight used words remaining in the state. This is a robustness
+  note, not a route to a lower score.
+- New-word days stay at 4.1429 even with membership known: the dormant pool is
+  about 12,500 words.
+- The 17 reuse days show no weekday pattern. Fifteen of the reused answers
+  first appeared within the first 190 puzzles; ages were 1,408-1,856 days with
+  one at 524.
+- The never-used pool fell from 857 words on 2025-07-03 to 494 on 2026-08-23,
+  about 24-28 words per 30 days. Never-used days scored 3.0765 before reuse
+  began and 3.0588 afterwards, within noise, so a pool-drain improvement is a
+  hypothesis to track, not an observed trend.
+
+Limits: this is the production policy under oracle beliefs, not the optimal
+policy for them; the folds are in-sample for the selected configuration; the
+intervals use a simple game-level bootstrap, not the chronological block
+bootstrap; the same-shape arm keeps the dormant new-word hedge.
+
+### Reopening bar
+
+The remaining gap can only come from word-level prediction inside the
+never-used pool. Across the 332 in-list games, guesses rise by about 0.283 per
+nat of post-opener log loss; the uniform-to-weighted baseline ladder implies
+about 0.36. Reaching three therefore needs roughly 0.5-0.75 nats, against
+0.007-0.013 nats for the best signals found. Reopen only for a date-safe
+signal showing at least about 0.3 nats of post-opener log-loss improvement on
+a chronological holdout. The earlier 0.03-nat gate is superseded.
+
+For scale, the published exact optimum for the static game is 3.421 average
+guesses with opener `salet`
+([Bertsimas and Paskov, Operations Research 73(3), 2025](https://doi.org/10.1287/opre.2022.0434)).
+The selected policy's lower means come from conditioning on date-bounded answer
+history, a different information set, not from better search on the same game.
+
+Word-free per-game rows, the hook source and the analysis script are retained
+privately under `target/oracle-membership-killtest/`.
+
 ## Retained product performance
 
 The existing pooled root bound reduced a matched top-ten request from 55.15 to
@@ -55,7 +132,8 @@ The existing pooled root bound reduced a matched top-ten request from 55.15 to
 highest-positive-mass-first ordering reduced a matched seven-profile slice
 from 80.62 to 17.98/17.96 seconds with identical 63 game payloads.
 
-The later complete seven-profile development matrix covered 2,520 profile-games
+The last complete seven-profile development matrix (September 28, pre-audit
+executable) covered 2,520 profile-games
 in 665.16 seconds, with zero failures/gaps; selected staged scored 3.194444 and
 had 21.83-ms shared-process suggestion p95. These are retained measurements of
 their recorded executables, not new close-out measurements or population-wide
@@ -88,6 +166,10 @@ must preserve this material, `dist`, runtime data and unrelated files.
 
 ## Close-out verification and remaining limits
 
+This section is the October 5 state. The
+[October 12 pass](#october-12-close-out-pass) supersedes its open items and its
+statements that nothing was frozen and the GUI stayed closed.
+
 Final local verification on the restored product source passed:
 
 - `cargo fmt --check`, locked/offline all-target Clippy with warnings denied,
@@ -115,3 +197,70 @@ configuration and dependencies are unchanged. The reserved seal remains
 untouched; no prospective freeze was consumed. Narrow/enlarged-text native GUI,
 accessibility and real UNC-share acceptance remain explicitly open in
 [TODO.md](../../../TODO.md), not silently passed. The GUI remains closed.
+
+## October 12 close-out pass
+
+Requested by the owner on 2026-10-12. Nothing here reopens research, tunes
+anything or changes the selected configuration.
+
+- **Kill-test and reopening bar.** Recorded above.
+- **Prospective check.** Ordinary commands cannot score dates after the
+  development cutoff, so the forward score uses the once-only prospective
+  workflow. On the final build, selected v20 against the previous release
+  (`config/baselines/previous-release-790ec2d.toml`) reproduced 1,150 guesses
+  over the 360 development games (3.1944, all solved) versus 1,199 (3.3306):
+  paired difference -0.1361, 95% interval [-0.1834, -0.0861], win/tie/loss
+  66/276/18. That met the eligibility rule, and unchanged v20 was frozen at
+  2026-10-12T04:17Z for 2026-10-13 through 2026-11-11
+  ([freeze record](../../../benchmarks/predictive/prospective-frozen-v1.json)).
+  It can be evaluated once, on or after 2026-11-12 UTC, with the same
+  executable. Until then any change to `src/`, `tests/`, `Cargo.toml`,
+  `Cargo.lock`, `config/evaluation.toml`, `data/seed/` or the packaged CLI
+  makes the evaluation refuse to run. The comparison is a retrospective
+  eligibility check, not new evidence; its per-game file contains answer words
+  and stays local.
+- **Native GUI acceptance.** Through UI Automation on the packaged Windows
+  build: all 38 input controls expose a name (nine did not before the fixes),
+  the five feedback tiles have distinct names, and no control leaves the window
+  at 1180 by 820 or at the 560 by 620 minimum, at 100% and 135% text. Keyboard
+  use was checked on the build before the fixes; it found that focus was lost
+  after Enter, which is now fixed. The keyboard pass and screenshots could not
+  be repeated on the final build because the desktop session was locked. See
+  [EXPERIMENTS.md](../../EXPERIMENTS.md#october-12-native-acceptance).
+- **Network-path persistence.** The packaged CLI built the model, wrote and
+  reused the pattern table and persisted a manual addition with its working
+  directory on a loopback SMB path, leaving no temporary files. A share on
+  another machine is untested. See [PERSISTENCE.md](../../PERSISTENCE.md).
+- **Dependencies.** The audit passes with the same two exceptions; a fix path
+  for one of them now exists. See [DEPENDENCIES.md](../../DEPENDENCIES.md).
+- **Dead-code removal.** An over-engineering audit removed a net 2,200 lines of
+  unused or duplicated code, mostly retired research scaffolding
+  (the Bellman dataset builder, the survival artifact layer and an unused
+  policy view). Two visible changes: the GUI loading status no longer claims
+  "no predictive artifact available" before the answer is known, and an
+  invalid date in `evaluate-live-config`, `three-guess-gap` and
+  `four-guess-openers` is now reported with the same wording as other
+  commands. Formatting, warning-denied Clippy, 591 tests and 15 benchmark
+  smokes pass. The count is lower than October 5 because tests of deleted code
+  went with it. The final build reproduces the published September audit
+  outcome for selected v20 on all 360 development games (status, guess count
+  and path length).
+- **Repository hygiene.** One duplicate and one superseded benchmark artifact
+  were deleted. The README was split into a short README and
+  [EXPERIMENTS.md](../../EXPERIMENTS.md), with the generated evidence blocks
+  unchanged.
+
+Still open:
+
+- Evaluate the prospective freeze once, on or after 2026-11-12.
+- Repeat the keyboard pass on the final build, and run a screen reader
+  (Narrator or NVDA) over the GUI.
+- Test persistence on a share hosted by another machine.
+- Update `eframe` to 0.36 and reassess the dependency exceptions, after the
+  prospective evaluation and no later than 2027-02-01.
+
+On 2026-10-12 the directory `target/subthree-research` named under
+"Evidence and recovery" was not present on the owner's machine, so the private
+close-out evidence and its hashes could not be rechecked. Whether it was moved
+or removed is not known. The kill-test evidence is under
+`target/oracle-membership-killtest/`.

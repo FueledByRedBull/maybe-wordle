@@ -30,6 +30,8 @@ items are explicitly retained, not counted as passing checks.
   replay. The paired interval crosses zero; production remains v20. The full
   seven-profile attempt stopped at 1,200,021 ms with only six complete profiles;
   its negative evidence/checkpoint is retained, not published as a full success.
+  (Later state: that checkpoint was removed with `target` and not recovered; see
+  [Local artifact recovery](#local-artifact-recovery).)
 - Generated rolling/timing-screen documentation passes both exact CI commands;
   all five public redacted artifacts pass the checker. Markdown local links and
   `git diff --check` pass. Measurement identities predate only the final empty-regret
@@ -39,6 +41,8 @@ items are explicitly retained, not counted as passing checks.
   Verified Cargo profile cleanup removed 7,511 debug files (8.2 GiB) and 2,556 release
   files (1.1 GiB). Dist, raw/runtime data, seeds, source, unrelated changes, private
   evidence, checkpoints and audit verification records are preserved.
+  (Superseded for local `dist` and `target` contents by
+  [Local artifact recovery](#local-artifact-recovery).)
 - Hosted Windows/Linux/macOS tests, binary builds and CLI smoke pass for `d2024bd`,
   including Unix persistence/symlink/FIFO regressions (run linked below). Native
   GUI visual/keyboard/accessibility/high-DPI and real Windows UNC-share acceptance
@@ -48,7 +52,9 @@ items are explicitly retained, not counted as passing checks.
 - At the local delivery checkpoint, the branch was `master` at `23a73e0` plus
   existing/audit uncommitted changes; publication had not yet been requested.
   The subsequent authorization is recorded below. Future promotion/prospective work
-  remains in TODO; no reserved seal was opened and no future evaluation invented.
+  remains in TODO (closed 2026-10-05; see the
+  [close-out ledger](2026-10-03-subthree-research.md)); no reserved seal was opened
+  and no future evaluation invented.
 
 ## Global constraints
 
@@ -122,7 +128,7 @@ Open items require implementation, relevant checks and review. Already-correct o
 | P2-15 | Explicit formal objective independent of name | Implemented; explicit enum and versioned identity, exact built-in migration only |
 | P2-16 | Coherent formal generations and end-to-end timing | Immutable checksum-bound generations published by pointer last, phase timings separated; independent generation/runtime review complete; formal 49 tests and earlier two integration fixtures pass |
 | P2-17 | Shared live/replay rules and offline boundaries | Shared replay selection/transition exercised by two normal/hard public parity tests; early-green bug reproduced/fixed. Study, sealed orchestration and formatters extracted with explicit imports and byte-preservation check; eval 78 passes |
-| P2-18 | GUI runtime/views and real CLI workflow boundaries | GUI runtime/views and CLI evidence publication module extracted; current GUI 39 and CLI 42 tests pass in final integration |
+| P2-18 | GUI runtime/views and real CLI workflow boundaries | GUI runtime/views and CLI evidence publication module extracted; current GUI 39 and CLI 42 tests pass in integration (43 CLI at the final gate) |
 | P2-19 | Authoritative metadata and valid sampling domains | Registry cohort/domain source consolidated, invalid generic bounds rejected, canonical feature names shared; registry 8/config 9/learned 15 tests pass |
 | P2-20 | Date-bounded history export | Implemented; future-only/repeated dates, inclusive cutoff and raw/effective summary regressions pass |
 | P2-21 | Platform core/persistence/CLI/GUI CI; pinned toolchain | Three-platform locked matrix and local toolchain pin implemented; hosted tests/builds/CLI smoke pass for d2024bd; native GUI acceptance remains unrun |

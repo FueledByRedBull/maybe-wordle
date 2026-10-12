@@ -1,5 +1,11 @@
 # Maybe Wordle Implementation Plan
 
+> 2026-10-12: Historical design plan. Current status lives in [TODO.md](TODO.md)
+> and the [research close-out](docs/superpowers/plans/2026-10-03-subthree-research.md);
+> sub-three research closed 2026-10-05.
+
+> Status: historical planning notes. The current user-facing behavior, commands, and artifact layout are documented in `README.md`; this file preserves the original implementation rationale and may describe phases that are already complete or superseded.
+
 > 2026-09-29: [The audit remediation ledger](docs/superpowers/plans/2026-09-29-audit-remediation.md)
 > records implementation and local verification for all 48 September 28 review
 > findings, including 603 passing tests and the unchanged selected-policy rolling
@@ -103,8 +109,6 @@
 
 > 2026-08-30 measurement audit: the next release is unfinished and production remains v20. Development is frozen through August 26; August 28–September 26 is the new untouched seal. Study format v17 computes solved-only totals from the solved histogram and excludes shared process peak memory from candidate ordering/Pareto ranks. Earlier August v16 screens remain historical, not current promotion evidence. New studies, isolated finalist memory validation, profile-matrix evidence, and release checks are still required; see `TODO.md`.
 
-> Status: historical planning notes. The current user-facing behavior, commands, and artifact layout are documented in `README.md`; this file preserves the original implementation rationale and may describe phases that are already complete or superseded.
->
 > 2026-07-26 release checkpoint: `selected-predictive-v20` is frozen and shipped in `config/prior.toml`. It solved all 360 development games at `3.1778` guesses versus `3.3000` and two failures for the previous default; paired delta `-0.1222`, interval `[-0.1722, -0.0722]`, W/T/L `69/265/26`. The once-only sealed evaluation solved `30/30` at `3.3000`, interval `[3.1333, 3.4667]`, with no gaps or failures. This is evidence of an improvement, not a flat-three result. Further tuning requires a new future holdout.
 >
 > 2026-08-02 learned-model checkpoint: the development-only residual-ridge experiment generated 401 exact continuation-cost rows over 24 chronological, trajectory-disjoint states in 8.275 seconds, with an additional five-state production/proxy/lookahead exhaustive reference in about 1.4 seconds. Atomic per-state resume is source/config/executable/budget bound, ETA logged, and verified to preserve a semantic dataset digest across JSON/checkpoint replay. The ridge tied baseline top-choice regret but worsened validation/test pairwise accuracy and test MAE, so production integration remains disabled. The 12-fold policy-era survival experiment, including a 720-run paired proxy-policy solve audit, completed in 81.768 seconds with only 26 fold-local reuse events. It was worse than logistic on log loss, Brier, failure-penalized mean guesses (`3.4444` versus `3.4250`), and maximum-fold p95 latency, despite reducing unsolved games from 3 to 1. It also remains disabled, and proxy-only solve evidence cannot satisfy the production-search gate. Both artifacts stop at development end `2026-06-17`; the sealed window was not reopened.
@@ -328,6 +332,8 @@ word,in_seed,is_historical,first_seen,last_seen,times_seen,base_weight,recency_w
 ## Weight Model
 
 The original idea of time-decay weights is correct, but it needs to be parameterized and testable.
+
+The base weights and recency defaults below are the original proposal; the shipped values differ and are in `config/prior.toml`.
 
 ### Base weight
 

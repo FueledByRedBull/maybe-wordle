@@ -4,6 +4,8 @@ This document specifies the predictive pipeline implemented by Maybe Wordle. It 
 
 The authoritative implementation lives in `src/scoring.rs`, `src/model.rs`, `src/solver/`, and `src/experiments/`. Tests are part of the contract; this document does not turn an untested heuristic into a proof.
 
+Production is the `staged` search policy in the selected v20 configuration (`config/prior.toml`). The finite-horizon material below describes an experimental, opt-in route that was evaluated in September 2026 and not promoted.
+
 ## 1. Date-bounded support and prior
 
 For a game on date `d`, the solver uses information available through `d - 1 day`.
@@ -48,8 +50,10 @@ Dormant valid guesses receive a total raw fallback mass controlled by `fallback_
 
 ### Experimental finite-horizon policy
 
-The September `finite_fast` and `finite_strong` policies are under integration and
-validation, not validated replacements for the selected production configuration.
+The September `finite_fast` and `finite_strong` policies are experimental and
+opt-in. They were evaluated in September 2026 and not promoted (see the
+[September release ledger](SEPTEMBER_RELEASE.md)); they are not validated
+replacements for the selected production configuration.
 They freeze a single distribution at the puzzle cutoff. Positive modeled answers
 form the core, with normalized total mass `1 - fallback_prior_mass`; remaining
 supported answers share the tail mass uniformly. A zero modeled weight (including
@@ -208,8 +212,9 @@ answers, limited by `reply_shortlist`, with lexical mass ties. It does not inher
 the calling root's probe shortlist: the same conditioned state must give the same
 baseline action in a rollout and a fresh request. Root improvement still considers
 non-answer probes. The state-local change introduced finite policy identity v2; earlier
-root-anchor latency results do not establish its solve quality. A matched-budget
-empirical comparison remains required before promotion.
+root-anchor latency results do not establish its solve quality. The matched
+empirical comparisons ran in September 2026 and the finite route was not
+promoted; see the [September release ledger](SEPTEMBER_RELEASE.md).
 Proposal partitions use the same proxy-score finalization as the shared ranking
 path, not a separate expected-bucket-count replacement formula.
 The experimental v3 policy schedules root proposals by summed unique-letter
@@ -378,11 +383,16 @@ Activation and pool size formerly depended on exact/lookahead thresholds. This m
 
 ## 6. Search allocation
 
-`search_policy_mode` is an explicit categorical policy:
+`search_policy_mode` is an explicit categorical policy with nine serialized values. `staged` is the production mode; every other value is diagnostic or experimental:
 
-- `staged`: exact at or below `exact_threshold`, danger-triggered pooled exact where eligible, lookahead at or below its thresholds, proxy otherwise;
-- `proxy_with_exact_endgame`: exact at or below `exact_threshold`, proxy otherwise;
-- `proxy_only`: proxy ranking at every state.
+- `staged` (production): exact at or below `exact_threshold`, danger-triggered pooled exact where eligible, lookahead at or below its thresholds, proxy otherwise;
+- `proxy_with_exact_endgame` (diagnostic): exact at or below `exact_threshold`, proxy otherwise;
+- `proxy_only` (diagnostic): proxy ranking at every state;
+- `staged_fixed_belief` (diagnostic): staged ranking on the finite modes' frozen core/tail belief;
+- `finite_fast`, `finite_strong` (experimental): fixed-belief finite-horizon search at the Fast and Strong budgets;
+- `finite_fast_fixed_work` (experimental): fixed-belief finite search with a work-unit budget;
+- `finite_fast_dynamic` (experimental): finite search on the staged dynamic belief;
+- `finite_baseline` (diagnostic): the finite baseline policy only, without refinement.
 
 Within exact mode, states at or below `exact_exhaustive_threshold` scan every allowed guess; larger eligible states use a bounded candidate pool. Candidate-pool exact search is exact only over that pool. The pool is a deduplicated mixture of the primary proxy, entropy, worst-bucket, worst-mass, solve-probability, and posterior-answer rankings. Each source fraction is registered independently. Tight and medium score-gap expansion multipliers are also registered rather than fixed in code.
 
@@ -441,6 +451,17 @@ optimum is rejected as contradictory evidence. Interrupted or incomplete referen
 retain an explicit status and null regret. These bounded diagnostics cannot support
 a claim about unexamined larger states or prospective games.
 
+`search-regret` follows deterministic historical targets with the artifact-free proxy policy until a requested posterior-size band is reached. It then evaluates the production choice, forced proxy choice, and configured bounded-lookahead choice on that identical posterior. The reference scans every allowed root guess and uses exhaustive Bellman continuation. Reports bind the executable, source, config, and data identities and record the exact observation path. Schema 2 checks the cumulative wall-clock cap cooperatively inside path collection and exhaustive search, as well as at boundaries. `complete` and `stop_reason` expose interruption; `planned_states` counts selected states and `sampled_states` counts fully evaluated rows. Summaries cover retained complete rows only, never partial values or unevaluated states. If no state completed, mean and maximum regret are JSON `null` and display as unavailable (`sampled_states=0`), not measured zero. These are diagnostic development results, not sealed-test solve scores.
+
+The first run found that proxy ranking could return a guess whose only non-green bucket contained the entire state, giving it infinite continuation cost under fixed weights. Unlimited-horizon fixed-weight ranking excludes such non-progressing guesses, with a deliberately inert extra-guess regression. Dynamic finite search retains probes that change dormant support, even if the active set does not shrink; its transition and oracle tests cover that exception.
+
+After that correction:
+
+- [`search-regret-v1.json`](../benchmarks/predictive/search-regret-v1.json) evaluated 16 time-spread states with 3–8 survivors. Production, proxy, and lookahead all matched exhaustive cost on every state, apart from sub-`1e-15` floating-point noise reported as zero positive-regret states.
+- [`search-regret-9-16-v1.json`](../benchmarks/predictive/search-regret-9-16-v1.json) evaluated 14 available states with 9–16 survivors. Proxy-only ranking was suboptimal on 6/14 states, with mean regret `0.340952` and maximum regret `0.899180` expected guesses. Bounded lookahead was suboptimal on 3/14 states, with mean regret `0.000154` and maximum regret `0.001724`. Production matched exhaustive cost on all 14 states.
+
+Across both reports, bounded lookahead matched exhaustive cost on 27/30 states and its combined mean regret was about `0.000072`, versus about `0.159111` for proxy-only ranking. This evidence supports retaining the bounded lookahead candidate mixture and exact escalation: the added search nearly eliminates the large proxy error. It does not establish that each individual penalty or pool source has held-out solve benefit; those terms still require the registered ablations and rolling studies before simplification or promotion.
+
 ### Same-state dynamic reference (2026-09-27)
 
 The opt-in `same-state-dynamic-regret` command requires a staged config, one
@@ -457,17 +478,6 @@ are evaluated with `hard_mode=false`. It does not validate recursive
 hard-mode routing, a whole-policy score, prospective performance, or an
 independent formal proof; the fixed-belief `search-regret` diagnostic remains
 separate.
-
-`search-regret` follows deterministic historical targets with the artifact-free proxy policy until a requested posterior-size band is reached. It then evaluates the production choice, forced proxy choice, and configured bounded-lookahead choice on that identical posterior. The reference scans every allowed root guess and uses exhaustive Bellman continuation. Reports bind the executable, source, config, and data identities and record the exact observation path. Schema 2 checks the cumulative wall-clock cap cooperatively inside path collection and exhaustive search, as well as at boundaries. `complete` and `stop_reason` expose interruption; `planned_states` counts selected states and `sampled_states` counts fully evaluated rows. Summaries cover retained complete rows only, never partial values or unevaluated states. If no state completed, mean and maximum regret are JSON `null` and display as unavailable (`sampled_states=0`), not measured zero. These are diagnostic development results, not sealed-test solve scores.
-
-The first run found that proxy ranking could return a guess whose only non-green bucket contained the entire state, giving it infinite continuation cost under fixed weights. Unlimited-horizon fixed-weight ranking excludes such non-progressing guesses, with a deliberately inert extra-guess regression. Dynamic finite search retains probes that change dormant support, even if the active set does not shrink; its transition and oracle tests cover that exception.
-
-After that correction:
-
-- [`search-regret-v1.json`](../benchmarks/predictive/search-regret-v1.json) evaluated 16 time-spread states with 3–8 survivors. Production, proxy, and lookahead all matched exhaustive cost on every state, apart from sub-`1e-15` floating-point noise reported as zero positive-regret states.
-- [`search-regret-9-16-v1.json`](../benchmarks/predictive/search-regret-9-16-v1.json) evaluated 14 available states with 9–16 survivors. Proxy-only ranking was suboptimal on 6/14 states, with mean regret `0.340952` and maximum regret `0.899180` expected guesses. Bounded lookahead was suboptimal on 3/14 states, with mean regret `0.000154` and maximum regret `0.001724`. Production matched exhaustive cost on all 14 states.
-
-Across both reports, bounded lookahead matched exhaustive cost on 27/30 states and its combined mean regret was about `0.000072`, versus about `0.159111` for proxy-only ranking. This evidence supports retaining the bounded lookahead candidate mixture and exact escalation: the added search nearly eliminates the large proxy error. It does not establish that each individual penalty or pool source has held-out solve benefit; those terms still require the registered ablations and rolling studies before simplification or promotion.
 
 ### Learned continuation-cost experiment (2026-08-02)
 
@@ -620,6 +630,11 @@ its paired difference from selected was `-0.0056` with interval
 the zero-failure gate. All three remain development evidence; see the
 [September release ledger](SEPTEMBER_RELEASE.md) for identities and dates.
 
+Later on September 26 the staged two-turn terminal rule described in section 1
+superseded those staged figures: selected staged v20 scores `3.1944` over the
+same 360 development games, all solved. That is the current development figure
+as of 2026-10-12; it is retrospective, not prospective or sealed evidence.
+
 ## 11. Study fidelity and promotion
 
 The common study runner evaluates only rolling-development folds. Given initial fold count `F0`, reduction factor `eta >= 2`, and maximum `Fmax`, its deterministic fidelity schedule is
@@ -630,7 +645,7 @@ F_r = min(Fmax, F0 * eta^r)
 
 with the final `Fmax` rung inserted when multiplication would skip it. A candidate resumes from its saved additive fold accumulators; an already-recorded fold cannot be merged twice. At each non-final rung, candidates are ordered lexicographically by coverage gaps, failures, all-game failure-penalized mean when that stage measures solves, log loss, Brier score, latency when available, and stable candidate number. Cumulative wall-clock and process-lifetime peak memory are cooperative stop limits, not allocator-enforced hard caps. Expensive search, book building and label work poll cancellation internally; completed folds/states/profiles are checkpointed, while interrupted work still consumes elapsed budget. Process-lifetime peaks cannot rank candidates in a shared process. The best `ceil(n / eta)` advance. Candidate zero is retained as the explicit reference baseline even when it would otherwise be pruned.
 
-The remaining roadmap studies use `F0 = 3`, `eta = 2`, and `Fmax = 12`, so their fidelity rungs are `3 -> 6 -> 12`. Each rung is a deterministic nested, time-spread subset of the same canonical 12 outer development folds; it is not a new resample or additional independent evidence. Spreading low-fidelity measurements across the development span avoids pruning solely on the oldest consecutive months. Every promoted finalist is evaluated on all 12 outer folds. Multiple optimization seeds alter candidate generation only, while `BookPolicy` rebuilds cutoff-safe artifacts for those same outer folds. Any inner chronological out-of-fold rows used to fit continuation-cost models belong exclusively to an outer fold's training data and never replace or augment its held-out validation score.
+The roadmap studies were specified with `F0 = 3`, `eta = 2`, and `Fmax = 12`, so their fidelity rungs are `3 -> 6 -> 12`; none remain queued, and the CLI default reduction factor is 3. Each rung is a deterministic nested, time-spread subset of the same canonical 12 outer development folds; it is not a new resample or additional independent evidence. Spreading low-fidelity measurements across the development span avoids pruning solely on the oldest consecutive months. Every promoted finalist is evaluated on all 12 outer folds. Multiple optimization seeds alter candidate generation only, while `BookPolicy` rebuilds cutoff-safe artifacts for those same outer folds. Any inner chronological out-of-fold rows used to fit continuation-cost models belong exclusively to an outer fold's training data and never replace or augment its held-out validation score.
 
 The declared process-memory cap is enforced against peak working-set bytes on Windows, Linux, and macOS at solver construction, fold/game checkpoints where available, and final latency measurement. Peak bytes are checkpointed as shared-process budget diagnostics and are excluded from guarded/Pareto ordering: later trials inherit the process high-water mark. Exceeding the cap fails the trial; candidate-specific memory comparisons require isolated matched processes. Windows is release-tested; the native macOS memory-sampler CI job passed on revision `23a73e0`, without validating the macOS GUI. Wall-clock time is cumulative across resumed fidelity rungs and includes contention while a candidate is active. The default is 7,200 seconds: the earlier 3,600-second v11 proxy screen could complete six folds but not the final 12-fold rung, so that partial state is screening evidence only.
 

@@ -139,7 +139,7 @@ read the wall-clock day's posterior, which could introduce later history into an
 earlier candidate's resource/selection evidence. Older latency figures retain
 their historical measurement scope and must not be compared as identical protocols.
 
-Study format v17 records process-lifetime peak working set only as a shared-process budget diagnostic. It is excluded from guarded candidate ordering and Pareto dominance: later candidates inherit earlier peaks, and restarting a process changes that history. Candidate-specific memory comparisons require isolated, matched processes before promotion. Serializing latency measurements removes worker contention but does not isolate memory. Earlier v16 memory-based rankings must not be treated as evidence of candidate memory savings.
+Since study format v17, process-lifetime peak working set is recorded only as a shared-process budget diagnostic. It is excluded from guarded candidate ordering and Pareto dominance: later candidates inherit earlier peaks, and restarting a process changes that history. Candidate-specific memory comparisons require isolated, matched processes before promotion. Serializing latency measurements removes worker contention but does not isolate memory. Earlier v16 memory-based rankings must not be treated as evidence of candidate memory savings.
 
 ## Historical July interpretation
 
@@ -167,10 +167,14 @@ Both commands flush periodic progress. Learned exact-state generation writes an 
 
 ## Reproduction
 
-From the repository root in PowerShell:
+From the repository root in PowerShell. This block reruns the default
+eight-state preview/Fast/Strong profile described under "September
+finite-policy diagnostic" with the current executable. It writes to a fresh
+local path so the retained `release-gameplay-latency-v1.json`, which is also
+the profiler's default output when no path is set, is not overwritten:
 
 ```powershell
-$env:MAYBE_WORDLE_PROFILE_OUTPUT = 'benchmarks/predictive/release-gameplay-latency-v1.json'
+$env:MAYBE_WORDLE_PROFILE_OUTPUT = 'benchmarks/predictive/release-gameplay-latency-rerun-v1.json'
 cargo bench --bench performance_profile
 Remove-Item Env:MAYBE_WORDLE_PROFILE_OUTPUT
 ```
@@ -187,12 +191,10 @@ ms Fast, and 2,000 ms Strong. Set the optional
 measure only that phase. `baseline` uses the Fast budget and reply shortlist
 with `baseline_only = true`; its budget identity is recorded in the selected
 phase. A selected-phase artifact omits the unmeasured phase fields and records
-the selection at the report level.
-
-For candidate-specific process-lifetime peak working-set diagnostics, run each
-candidate/phase as a separate benchmark process and give each result a distinct
-output path. This keeps the fixed date, inputs, eight workloads, and sample
-count identical while isolating the process high-water mark for that candidate:
+the selection at the report level. The fifth accepted value, `staged-audit`,
+is not a finite phase: it measures the configured staged policy by bounded
+single calls, as in the September 29 audit block above, and by default writes
+to `target/audit-work/staged-gameplay-profile-v1.json`.
 
 Set `MAYBE_WORDLE_PROFILE_CONFIG` to an experimental TOML path to profile that
 candidate without replacing `config/prior.toml`. Relative paths are resolved from
@@ -200,6 +202,11 @@ the repository root. The selected file is fingerprinted before and after the run
 an unreadable or invalid config is an error, not a fallback to production defaults.
 Leave it unset for the production config. Preserve and restore any existing value
 when changing this environment variable for a run.
+
+For candidate-specific process-lifetime peak working-set diagnostics, run each
+candidate/phase as a separate benchmark process and give each result a distinct
+output path. This keeps the fixed date, inputs, eight workloads, and sample
+count identical while isolating the process high-water mark for that candidate:
 
 ```powershell
 $oldPhase = $env:MAYBE_WORDLE_PROFILE_PHASE
@@ -301,7 +308,7 @@ The same three-sample and process-lifetime limitations apply. The default-config
 preview smoke verified the production config identity; an explicit missing config
 exited with code 1 and published no report. Production config was never replaced.
 
-## Limitations
+## September measurement ledger
 
 The bounded `../benchmarks/predictive/september-finite-regret-legality-hard-v1.json`
 reuses compiled constraints across each recursive dictionary scan and formats
@@ -518,7 +525,9 @@ test additions. Selected staged and v19b again solved 360/360 each, with means
 508.3 s and the shared process peak was about 161.1 MiB. The paired
 v19b-minus-selected mean was -0.002778 guesses with a 95% interval
 [-0.022222,+0.016667]; the result does not justify changing the selected policy.
-The full per-game JSON is retained locally pending the publication decision.
+The word-bearing per-game JSON remains local; a
+[redacted public copy](evidence/september-post-layout-tests-rolling-public-v1.json)
+was published.
 
 A September 27 repeat of
 `cargo +1.97.0 bench --bench solver_bench staged_gameplay_four_feedback`
@@ -665,6 +674,8 @@ shared deadline during the eighth (`generation_elapsed_ms=240875`,
 `complete=false`). It cannot estimate an eligibility rate over nine days, and
 its cost does not support a live router. The deadline is cooperative around
 root checks and final identity/provenance work, so a small overrun is possible.
+
+## Limitations
 
 - Relaxed atomic allocation counters add overhead; allocation results are best treated as comparative workload evidence.
 - Process CPU and cycles include Rayon worker threads.

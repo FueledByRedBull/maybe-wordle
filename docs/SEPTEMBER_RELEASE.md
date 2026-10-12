@@ -3,11 +3,35 @@
 Current close-out, October 5: retain staged v20 and the verified exact-search
 speedups. The owner ended speculative sub-three research without a qualified
 replacement or an under-three result. The [concise research close-out](superpowers/plans/2026-10-03-subthree-research.md)
-records what was retained and archived. The later seven-profile matrix completed
-2,520/2,520 games in 665.16 seconds with no failures/gaps; older interrupted
-attempts below remain historical failures, not the current matrix status.
+records what was retained and archived. The last complete seven-profile matrix
+(September 28, pre-audit executable) covered 2,520/2,520 games in 665.16
+seconds with no failures/gaps. The September 29 audit-build attempt did not
+complete: it stopped at its 1,200,021-ms cap with the selected disk-artifact
+profile unfinished. Older interrupted attempts below also remain historical
+failures.
 Native narrow/enlarged-text/accessibility and real UNC-share acceptance remain
 open; no new policy is promoted and no seal is consumed.
+
+October 12 addendum: an oracle-membership kill-test gave selected staged the
+pool each answer came from and scored 3.1583 over the 360 development games,
+against 3.1944 for production, confirming the close-out; see the
+[kill-test section](superpowers/plans/2026-10-03-subthree-research.md#october-12-oracle-membership-kill-test).
+Raw history is now synced through 2026-10-12, so the reserved seal dates are on
+disk as history only; the seal remains unevaluated. Unchanged selected v20 was
+frozen the same day for one prospective window, 2026-10-13 through 2026-11-11,
+and has not been evaluated. Native accessibility-name and layout acceptance and
+a loopback network-path persistence check were also done that day; the keyboard
+pass on the final build, a screen-reader pass and a share on another machine
+remain open. See the
+[October 12 pass](superpowers/plans/2026-10-03-subthree-research.md#october-12-close-out-pass).
+The dependency audit was re-run on 2026-10-12 with the same two documented
+exceptions; see [DEPENDENCIES.md](DEPENDENCIES.md).
+
+Reading guide: the status notes above, the decision contract and checklist
+sections 1-6 are the summary. The September 29 audit delivery section and
+everything from "Evaluation readiness (September 8)" onward form an append-only
+historical ledger: each entry was true on its date, and "current", "latest" or
+"remains open" there means as of that entry.
 
 Audit remediation was locally and hosted-CI verified; remaining release/promotion
 acceptance limits below are not silently passed. This plan consolidates the six source-audit and
@@ -99,6 +123,10 @@ benchmark executable identity.
 
 ## Decision contract
 
+This contract was the September goal, not a description of shipped behavior:
+staged v20 applies the failure-first objective only in its last two turns, and
+the work to extend it closed on 2026-10-05 without a replacement.
+
 The primary product is online, artifact-free six-turn predictive Wordle. Choose legal
 moves by modeled failure probability first, then expected attempts. Report failures,
 coverage gaps, solved-guess distribution, probability of solving by turn three, and
@@ -148,7 +176,8 @@ evaluate the same objective. Formal proof remains optional research.
   inexpensive baseline policy; include its own move. Compare with the corrected
   baseline at identical prior, rules, dates, book policy and time budget. Keep
   exact manageable endgames.
-- [ ] Make the selected staged policy choose by the six-turn failure-first objective
+- [ ] Closed 2026-10-05, not achieved: no staged or finite replacement qualified.
+  Make the selected staged policy choose by the six-turn failure-first objective
   before the final two turns, or select a finite policy that meets all paired
   quality, calibration and resource guards. The current staged terminal rule
   corrects late decisions only; its earlier unlimited-horizon ranks and
@@ -179,7 +208,11 @@ evaluate the same objective. Formal proof remains optional research.
   isolated finalist memory. The bounded suite has eight states and three samples per profile;
   its p95 is the maximum of three samples, not a population p95, and it excludes native GUI
   paint latency. See [`PERFORMANCE.md`](PERFORMANCE.md).
-- [ ] Profile before kernel changes. Remove unused predictive small-state-table work and
+- [ ] Closed 2026-10-05, partly done: the profile, rejected shortcut and retained
+  bound are recorded below; weighted-log, scratch-reuse and shared-immutable-table
+  measurements are in [`PERFORMANCE.md`](PERFORMANCE.md). No ID-based-row or
+  partial-selection measurement was recorded.
+  Profile before kernel changes. Remove unused predictive small-state-table work and
   false bound claims. Measure invariant weighted-log precomputation, immutable geometry
   sharing, ID-based rows, scratch reuse and partial selection where applicable. Record
   rejected optimizations; do not claim translated C++ timings as Rust measurements.
@@ -229,12 +262,16 @@ evaluate the same objective. Formal proof remains optional research.
   including useful posterior calibration after feedback.
 - [x] Diagnose regret on reachable states where production can lose quality. Treat larger
   bounded reference values as intervals or approximations, never fabricated exact labels.
-- [ ] Run conditional cohorts in cost order, only Pareto finalists in small multi-seed
+- [ ] Closed 2026-10-05 without a finalist: the small-state and proxy-risk cohorts
+  and a two-seed joint follow-up ran, but no candidate passed repeat or paired
+  validation, so nothing was frozen.
+  Run conditional cohorts in cost order, only Pareto finalists in small multi-seed
   joint refinement, then all common development folds and seven-profile evidence. Freeze
   exact executable/config/data/rules/date/book/budget identities and per-game outcomes.
 - [x] Complete the seven-profile incumbent/baseline development matrix under the
-  roughly 20-minute ceiling. The rebuilt current-executable 12-fold rerun covered
-  2,520/2,520 profile-games in about 11.1 minutes with zero failures and gaps; it does not
+  roughly 20-minute ceiling. The September 28 12-fold rerun on the rebuilt pre-audit
+  executable covered 2,520/2,520 profile-games in about 11.1 minutes with zero failures
+  and gaps; the September 29 audit-build attempt did not complete. It does not
   substitute for a future qualified finalist's paired promotion gate.
 - [x] Validate atomic identity-bound per-profile checkpoints and progress/ETA with fresh,
   resumed and isolated-result agreement plus rejection of changed sources/config/data,
@@ -242,13 +279,17 @@ evaluate the same objective. Formal proof remains optional research.
 
 ## 5. Information boundaries and maintenance
 
-- [ ] Preserve development cutoff August 26 and exclude both consumed June 18-July 17
+- Standing invariant, not a task: preserve development cutoff August 26 and exclude
+  both consumed June 18-July 17
   and declared August 28-September 26 windows as tuning/validation targets;
   consumed answers may remain chronological training history for later dates.
   Record frozen-candidate dates
   and window consumption. A candidate selected after a window starts must not be called
   prospectively frozen before it. Declare a later prospective confirmation if necessary.
   Future outcomes are an external dependency, never a reason to fabricate completion.
+  As of 2026-10-12 the reserved seal is unevaluated; raw history, now synced
+  through 2026-10-12, holds the seal dates as history only. Unchanged selected v20 is
+  frozen for the prospective window 2026-10-13 through 2026-11-11 and not yet evaluated.
 - [x] Validate upstream history words/dates before persistence; preserve useful fetch/decode
   error categories. Audit cache payload integrity and the independent oracle trust boundary;
   input hashes and in-range bytes alone do not prove an uncorrupted feedback payload.
@@ -1308,7 +1349,10 @@ The earlier 12-fold comparison artifacts were measured before this
 checkpoint-validator change; no search-policy or scoring code changed, but
 their code identity is historical rather than the final release build.
 
-### Current selected-policy development comparison
+### Selected-policy development comparison (September 26)
+
+Superseded later the same day: after the two-turn staged correction recorded
+below, selected staged solved 360/360 at 3.1944.
 
 The corrected `dist` CLI ran a fresh staged-versus-finite 12-fold comparison (`benchmarks/predictive/september-staged-finite-current-source-v1.json`)
 and a fresh-label Fast repeat reusing its identity-checked staged baseline (`benchmarks/predictive/september-staged-finite-current-source-repeat-v1.json`).
@@ -1832,7 +1876,7 @@ production `config/prior.toml` remains unchanged. The fixed-belief-only
 `search-regret --finite` diagnostic must not be described as validation of this
 dynamic mode, because its reference values use frozen-belief semantics.
 
-### Latest current-source distributed-binary development replay
+### Post-layout-tests distributed-binary development replay (September 26)
 
 The completed current `dist` CLI (SHA-256
 `ECFEE91B8199956E327954BD5E5BE233F07129A8C2CDE3D6F4612CA740B46B72`) ran the
@@ -1849,6 +1893,8 @@ p95. V19b-minus-selected was -0.0027778 guesses, 95% CI
 per-game JSON remains local pending a publication decision. This is
 retrospective development evidence only; no promotion or flat-three claim
 follows. The current source/binary identity supersedes the prior “latest” link.
+A [redacted public copy](evidence/september-post-layout-tests-rolling-public-v1.json)
+was published later; the word-bearing JSON stays local.
 
 ### Earlier distributed-binary development replay (historical)
 
