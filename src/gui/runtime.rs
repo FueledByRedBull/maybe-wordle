@@ -89,11 +89,11 @@ impl MaybeWordleApp {
 }
 
 impl eframe::App for MaybeWordleApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         match self {
-            Self::Ready(app) => app.update(ctx, frame),
+            Self::Ready(app) => eframe::App::ui(app.as_mut(), ui, frame),
             Self::Loading(app) => {
-                if let Some(workspace) = app.update(ctx) {
+                if let Some(workspace) = app.update(ui) {
                     let mut ready = WordleGuiApp::new(workspace);
                     ready.start_formal_load(app.paths.clone());
                     *self = Self::Ready(Box::new(ready));
@@ -208,8 +208,8 @@ impl SetupApp {
         }
     }
 
-    pub(super) fn update(&mut self, ctx: &egui::Context) -> Option<LoadedWorkspace> {
-        ctx.set_visuals(workspace_visuals());
+    pub(super) fn update(&mut self, ui: &mut egui::Ui) -> Option<LoadedWorkspace> {
+        apply_workspace_visuals(ui);
         let mut completed = None;
         if let Some(receiver) = &self.receiver {
             loop {
@@ -247,7 +247,7 @@ impl SetupApp {
             }
         }
         if self.running {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
         egui::CentralPanel::default()
@@ -256,7 +256,7 @@ impl SetupApp {
                     .fill(Color32::from_rgb(246, 240, 232))
                     .inner_margin(32.0),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(28.0);
                     ui.label(

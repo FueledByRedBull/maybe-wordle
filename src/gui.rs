@@ -433,18 +433,19 @@ impl WordleGuiApp {
 }
 
 impl eframe::App for WordleGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         ctx.set_zoom_factor(self.text_scale);
-        ctx.set_visuals(workspace_visuals());
+        apply_workspace_visuals(ui);
         self.drain_worker_responses();
         self.drain_formal_load();
-        if !ctx.wants_keyboard_input()
+        if !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
         {
             self.observations.pop();
             self.schedule_recompute();
         }
-        if !ctx.wants_keyboard_input()
+        if !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.apply_board_action(BoardAction::Reset);
@@ -458,7 +459,7 @@ impl eframe::App for WordleGuiApp {
                     .fill(Color32::from_rgb(246, 240, 232))
                     .inner_margin(24.0),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("workspace-scroll")
                     .show(ui, |ui| {
@@ -561,7 +562,7 @@ impl eframe::App for WordleGuiApp {
                     WorkspaceView::Play => {}
                 }
 
-                self.show_play(ui, ctx);
+                self.show_play(ui, &ctx);
                     });
             });
     }
@@ -651,6 +652,14 @@ fn diagnostic_badge(ui: &mut egui::Ui, label: &str, value: &str) {
             );
             ui.label(RichText::new(value).strong());
         });
+}
+
+/// The root `Ui` snapshots the global style before `App::ui` runs, so it needs the
+/// visuals directly to match popups and later frames from the first frame onward.
+fn apply_workspace_visuals(ui: &mut egui::Ui) {
+    let visuals = workspace_visuals();
+    ui.ctx().set_visuals(visuals.clone());
+    *ui.visuals_mut() = visuals;
 }
 
 fn workspace_visuals() -> egui::Visuals {
@@ -855,6 +864,18 @@ mod tests {
         worker_request_cancelled,
     };
 
+    /// Headless frames have no renderer to apply texture uploads, and epaint debug-asserts
+    /// that unapplied texture deltas are discarded explicitly.
+    fn run_headless_frame(
+        context: &eframe::egui::Context,
+        input: eframe::egui::RawInput,
+        run_ui: impl FnMut(&mut eframe::egui::Ui),
+    ) -> eframe::egui::FullOutput {
+        let mut output = context.run_ui(input, run_ui);
+        output.textures_delta.clear();
+        output
+    }
+
     fn worker_fixture_solver() -> (Solver, crate::test_support::TestDirectory) {
         let root = crate::test_support::TestDirectory::new("gui-worker");
         let paths = crate::data::ProjectPaths::new(root.path());
@@ -1040,8 +1061,8 @@ mod tests {
         let mut app = super::MaybeWordleApp::Loading(Box::new(setup));
         let context = eframe::egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
-        let output = context.run(Default::default(), |ctx| {
-            eframe::App::update(&mut app, ctx, &mut frame)
+        let output = run_headless_frame(&context, Default::default(), |ui| {
+            eframe::App::ui(&mut app, ui, &mut frame)
         });
         assert!(matches!(app, super::MaybeWordleApp::Loading(_)));
         assert!(!output.shapes.is_empty());
@@ -1094,7 +1115,8 @@ mod tests {
             let mut declared_content_height = 0.0;
             let mut row_spacing = 0.0;
             for step in 0..3 {
-                output = Some(context.run(
+                output = Some(run_headless_frame(
+                    &context,
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -1102,18 +1124,18 @@ mod tests {
                         )),
                         ..Default::default()
                     },
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
                             if step == 1 {
-                                let id = ui.make_persistent_id(egui::Id::new(
+                                let id = ui.make_persistent_id(egui::IdSalt::new(
                                     "predictive-candidate-scroll",
                                 ));
-                                let mut state = egui::scroll_area::State::load(ctx, id)
+                                let mut state = egui::scroll_area::State::load(ui.ctx(), id)
                                     .expect("candidate scroll state");
                                 // Let the widget clamp to its actual bottom; the test
                                 // must not duplicate the production row-height formula.
                                 state.offset.y = 1_000_000.0;
-                                state.store(ctx, id);
+                                state.store(ui.ctx(), id);
                             }
                             row_spacing = ui.spacing().item_spacing.y;
                             declared_content_height =
@@ -1405,8 +1427,8 @@ mod tests {
         app.running = true;
         drop(sender);
         let context = eframe::egui::Context::default();
-        let _ = context.run(Default::default(), |ctx| {
-            assert!(app.update(ctx).is_none());
+        let _ = run_headless_frame(&context, Default::default(), |ui| {
+            assert!(app.update(ui).is_none());
         });
         assert!(!app.running);
         assert!(app.error.contains("disconnected"));
@@ -1472,8 +1494,8 @@ mod tests {
         app.predictive_execution = Some(response.execution);
         app.surviving_count = response.state.surviving;
         let context = eframe::egui::Context::default();
-        let output = context.run(Default::default(), |ctx| {
-            eframe::egui::CentralPanel::default().show(ctx, |ui| app.show_live_trace(ui));
+        let output = run_headless_frame(&context, Default::default(), |ui| {
+            eframe::egui::CentralPanel::default().show(ui, |ui| app.show_live_trace(ui));
         });
         let text = output
             .shapes
@@ -1849,8 +1871,8 @@ mod tests {
     fn decorative_game_board_tiles_are_not_accessibility_buttons() {
         let context = eframe::egui::Context::default();
         context.enable_accesskit();
-        let output = context.run(eframe::egui::RawInput::default(), |context| {
-            eframe::egui::CentralPanel::default().show(context, |ui| {
+        let output = run_headless_frame(&context, eframe::egui::RawInput::default(), |ui| {
+            eframe::egui::CentralPanel::default().show(ui, |ui| {
                 super::show_game_board(ui, &[("olate".to_string(), 0)], "crane", [0; 5]);
             });
         });
@@ -1882,7 +1904,8 @@ mod tests {
         for width in [861.0, 1180.0] {
             for applied in [false, true] {
                 let mut suggestions_left = None;
-                let output = context.run(
+                let output = run_headless_frame(
+                    &context,
                     eframe::egui::RawInput {
                         screen_rect: Some(eframe::egui::Rect::from_min_size(
                             eframe::egui::Pos2::ZERO,
@@ -1890,8 +1913,8 @@ mod tests {
                         )),
                         ..Default::default()
                     },
-                    |context| {
-                        eframe::egui::CentralPanel::default().show(context, |ui| {
+                    |ui| {
+                        eframe::egui::CentralPanel::default().show(ui, |ui| {
                             ui.columns(2, |columns| {
                                 columns[0].group(|ui| {
                                     let observations = if applied {
@@ -2027,12 +2050,13 @@ mod tests {
             let context = eframe::egui::Context::default();
             context.enable_accesskit();
             let mut frame = eframe::Frame::_new_kittest();
-            let output = context.run(
+            let output = run_headless_frame(
+                &context,
                 eframe::egui::RawInput {
                     screen_rect: Some(screen_rect),
                     ..Default::default()
                 },
-                |context| eframe::App::update(&mut app, context, &mut frame),
+                |ui| eframe::App::ui(&mut app, ui, &mut frame),
             );
 
             // Assistive technology needs a name for every input and a position for each tile.
@@ -2228,12 +2252,13 @@ mod tests {
         );
         let context = eframe::egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
-        let output = context.run(
+        let output = run_headless_frame(
+            &context,
             eframe::egui::RawInput {
                 screen_rect: Some(screen_rect),
                 ..Default::default()
             },
-            |context| eframe::App::update(&mut app, context, &mut frame),
+            |ui| eframe::App::ui(&mut app, ui, &mut frame),
         );
         let feedback_tiles = output
             .shapes

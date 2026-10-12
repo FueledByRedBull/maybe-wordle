@@ -29,4 +29,4 @@ jobs:
         # Maintenance-only exceptions and review conditions: docs/DEPENDENCIES.md.
         run: >-
           cargo audit --file Cargo.lock --deny warnings
-          --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192
+          --ignore RUSTSEC-2026-0192

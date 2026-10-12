@@ -684,8 +684,8 @@ impl WordleGuiApp {
     }
 }
 
-/// egui gives a combo box without a trailing label an empty accessible name, which overrides
-/// `labelled_by`; name it directly and expose the selection as its value.
+/// egui leaves a combo box without a trailing label unnamed; name it directly and expose the
+/// selection as its value.
 fn name_combo_box(response: &egui::Response, name: &str, selected: &str) {
     response.widget_info(|| {
         let mut info = egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, name);
