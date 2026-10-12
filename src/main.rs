@@ -31,11 +31,10 @@ use maybe_wordle::{
         PredictiveSuggestRequest, PredictiveSuggestResponse, PredictiveSuggestionMode,
         history_cutoff,
     },
-    research::{fit_learned_proxy_experiment, run_survival_experiment},
     seed::{MergeStrategy, add_manual_addition, merge_seed_lists, reconcile_seed_lists},
     solver::{
         AbsurdleSuggestion, EvidenceDateSelection, EvidenceResourceBudget,
-        FiniteSearchRegretRequest, LearnedProxyDatasetRequest, SearchRegretRequest, Solver,
+        FiniteSearchRegretRequest, SearchRegretRequest, Solver,
         StagedZeroFailureCertificateRequest,
     },
 };
@@ -62,7 +61,7 @@ enum Command {
         )]
         strict: bool,
         #[arg(long, help = "Last NYT print date to fetch; defaults to today")]
-        through: Option<String>,
+        through: Option<NaiveDate>,
     },
     #[command(about = "Build modeled answer CSVs under data/derived")]
     BuildModel,
@@ -123,9 +122,10 @@ enum Command {
         #[arg(
             long,
             default_value = "union",
+            value_parser = enum_arg::<MergeStrategy>,
             help = "Seed merge strategy: union or keep_primary"
         )]
-        strategy: String,
+        strategy: MergeStrategy,
         #[arg(
             long,
             default_value_t = false,
@@ -154,13 +154,14 @@ enum Command {
         )]
         top: usize,
         #[arg(long, help = "Predictive as-of date in YYYY-MM-DD; defaults to today")]
-        date: Option<String>,
+        date: Option<NaiveDate>,
         #[arg(
             long,
             default_value = "predictive",
+            value_parser = enum_arg::<SolverMode>,
             help = "Solver mode: predictive, absurdle, or formal-optimal"
         )]
-        mode: String,
+        mode: SolverMode,
         #[arg(
             long,
             default_value_t = false,
@@ -196,13 +197,14 @@ enum Command {
         )]
         top: usize,
         #[arg(long, help = "Predictive as-of date in YYYY-MM-DD; defaults to today")]
-        date: Option<String>,
+        date: Option<NaiveDate>,
         #[arg(
             long,
             default_value = "predictive",
+            value_parser = enum_arg::<SolverMode>,
             help = "Solver mode: predictive, absurdle, or formal-optimal"
         )]
-        mode: String,
+        mode: SolverMode,
         #[arg(
             long,
             default_value_t = false,
@@ -247,12 +249,12 @@ enum Command {
             long,
             help = "Backtest start date in YYYY-MM-DD (required; declared development only)"
         )]
-        from: String,
+        from: NaiveDate,
         #[arg(
             long,
             help = "Backtest end date in YYYY-MM-DD (required; declared development only)"
         )]
-        to: String,
+        to: NaiveDate,
         #[arg(
             long,
             default_value_t = 5,
@@ -278,12 +280,12 @@ enum Command {
             long,
             help = "Evaluation start date in YYYY-MM-DD; defaults to earliest synced date"
         )]
-        from: Option<String>,
+        from: Option<NaiveDate>,
         #[arg(
             long,
             help = "Evaluation end date in YYYY-MM-DD; defaults to latest synced date"
         )]
-        to: Option<String>,
+        to: Option<NaiveDate>,
         #[arg(
             long,
             default_value_t = 5,
@@ -305,9 +307,9 @@ enum Command {
         #[arg(long, help = "Path to the candidate prior TOML file to evaluate")]
         config: String,
         #[arg(long, help = "Evaluation start date in YYYY-MM-DD")]
-        from: String,
+        from: NaiveDate,
         #[arg(long, help = "Evaluation end date in YYYY-MM-DD")]
-        to: String,
+        to: NaiveDate,
         #[arg(
             long,
             default_value_t = 5,
@@ -324,9 +326,9 @@ enum Command {
     #[command(about = "Report states where aggressive three-guess play closes a gap")]
     ThreeGuessGap {
         #[arg(long, help = "Evaluation start date in YYYY-MM-DD")]
-        from: String,
+        from: NaiveDate,
         #[arg(long, help = "Evaluation end date in YYYY-MM-DD")]
-        to: String,
+        to: NaiveDate,
         #[arg(
             long,
             default_value_t = 5,
@@ -337,9 +339,9 @@ enum Command {
     #[command(about = "Compare specified opener words against four-guess targets")]
     FourGuessOpeners {
         #[arg(long, help = "Evaluation start date in YYYY-MM-DD")]
-        from: String,
+        from: NaiveDate,
         #[arg(long, help = "Evaluation end date in YYYY-MM-DD")]
-        to: String,
+        to: NaiveDate,
         #[arg(
             long,
             default_value_t = 5,
@@ -355,36 +357,40 @@ enum Command {
     #[command(about = "Build a predictive opener artifact for one date and one model variant")]
     BuildPredictiveOpener {
         #[arg(long, help = "Artifact date in YYYY-MM-DD; defaults to today")]
-        date: Option<String>,
+        date: Option<NaiveDate>,
         #[arg(
             long,
             default_value = "weighted",
+            value_parser = enum_arg::<WeightMode>,
             help = "Answer-weight model: weighted, uniform, cooldown_only, used_unused, recency_buckets, empirical_frequency, or regularized_frequency"
         )]
-        weight_mode: String,
+        weight_mode: WeightMode,
         #[arg(
             long,
             default_value = "seed_plus_history",
+            value_parser = enum_arg::<ModelVariant>,
             help = "Model variant: seed_only or seed_plus_history"
         )]
-        variant: String,
+        variant: ModelVariant,
     },
     #[command(about = "Build a predictive reply-book artifact for one date and one model variant")]
     BuildPredictiveReplies {
         #[arg(long, help = "Artifact date in YYYY-MM-DD; defaults to today")]
-        date: Option<String>,
+        date: Option<NaiveDate>,
         #[arg(
             long,
             default_value = "weighted",
+            value_parser = enum_arg::<WeightMode>,
             help = "Answer-weight model: weighted, uniform, cooldown_only, used_unused, recency_buckets, empirical_frequency, or regularized_frequency"
         )]
-        weight_mode: String,
+        weight_mode: WeightMode,
         #[arg(
             long,
             default_value = "seed_plus_history",
+            value_parser = enum_arg::<ModelVariant>,
             help = "Model variant: seed_only or seed_plus_history"
         )]
-        variant: String,
+        variant: ModelVariant,
     },
     #[command(about = "Run the predictive experiment matrix over a synced date range")]
     Experiments {
@@ -392,12 +398,12 @@ enum Command {
             long,
             help = "Evaluation start date in YYYY-MM-DD (required; declared development only)"
         )]
-        from: String,
+        from: NaiveDate,
         #[arg(
             long,
             help = "Evaluation end date in YYYY-MM-DD (required; declared development only)"
         )]
-        to: String,
+        to: NaiveDate,
         #[arg(
             long,
             default_value_t = 5,
@@ -432,9 +438,10 @@ enum Command {
         #[arg(
             long,
             default_value = "calibration",
+            value_parser = enum_arg::<StudyStage>,
             help = "Study stage or typed cohort; use proxy-ranker/solve-policy for aggregate compatibility or proxy-core, proxy-risk, proxy-small-state, search-routing, search-exact, search-coverage, search-lookahead, search-pool, search-danger, and search-penalty for coherent studies"
         )]
-        stage: String,
+        stage: StudyStage,
         #[arg(
             long,
             default_value_t = 16,
@@ -452,9 +459,10 @@ enum Command {
         #[arg(
             long,
             default_value = "low-discrepancy",
+            value_parser = enum_arg::<StudySearchStrategy>,
             help = "Candidate strategy: grid, low-discrepancy, random, local-refinement, or model-based"
         )]
-        strategy: String,
+        strategy: StudySearchStrategy,
         #[arg(
             long,
             default_value_t = 12,
@@ -507,45 +515,6 @@ enum Command {
         about = "Tune registered proxy-ranker weights through the common rolling study runner"
     )]
     FitProxyWeights,
-    #[command(about = "Build development-only exhaustive costs and fit a residual ridge proxy")]
-    LearnedProxyExperiment {
-        #[arg(long, default_value_t = 3)]
-        minimum_survivors: usize,
-        #[arg(long, default_value_t = 12)]
-        maximum_survivors: usize,
-        #[arg(long, default_value_t = 8)]
-        maximum_states_per_split: usize,
-        #[arg(long, default_value_t = 18)]
-        guesses_per_state: usize,
-        #[arg(long, default_value_t = 1200)]
-        maximum_seconds: u64,
-        #[arg(long, default_value_t = 4096)]
-        maximum_memory_mb: u64,
-        #[arg(
-            long,
-            default_value = "target/studies/learned-proxy-checkpoint-v1.json",
-            help = "Atomic resumable checkpoint written after each exact state"
-        )]
-        checkpoint: PathBuf,
-        #[arg(
-            long,
-            default_value = "benchmarks/predictive/learned-proxy-dataset-v1.json"
-        )]
-        dataset_output: PathBuf,
-        #[arg(
-            long,
-            default_value = "benchmarks/predictive/learned-proxy-experiment-v1.json"
-        )]
-        output: PathBuf,
-    },
-    #[command(about = "Evaluate a fold-local policy-era survival prior against logistic recency")]
-    SurvivalExperiment {
-        #[arg(
-            long,
-            default_value = "benchmarks/predictive/survival-experiment-v1.json"
-        )]
-        output: PathBuf,
-    },
     #[command(
         about = "Audit legacy or finite-horizon search choices against tractable exact references"
     )]
@@ -553,9 +522,9 @@ enum Command {
         #[arg(long, help = "Optional alternate prior TOML config")]
         config: Option<PathBuf>,
         #[arg(long, help = "Historical audit start date in YYYY-MM-DD")]
-        from: String,
+        from: NaiveDate,
         #[arg(long, help = "Historical audit end date in YYYY-MM-DD")]
-        to: String,
+        to: NaiveDate,
         #[arg(long, default_value_t = 3)]
         minimum_survivors: usize,
         #[arg(long, default_value_t = 6)]
@@ -591,7 +560,7 @@ enum Command {
         #[arg(long, help = "Selected staged prior TOML config")]
         config: Option<PathBuf>,
         #[arg(long, help = "Development-only NYT print date in YYYY-MM-DD")]
-        date: String,
+        date: NaiveDate,
         #[arg(
             long,
             default_value_t = 1,
@@ -614,9 +583,9 @@ enum Command {
         #[arg(long, help = "Selected staged prior TOML config")]
         config: Option<PathBuf>,
         #[arg(long, help = "Development-only range start date in YYYY-MM-DD")]
-        from: String,
+        from: NaiveDate,
         #[arg(long, help = "Development-only range end date in YYYY-MM-DD")]
-        to: String,
+        to: NaiveDate,
         #[arg(long, help = "Maximum selected staged decision roots")]
         maximum_states: usize,
         #[arg(long, help = "Shared diagnostic budget in seconds")]
@@ -637,9 +606,10 @@ enum Command {
         #[arg(
             long,
             default_value = "predictive",
+            value_parser = enum_arg::<SolverMode>,
             help = "Solver mode: predictive, absurdle, or formal-optimal"
         )]
-        mode: String,
+        mode: SolverMode,
         #[arg(long, default_value = DEFAULT_FORMAL_MODEL_ID, help = "Formal model id when --mode formal-optimal is used")]
         model: String,
     },
@@ -651,14 +621,14 @@ enum Command {
             conflicts_with = "rolling_folds",
             help = "Development evaluation start date in YYYY-MM-DD"
         )]
-        from: Option<String>,
+        from: Option<NaiveDate>,
         #[arg(
             long,
             required_unless_present = "rolling_folds",
             conflicts_with = "rolling_folds",
             help = "Development evaluation end date in YYYY-MM-DD"
         )]
-        to: Option<String>,
+        to: Option<NaiveDate>,
         #[arg(
             long,
             conflicts_with_all = ["from", "to"],
@@ -802,10 +772,11 @@ enum Command {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 enum SolverMode {
     Predictive,
     Absurdle,
+    #[value(aliases = ["formal", "optimal"])]
     FormalOptimal,
 }
 
@@ -850,7 +821,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::SyncData { strict, through } => {
-            let through = parse_or_today(through.as_deref())?;
+            let through = through.unwrap_or_else(Solver::today);
             let summary = sync_nyt_history_cancellable(&paths, &config, through, &|| false)?;
             println!("{}", format_sync_summary(&summary));
             if !summary.changed_dates.is_empty() {
@@ -1008,7 +979,6 @@ fn run() -> Result<()> {
             );
         }
         Command::MergeSeeds { strategy, apply } => {
-            let strategy = parse_merge_strategy(&strategy)?;
             let summary = merge_seed_lists(&paths, strategy, apply)?;
             println!(
                 "strategy={} primary={} reference={} merged={} output={} applied={}",
@@ -1031,10 +1001,10 @@ fn run() -> Result<()> {
             proxy_preview,
             search_budget,
             model,
-        } => match parse_solver_mode(&mode)? {
+        } => match mode {
             SolverMode::Predictive => {
                 let observations = Solver::parse_observations(&guess, &feedback)?;
-                let as_of = parse_or_today(date.as_deref())?;
+                let as_of = date.unwrap_or_else(Solver::today);
                 warn_predictive_history_range(&paths, as_of)?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let predictive_mode = predictive_cli_mode(live_fallback);
@@ -1144,9 +1114,9 @@ fn run() -> Result<()> {
             hard,
             live_fallback,
             model,
-        } => match parse_solver_mode(&mode)? {
+        } => match mode {
             SolverMode::Predictive => {
-                let as_of = parse_or_today(date.as_deref())?;
+                let as_of = date.unwrap_or_else(Solver::today);
                 warn_predictive_history_range(&paths, as_of)?;
                 let solver = Solver::from_paths(&paths, &config)?;
                 let mut observations = Vec::new();
@@ -1301,8 +1271,6 @@ fn run() -> Result<()> {
             detailed,
             failures_only,
         } => {
-            let from = parse_date(Some(&from))?.expect("--from is required by clap");
-            let to = parse_date(Some(&to))?.expect("--to is required by clap");
             let requested = validate_development_target_range(&paths, from, to, "backtest")?;
             let backtest_config = load_config_or(backtest_config.as_deref(), &config)?;
             let solver = Solver::from_paths(&paths, &backtest_config)?;
@@ -1395,8 +1363,8 @@ fn run() -> Result<()> {
         } => {
             let (default_from, default_to) = Solver::latest_history_range(&paths)?
                 .ok_or_else(|| anyhow!("run sync-data before predictive-ablations"))?;
-            let from = parse_date(from.as_deref())?.unwrap_or(default_from);
-            let to = parse_date(to.as_deref())?.unwrap_or(default_to);
+            let from = from.unwrap_or(default_from);
+            let to = to.unwrap_or(default_to);
             if from > to {
                 bail!("--from cannot be after --to");
             }
@@ -1468,8 +1436,6 @@ fn run() -> Result<()> {
             json,
         } => {
             let evaluation_config = PriorConfig::load(std::path::Path::new(&config_path))?;
-            let from = parse_date(Some(&from))?.expect("--from is required by clap");
-            let to = parse_date(Some(&to))?.expect("--to is required by clap");
             if from > to {
                 bail!("--from cannot be after --to");
             }
@@ -1494,8 +1460,6 @@ fn run() -> Result<()> {
             }
         }
         Command::ThreeGuessGap { from, to, top } => {
-            let from = parse_date(Some(&from))?.expect("--from is required by clap");
-            let to = parse_date(Some(&to))?.expect("--to is required by clap");
             if from > to {
                 bail!("--from cannot be after --to");
             }
@@ -1532,8 +1496,6 @@ fn run() -> Result<()> {
             top,
             opener,
         } => {
-            let from = parse_date(Some(&from))?.expect("--from is required by clap");
-            let to = parse_date(Some(&to))?.expect("--to is required by clap");
             if from > to {
                 bail!("--from cannot be after --to");
             }
@@ -1564,13 +1526,8 @@ fn run() -> Result<()> {
             weight_mode,
             variant,
         } => {
-            let as_of = parse_or_today(date.as_deref())?;
-            let solver = Solver::from_paths_with_settings(
-                &paths,
-                &config,
-                parse_weight_mode(&weight_mode)?,
-                parse_model_variant(&variant)?,
-            )?;
+            let as_of = date.unwrap_or_else(Solver::today);
+            let solver = Solver::from_paths_with_settings(&paths, &config, weight_mode, variant)?;
             let summary = solver.build_predictive_opener_cache(as_of)?;
             println!(
                 "mode={} variant={} as_of={} opener={} games={} four_guess_games={} avg_guesses={:.4} failures={} holdout_games={} holdout_four_guess_games={} holdout_avg_guesses={:.4} holdout_failures={} fingerprint={} path={}",
@@ -1595,13 +1552,8 @@ fn run() -> Result<()> {
             weight_mode,
             variant,
         } => {
-            let as_of = parse_or_today(date.as_deref())?;
-            let solver = Solver::from_paths_with_settings(
-                &paths,
-                &config,
-                parse_weight_mode(&weight_mode)?,
-                parse_model_variant(&variant)?,
-            )?;
+            let as_of = date.unwrap_or_else(Solver::today);
+            let solver = Solver::from_paths_with_settings(&paths, &config, weight_mode, variant)?;
             let summary = solver.build_predictive_reply_book(as_of)?;
             println!(
                 "mode={} variant={} as_of={} opener={} replies={} third_replies={} fingerprint={} path={}",
@@ -1616,8 +1568,6 @@ fn run() -> Result<()> {
             );
         }
         Command::Experiments { from, to, top } => {
-            let from = parse_date(Some(&from))?.expect("--from is required by clap");
-            let to = parse_date(Some(&to))?.expect("--to is required by clap");
             let requested = validate_development_target_range(&paths, from, to, "experiments")?;
             for mode in [
                 WeightMode::Uniform,
@@ -1710,11 +1660,11 @@ fn run() -> Result<()> {
                 &study_base_config,
                 StudySpec {
                     name,
-                    stage: parse_study_stage(&stage)?,
+                    stage,
                     seed,
                     trial_count: trials,
                     parallelism: jobs,
-                    strategy: parse_study_strategy(&strategy)?,
+                    strategy,
                     maximum_validation_folds,
                     initial_validation_folds,
                     reduction_factor,
@@ -1817,86 +1767,6 @@ fn run() -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
-        Command::LearnedProxyExperiment {
-            minimum_survivors,
-            maximum_survivors,
-            maximum_states_per_split,
-            guesses_per_state,
-            maximum_seconds,
-            maximum_memory_mb,
-            checkpoint,
-            dataset_output,
-            output,
-        } => {
-            let solver = Solver::from_paths(&paths, &config)?;
-            let dataset = solver.learned_proxy_dataset(
-                &paths,
-                LearnedProxyDatasetRequest {
-                    minimum_survivors,
-                    maximum_survivors,
-                    maximum_states_per_split,
-                    guesses_per_state,
-                    maximum_seconds,
-                    maximum_memory_mb,
-                    checkpoint_path: Some(checkpoint),
-                },
-            )?;
-            atomic_write(&dataset_output, dataset.to_json()?.as_bytes())?;
-            let mut report = fit_learned_proxy_experiment(&dataset)?;
-            let test_window = dataset
-                .split
-                .chronological
-                .as_ref()
-                .ok_or_else(|| anyhow!("learned-proxy dataset has no chronological split"))?;
-            report.reference_search_regret = Some(solver.search_regret_report(
-                &paths,
-                SearchRegretRequest {
-                    from: test_window.test_start,
-                    to: test_window.test_end,
-                    minimum_survivors,
-                    maximum_survivors: maximum_survivors.min(6),
-                    maximum_states: maximum_states_per_split,
-                    maximum_seconds: maximum_seconds.clamp(60, 600),
-                },
-            )?);
-            atomic_write(&output, &serde_json::to_vec_pretty(&report)?)?;
-            println!(
-                "learned_proxy={} dataset={} rows={} lambda={} validation_regret={:.6} test_regret={:.6} promotable={}",
-                output.display(),
-                dataset_output.display(),
-                dataset.rows.len(),
-                report.selected_lambda,
-                report.learned_validation.mean_regret,
-                report.learned_test.mean_regret,
-                report.promotable
-            );
-        }
-        Command::SurvivalExperiment { output } => {
-            let solver = Solver::from_paths(&paths, &config)?;
-            let report = run_survival_experiment(&paths, &config, &solver)?;
-            atomic_write(&output, &serde_json::to_vec_pretty(&report)?)?;
-            println!(
-                "survival={} folds={} reuse_events={} logistic_logloss={} survival_logloss={} promotable={}",
-                output.display(),
-                report.folds.len(),
-                report.total_reuse_events,
-                report.logistic.mean_log_loss.map_or_else(
-                    || format!(
-                        "unavailable (covered_games={})",
-                        report.logistic.covered_games
-                    ),
-                    |value| format!("{value:.6}"),
-                ),
-                report.survival.mean_log_loss.map_or_else(
-                    || format!(
-                        "unavailable (covered_games={})",
-                        report.survival.covered_games
-                    ),
-                    |value| format!("{value:.6}"),
-                ),
-                report.promotable
-            );
-        }
         Command::SearchRegret {
             config: audit_config,
             from,
@@ -1910,10 +1780,6 @@ fn run() -> Result<()> {
             output,
         } => {
             let audit_config = load_config_or(audit_config.as_deref(), &config)?;
-            let from = parse_date(Some(&from))?
-                .ok_or_else(|| anyhow!("--from is required for search-regret"))?;
-            let to = parse_date(Some(&to))?
-                .ok_or_else(|| anyhow!("--to is required for search-regret"))?;
             let maximum_states = maximum_states.unwrap_or(if finite { 6 } else { 16 });
             let maximum_seconds = maximum_seconds.unwrap_or(if finite { 60 } else { 1800 });
             let solver = Solver::from_paths(&paths, &audit_config)?;
@@ -1994,8 +1860,6 @@ fn run() -> Result<()> {
             output,
         } => {
             let audit_config = load_config_or(audit_config.as_deref(), &config)?;
-            let date = parse_date(Some(&date))?
-                .ok_or_else(|| anyhow!("--date is required for same-state-dynamic-regret"))?;
             let solver = Solver::from_paths(&paths, &audit_config)?;
             let report =
                 solver.same_state_dynamic_regret_report(&paths, date, turn, maximum_seconds)?;
@@ -2027,8 +1891,6 @@ fn run() -> Result<()> {
             if maximum_seconds == 0 {
                 bail!("--maximum-seconds must be greater than zero");
             }
-            let from = parse_date(Some(&from))?.expect("--from is required by clap");
-            let to = parse_date(Some(&to))?.expect("--to is required by clap");
             let requested = validate_development_target_range(
                 &paths,
                 from,
@@ -2070,7 +1932,7 @@ fn run() -> Result<()> {
             if runs == 0 {
                 bail!("runs must be greater than 0");
             }
-            match parse_solver_mode(&mode)? {
+            match mode {
                 SolverMode::Predictive => {
                     let solver = Solver::from_paths(&paths, &config)?;
                     let state = solver.initial_state(Solver::today());
@@ -2127,15 +1989,9 @@ fn run() -> Result<()> {
                 EvidenceDateSelection::RollingFolds
             } else {
                 let from = from
-                    .as_deref()
                     .ok_or_else(|| anyhow!("--from is required unless --rolling-folds is used"))?;
-                let to = to
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("--to is required unless --rolling-folds is used"))?;
-                let from = NaiveDate::parse_from_str(from, "%Y-%m-%d")
-                    .with_context(|| format!("invalid --from date: {from}"))?;
-                let to = NaiveDate::parse_from_str(to, "%Y-%m-%d")
-                    .with_context(|| format!("invalid --to date: {to}"))?;
+                let to =
+                    to.ok_or_else(|| anyhow!("--to is required unless --rolling-folds is used"))?;
                 if from > to {
                     bail!("--from cannot be after --to");
                 }
@@ -2344,16 +2200,16 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn parse_or_today(raw: Option<&str>) -> Result<NaiveDate> {
-    Ok(parse_date(raw)?.unwrap_or_else(Solver::today))
-}
-
-fn parse_date(raw: Option<&str>) -> Result<Option<NaiveDate>> {
-    raw.map(|value| {
-        NaiveDate::parse_from_str(value, "%Y-%m-%d")
-            .with_context(|| format!("invalid date: {value}"))
+/// Accepts any letter case and `_` in place of `-`.
+fn enum_arg<T: clap::ValueEnum>(raw: &str) -> Result<T, String> {
+    T::from_str(&raw.trim().replace('_', "-"), true).map_err(|_| {
+        let names: Vec<_> = T::value_variants()
+            .iter()
+            .filter_map(|variant| variant.to_possible_value())
+            .map(|value| value.get_name().to_owned())
+            .collect();
+        format!("expected one of: {}", names.join(", "))
     })
-    .transpose()
 }
 
 fn load_config_or(path: Option<&Path>, default: &PriorConfig) -> Result<PriorConfig> {
@@ -2693,53 +2549,6 @@ fn format_absurdle_suggestion(suggestion: &AbsurdleSuggestion) -> String {
     )
 }
 
-fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "union" => Ok(MergeStrategy::Union),
-        "keep_primary" => Ok(MergeStrategy::KeepPrimary),
-        _ => bail!("merge strategy must be one of: union, keep_primary"),
-    }
-}
-
-fn parse_study_stage(raw: &str) -> Result<StudyStage> {
-    match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-        "calibration" | "prior" => Ok(StudyStage::Calibration),
-        "coverage-recovery" | "recovery" => Ok(StudyStage::CoverageRecovery),
-        "proxy-core" => Ok(StudyStage::ProxyCore),
-        "proxy-risk" => Ok(StudyStage::ProxyRisk),
-        "proxy-small-state" => Ok(StudyStage::ProxySmallState),
-        "proxy-ranker" | "proxy" => Ok(StudyStage::ProxyRanker),
-        "search-routing" => Ok(StudyStage::SearchRouting),
-        "search-exact" => Ok(StudyStage::SearchExact),
-        "search-coverage" => Ok(StudyStage::SearchCoverage),
-        "search-lookahead" => Ok(StudyStage::SearchLookahead),
-        "search-pool" => Ok(StudyStage::SearchPool),
-        "search-danger" => Ok(StudyStage::SearchDanger),
-        "search-penalty" => Ok(StudyStage::SearchPenalty),
-        "solve-policy" | "solve" => Ok(StudyStage::SolvePolicy),
-        "book-policy" | "book" => Ok(StudyStage::BookPolicy),
-        "joint" | "all" => Ok(StudyStage::Joint),
-        _ => bail!(
-            "study stage must be one of: calibration, coverage-recovery, proxy-core, proxy-risk, proxy-small-state, proxy-ranker, search-routing, search-exact, search-coverage, search-lookahead, search-pool, search-danger, search-penalty, solve-policy, book-policy, joint"
-        ),
-    }
-}
-
-fn parse_study_strategy(raw: &str) -> Result<StudySearchStrategy> {
-    match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-        "grid" => Ok(StudySearchStrategy::Grid),
-        "low-discrepancy" | "quasi-random" => Ok(StudySearchStrategy::LowDiscrepancy),
-        "random" => Ok(StudySearchStrategy::Random),
-        "local-refinement" | "local" => Ok(StudySearchStrategy::LocalRefinement),
-        "model-based" | "model_based" | "tpe" => Ok(StudySearchStrategy::ModelBased),
-        _ => {
-            bail!(
-                "study strategy must be one of: grid, low-discrepancy, random, local-refinement, model-based"
-            )
-        }
-    }
-}
-
 fn reject_hard_mode_for_non_predictive(hard: bool, mode: &str) -> Result<()> {
     if hard {
         bail!("--hard is only supported in predictive Wordle mode, not {mode}");
@@ -2759,40 +2568,6 @@ fn predictive_cli_mode(live_fallback: bool) -> PredictiveSuggestionMode {
         PredictiveSuggestionMode::Full
     } else {
         PredictiveSuggestionMode::FastDiskOnly
-    }
-}
-
-fn parse_solver_mode(raw: &str) -> Result<SolverMode> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "predictive" => Ok(SolverMode::Predictive),
-        "absurdle" => Ok(SolverMode::Absurdle),
-        "formal-optimal" | "formal_optimal" | "formal" | "optimal" => Ok(SolverMode::FormalOptimal),
-        _ => bail!("mode must be one of: predictive, absurdle, formal-optimal"),
-    }
-}
-
-fn parse_weight_mode(raw: &str) -> Result<WeightMode> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "weighted" => Ok(WeightMode::Weighted),
-        "uniform" => Ok(WeightMode::Uniform),
-        "cooldown_only" | "cooldown-only" => Ok(WeightMode::CooldownOnly),
-        "used_unused" | "used-unused" => Ok(WeightMode::UsedUnused),
-        "recency_buckets" | "recency-buckets" => Ok(WeightMode::RecencyBuckets),
-        "empirical_frequency" | "empirical-frequency" => Ok(WeightMode::EmpiricalFrequency),
-        "regularized_frequency" | "regularized-frequency" => Ok(WeightMode::RegularizedFrequency),
-        _ => bail!(
-            "weight mode must be one of: weighted, uniform, cooldown_only, used_unused, recency_buckets, empirical_frequency, regularized_frequency"
-        ),
-    }
-}
-
-fn parse_model_variant(raw: &str) -> Result<ModelVariant> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "seed_only" | "seed-only" => Ok(ModelVariant::SeedOnly),
-        "seed_plus_history" | "seed-plus-history" | "seed" | "default" => {
-            Ok(ModelVariant::SeedPlusHistory)
-        }
-        _ => bail!("variant must be one of: seed_only, seed_plus_history"),
     }
 }
 
@@ -2871,12 +2646,11 @@ mod tests {
     use maybe_wordle::solver::AbsurdleSuggestion;
 
     use super::{
-        Cli, Command, enforce_sync_policy, find_project_root, format_absurdle_suggestion,
+        Cli, Command, enforce_sync_policy, enum_arg, find_project_root, format_absurdle_suggestion,
         format_predictive_context, format_predictive_suggestion, format_sync_summary,
-        normalize_interactive_guess, parse_solver_mode, parse_study_stage, parse_study_strategy,
-        predictive_cli_mode, predictive_history_range_warnings, predictive_warning_lines,
-        reject_hard_mode_for_non_predictive, reject_live_fallback_for_non_predictive,
-        try_append_observation,
+        normalize_interactive_guess, predictive_cli_mode, predictive_history_range_warnings,
+        predictive_warning_lines, reject_hard_mode_for_non_predictive,
+        reject_live_fallback_for_non_predictive, try_append_observation,
     };
 
     #[test]
@@ -2892,7 +2666,7 @@ mod tests {
         match cli.command {
             Command::SyncData { strict, through } => {
                 assert!(strict);
-                assert_eq!(through.as_deref(), Some("2026-08-26"));
+                assert_eq!(through, NaiveDate::from_ymd_opt(2026, 8, 26));
             }
             _ => panic!("expected sync-data"),
         }
@@ -3122,57 +2896,65 @@ mod tests {
     }
 
     #[test]
-    fn parse_solver_mode_accepts_absurdle() {
-        assert!(matches!(
-            parse_solver_mode("absurdle").expect("mode"),
-            super::SolverMode::Absurdle
-        ));
+    fn enum_arg_accepts_any_case_separator_and_alias() {
+        use super::{MergeStrategy, ModelVariant, SolverMode, WeightMode};
+
+        assert_eq!(enum_arg("absurdle"), Ok(SolverMode::Absurdle));
+        assert_eq!(enum_arg("Formal_Optimal"), Ok(SolverMode::FormalOptimal));
+        assert_eq!(enum_arg("optimal"), Ok(SolverMode::FormalOptimal));
+        assert_eq!(enum_arg("keep_primary"), Ok(MergeStrategy::KeepPrimary));
+        assert_eq!(enum_arg("cooldown-only"), Ok(WeightMode::CooldownOnly));
+        assert_eq!(enum_arg("default"), Ok(ModelVariant::SeedPlusHistory));
+        assert_eq!(
+            enum_arg::<SolverMode>("nope"),
+            Err("expected one of: predictive, absurdle, formal-optimal".to_owned())
+        );
     }
 
     #[test]
-    fn parse_study_strategy_accepts_documented_aliases_and_rejects_unknown_values() {
+    fn study_strategy_accepts_documented_aliases_and_rejects_unknown_values() {
         assert_eq!(
-            parse_study_strategy("low_discrepancy").expect("low discrepancy"),
+            enum_arg::<StudySearchStrategy>("low_discrepancy").expect("low discrepancy"),
             StudySearchStrategy::LowDiscrepancy
         );
         assert_eq!(
-            parse_study_strategy("quasi-random").expect("quasi-random"),
+            enum_arg::<StudySearchStrategy>("quasi-random").expect("quasi-random"),
             StudySearchStrategy::LowDiscrepancy
         );
         assert_eq!(
-            parse_study_strategy("local").expect("local"),
+            enum_arg::<StudySearchStrategy>("local").expect("local"),
             StudySearchStrategy::LocalRefinement
         );
         assert_eq!(
-            parse_study_strategy("tpe").expect("tpe"),
+            enum_arg::<StudySearchStrategy>("tpe").expect("tpe"),
             StudySearchStrategy::ModelBased
         );
     }
 
     #[test]
-    fn parse_study_stage_accepts_proxy_ranker_aliases() {
+    fn study_stage_accepts_proxy_ranker_aliases() {
         assert_eq!(
-            parse_study_stage("proxy-ranker").expect("proxy ranker"),
+            enum_arg::<super::StudyStage>("proxy-ranker").expect("proxy ranker"),
             maybe_wordle::experiments::StudyStage::ProxyRanker
         );
         assert_eq!(
-            parse_study_stage("proxy").expect("proxy alias"),
+            enum_arg::<super::StudyStage>("proxy").expect("proxy alias"),
             maybe_wordle::experiments::StudyStage::ProxyRanker
         );
     }
 
     #[test]
-    fn parse_study_stage_accepts_typed_cohort_aliases() {
+    fn study_stage_accepts_typed_cohort_aliases() {
         assert_eq!(
-            parse_study_stage("proxy_small_state").expect("proxy small state"),
+            enum_arg::<super::StudyStage>("proxy_small_state").expect("proxy small state"),
             maybe_wordle::experiments::StudyStage::ProxySmallState
         );
         assert_eq!(
-            parse_study_stage("search-exact").expect("search exact"),
+            enum_arg::<super::StudyStage>("search-exact").expect("search exact"),
             maybe_wordle::experiments::StudyStage::SearchExact
         );
         assert_eq!(
-            parse_study_stage("search_penalty").expect("search penalty"),
+            enum_arg::<super::StudyStage>("search_penalty").expect("search penalty"),
             maybe_wordle::experiments::StudyStage::SearchPenalty
         );
     }
@@ -3470,8 +3252,8 @@ mod tests {
                 matrix,
                 ..
             } => {
-                assert_eq!(from.as_deref(), Some("2026-01-01"));
-                assert_eq!(to.as_deref(), Some("2026-01-31"));
+                assert_eq!(from, NaiveDate::from_ymd_opt(2026, 1, 1));
+                assert_eq!(to, NaiveDate::from_ymd_opt(2026, 1, 31));
                 assert!(!rolling_folds);
                 assert_eq!(matrix, Some(PathBuf::from("matrix.json")));
             }
@@ -3564,7 +3346,7 @@ mod tests {
                 output,
                 ..
             } => {
-                assert_eq!(date, "2026-08-01");
+                assert_eq!(Some(date), NaiveDate::from_ymd_opt(2026, 8, 1));
                 assert_eq!(turn, 3);
                 assert_eq!(maximum_seconds, 20);
                 assert_eq!(output, PathBuf::from("same-state.json"));
@@ -3631,8 +3413,8 @@ mod tests {
                 output,
                 ..
             } => {
-                assert_eq!(from, "2026-08-01");
-                assert_eq!(to, "2026-08-02");
+                assert_eq!(Some(from), NaiveDate::from_ymd_opt(2026, 8, 1));
+                assert_eq!(Some(to), NaiveDate::from_ymd_opt(2026, 8, 2));
                 assert_eq!(maximum_states, 1);
                 assert_eq!(maximum_seconds, 1);
                 assert!(hard_mode);

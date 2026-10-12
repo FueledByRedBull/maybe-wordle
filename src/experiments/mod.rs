@@ -1,5 +1,4 @@
 mod diagnostic;
-pub mod exhaustive_cost;
 mod folds;
 mod matrix;
 mod metrics;

@@ -61,6 +61,7 @@ impl Solver {
             .collect()
     }
 
+    #[cfg(test)]
     pub(super) fn score_guess_metrics_for_subset(
         &self,
         subset: &[usize],

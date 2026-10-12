@@ -25,7 +25,7 @@ pub struct SeedReconciliationSummary {
     pub reference_only_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum MergeStrategy {
     KeepPrimary,
     Union,

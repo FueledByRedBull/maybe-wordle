@@ -1,6 +1,6 @@
 use std::{
     array,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -16,11 +16,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::PriorConfig,
     data::{NytDailyEntry, ProjectPaths, read_history_jsonl},
-    experiments::exhaustive_cost::{
-        ChronologicalSplitMetadata, DatasetProvenance, DatasetSplit, DatasetSplitMetadata,
-        ExactState, ExhaustiveCostCheckpoint, ExhaustiveCostDatasetArtifact, ExhaustiveCostRow,
-        ExhaustiveProgress, ReplayIdentityInput, ResourceBudget,
-    },
     experiments::{
         BootstrapConfig, DateRange, EvaluationPlan, ExperimentArtifactMode, GameOutcome,
         PairedDifference, PredictiveConfigProfile, PredictiveExperimentMatrix, PredictiveMetrics,
@@ -65,10 +60,6 @@ use self::books::write_predictive_artifact;
 use self::eval::*;
 use self::state::*;
 use self::{ranking::*, search::*};
-
-pub(crate) use self::eval::{
-    current_executable_fingerprint, development_source_identity, ensure_development_source_identity,
-};
 
 const HARD_MODE_WORD_LENGTH: usize = 5;
 #[derive(Clone, Debug)]
@@ -205,20 +196,6 @@ pub struct BacktestStats {
     pub coverage_gaps: usize,
     pub average_guesses_ci95: Option<(f64, f64)>,
     pub failure_rate_ci95: (f64, f64),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SolvePolicyEvidence {
-    pub summary: BacktestStats,
-    pub elapsed_ms: u64,
-    pub latency_p95_ms: f64,
-    pub peak_memory_bytes: Option<u64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SurvivalSolveComparison {
-    pub baseline: SolvePolicyEvidence,
-    pub survival: SolvePolicyEvidence,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -728,18 +705,6 @@ pub struct SearchRegretRequest {
     pub maximum_survivors: usize,
     pub maximum_states: usize,
     pub maximum_seconds: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LearnedProxyDatasetRequest {
-    pub minimum_survivors: usize,
-    pub maximum_survivors: usize,
-    pub maximum_states_per_split: usize,
-    pub guesses_per_state: usize,
-    pub maximum_seconds: u64,
-    pub maximum_memory_mb: u64,
-    #[serde(default)]
-    pub checkpoint_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

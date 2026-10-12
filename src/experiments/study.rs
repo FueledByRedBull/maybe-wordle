@@ -45,14 +45,17 @@ fn default_fold_selection() -> StudyFoldSelection {
     StudyFoldSelection::NestedTimeSpread
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum StudySearchStrategy {
     Grid,
     #[default]
+    #[value(alias = "quasi-random")]
     LowDiscrepancy,
     Random,
+    #[value(alias = "local")]
     LocalRefinement,
+    #[value(alias = "tpe")]
     ModelBased,
 }
 
@@ -87,14 +90,17 @@ impl StudyProvenance {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum StudyStage {
+    #[value(alias = "prior")]
     Calibration,
+    #[value(alias = "recovery")]
     CoverageRecovery,
     ProxyCore,
     ProxyRisk,
     ProxySmallState,
+    #[value(alias = "proxy")]
     ProxyRanker,
     SearchRouting,
     SearchExact,
@@ -103,8 +109,11 @@ pub enum StudyStage {
     SearchPool,
     SearchDanger,
     SearchPenalty,
+    #[value(alias = "solve")]
     SolvePolicy,
+    #[value(alias = "book")]
     BookPolicy,
+    #[value(alias = "all")]
     Joint,
 }
 
