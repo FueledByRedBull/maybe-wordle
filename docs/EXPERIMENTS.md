@@ -4,7 +4,7 @@ This document holds the detail that used to sit in the README: the September
 2026 audit and experiment notes, the experiment and evidence tooling
 reference, and the GUI behaviour and verification history. The notes are dated
 history written at the time. Current status is in the
-[README](../README.md), [TODO.md](../TODO.md) and the
+[README](../README.md) and the
 [research close-out](./superpowers/plans/2026-10-03-subthree-research.md).
 
 Many `benchmarks/predictive/september-*.json` artifacts named below contain
@@ -220,7 +220,7 @@ registry v7 removes the obsolete coverage child cap. It retains v17's solved-his
 totals and exclusion of shared-process memory from ranking. Older studies are historical
 evidence and cannot be resumed against the changed policy. New pattern caches use
 `MWORDPT3` with a SHA-256 payload digest and regenerate older caches automatically.
-Fresh evaluation and release verification remain in [`TODO.md`](../TODO.md).
+Fresh evaluation and release verification remain in `TODO.md`.
 
 ## Experiment, study and evidence tooling
 

@@ -196,7 +196,7 @@ and private artifacts. No binary release is needed: application source, selected
 configuration and dependencies are unchanged. The reserved seal remains
 untouched; no prospective freeze was consumed. Narrow/enlarged-text native GUI,
 accessibility and real UNC-share acceptance remain explicitly open in
-[TODO.md](../../../TODO.md), not silently passed. The GUI remains closed.
+`TODO.md`, not silently passed. The GUI remains closed.
 
 ## October 12 close-out pass
 
@@ -307,6 +307,9 @@ Still open:
 - Test persistence on a share hosted by another machine.
 - Reassess the remaining dependency exception on the next GUI or lockfile
   update and no later than 2027-02-01.
+
+`TODO.md` is the owner's local working list and is no longer published; older
+mentions of it in this repository refer to that file.
 
 On 2026-10-12 the directory `target/subthree-research` named under
 "Evidence and recovery" was not present on the owner's machine, so the private

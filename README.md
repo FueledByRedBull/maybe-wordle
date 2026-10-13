@@ -45,8 +45,7 @@ models.
   whatever it is.
 
 Open items are listed at the end of the
-[research close-out](docs/superpowers/plans/2026-10-03-subthree-research.md#october-12-close-out-pass)
-and in [TODO.md](TODO.md).
+[research close-out](docs/superpowers/plans/2026-10-03-subthree-research.md#october-12-follow-up-and-re-freeze).
 
 ## Quick start
 

@@ -1,7 +1,7 @@
 # Maybe Wordle Implementation Plan
 
-> 2026-10-12: Historical design plan. Current status lives in [TODO.md](TODO.md)
-> and the [research close-out](docs/superpowers/plans/2026-10-03-subthree-research.md);
+> 2026-10-12: Historical design plan. Current status lives in the
+> [research close-out](docs/superpowers/plans/2026-10-03-subthree-research.md);
 > sub-three research closed 2026-10-05.
 
 > Status: historical planning notes. The current user-facing behavior, commands, and artifact layout are documented in `README.md`; this file preserves the original implementation rationale and may describe phases that are already complete or superseded.
