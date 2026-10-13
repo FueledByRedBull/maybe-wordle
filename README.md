@@ -1,13 +1,13 @@
-<div align="center">
-  <h1>Maybe Wordle</h1>
-  <p><strong>A Wordle solver for the NYT era where the answer list stopped behaving like a fixed museum exhibit.</strong></p>
-  <p>
-    <img alt="Rust" src="https://img.shields.io/badge/Rust-2024%20edition-1f6feb?style=flat-square">
-    <img alt="CLI and GUI" src="https://img.shields.io/badge/interface-CLI%20%2B%20GUI-0f766e?style=flat-square">
-    <img alt="NYT aware" src="https://img.shields.io/badge/model-NYT%20history%20aware-b45309?style=flat-square">
-    <img alt="Checked formal search" src="https://img.shields.io/badge/formal-fixed--model%20checks-7c3aed?style=flat-square">
-  </p>
-</div>
+# Maybe Wordle
+
+A Wordle solver that models NYT's dated answer history, including reused and
+newly added answers, instead of assuming a fixed answer list.
+
+[![CI](https://github.com/FueledByRedBull/maybe-wordle/actions/workflows/ci.yml/badge.svg)](https://github.com/FueledByRedBull/maybe-wordle/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/FueledByRedBull/maybe-wordle)](LICENSE)
+[![Rust 1.97+](https://img.shields.io/badge/rust-1.97%2B-orange)](rust-toolchain.toml)
+
+<img src="docs/assets/gui-play.png" alt="The Maybe Wordle GUI after one guess: the game board with coloured feedback tiles on the left and ten ranked suggestions with entropy, remaining-candidate and cost columns on the right" width="820">
 
 Classic Wordle solvers assume a fixed answer list and a uniform prior. Since
 February 2026 NYT has reused past answers and keeps adding new ones, so Maybe
@@ -16,6 +16,10 @@ weights each candidate by whether and how recently it was used, and searches
 for the guess that minimises expected guesses under that belief. It ships a
 desktop GUI and a CLI, plus a separate certificate-checked solver for fixed
 models.
+
+Status: a personal research project. Research toward a three-guess average is
+closed and one prospective test is pending (see below). No releases or
+prebuilt binaries are published; build from source.
 
 ## Results at a glance
 
@@ -49,9 +53,13 @@ Open items are listed at the end of the
 
 ## Quick start
 
-You need Rust 1.97; `rust-toolchain.toml` selects it.
+You need Rust 1.97 (`rust-toolchain.toml` selects it) and a network connection
+for the first sync. CI builds and tests on Windows, Linux and macOS; the GUI
+has been checked natively only on Windows.
 
 ```bash
+git clone https://github.com/FueledByRedBull/maybe-wordle.git
+cd maybe-wordle
 cargo run -- sync-data     # fetch the dated NYT answers (network; slowest step on a fresh clone)
 cargo run -- build-model   # derive the model files under data/derived/
 cargo run                  # open the GUI
@@ -66,6 +74,18 @@ cargo run -- solve-interactive
 
 Feedback is five symbols, one per letter: `0` absent, `1` present, `2` correct
 (`b`/`y`/`g` also work).
+
+With history synced through 2026-03-08, the `suggest` command prints two
+warnings about the optional predictive books and the model identity, and ends
+with the ranked guesses:
+
+```text
+smolt value_kind="heuristic proxy" entropy=5.30491 solve_prob=0.00000 expected_remaining=7.080
+diols value_kind="heuristic proxy" entropy=5.19136 solve_prob=0.00000 expected_remaining=8.126
+sloid value_kind="heuristic proxy" entropy=5.11533 solve_prob=0.00000 expected_remaining=8.631
+sluit value_kind="heuristic proxy" entropy=5.16510 solve_prob=0.00000 expected_remaining=7.806
+moult value_kind="heuristic proxy" entropy=5.08914 solve_prob=0.00152 expected_remaining=8.041
+```
 
 On Windows, `cargo build --release --bins` produces `maybe-wordle-gui.exe`
 (double-clickable, no console window) and `maybe-wordle.exe` (the CLI). The

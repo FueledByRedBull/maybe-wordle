@@ -24,6 +24,7 @@ configuration was reached. No other document links them by name.
 | `benchmarks/predictive/study-strategy-comparison-v5.json` | The earlier format of the search-strategy comparison; `-v8.json` is the one described below |
 | `config/candidates/*.toml` | Candidate configurations evaluated by those studies and comparisons |
 | `config/profiles/proxy-only.toml`, `config/profiles/proxy-exact-endgame.toml` | Configurations named for the two proxy-versus-default rolling comparisons |
+| `docs/generated/september-policy-screen-{before,after,progress,legality}.md`, `docs/generated/september-staged-root-bound-30day.md` | Word-free rendered tables of local-only September screens; the policy screens are described in [SEPTEMBER_RELEASE.md](SEPTEMBER_RELEASE.md), the root-bound replay in [PERFORMANCE.md](PERFORMANCE.md) |
 
 ## September 2026 audit and experiment notes
 
