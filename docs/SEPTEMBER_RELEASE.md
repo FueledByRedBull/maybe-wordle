@@ -27,6 +27,12 @@ remain open. See the
 The dependency audit was re-run on 2026-10-12 with the same two documented
 exceptions; see [DEPENDENCIES.md](DEPENDENCIES.md).
 
+Later on 2026-10-12 the keyboard pass was completed, one of the two dependency
+exceptions was retired and the freeze was re-made for the same window; see the
+[follow-up](superpowers/plans/2026-10-03-subthree-research.md#october-12-follow-up-and-re-freeze).
+`TODO.md`, mentioned below, is the owner's local working list and is no longer
+published.
+
 Reading guide: the status notes above, the decision contract and checklist
 sections 1-6 are the summary. The September 29 audit delivery section and
 everything from "Evaluation readiness (September 8)" onward form an append-only

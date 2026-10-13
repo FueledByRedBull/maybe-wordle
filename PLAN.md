@@ -2,7 +2,8 @@
 
 > 2026-10-12: Historical design plan. Current status lives in the
 > [research close-out](docs/superpowers/plans/2026-10-03-subthree-research.md);
-> sub-three research closed 2026-10-05.
+> sub-three research closed 2026-10-05. `TODO.md`, mentioned below, is the
+> owner's local working list and is no longer published.
 
 > Status: historical planning notes. The current user-facing behavior, commands, and artifact layout are documented in `README.md`; this file preserves the original implementation rationale and may describe phases that are already complete or superseded.
 

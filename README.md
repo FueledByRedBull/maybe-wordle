@@ -187,7 +187,9 @@ In that table the selected staged policy's edge over the simpler
 a paired difference of 0.0056 guesses with a 95% interval of
 [-0.0222, +0.0306], better on 16 of the 360 games and worse on 14. The
 lookahead, danger and pool-expansion stages are therefore not shown to improve
-the score.
+the score. Whether to retire those stages is deferred until the prospective
+evaluation has run, because any change to the selected policy or the source
+would void the freeze.
 
 <!-- BEGIN GENERATED PREDICTIVE EVIDENCE -->
 ## Predictive solver evidence

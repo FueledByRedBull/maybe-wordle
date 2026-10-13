@@ -6,6 +6,8 @@ reference, and the GUI behaviour and verification history. The notes are dated
 history written at the time. Current status is in the
 [README](../README.md) and the
 [research close-out](./superpowers/plans/2026-10-03-subthree-research.md).
+`TODO.md`, mentioned in those notes, is the owner's local working list and is
+no longer published.
 
 Many `benchmarks/predictive/september-*.json` artifacts named below contain
 answer words and are local-only; they are not in a clean checkout.
