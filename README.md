@@ -182,6 +182,13 @@ validation. An attempted full seven-profile matrix on the audit build hit its
 covers all 12 folds for seven baselines; on 2026-10-12 a replay with the
 current source reproduced its selected-profile outcome on all 360 games.
 
+In that table the selected staged policy's edge over the simpler
+`weighted_proxy_exact_endgame` profile is within noise: 3.1944 versus 3.2000,
+a paired difference of 0.0056 guesses with a 95% interval of
+[-0.0222, +0.0306], better on 16 of the 360 games and worse on 14. The
+lookahead, danger and pool-expansion stages are therefore not shown to improve
+the score.
+
 <!-- BEGIN GENERATED PREDICTIVE EVIDENCE -->
 ## Predictive solver evidence
 
