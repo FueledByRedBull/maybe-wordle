@@ -145,10 +145,11 @@ your draft. Tiles carry `A`, `P` and `C` text markers as well as colour. A Text
 slider scales the interface from 85% to 135%, and narrow windows stack the
 layout into one column. The minimum window is 560 by 620.
 
-On 2026-10-12 the packaged Windows build was checked through UI Automation:
-every input control exposes a name, and no control leaves the window at the
-minimum size or at 135% text. Keyboard use passed on the preceding build; the
-keyboard pass on the final build and a screen-reader pass are still open.
+On 2026-10-12 the packaged Windows build was checked through UI Automation and
+sent keystrokes: every input control exposes a name, no control leaves the
+window at the minimum size or at 135% text, and typing a row and pressing Enter
+applies it and returns focus to the Guess field. A screen-reader pass is still
+open.
 
 Detailed behaviour and the verification history are in
 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md#gui-behaviour-and-verification-history).
