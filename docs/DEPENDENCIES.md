@@ -41,12 +41,24 @@ earlier that day used `7eebec69c352c7191b1f13eb95dd510eeca5d1de`, and the
 | Advisory | Locked package | Review and disposition |
 | --- | --- | --- |
 | [RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192.html) | `ttf-parser` 0.25.1 | Unmaintained transitive font parser. `epaint` 0.36 renders text with `skrifa` and no longer uses `ab_glyph`. The remaining path is `winit` 0.30.13, `sctk-adwaita` 0.10.1, `ab_glyph`, `owned_ttf_parser`: the Wayland window-decoration title font, on Linux and BSD targets only. The audit scans the whole lockfile, so the exception stays although Windows and macOS builds do not compile the parser. Keep it visible as dependency debt; do not claim the parser is risk-free. Removing it needs an upstream `winit` or `sctk-adwaita` release without `ab_glyph`. |
+| [RUSTSEC-2026-0370](https://rustsec.org/advisories/RUSTSEC-2026-0370.html), [RUSTSEC-2026-0371](https://rustsec.org/advisories/RUSTSEC-2026-0371.html), [RUSTSEC-2026-0372](https://rustsec.org/advisories/RUSTSEC-2026-0372.html) | `zvariant` 5.15.0, `zbus_names` 4.3.4, `zvariant_derive` 5.15.0 | Unmaintained, with no patched version: these crates merged into `zbus` 6. They arrive through `eframe`, `egui-winit`, `accesskit_winit` and `accesskit_unix`, the Linux and BSD accessibility bridge. `cargo tree --locked -i zvariant` prints nothing on Windows, so the released executables do not contain them. Removing them needs an upstream `accesskit` release on `zbus` 6. |
 
-Only this advisory ID is ignored by the warning-denied job. Reassess it on the
-next GUI or lockfile update and no later than 2027-02-01; remove the exception
-when its package or advisory no longer applies. New advisories fail the job.
-Do not add broad package ignores, suppress database errors, or label an
-unreviewed exception as a clean audit.
+Only these advisory IDs are ignored by the warning-denied job. New advisories
+fail the job. Do not add broad package ignores, suppress database errors, or
+label an unreviewed exception as a clean audit.
+
+The project closed at v1.0.0 on 2026-11-01. These exceptions are accepted as
+they stand, and no further reassessment or dependency update is planned.
+
+Lockfile changes on 2026-11-01, for v1.0.0:
+
+- `rustls` 0.23.45 to 0.23.46, `rustls-webpki` 0.103.15 to 0.103.16 and
+  `webpki-roots` 1.0.6 to 1.0.11, for RUSTSEC-2026-0346 through 0349,
+  RUSTSEC-2026-0381 and RUSTSEC-2026-0382.
+- `tokio` 1.50.0 to 1.54.1 (with `mio` 1.1.1 to 1.2.4) for RUSTSEC-2026-0386.
+- `clipboard-win` 5.4.1 to 5.4.3, because 5.4.1 was yanked.
+- The open Dependabot updates: `chrono` 0.4.45, `clap` 4.6.7 and `serde_json`
+  1.0.154.
 
 Lockfile changes on 2026-10-12, all before the prospective freeze was made:
 
@@ -70,7 +82,7 @@ Lockfile changes on 2026-10-12, all before the prospective freeze was made:
 Local reproduction:
 
 ```powershell
-cargo audit --file Cargo.lock --deny warnings --ignore RUSTSEC-2026-0192
+cargo audit --file Cargo.lock --deny warnings --ignore RUSTSEC-2026-0192 --ignore RUSTSEC-2026-0370 --ignore RUSTSEC-2026-0371 --ignore RUSTSEC-2026-0372
 cargo tree --locked --target all --invert ttf-parser@0.25.1
 ```
 

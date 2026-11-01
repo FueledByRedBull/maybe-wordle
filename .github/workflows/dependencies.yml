@@ -30,3 +30,6 @@ jobs:
         run: >-
           cargo audit --file Cargo.lock --deny warnings
           --ignore RUSTSEC-2026-0192
+          --ignore RUSTSEC-2026-0370
+          --ignore RUSTSEC-2026-0371
+          --ignore RUSTSEC-2026-0372

@@ -17,6 +17,11 @@ prediction can average three on the development games, even one told each
 day's answer pool in advance. See the
 [floor analysis](#october-27-floor-analysis).
 
+November 1 update: the owner closed the project at v1.0.0. The prospective
+freeze was abandoned unscored, because the release's dependency updates changed
+files it binds. The items listed under "Still open" below will not be done and
+are accepted limits; see the [README](../../../README.md).
+
 ## Product decision
 
 Keep selected staged v20 in `config/prior.toml`. No research candidate met all

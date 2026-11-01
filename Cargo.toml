@@ -1,6 +1,9 @@
 [package]
 name = "maybe-wordle"
-version = "0.1.0"
+version = "1.0.0"
+description = "Wordle solver that models NYT's dated answer history instead of assuming a fixed answer list"
+license = "MIT"
+repository = "https://github.com/FueledByRedBull/maybe-wordle"
 edition = "2024"
 rust-version = "1.97"
 default-run = "maybe-wordle"

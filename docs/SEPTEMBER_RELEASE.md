@@ -1,5 +1,9 @@
 # September predictive release acceptance plan
 
+November 1 close-out: the owner closed the project at v1.0.0. The prospective
+freeze mentioned below was abandoned unscored, and the items still listed as
+open are accepted limits; see the [README](../README.md).
+
 Current close-out, October 5: retain staged v20 and the verified exact-search
 speedups. The owner ended speculative sub-three research without a qualified
 replacement or an under-three result. The [concise research close-out](superpowers/plans/2026-10-03-subthree-research.md)
