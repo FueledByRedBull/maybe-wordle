@@ -334,8 +334,9 @@ reservation for this release;
 interrupted attempts cannot be rerun as fresh tests. The raw report defaults
 to ignored `target/diagnostics/`; keep it and the markers local. On 2026-10-12
 unchanged selected v20 was frozen for the window 2026-10-13 through 2026-11-11
-([freeze record](../benchmarks/predictive/prospective-frozen-v1.json)); it has
-not been evaluated.
+([freeze record](../benchmarks/predictive/prospective-frozen-v1.json)). It was
+never evaluated: the owner closed the project on 2026-11-01, and the v1.0.0
+dependency updates changed files the freeze binds.
 
 `benchmark-evidence` writes versioned JSON plus a generated Markdown fragment and rejects excluded evaluation dates. Use `--rolling-folds` instead of `--from/--to` for the exact noncontiguous development folds, and `--matrix` to select a separate experiment matrix. Checkpoint v5 binds the selected dates, matrix contents, resolved profile configurations, time/memory ceilings, and effective Rayon worker count; older checkpoints cannot resume. Long runs emit flushed `profile-start`, per-game, and `profile-complete` records with completed/total work, elapsed time, and an evolving ETA. Profiles run sequentially; finite-policy games also run sequentially so their wall-clock search budgets do not compete. Legacy games may use Rayon. Cumulative resource limits are polled within games, search, books and latency probes as well as at profile boundaries; partial profiles are not published as completed evidence. The selected v20 configuration remains the production default; its historical sealed score is `3.3000`, not a three-guess claim or validation of the experimental finite policy.
 

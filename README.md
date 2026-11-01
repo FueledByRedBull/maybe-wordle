@@ -17,9 +17,9 @@ for the guess that minimises expected guesses under that belief. It ships a
 desktop GUI and a CLI, plus a separate certificate-checked solver for fixed
 models.
 
-Status: a personal research project. Research toward a three-guess average is
-closed and one prospective test is pending (see below). No releases or
-prebuilt binaries are published; build from source.
+Status: finished. This was a personal research project and v1.0.0 is its final
+release. It is not being developed further, and the limits below are accepted
+as they stand.
 
 ## Results at a glance
 
@@ -42,14 +42,23 @@ prebuilt binaries are published; build from source.
   which pool each answer comes from gives 3.1583. The
   [research close-out](docs/superpowers/plans/2026-10-03-subthree-research.md)
   records what was tried, why it stopped and what would justify reopening it.
-- A prospective test is pending. The unchanged selected configuration was
-  frozen on 2026-10-12 for the 30 puzzles from 2026-10-13 through 2026-11-11
-  ([freeze record](benchmarks/predictive/prospective-frozen-v1.json)). It can
-  be scored once, on or after 2026-11-12, and that score will be reported here
-  whatever it is.
+- The planned prospective test was abandoned and never scored. The selected
+  configuration was frozen on 2026-10-12 for the 30 puzzles from 2026-10-13
+  through 2026-11-11
+  ([freeze record](benchmarks/predictive/prospective-frozen-v1.json)). The
+  v1.0.0 dependency updates changed files that freeze binds, so it can no
+  longer run.
 
-Open items are listed at the end of the
-[research close-out](docs/superpowers/plans/2026-10-03-subthree-research.md#october-12-follow-up-and-re-freeze).
+Accepted limits at v1.0.0:
+
+- The GUI has been checked natively only on Windows, and never with a screen
+  reader.
+- Persistence has not been tested on a share hosted by another machine.
+- The staged lookahead, danger and pool-expansion stages stay in the selected
+  configuration, although they are not shown to improve the score.
+- Four unmaintained crates remain in the lockfile, documented in
+  [DEPENDENCIES.md](docs/DEPENDENCIES.md).
+- Dependency updates and security fixes after v1.0.0 are not planned.
 
 ## Quick start
 
@@ -64,6 +73,11 @@ cargo run -- sync-data     # fetch the dated NYT answers (network; slowest step 
 cargo run -- build-model   # derive the model files under data/derived/
 cargo run                  # open the GUI
 ```
+
+The [v1.0.0 release](https://github.com/FueledByRedBull/maybe-wordle/releases/tag/v1.0.0)
+has Windows executables. They still need the repository's `config/` and `data/`
+directories, so put them in a folder inside a clone. They contain no NYT data;
+run `sync-data` and `build-model` first, as above.
 
 From the command line:
 
@@ -208,9 +222,7 @@ In that table the selected staged policy's edge over the simpler
 a paired difference of 0.0056 guesses with a 95% interval of
 [-0.0222, +0.0306], better on 16 of the 360 games and worse on 14. The
 lookahead, danger and pool-expansion stages are therefore not shown to improve
-the score. Whether to retire those stages is deferred until the prospective
-evaluation has run, because any change to the selected policy or the source
-would void the freeze.
+the score. They were left in place when the project closed.
 
 <!-- BEGIN GENERATED PREDICTIVE EVIDENCE -->
 ## Predictive solver evidence

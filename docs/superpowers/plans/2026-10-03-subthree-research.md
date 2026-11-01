@@ -12,6 +12,16 @@ through 2026-11-11. See the
 [kill-test](#october-12-oracle-membership-kill-test) and the
 [October 12 close-out pass](#october-12-close-out-pass).
 
+October 27 update: exact floors show that no policy without word-level
+prediction can average three on the development games, even one told each
+day's answer pool in advance. See the
+[floor analysis](#october-27-floor-analysis).
+
+November 1 update: the owner closed the project at v1.0.0. The prospective
+freeze was abandoned unscored, because the release's dependency updates changed
+files it binds. The items listed under "Still open" below will not be done and
+are accepted limits; see the [README](../../../README.md).
+
 ## Product decision
 
 Keep selected staged v20 in `config/prior.toml`. No research candidate met all
@@ -320,3 +330,90 @@ four source snapshots, the old TODO, `research-working-tree.patch` and
 `preservation.json` as lost; the recovery steps above can no longer be
 followed. This ledger and the committed history are the surviving record. The
 kill-test evidence is under `target/oracle-membership-killtest/`.
+
+## October 27 floor analysis
+
+Question: can any policy average three on the 360 development games if it
+cannot predict which word NYT picks inside an answer pool? It cannot. Nothing
+in `src/`, `tests/` or the freeze-bound files changed; history was read only
+through 2026-08-26.
+
+### Method
+
+Each pool is taken as uniform: never-used list words, reused answers, and
+unlisted valid guesses for new words. Guesses come from the full 14,855-word
+list. A word that the next guess does not solve needs at least two more
+guesses, so a group of k equally likely words costs at least 2k - 1 guesses
+from that point. The floor applies this after every first and second guess and
+takes the minimum over all first guesses. It is computed for a solver that
+knows each day's pool, so it also bounds the real solver, which does not.
+
+Checks: on 12 random pools of 12 to 60 words the floor equals the exact
+optimum from a full search. On the 493-word never-used pool of 2026-08-25 a
+concrete strategy (opener `saner`) averages 2.9290 with a worst case of four,
+against a floor of 2.9270; replaying all 493 answers with the plain feedback
+function reproduces its total.
+
+### Result
+
+| Answer pool | Games | Selected v20 | Floor |
+| --- | ---: | ---: | ---: |
+| Never-used list word | 315 | 967 (3.0698) | 955.1 (3.0322) |
+| Reused answer | 17 | 59 (3.4706) | 45.2 (2.66) |
+| New word | 28 | 124 (4.4286) | at least 89.6 (3.2) |
+| All | 360 | 1,150 (3.1944) | at least 1,089.9 (3.0275) |
+
+A flat three allows 1,080. The floor exceeds it with the pool known in
+advance, an optimistic reuse pool (answers of puzzles 1-200 not yet reused;
+answers at least 1,400 days old give 48.0) and a weak new-word bound (3.2 is
+proven over the 12,491 unlisted words; a run to prove 3.4 was stopped).
+
+- Never-used days are at the limit. The selected policy is 11.9 guesses above
+  the floor over 315 games, about one standard deviation of sampling noise. On
+  102 sampled never-used days, playing each day's answer through the
+  near-optimal strategy gave 3.0882 against the selected 3.0196 (selected
+  minus strategy -0.0686, bootstrap interval [-0.1765, +0.0490]).
+- The most any non-predictive change could save, even with the pool known:
+  12 on never-used days, 14 on reuse days, 34 on new-word days. That is 60
+  against the 70 needed.
+- The never-used floor falls as the list drains: 3.0993 at 857 words
+  (2025-07-03), 2.9270 at 493 (2026-08-25). Random smaller pools give 2.9030
+  at 450, 2.8700 at 400, 2.7900 at 300, 2.7133 at 200 and 2.4967 at 100,
+  about 0.28 guesses per nat, in line with the 0.283 above.
+- The mix moved the other way. Folds through 2026-05-28 had 24-30 never-used
+  days in 30; the last development fold (2026-07-28 to 2026-08-26) had 20
+  never-used, 5 reused and 5 new. At the development mix and current per-pool
+  costs, the selected policy would reach about 3.0 near 300 never-used words.
+  At the last fold's mix it would sit near 3.3 and need about 100. Both are
+  projections, not floors.
+- A 30-game window averages at most three by chance with probability 0.064
+  for the development distribution, 0.009 for the sealed test's and 0.013 for
+  the last fold's.
+
+Untried signals, measured as KL divergence from the pool on the 315 never-used
+days (a random pool word in place of the answer gives the noise level):
+
+| Feature | Nats | Random word |
+| --- | ---: | ---: |
+| Letters shared with yesterday's answer | 0.0038 | 0.0122 |
+| Most letters shared with an answer of the last 7 days | 0.0096 | 0.0140 |
+| Same first letter as yesterday's answer | 0.0300 | 0.0009 |
+| Same last two letters as an answer of the last 30 days | 0.0009 | 0.0001 |
+
+Only the first-letter feature clears the noise, and at 0.283 guesses per nat
+it is worth about three guesses over 360 games. On new-word days, 2 of 28
+answers end in s against 34.4% of the unlisted pool: about 0.21 nat on those
+days and 0.016 nat across all days, likely what the positional-letter tail
+prior already captures.
+
+Limits: floors are expected values under uniform choice inside each pool; the
+realized total over 315 games varies by about nine guesses. The case where new
+words come from a small known set was not computed. The folds are in-sample
+for the selected configuration. The reopening bar is unchanged.
+
+Reproduce with `scripts/floor_analysis.py` (Python 3.12, numpy 2.4.6, numba
+0.64.0, synced history in `data/raw/`). It runs on four threads unless
+`NUMBA_NUM_THREADS` is set and writes nothing except the CSV named on the
+`never` command line. `check`, `pool`, `summary`, `mix` and `signals` take
+seconds to minutes; at 16 threads `never` took about 30 minutes and the 3.2
+step of `dormant` about 15.
